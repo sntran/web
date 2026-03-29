@@ -126,6 +126,11 @@ defmodule Web.Dispatcher.HTTPTest do
     assert {:error, _} = HTTP.fetch(req)
   end
 
+  test "fetch/1 defaults empty protocol urls to http before connecting" do
+    req = Request.new("/relative-only")
+    assert {:error, _} = HTTP.fetch(req)
+  end
+
   test "fetch/1 returns request errors after connecting when the request target is invalid" do
     port = HTTPServer.start_link([])
 
@@ -190,6 +195,20 @@ defmodule Web.Dispatcher.HTTPTest do
 
     assert resp.status == 200
     assert Enum.to_list(resp.body) == []
+  end
+
+  test "fetch/1 reads body data that arrives after headers in later recv cycles" do
+    port =
+      HTTPServer.start_link([
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n",
+        {:sleep, 10},
+        "data"
+      ])
+
+    req = Request.new("http://localhost:#{port}/deferred-body")
+    {:ok, resp} = HTTP.fetch(req)
+
+    assert Enum.to_list(resp.body) == ["data"]
   end
 
   test "fetch/1 aborts an in-flight body stream and closes the connection" do

@@ -88,6 +88,11 @@ defmodule Web.Dispatcher.TCPTest do
     assert {:error, _} = TCP.fetch(req)
   end
 
+  test "fetch/1 parses rclone style urls without an explicit port by defaulting to 80" do
+    req = Request.new("remote:localhost/path")
+    assert {:error, _} = TCP.fetch(req)
+  end
+
   test "fetch/1 streaming yields appropriately on clean closed termination" do
     # Drop immediately
     port = TCPServer.start_link("data", false, true)

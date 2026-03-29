@@ -7,8 +7,11 @@ Built with a "Dispatcher" architecture, `Web` provides a unified interface for H
 ## Key Features
 
 - **JS Fetch Parity**: Familiar `Request`, `Response`, and `Headers` structs.
-- **Polymorphic Entry**: `Web.fetch/2` accepts either a URL string or a pre-constructed `Web.Request` struct.
-- **RequestInit Support**: `Web.Request.new/2` accepts `method`, `headers`, `body`, `redirect`, `signal`, and `dispatcher`.
+- **Polymorphic Entry**: `Web.fetch/2` accepts a URL string, a `Web.URL`, or a pre-constructed `Web.Request` struct.
+- **Pure URL Value Object**: `Web.URL` is a plain struct with `protocol`, `hostname`, `port`, `pathname`, `hash`, `search_params`, and `kind`.
+- **Pure URLSearchParams**: `Web.URLSearchParams` stores ordered `{key, value}` pairs, preserves duplicates, and implements `Access` and `Enumerable`.
+- **Overloaded URL API**: `Web.URL.href/1,2`, `host/1,2`, `search/1,2`, and `hash/1,2` provide getter/setter style APIs while still returning new immutable structs.
+- **RequestInit Support**: `Web.Request.new/2` accepts a URL string or `Web.URL`, plus `method`, `headers`, `body`, `redirect`, `signal`, and `dispatcher`.
 - **Fetch-Style Redirect Handling**: `Web.Dispatcher.HTTP` supports `"follow"`, `"manual"`, and `"error"` redirect modes with a 20-hop safety limit.
 - **AbortController Support**: `Web.AbortController` and `Web.AbortSignal` can cancel in-flight fetches and active body streams.
 - **AbortSignal Helpers**: Build pre-aborted, timeout-driven, or combined signals with `Web.AbortSignal.abort/1`, `timeout/1`, and `any/1`.
@@ -52,6 +55,34 @@ req =
 {:ok, response} = Web.fetch(req)
 ```
 
+### Using `Web.URL`
+```elixir
+url =
+  Web.URL.new("https://example.com/search?q=elixir")
+  |> Web.URL.host("api.example.com:8443")
+  |> Web.URL.search("?q=elixir&lang=en")
+  |> Web.URL.hash("docs")
+
+Web.URL.href(url)
+# "https://api.example.com:8443/search?q=elixir&lang=en#docs"
+
+{:ok, response} = Web.fetch(url)
+```
+
+### Working with `Web.URLSearchParams`
+```elixir
+params =
+  Web.URLSearchParams.new("tag=one&tag=two")
+  |> Web.URLSearchParams.append("q", "hello world")
+  |> Web.URLSearchParams.set("page", "1")
+
+Web.URLSearchParams.get_all(params, "tag")
+# ["one", "two"]
+
+Web.URLSearchParams.to_string(params)
+# "tag=one&tag=two&q=hello+world&page=1"
+```
+
 ### Working with Headers
 ```elixir
 headers =
@@ -90,8 +121,13 @@ Enum.to_list(Web.Headers.entries(headers))
 ```elixir
 # Routes automatically to Web.Dispatcher.TCP
 {:ok, response} = Web.fetch("tcp://localhost:8080")
+
 # Or rclone-style
 {:ok, response} = Web.fetch("myserver:8080/data")
+
+url = Web.URL.new("my_remote:bucket/path/to/file")
+Web.URL.protocol(url)
+# "my_remote:"
 ```
 
 ### Advanced Options
@@ -157,6 +193,7 @@ Process.sleep(50)
 
 - **`Web.Dispatcher`**: The core behavior for all protocol handlers.
 - **`Web.Resolver`**: Logic to map URL schemes and prefixes to Dispatchers.
+- **`Web.URL` / `Web.URLSearchParams`**: Pure, Web API-inspired value structs for URL parsing, reconstruction, and ordered query param storage.
 - **`Web.Headers`**: A case-insensitive, multi-value header container with Web API-style operations, `Access`, and `Enumerable`.
 - **`Web.Request` / `Web.Response`**: Fetch-compatible structs whose `:headers` field is always normalized into `Web.Headers`.
 - **`Web.Dispatcher.HTTP`**: Powered by `Mint`, handles HTTP redirects internally, respects already-aborted signals, and aborts cleanly during header reads and body streaming.

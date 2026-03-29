@@ -15,7 +15,7 @@ defmodule Web.Request do
   ]
 
   @type t :: %__MODULE__{
-          url: String.t(),
+          url: Web.URL.t(),
           method: String.t(),
           headers: Web.Headers.t(),
           body: any(),
@@ -44,8 +44,26 @@ defmodule Web.Request do
   """
   def new(%__MODULE__{} = request, _init), do: request
 
+  def new(%Web.URL{} = input, init) do
+    build_request(input, init)
+  end
+
   def new(input, init) do
-    url = input
+    input
+    |> Web.URL.new()
+    |> build_request(init)
+  end
+
+  @doc """
+  Initializes a new Web.Request struct.
+
+  Supports URL strings.
+  """
+  def new(input) do
+    new(input, [])
+  end
+
+  defp build_request(url, init) do
     method = Keyword.get(init, :method, "GET") |> to_string() |> String.upcase()
     headers = Web.Headers.new(Keyword.get(init, :headers, %{}))
     body = Keyword.get(init, :body)
@@ -69,14 +87,5 @@ defmodule Web.Request do
       signal: signal,
       options: options
     }
-  end
-
-  @doc """
-  Initializes a new Web.Request struct.
-
-  Supports URL strings.
-  """
-  def new(input) do
-    new(input, [])
   end
 end

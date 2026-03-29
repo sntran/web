@@ -142,7 +142,11 @@ defmodule Web.HeadersTest do
         |> Headers.append("A", "2")
         |> Headers.set("B", "3")
 
-      assert Enum.map(headers, fn {name, value} -> {name, value} end) == [{"a", "1, 2"}, {"b", "3"}]
+      assert Enum.map(headers, fn {name, value} -> {name, value} end) == [
+               {"a", "1, 2"},
+               {"b", "3"}
+             ]
+
       assert Enum.count(headers) == 2
       assert Enum.member?(headers, {"a", "1, 2"})
     end

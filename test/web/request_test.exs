@@ -7,7 +7,7 @@ defmodule Web.RequestTest do
   property "new/2 defaults methodology handles varied URLs correctly" do
     check all(url <- string(:ascii, min_length: 1)) do
       req = Request.new(url)
-      assert req.url == url
+      assert match?(%Web.URL{}, req.url)
       assert req.method == "GET"
       assert req.headers == Web.Headers.new()
       assert req.body == nil
@@ -32,6 +32,7 @@ defmodule Web.RequestTest do
         extra_option: true
       )
 
+    assert Web.URL.href(req.url) == "http://example.com/"
     assert req.method == "POST"
     assert req.body == "data"
     assert req.headers == Web.Headers.new(%{"x" => "y"})
@@ -52,5 +53,13 @@ defmodule Web.RequestTest do
 
   test "struct defaults include a Web.Headers container" do
     assert %Request{}.headers == Web.Headers.new()
+  end
+
+  test "new/2 accepts an existing Web.URL struct" do
+    url = Web.URL.new("https://example.com/path")
+    req = Request.new(url, method: :put)
+
+    assert req.url == url
+    assert req.method == "PUT"
   end
 end

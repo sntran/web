@@ -23,20 +23,27 @@ defmodule Web.Resolver do
       iex> Web.Resolver.resolve("bare-string")
       Web.Dispatcher.HTTP
   """
-  def resolve(input) when is_binary(input) do
+  def resolve(%Web.URL{} = url) do
+    protocol = Web.URL.protocol(url)
+
     cond do
-      String.starts_with?(input, "http://") or String.starts_with?(input, "https://") ->
+      protocol in ["http:", "https:"] ->
         Web.Dispatcher.HTTP
 
-      String.starts_with?(input, "tcp://") ->
+      protocol == "tcp:" ->
         Web.Dispatcher.TCP
 
-      # Support connection strings like remote:path/to/file (rclone-style prefix)
-      String.contains?(input, ":") and not String.match?(input, ~r/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//) ->
+      Web.URL.rclone?(url) ->
         Web.Dispatcher.TCP
 
       true ->
         Web.Dispatcher.HTTP
     end
+  end
+
+  def resolve(input) when is_binary(input) do
+    input
+    |> Web.URL.new()
+    |> resolve()
   end
 end

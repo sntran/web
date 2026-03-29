@@ -38,10 +38,23 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp do_fetch_with_signal(request, redirect_count, signal_subscription) do
-    uri = URI.parse(request.url)
-    scheme = String.to_atom(uri.scheme || "http")
-    host = uri.host || ""
-    port = uri.port || if scheme == :https, do: 443, else: 80
+    scheme =
+      request.url
+      |> Web.URL.protocol()
+      |> String.trim_trailing(":")
+      |> case do
+        "" -> "http"
+        value -> value
+      end
+      |> String.to_atom()
+
+    host = Web.URL.hostname(request.url)
+
+    port =
+      case Web.URL.port(request.url) do
+        "" -> if(scheme == :https, do: 443, else: 80)
+        value -> String.to_integer(value)
+      end
 
     opts =
       case scheme do
@@ -52,7 +65,7 @@ defmodule Web.Dispatcher.HTTP do
     case Mint.HTTP.connect(scheme, host, port, opts) do
       {:ok, conn} ->
         headers = request.headers |> Web.Headers.to_list()
-        path = if uri.query, do: "#{uri.path}?#{uri.query}", else: uri.path || "/"
+        path = build_request_path(request.url)
 
         case Mint.HTTP.request(conn, request.method, path, headers, request.body) do
           {:ok, conn, request_ref} ->
@@ -74,7 +87,7 @@ defmodule Web.Dispatcher.HTTP do
                    status: status,
                    headers: resp_headers,
                    body: stream,
-                   url: request.url
+                   url: Web.URL.href(request.url)
                  )}
                 |> handle_redirect(request, redirect_count)
 
@@ -119,7 +132,13 @@ defmodule Web.Dispatcher.HTTP do
           location ->
             close_body(response.body)
 
-            next_url = request.url |> URI.parse() |> URI.merge(location) |> URI.to_string()
+            next_url =
+              request.url
+              |> Web.URL.href()
+              |> URI.parse()
+              |> URI.merge(location)
+              |> URI.to_string()
+
             next_request = next_redirect_request(request, response.status, next_url)
 
             do_fetch(next_request, redirect_count + 1)
@@ -133,7 +152,7 @@ defmodule Web.Dispatcher.HTTP do
   defp next_redirect_request(request, 303, next_url) do
     %{
       request
-      | url: next_url,
+      | url: Web.URL.new(next_url),
         method: "GET",
         body: nil,
         headers: Web.Headers.delete(request.headers, "content-length")
@@ -141,7 +160,19 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp next_redirect_request(request, _status, next_url) do
-    %{request | url: next_url}
+    %{request | url: Web.URL.new(next_url)}
+  end
+
+  defp build_request_path(url) do
+    path = Web.URL.pathname(url)
+    search = Web.URL.search(url)
+
+    cond do
+      search == "" and path == "" -> "/"
+      search == "" -> path
+      path == "" -> "/" <> search
+      true -> path <> search
+    end
   end
 
   defp close_body(body_stream) do
@@ -185,8 +216,19 @@ defmodule Web.Dispatcher.HTTP do
         {:error, :aborted}
 
       {:error, next_conn, reason, responses} ->
-        Web.AbortSignal.unsubscribe(signal_subscription)
-        {:error, next_conn, reason, responses}
+        case Web.AbortSignal.receive_abort(signal_subscription, 0) do
+          # coveralls-ignore-start
+          {:error, :aborted} ->
+            Mint.HTTP.close(next_conn)
+            Web.AbortSignal.unsubscribe(signal_subscription)
+            {:error, :aborted}
+
+          # coveralls-ignore-stop
+
+          :ok ->
+            Web.AbortSignal.unsubscribe(signal_subscription)
+            {:error, next_conn, reason, responses}
+        end
     end
   end
 

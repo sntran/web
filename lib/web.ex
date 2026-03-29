@@ -43,11 +43,18 @@ defmodule Web do
       iex> req = Web.Request.new("http://localhost_nxdomain")
       iex> {:error, _} = Web.fetch(req)
   """
-  @spec fetch(String.t() | Web.Request.t(), keyword()) ::
+  @spec fetch(String.t() | Web.URL.t() | Web.Request.t(), keyword()) ::
           {:ok, Web.Response.t()} | {:error, any()}
   def fetch(input, init \\ [])
 
   def fetch(%Web.Request{} = request, _init) do
+    do_fetch(request)
+  catch
+    :throw, {:abort, :aborted} -> {:error, :aborted}
+  end
+
+  def fetch(%Web.URL{} = input, init) do
+    request = Web.Request.new(input, init)
     do_fetch(request)
   catch
     :throw, {:abort, :aborted} -> {:error, :aborted}

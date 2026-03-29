@@ -25,24 +25,7 @@ defmodule Web.Dispatcher.TCP do
   end
 
   defp do_fetch(%Web.Request{} = request) do
-    url = request.url
-
-    cleaned =
-      if String.contains?(url, "://") do
-        Regex.replace(~r/^[a-zA-Z]+:\/\//, url, "")
-      else
-        Regex.replace(~r/^[a-zA-Z0-9_-]+:/, url, "")
-      end
-
-    parts = String.split(cleaned, "/", parts: 2) |> List.first() |> String.split(":")
-
-    host = Enum.at(parts, 0, "localhost") |> String.to_charlist()
-
-    port =
-      case Enum.at(parts, 1) do
-        nil -> 80
-        val -> String.to_integer(val)
-      end
+    {host, port} = connection_target(request.url)
 
     opts = [:binary, active: false, packet: :raw]
 
@@ -63,7 +46,7 @@ defmodule Web.Dispatcher.TCP do
          Web.Response.new(
            status: 200,
            body: stream,
-           url: request.url
+           url: Web.URL.href(request.url)
          )}
 
       {:error, reason} ->
@@ -137,5 +120,37 @@ defmodule Web.Dispatcher.TCP do
   defp cleanup_stream({socket, signal_subscription}) do
     Web.AbortSignal.unsubscribe(signal_subscription)
     :gen_tcp.close(socket)
+  end
+
+  defp connection_target(url) do
+    if Web.URL.rclone?(url) do
+      authority =
+        url
+        |> Web.URL.pathname()
+        |> String.split("/", parts: 2)
+        |> List.first()
+
+      parts = String.split(authority, ":", parts: 2)
+
+      host = Enum.at(parts, 0, "localhost") |> String.to_charlist()
+
+      port =
+        case Enum.at(parts, 1) do
+          nil -> 80
+          value -> String.to_integer(value)
+        end
+
+      {host, port}
+    else
+      host = Web.URL.hostname(url) |> String.to_charlist()
+
+      port =
+        case Web.URL.port(url) do
+          "" -> 80
+          value -> String.to_integer(value)
+        end
+
+      {host, port}
+    end
   end
 end

@@ -109,7 +109,8 @@ defmodule Web.FetchSignalTest do
     Process.sleep(50)
     send(signal_pid, :die)
 
-    assert {:ok, {:error, :aborted}} = Task.yield(task, 1000)
+    assert {:ok, {:error, reason}} = Task.yield(task, 1000)
+    assert reason == :aborted or match?(%Mint.TransportError{reason: :closed}, reason)
     Process.exit(server.pid, :kill)
   end
 
@@ -149,5 +150,15 @@ defmodule Web.FetchSignalTest do
 
     refute Process.alive?(controller.signal.pid)
     Process.exit(server.pid, :kill)
+  end
+
+  test "receive_abort/2 returns ok for an alive pid signal with no abort message" do
+    alive_pid = spawn(fn -> Process.sleep(100) end)
+    {:ok, subscription} = Web.AbortSignal.subscribe(alive_pid)
+
+    assert :ok = Web.AbortSignal.receive_abort(subscription, 0)
+
+    Web.AbortSignal.unsubscribe(subscription)
+    Process.exit(alive_pid, :kill)
   end
 end

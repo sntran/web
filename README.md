@@ -196,7 +196,7 @@ Process.sleep(50)
 - **`Web.URL` / `Web.URLSearchParams`**: Pure, Web API-inspired value structs for URL parsing, reconstruction, and ordered query param storage.
 - **`Web.Headers`**: A case-insensitive, multi-value header container with Web API-style operations, `Access`, and `Enumerable`.
 - **`Web.Request` / `Web.Response`**: Fetch-compatible structs whose `:headers` field is always normalized into `Web.Headers`.
-- **`Web.Dispatcher.HTTP`**: Powered by `Mint`, handles HTTP redirects internally, respects already-aborted signals, and aborts cleanly during header reads and body streaming.
+- **`Web.Dispatcher.HTTP`**: Powered by `Finch`, handles HTTP redirects internally, respects already-aborted signals, and exposes a zero-buffer streaming body.
 - **`Web.Dispatcher.TCP`**: Base TCP implementation using `:gen_tcp`, with abort-aware streaming and immediate socket cleanup.
 - **`Web.AbortController` / `Web.AbortSignal`**: Small cancellation primitives that mirror the browser Fetch API, including timeout and aggregate-signal support.
 

@@ -1,21 +1,11 @@
 defmodule Web.Dispatcher.HTTP do
-  @moduledoc "HTTP dispatcher using Mint in passive mode to support zero-buffer streaming."
+  @moduledoc "HTTP dispatcher using Finch with zero-buffer streaming."
   @behaviour Web.Dispatcher
 
   @max_redirects 20
   @redirect_statuses [301, 302, 303, 307, 308]
 
   @impl true
-  @doc """
-  Initiates an HTTP fetch, returning a streamable response body.
-
-  ## Parameters
-    - `request`: A `Web.Request` struct.
-
-  ## Returns
-    - `{:ok, Web.Response.t()}` on success.
-    - `{:error, reason}` on failure.
-  """
   @spec fetch(Web.Request.t()) :: {:ok, Web.Response.t()} | {:error, any()}
   def fetch(%Web.Request{} = request) do
     do_fetch(request, 0)
@@ -28,56 +18,18 @@ defmodule Web.Dispatcher.HTTP do
   defp do_fetch(%Web.Request{} = request, redirect_count) do
     case Web.AbortSignal.subscribe(request.signal) do
       {:ok, signal_subscription} ->
-        do_fetch_with_signal(request, redirect_count, signal_subscription)
+        case build_finch_request(request) do
+          {:ok, finch_request} ->
+            {bridge_pid, bridge_ref, bridge_monitor} = start_stream_bridge(finch_request)
 
-      # coveralls-ignore-start
-      {:error, :aborted} ->
-        {:error, :aborted}
-        # coveralls-ignore-stop
-    end
-  end
-
-  defp do_fetch_with_signal(request, redirect_count, signal_subscription) do
-    scheme =
-      request.url
-      |> Web.URL.protocol()
-      |> String.trim_trailing(":")
-      |> case do
-        "" -> "http"
-        value -> value
-      end
-      |> String.to_atom()
-
-    host = Web.URL.hostname(request.url)
-
-    port =
-      case Web.URL.port(request.url) do
-        "" -> if(scheme == :https, do: 443, else: 80)
-        value -> String.to_integer(value)
-      end
-
-    opts =
-      case scheme do
-        :https -> [transport_opts: [verify: :verify_none], mode: :passive]
-        _ -> [mode: :passive]
-      end
-
-    case Mint.HTTP.connect(scheme, host, port, opts) do
-      {:ok, conn} ->
-        headers = request.headers |> Web.Headers.to_list()
-        path = build_request_path(request.url)
-
-        case Mint.HTTP.request(conn, request.method, path, headers, request.body) do
-          {:ok, conn, request_ref} ->
-            case receive_headers(conn, request_ref, signal_subscription) do
-              {:ok, conn, status, resp_headers, data_chunks, done?} ->
+            case await_response_head(bridge_pid, bridge_ref, bridge_monitor, signal_subscription) do
+              {:ok, status, headers} ->
                 Web.AbortSignal.unsubscribe(signal_subscription)
+                Process.demonitor(bridge_monitor, [:flush])
 
                 stream =
                   Stream.resource(
-                    fn ->
-                      build_stream_state(conn, request_ref, done?, data_chunks, request.signal)
-                    end,
+                    fn -> build_stream_state(bridge_pid, bridge_ref, request.signal) end,
                     &receive_body_chunk/1,
                     &cleanup_stream/1
                   )
@@ -85,30 +37,26 @@ defmodule Web.Dispatcher.HTTP do
                 {:ok,
                  Web.Response.new(
                    status: status,
-                   headers: resp_headers,
+                   headers: headers,
                    body: stream,
                    url: Web.URL.href(request.url)
                  )}
                 |> handle_redirect(request, redirect_count)
 
-              {:error, :aborted} ->
-                {:error, :aborted}
-
-              {:error, _conn, reason, _responses} ->
+              {:error, reason} ->
                 Web.AbortSignal.unsubscribe(signal_subscription)
+                Process.demonitor(bridge_monitor, [:flush])
+                cancel_bridge(bridge_pid, bridge_ref)
                 {:error, reason}
             end
 
-          {:error, _conn, reason} ->
+          {:error, reason} ->
             Web.AbortSignal.unsubscribe(signal_subscription)
-            # coveralls-ignore-start
             {:error, reason}
-            # coveralls-ignore-stop
         end
 
-      {:error, reason} ->
-        Web.AbortSignal.unsubscribe(signal_subscription)
-        {:error, reason}
+      {:error, :aborted} ->
+        {:error, :aborted}
     end
   end
 
@@ -163,167 +111,302 @@ defmodule Web.Dispatcher.HTTP do
     %{request | url: Web.URL.new(next_url)}
   end
 
-  defp build_request_path(url) do
-    path = Web.URL.pathname(url)
-    search = Web.URL.search(url)
-
-    cond do
-      search == "" and path == "" -> "/"
-      search == "" -> path
-      path == "" -> "/" <> search
-      true -> path <> search
-    end
-  end
-
   defp close_body(body_stream) do
     Enum.reduce_while(body_stream, :ok, fn _, acc -> {:halt, acc} end)
     :ok
   end
 
-  # Internal recursive helper to drain the socket until status + headers are captured.
-  defp receive_headers(conn, ref, signal_subscription, status \\ nil, headers \\ []) do
-    case recv(conn, signal_subscription) do
-      {:ok, next_conn, responses} ->
-        {new_status, new_headers, data_chunks, done?} =
-          Enum.reduce(responses, {status, headers, [], false}, fn
-            {:status, ^ref, code}, {_, h, d, done} ->
-              {code, h, d, done}
+  defp build_finch_request(request) do
+    {:ok,
+     Finch.build(
+       request.method,
+       Web.URL.href(request.url),
+       Web.Headers.to_list(request.headers),
+       normalize_body(request.body)
+     )}
+  rescue
+    error -> {:error, error}
+  end
 
-            {:headers, ^ref, hs}, {s, h, d, done} ->
-              {s, h ++ hs, d, done}
+  defp normalize_body(nil), do: nil
+  defp normalize_body(body) when is_binary(body) or is_list(body), do: body
 
-            {:data, ^ref, chunk}, {s, h, d, done} ->
-              {s, h, d ++ [chunk], done}
+  defp normalize_body(body) do
+    if Enumerable.impl_for(body) do
+      {:stream, body}
+    else
+      body
+    end
+  end
 
-            {:done, ^ref}, {s, h, d, _} ->
-              {s, h, d, true}
+  defp start_stream_bridge(finch_request) do
+    bridge_ref = make_ref()
+    owner = self()
 
-            # coveralls-ignore-start
-            _, acc ->
-              acc
-              # coveralls-ignore-stop
-          end)
+    bridge_pid =
+      spawn(fn ->
+        Process.flag(:trap_exit, true)
 
-        if new_status && new_headers != [] do
-          {:ok, next_conn, new_status, new_headers, data_chunks, done?}
-        else
-          receive_headers(next_conn, ref, signal_subscription, new_status, new_headers)
+        bridge_loop(%{
+          owner: owner,
+          ref: bridge_ref,
+          request: finch_request,
+          worker_pid: nil,
+          worker_monitor: nil,
+          status: nil,
+          headers: [],
+          headers_received?: false,
+          ready_sent?: false,
+          waiting_consumer: nil,
+          pending_chunk: nil,
+          terminal: nil
+        })
+      end)
+
+    {bridge_pid, bridge_ref, Process.monitor(bridge_pid)}
+  end
+
+  defp bridge_loop(%{worker_pid: nil, request: request} = state) do
+    bridge_pid = self()
+    worker_pid = spawn(fn -> bridge_worker(bridge_pid, state.ref, request) end)
+    bridge_loop(%{state | worker_pid: worker_pid, worker_monitor: Process.monitor(worker_pid)})
+  end
+
+  defp bridge_loop(state) do
+    receive do
+      {:bridge_status, ref, status} when ref == state.ref ->
+        state
+        |> Map.put(:status, status)
+        |> maybe_send_ready()
+        |> bridge_loop()
+
+      {:bridge_headers, ref, headers} when ref == state.ref and not state.headers_received? ->
+        state
+        |> Map.put(:headers, headers)
+        |> Map.put(:headers_received?, true)
+        |> maybe_send_ready()
+        |> bridge_loop()
+
+      {:bridge_headers, ref, _trailers} when ref == state.ref ->
+        bridge_loop(state)
+
+      {:bridge_data, ref, chunk, worker_pid}
+      when ref == state.ref and is_nil(state.waiting_consumer) ->
+        bridge_loop(%{state | pending_chunk: {worker_pid, chunk}})
+
+      {:bridge_data, ref, chunk, worker_pid} when ref == state.ref ->
+        send(state.waiting_consumer, {:bridge_chunk, ref, chunk})
+        send(worker_pid, {:bridge_ack, ref})
+        bridge_loop(%{state | waiting_consumer: nil})
+
+      {:bridge_done, ref} when ref == state.ref ->
+        state = %{state | terminal: :done}
+
+        if state.waiting_consumer do
+          send(state.waiting_consumer, {:bridge_done, ref})
         end
 
-      {:error, next_conn, :aborted, _responses} ->
-        Mint.HTTP.close(next_conn)
-        Web.AbortSignal.unsubscribe(signal_subscription)
-        {:error, :aborted}
+        bridge_loop(%{state | waiting_consumer: nil})
 
-      {:error, next_conn, reason, responses} ->
+      {:bridge_error, ref, reason} when ref == state.ref ->
+        state = %{state | terminal: {:error, reason}}
+
+        if state.waiting_consumer do
+          send(state.waiting_consumer, {:bridge_error, ref, reason})
+        else
+          send(state.owner, {:bridge_failed, ref, reason})
+        end
+
+        bridge_loop(%{state | waiting_consumer: nil})
+
+      {:bridge_next, ref, consumer} when ref == state.ref and not is_nil(state.pending_chunk) ->
+        {worker_pid, chunk} = state.pending_chunk
+        send(consumer, {:bridge_chunk, ref, chunk})
+        send(worker_pid, {:bridge_ack, ref})
+        bridge_loop(%{state | pending_chunk: nil})
+
+      {:bridge_next, ref, consumer} when ref == state.ref and state.terminal == :done ->
+        send(consumer, {:bridge_done, ref})
+        bridge_loop(state)
+
+      {:bridge_next, ref, consumer} when ref == state.ref ->
+        case state.terminal do
+          {:error, reason} ->
+            send(consumer, {:bridge_error, ref, reason})
+            bridge_loop(state)
+
+          _ ->
+            bridge_loop(%{state | waiting_consumer: consumer})
+        end
+
+      {:bridge_cancel, ref} when ref == state.ref ->
+        if state.worker_pid && Process.alive?(state.worker_pid) do
+          Process.exit(state.worker_pid, :kill)
+        end
+
+        :ok
+
+      {:DOWN, monitor_ref, :process, worker_pid, reason}
+      when monitor_ref == state.worker_monitor and worker_pid == state.worker_pid ->
+        unless reason in [:normal, :killed] or match?({:shutdown, _}, reason) do
+          send(state.owner, {:bridge_failed, state.ref, reason})
+        end
+
+        :ok
+    end
+  end
+
+  defp bridge_worker(bridge_pid, ref, finch_request) do
+    result =
+      Finch.stream(
+        finch_request,
+        Web.Finch,
+        :ok,
+        fn
+          {:status, status}, acc ->
+            send(bridge_pid, {:bridge_status, ref, status})
+            acc
+
+          {:headers, headers}, acc ->
+            send(bridge_pid, {:bridge_headers, ref, headers})
+            acc
+
+          {:data, chunk}, acc ->
+            send(bridge_pid, {:bridge_data, ref, chunk, self()})
+
+            receive do
+              {:bridge_ack, ^ref} ->
+                acc
+
+              {:bridge_cancel, ^ref} ->
+                exit(:normal)
+            end
+
+          {:trailers, _trailers}, acc ->
+            acc
+        end,
+        receive_timeout: :infinity,
+        request_timeout: :infinity
+      )
+
+    case result do
+      {:ok, _acc} ->
+        send(bridge_pid, {:bridge_done, ref})
+
+      {:error, reason, _acc} ->
+        send(bridge_pid, {:bridge_error, ref, reason})
+    end
+  end
+
+  defp maybe_send_ready(%{ready_sent?: true} = state), do: state
+
+  defp maybe_send_ready(%{status: status, headers_received?: true} = state) when not is_nil(status) do
+    send(state.owner, {:bridge_ready, state.ref, status, state.headers})
+    %{state | ready_sent?: true}
+  end
+
+  defp maybe_send_ready(state), do: state
+
+  defp await_response_head(bridge_pid, bridge_ref, bridge_monitor, signal_subscription) do
+    receive do
+      {:bridge_ready, ^bridge_ref, status, headers} ->
+        {:ok, status, headers}
+
+      {:bridge_failed, ^bridge_ref, reason} ->
+        {:error, reason}
+
+      {:DOWN, ^bridge_monitor, :process, ^bridge_pid, reason} ->
+        {:error, reason}
+    after
+      50 ->
         case Web.AbortSignal.receive_abort(signal_subscription, 0) do
-          # coveralls-ignore-start
           {:error, :aborted} ->
-            Mint.HTTP.close(next_conn)
-            Web.AbortSignal.unsubscribe(signal_subscription)
+            cancel_bridge(bridge_pid, bridge_ref)
             {:error, :aborted}
 
-          # coveralls-ignore-stop
-
           :ok ->
-            Web.AbortSignal.unsubscribe(signal_subscription)
-            {:error, next_conn, reason, responses}
+            await_response_head(bridge_pid, bridge_ref, bridge_monitor, signal_subscription)
         end
     end
   end
 
-  # Stream generator logic. It yields chunks from the data buffer first, 
-  # then performs fresh Mint.HTTP.recv calls until :done is seen.
-  defp build_stream_state(conn, request_ref, done?, data_chunks, signal) do
+  defp build_stream_state(bridge_pid, bridge_ref, signal) do
     case Web.AbortSignal.subscribe(signal) do
       {:ok, signal_subscription} ->
-        {conn, request_ref, if(done?, do: :done, else: :streaming), data_chunks,
-         signal_subscription}
+        %{
+          bridge_pid: bridge_pid,
+          bridge_ref: bridge_ref,
+          bridge_monitor: Process.monitor(bridge_pid),
+          signal_subscription: signal_subscription
+        }
 
-      # coveralls-ignore-start
       {:error, :aborted} ->
-        {conn, request_ref, :aborted, [], nil}
-        # coveralls-ignore-stop
+        cancel_bridge(bridge_pid, bridge_ref)
+
+        %{
+          bridge_pid: bridge_pid,
+          bridge_ref: bridge_ref,
+          bridge_monitor: Process.monitor(bridge_pid),
+          signal_subscription: nil,
+          aborted?: true
+        }
     end
   end
 
-  defp receive_body_chunk({conn, ref, :aborted, [], signal_subscription}) do
-    {:halt, {conn, ref, :aborted, [], signal_subscription}}
-  end
+  defp receive_body_chunk(state) do
+    if Map.get(state, :aborted?, false) do
+      {:halt, state}
+    else
+      case Web.AbortSignal.receive_abort(state.signal_subscription, 0) do
+        {:error, :aborted} ->
+          cancel_bridge(state.bridge_pid, state.bridge_ref)
+          {:halt, Map.put(state, :aborted?, true)}
 
-  defp receive_body_chunk({conn, ref, state, [chunk | rest], signal_subscription}) do
-    {[chunk], {conn, ref, state, rest, signal_subscription}}
-  end
-
-  defp receive_body_chunk({conn, ref, :done, [], signal_subscription}) do
-    {:halt, {conn, ref, :done, [], signal_subscription}}
-  end
-
-  defp receive_body_chunk({conn, ref, :streaming, [], signal_subscription}) do
-    case recv(conn, signal_subscription) do
-      {:ok, next_conn, responses} ->
-        chunks =
-          Enum.flat_map(responses, fn
-            {:data, ^ref, chunk} ->
-              [chunk]
-
-            # coveralls-ignore-start
-            _ ->
-              []
-              # coveralls-ignore-stop
-          end)
-
-        done? =
-          Enum.any?(responses, fn
-            # coveralls-ignore-start
-            {:done, ^ref} -> true
-            # coveralls-ignore-stop
-            _ -> false
-          end)
-
-        state = if done?, do: :done, else: :streaming
-
-        # coveralls-ignore-start
-        if chunks == [] and not done? do
-          receive_body_chunk({next_conn, ref, :streaming, [], signal_subscription})
-        else
-          {chunks, {next_conn, ref, state, [], signal_subscription}}
-        end
-
-      # coveralls-ignore-stop
-
-      {:error, next_conn, _reason, _responses} ->
-        {:halt, {next_conn, ref, :error, [], signal_subscription}}
+        :ok ->
+          send(state.bridge_pid, {:bridge_next, state.bridge_ref, self()})
+          await_body_chunk(state)
+      end
     end
   end
 
-  defp cleanup_stream({conn, _, _, _, signal_subscription}) do
-    Web.AbortSignal.unsubscribe(signal_subscription)
-    Mint.HTTP.close(conn)
-  end
+  defp await_body_chunk(state) do
+    receive do
+      {:bridge_chunk, ref, chunk} when ref == state.bridge_ref ->
+        {[chunk], state}
 
-  defp recv(conn, signal_subscription) do
-    case Web.AbortSignal.receive_abort(signal_subscription, 0) do
-      {:error, :aborted} ->
-        {:error, conn, :aborted, []}
+      {:bridge_done, ref} when ref == state.bridge_ref ->
+        {:halt, state}
 
-      :ok ->
-        case Mint.HTTP.recv(conn, 0, 50) do
-          {:ok, next_conn, responses} ->
-            {:ok, next_conn, responses}
+      {:bridge_error, ref, _reason} when ref == state.bridge_ref ->
+        {:halt, state}
 
-          {:error, next_conn, %Mint.TransportError{reason: :timeout}, _responses} ->
-            case Web.AbortSignal.receive_abort(signal_subscription, 0) do
-              {:error, :aborted} -> {:error, next_conn, :aborted, []}
-              :ok -> recv(next_conn, signal_subscription)
-            end
+      {:DOWN, monitor_ref, :process, pid, _reason}
+      when monitor_ref == state.bridge_monitor and pid == state.bridge_pid ->
+        {:halt, state}
+    after
+      50 ->
+        case Web.AbortSignal.receive_abort(state.signal_subscription, 0) do
+          {:error, :aborted} ->
+            cancel_bridge(state.bridge_pid, state.bridge_ref)
+            {:halt, Map.put(state, :aborted?, true)}
 
-          {:error, next_conn, reason, responses} ->
-            case Web.AbortSignal.receive_abort(signal_subscription, 0) do
-              {:error, :aborted} -> {:error, next_conn, :aborted, responses}
-              :ok -> {:error, next_conn, reason, responses}
-            end
+          :ok ->
+            await_body_chunk(state)
         end
     end
+  end
+
+  defp cleanup_stream(state) do
+    Web.AbortSignal.unsubscribe(state.signal_subscription)
+    Process.demonitor(state.bridge_monitor, [:flush])
+    cancel_bridge(state.bridge_pid, state.bridge_ref)
+  end
+
+  defp cancel_bridge(bridge_pid, bridge_ref) do
+    if Process.alive?(bridge_pid) do
+      send(bridge_pid, {:bridge_cancel, bridge_ref})
+    end
+
+    :ok
   end
 end

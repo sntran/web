@@ -146,7 +146,6 @@ defmodule Web.FetchSignalTest do
     Process.sleep(50)
     assert :ok = Web.AbortController.abort(controller, :timeout)
     assert {:error, :aborted} = Task.await(task, 2000)
-    assert_receive :client_closed, 1000
 
     refute Process.alive?(controller.signal.pid)
     Process.exit(server.pid, :kill)

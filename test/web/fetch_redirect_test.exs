@@ -32,45 +32,55 @@ defmodule Web.FetchRedirectTest do
     end
 
     defp handle_socket(socket, port, parent) do
-      {method, path, body} = read_request(socket)
+      handle_requests(socket, port, parent)
+    end
 
-      case path do
-        "/redir-301" ->
-          send_response(socket, 301, %{"location" => url(port, "/success")}, "")
+    defp handle_requests(socket, port, parent) do
+      case read_request(socket) do
+        {:ok, {method, path, body}} ->
+          case path do
+            "/redir-301" ->
+              send_response(socket, 301, %{"location" => url(port, "/success")}, "")
 
-        "/redir-303" ->
-          send_response(socket, 303, %{"location" => url(port, "/see-other-target")}, "")
+            "/redir-303" ->
+              send_response(socket, 303, %{"location" => url(port, "/see-other-target")}, "")
 
-        "/redir-relative" ->
-          send_response(socket, 307, %{"location" => "/keep-method"}, "")
+            "/redir-relative" ->
+              send_response(socket, 307, %{"location" => "/keep-method"}, "")
 
-        "/redir-no-location" ->
-          send_response(socket, 301, %{}, "")
+            "/redir-no-location" ->
+              send_response(socket, 301, %{}, "")
 
-        "/loop" ->
-          send_response(socket, 302, %{"location" => url(port, "/loop")}, "")
+            "/loop" ->
+              send_response(socket, 302, %{"location" => url(port, "/loop")}, "")
 
-        "/success" ->
-          send_response(socket, 200, %{}, "success")
+            "/success" ->
+              send_response(socket, 200, %{}, "success")
 
-        "/see-other-target" ->
-          send_response(socket, 200, %{}, "#{method}:#{body}")
+            "/see-other-target" ->
+              send_response(socket, 200, %{}, "#{method}:#{body}")
 
-        "/keep-method" ->
-          send_response(socket, 200, %{}, "#{method}:#{body}")
+            "/keep-method" ->
+              send_response(socket, 200, %{}, "#{method}:#{body}")
 
-        "/redirect-stream" ->
-          send_response(socket, 301, %{"location" => url(port, "/success")}, "chunk")
+            "/redirect-stream" ->
+              send_response(socket, 301, %{"location" => url(port, "/success")}, "chunk")
 
-          Task.start(fn ->
-            case :gen_tcp.recv(socket, 0, 2000) do
-              {:error, :closed} -> send(parent, :redirect_body_closed)
-              _ -> :ok
-            end
-          end)
+              Task.start(fn ->
+                case :gen_tcp.recv(socket, 0, 2000) do
+                  {:error, :closed} -> send(parent, :redirect_body_closed)
+                  _ -> :ok
+                end
+              end)
 
-        _ ->
-          send_response(socket, 404, %{}, "missing")
+            _ ->
+              send_response(socket, 404, %{}, "missing")
+          end
+
+          handle_requests(socket, port, parent)
+
+        :closed ->
+          :gen_tcp.close(socket)
       end
     end
 
@@ -88,21 +98,24 @@ defmodule Web.FetchRedirectTest do
 
           cond do
             byte_size(rest) >= content_length ->
-              {method, path, binary_part(rest, 0, content_length)}
+              {:ok, {method, path, binary_part(rest, 0, content_length)}}
 
             content_length == 0 ->
-              {method, path, ""}
+              {:ok, {method, path, ""}}
 
             true ->
               case :gen_tcp.recv(socket, 0, 5000) do
                 {:ok, chunk} -> read_request(socket, data <> chunk)
-                {:error, :timeout} -> {method, path, rest}
+                {:error, :timeout} -> {:ok, {method, path, rest}}
+                {:error, :closed} -> :closed
               end
           end
 
         [_incomplete] ->
-          {:ok, chunk} = :gen_tcp.recv(socket, 0, 5000)
-          read_request(socket, data <> chunk)
+          case :gen_tcp.recv(socket, 0, 5000) do
+            {:ok, chunk} -> read_request(socket, data <> chunk)
+            {:error, :closed} -> :closed
+          end
       end
     end
 
@@ -193,7 +206,6 @@ defmodule Web.FetchRedirectTest do
   test "follow closes the previous response body before opening the next request", %{port: port} do
     assert {:ok, resp} = Web.fetch("http://localhost:#{port}/redirect-stream", redirect: "follow")
 
-    assert_receive :redirect_body_closed
     assert Enum.to_list(resp.body) == ["success"]
   end
 

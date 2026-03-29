@@ -15,7 +15,8 @@ defmodule Web.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:logger],
+      mod: {Web.Application, []}
     ]
   end
 
@@ -33,7 +34,7 @@ defmodule Web.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:mint, "~> 1.0"},
+      {:finch, "~> 0.16"},
       {:castore, "~> 1.0"},
       {:stream_data, "~> 1.0", only: :test},
       {:excoveralls, "~> 0.18", only: :test}

@@ -28,4 +28,15 @@ defmodule Web.ResponseTest do
     assert resp.url == nil
     assert resp.headers == Web.Headers.new()
   end
+
+  test "new/1 normalizes repeated tuple-list headers into Web.Headers" do
+    resp = Response.new(headers: [{"Set-Cookie", "a=1"}, {"set-cookie", "b=2"}])
+
+    assert resp.headers == Web.Headers.new([{"Set-Cookie", "a=1"}, {"set-cookie", "b=2"}])
+    assert Web.Headers.get_set_cookie(resp.headers) == ["a=1", "b=2"]
+  end
+
+  test "struct defaults include a Web.Headers container" do
+    assert %Response{}.headers == Web.Headers.new()
+  end
 end

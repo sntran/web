@@ -42,4 +42,15 @@ defmodule Web.RequestTest do
     assert req.options[:redirect] == "manual"
     assert req.options[:signal] == self()
   end
+
+  test "new/2 normalizes tuple-list headers into Web.Headers" do
+    req = Request.new("http://example.com", headers: [{"X-Test", "1"}, {"x-test", "2"}])
+
+    assert req.headers == Web.Headers.new([{"X-Test", "1"}, {"x-test", "2"}])
+    assert Web.Headers.get(req.headers, "x-test") == "1, 2"
+  end
+
+  test "struct defaults include a Web.Headers container" do
+    assert %Request{}.headers == Web.Headers.new()
+  end
 end

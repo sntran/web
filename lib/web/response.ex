@@ -6,10 +6,10 @@ defmodule Web.Response do
 
   defstruct [
     :body,
-    :headers,
     :status,
     :ok,
-    :url
+    :url,
+    headers: Web.Headers.new()
   ]
 
   @type t :: %__MODULE__{

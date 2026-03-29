@@ -12,7 +12,8 @@ Built with a "Dispatcher" architecture, `Web` provides a unified interface for H
 - **Fetch-Style Redirect Handling**: `Web.Dispatcher.HTTP` supports `"follow"`, `"manual"`, and `"error"` redirect modes with a 20-hop safety limit.
 - **AbortController Support**: `Web.AbortController` and `Web.AbortSignal` can cancel in-flight fetches and active body streams.
 - **AbortSignal Helpers**: Build pre-aborted, timeout-driven, or combined signals with `Web.AbortSignal.abort/1`, `timeout/1`, and `any/1`.
-- **Case-Insensitive Headers**: `Web.Headers` implements the `Access` protocol with case-insensitive normalization.
+- **Web-Style Headers API**: `Web.Headers` is case-insensitive, supports multiple values per header, implements `Access` and `Enumerable`, and exposes `append`, `set`, `get`, `delete`, `has`, `entries`, `keys`, `values`, and `getSetCookie`.
+- **Automatic Header Normalization**: `Web.Request` and `Web.Response` always normalize their `:headers` field into a `Web.Headers` struct, whether initialized from a map, tuple list, or an existing `Web.Headers`.
 - **Zero-Buffer Streaming**: `Web.Response.body` is an Elixir `Stream` that yields chunks as they arrive from the socket, ensuring memory safety for large resources.
 - **Extensible Dispatchers**: Plug in custom protocol handlers (HTTP, TCP, NNTP, etc.) via the `Web.Dispatcher` behaviour.
 - **Rclone-Style Resolution**: Supports standard URIs (`https://...`) and connection strings (`remote:path/...`).
@@ -49,6 +50,28 @@ req =
   )
 
 {:ok, response} = Web.fetch(req)
+```
+
+### Working with Headers
+```elixir
+headers =
+  Web.Headers.new([{"Content-Type", "text/plain"}])
+  |> Web.Headers.append("X-Trace", "a")
+  |> Web.Headers.append("x-trace", "b")
+  |> Web.Headers.append("Set-Cookie", "a=1")
+  |> Web.Headers.append("set-cookie", "b=2")
+
+Web.Headers.get(headers, "content-type")
+# "text/plain"
+
+Web.Headers.get(headers, "X-Trace")
+# "a, b"
+
+Web.Headers.getSetCookie(headers)
+# ["a=1", "b=2"]
+
+Enum.to_list(Web.Headers.entries(headers))
+# [{"content-type", "text/plain"}, {"set-cookie", "a=1, b=2"}, {"x-trace", "a, b"}]
 ```
 
 ### Redirect Modes
@@ -134,7 +157,8 @@ Process.sleep(50)
 
 - **`Web.Dispatcher`**: The core behavior for all protocol handlers.
 - **`Web.Resolver`**: Logic to map URL schemes and prefixes to Dispatchers.
-- **`Web.Headers`**: Case-insensitive map implementation for HTTP headers.
+- **`Web.Headers`**: A case-insensitive, multi-value header container with Web API-style operations, `Access`, and `Enumerable`.
+- **`Web.Request` / `Web.Response`**: Fetch-compatible structs whose `:headers` field is always normalized into `Web.Headers`.
 - **`Web.Dispatcher.HTTP`**: Powered by `Mint`, handles HTTP redirects internally, respects already-aborted signals, and aborts cleanly during header reads and body streaming.
 - **`Web.Dispatcher.TCP`**: Base TCP implementation using `:gen_tcp`, with abort-aware streaming and immediate socket cleanup.
 - **`Web.AbortController` / `Web.AbortSignal`**: Small cancellation primitives that mirror the browser Fetch API, including timeout and aggregate-signal support.

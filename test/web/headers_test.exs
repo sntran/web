@@ -4,24 +4,30 @@ defmodule Web.HeadersTest do
 
   alias Web.Headers
 
-  describe "initialization" do
+  describe "new/1" do
     property "creates empty headers safely" do
       check all(empty <- constant(%{})) do
-        assert Headers.new(empty).headers == %{}
-        assert Headers.new().headers == %{}
+        assert Headers.new(empty).data == %{}
+        assert Headers.new().data == %{}
       end
     end
 
-    property "initializes from list and normalizes keys" do
+    property "initializes from maps case-insensitively" do
       check all(
               key <- string(:alphanumeric, min_length: 1),
               val <- string(:alphanumeric, min_length: 1)
             ) do
-        k_str = to_string(key)
-        v_str = to_string(val)
-        headers = Headers.new([{k_str, v_str}])
-        assert Headers.get(headers, String.downcase(k_str)) == v_str
+        headers = Headers.new(%{String.upcase(key) => val})
+        assert Headers.get(headers, String.downcase(key)) == val
       end
+    end
+
+    test "initializes from duplicate tuples by appending values" do
+      headers = Headers.new([{"X-Test", "1"}, {"x-test", "2"}])
+
+      assert headers.data == %{"x-test" => ["1", "2"]}
+      assert Headers.get(headers, "X-Test") == "1, 2"
+      assert Headers.to_list(headers) == [{"x-test", "1"}, {"x-test", "2"}]
     end
 
     test "initializes from existing struct idempotently" do
@@ -29,57 +35,123 @@ defmodule Web.HeadersTest do
       assert Headers.new(base) == base
     end
 
-    test "initializes from atom keys" do
-      headers = Headers.new(%{key: "val"})
-      assert Headers.get(headers, "key") == "val"
+    test "normalizes atom keys and values" do
+      headers = Headers.new(%{key: :val})
+      assert Headers.get(headers, "KEY") == "val"
+    end
+  end
+
+  describe "header operations" do
+    test "set/get/has/delete are case-insensitive" do
+      headers =
+        Headers.new()
+        |> Headers.set("X-Test", 1)
+
+      assert Headers.has(headers, "x-test")
+      assert Headers.get(headers, "x-test") == "1"
+      refute Headers.has(Headers.delete(headers, "X-TEST"), "x-test")
+    end
+
+    test "append joins multiple values for get/2" do
+      headers =
+        Headers.new()
+        |> Headers.append("Accept", "text/plain")
+        |> Headers.append("accept", "application/json")
+
+      assert headers.data == %{"accept" => ["text/plain", "application/json"]}
+      assert Headers.get(headers, "ACCEPT") == "text/plain, application/json"
+    end
+
+    test "set replaces appended values" do
+      headers =
+        Headers.new()
+        |> Headers.append("x-test", "1")
+        |> Headers.append("x-test", "2")
+        |> Headers.set("X-Test", "3")
+
+      assert headers.data == %{"x-test" => ["3"]}
+      assert Headers.get(headers, "x-test") == "3"
+    end
+
+    test "get_set_cookie returns all set-cookie values" do
+      headers =
+        Headers.new()
+        |> Headers.append("Set-Cookie", "a=1")
+        |> Headers.append("set-cookie", "b=2")
+
+      assert Headers.get(headers, "set-cookie") == "a=1, b=2"
+      assert Headers.get_set_cookie(headers) == ["a=1", "b=2"]
+      assert apply(Headers, :getSetCookie, [headers]) == ["a=1", "b=2"]
+    end
+
+    test "missing headers return nil by default" do
+      assert Headers.get(Headers.new(), "missing") == nil
+      assert Headers.get(Headers.new(), "missing", :default) == :default
     end
   end
 
   describe "Access behaviour implementation" do
-    property "fetch and element referencing handle presence correctly" do
-      check all(
-              h_map_raw <-
-                map_of(string(:alphanumeric, min_length: 1), string(:alphanumeric, min_length: 1))
-            ) do
-        h_map = h_map_raw |> Enum.uniq_by(fn {k, _} -> String.downcase(k) end) |> Map.new()
-        h = Headers.new(h_map)
+    test "fetch and square-bracket access use normalized lookups" do
+      headers = Headers.new(%{"Content-Type" => "text/plain"})
 
-        for {k, v} <- h_map do
-          k_down = String.downcase(k)
-          assert ^v = h[k_down]
-        end
-
-        assert h["non_existent"] == nil
-        assert Headers.fetch(h, "non_existent") == :error
-      end
+      assert headers["content-type"] == "text/plain"
+      assert Headers.fetch(headers, "CONTENT-TYPE") == {:ok, "text/plain"}
+      assert headers["missing"] == nil
+      assert Headers.fetch(headers, "missing") == :error
     end
 
-    test "get_and_update" do
-      h = Headers.new()
-      {nil, h2} = get_and_update_in(h["a"], fn current -> {current, "b"} end)
-      assert h2["a"] == "b"
+    test "get_and_update stores a replacement value" do
+      headers = Headers.new()
+      {nil, updated} = get_and_update_in(headers["a"], fn current -> {current, "b"} end)
 
-      {"b", h3} = get_and_update_in(h2["a"], fn _ -> :pop end)
-      assert h3["a"] == nil
+      assert updated["a"] == "b"
     end
 
-    test "pop" do
-      h = Headers.new(%{"a" => "b"})
-      {"b", h2} = pop_in(h["a"])
-      assert h2["a"] == nil
+    test "get_and_update can pop a value" do
+      headers = Headers.new(%{"a" => "b"})
+      {"b", updated} = get_and_update_in(headers["a"], fn _ -> :pop end)
+
+      assert updated["a"] == nil
     end
 
-    test "put, get, has_key?, delete, to_list directly" do
-      h = Headers.new()
-      h = Headers.put(h, "FOO", "bar")
-      assert Headers.has_key?(h, "foo")
-      assert Headers.get(h, "fOO") == "bar"
+    test "pop removes a value" do
+      headers = Headers.new(%{"a" => "b"})
+      {"b", updated} = pop_in(headers["a"])
 
-      h = Headers.delete(h, "Foo")
-      refute Headers.has_key?(h, "foo")
+      assert updated["a"] == nil
+    end
+  end
 
-      h = Headers.put(h, :atom_key, "val")
-      assert Headers.to_list(h) == [{"atom_key", "val"}]
+  describe "iteration" do
+    test "entries, keys, and values expose combined iterator views" do
+      headers =
+        Headers.new()
+        |> Headers.append("B", "2")
+        |> Headers.append("A", "1")
+        |> Headers.append("A", "3")
+
+      assert Enum.to_list(Headers.entries(headers)) == [{"a", "1, 3"}, {"b", "2"}]
+      assert Enum.to_list(Headers.keys(headers)) == ["a", "b"]
+      assert Enum.to_list(Headers.values(headers)) == ["1, 3", "2"]
+    end
+
+    test "Enumerable allows Enum functions directly on headers" do
+      headers =
+        Headers.new()
+        |> Headers.append("A", "1")
+        |> Headers.append("A", "2")
+        |> Headers.set("B", "3")
+
+      assert Enum.map(headers, fn {name, value} -> {name, value} end) == [{"a", "1, 2"}, {"b", "3"}]
+      assert Enum.count(headers) == 2
+      assert Enum.member?(headers, {"a", "1, 2"})
+    end
+
+    test "Enumerable slice reports unsupported slicing" do
+      headers = Headers.new(%{"a" => "1"})
+      impl = Enumerable.impl_for!(headers)
+
+      assert impl.slice(headers) == {:error, impl}
     end
   end
 end

@@ -6,12 +6,12 @@ defmodule Web.Request do
   defstruct [
     :url,
     :method,
-    :headers,
     :body,
     :dispatcher,
     :redirect,
     :signal,
-    :options
+    :options,
+    headers: Web.Headers.new()
   ]
 
   @type t :: %__MODULE__{

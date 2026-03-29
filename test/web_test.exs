@@ -3,6 +3,8 @@ defmodule WebTest do
   use ExUnitProperties
 
   doctest Web
+  doctest Web.AbortController
+  doctest Web.AbortSignal
   doctest Web.Headers
   doctest Web.Request
   doctest Web.Response
@@ -13,17 +15,18 @@ defmodule WebTest do
     def fetch(%Web.Request{url: "mock://success"} = req) do
       {:ok, Web.Response.new(status: 200, url: req.url)}
     end
+
     def fetch(%Web.Request{url: "mock://error"}) do
       {:error, :simulated_error}
     end
   end
 
   test "Web.fetch routes to provided dispatcher directly via options" do
-    assert {:ok, %Web.Response{ok: true, url: "mock://success"}} = 
-      Web.fetch("mock://success", dispatcher: MockDispatcher)
+    assert {:ok, %Web.Response{ok: true, url: "mock://success"}} =
+             Web.fetch("mock://success", dispatcher: MockDispatcher)
 
-    assert {:error, :simulated_error} = 
-      Web.fetch("mock://error", dispatcher: MockDispatcher)
+    assert {:error, :simulated_error} =
+             Web.fetch("mock://error", dispatcher: MockDispatcher)
   end
 
   test "Web.fetch routes to resolved dispatcher when missing from options" do

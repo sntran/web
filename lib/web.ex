@@ -26,6 +26,8 @@ defmodule Web do
       - `:method` (String.t | atom) - HTTP method (default: "GET").
       - `:headers` (Map.t | List.t | Web.Headers.t) - Request headers.
       - `:body` (any) - Request payload.
+      - `:redirect` (`"follow" | "error" | "manual"`) - Redirect handling mode.
+      - `:signal` (`Web.AbortSignal.t()` | pid | reference) - Optional abort signal.
       - `:dispatcher` (module) - Optional override for the request handler.
 
   ## Returns
@@ -41,22 +43,29 @@ defmodule Web do
       iex> req = Web.Request.new("http://localhost_nxdomain")
       iex> {:error, _} = Web.fetch(req)
   """
-  @spec fetch(String.t() | Web.Request.t(), keyword()) :: {:ok, Web.Response.t()} | {:error, any()}
+  @spec fetch(String.t() | Web.Request.t(), keyword()) ::
+          {:ok, Web.Response.t()} | {:error, any()}
   def fetch(input, init \\ [])
-  
+
   def fetch(%Web.Request{} = request, _init) do
     do_fetch(request)
+  catch
+    :throw, {:abort, :aborted} -> {:error, :aborted}
   end
 
   def fetch(input, init) when is_binary(input) do
     request = Web.Request.new(input, init)
     do_fetch(request)
+  catch
+    :throw, {:abort, :aborted} -> {:error, :aborted}
   end
 
   defp do_fetch(request) do
-    dispatcher = 
-      request.dispatcher || 
-      Web.Resolver.resolve(request.url)
+    Web.AbortSignal.check!(request.signal)
+
+    dispatcher =
+      request.dispatcher ||
+        Web.Resolver.resolve(request.url)
 
     dispatcher.fetch(request)
   end

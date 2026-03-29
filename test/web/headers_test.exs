@@ -6,15 +6,17 @@ defmodule Web.HeadersTest do
 
   describe "initialization" do
     property "creates empty headers safely" do
-      check all empty <- constant(%{}) do
+      check all(empty <- constant(%{})) do
         assert Headers.new(empty).headers == %{}
         assert Headers.new().headers == %{}
       end
     end
 
     property "initializes from list and normalizes keys" do
-      check all key <- string(:alphanumeric, min_length: 1),
-                val <- string(:alphanumeric, min_length: 1) do
+      check all(
+              key <- string(:alphanumeric, min_length: 1),
+              val <- string(:alphanumeric, min_length: 1)
+            ) do
         k_str = to_string(key)
         v_str = to_string(val)
         headers = Headers.new([{k_str, v_str}])
@@ -35,10 +37,13 @@ defmodule Web.HeadersTest do
 
   describe "Access behaviour implementation" do
     property "fetch and element referencing handle presence correctly" do
-      check all h_map_raw <- map_of(string(:alphanumeric, min_length: 1), string(:alphanumeric, min_length: 1)) do
+      check all(
+              h_map_raw <-
+                map_of(string(:alphanumeric, min_length: 1), string(:alphanumeric, min_length: 1))
+            ) do
         h_map = h_map_raw |> Enum.uniq_by(fn {k, _} -> String.downcase(k) end) |> Map.new()
         h = Headers.new(h_map)
-        
+
         for {k, v} <- h_map do
           k_down = String.downcase(k)
           assert ^v = h[k_down]
@@ -69,10 +74,10 @@ defmodule Web.HeadersTest do
       h = Headers.put(h, "FOO", "bar")
       assert Headers.has_key?(h, "foo")
       assert Headers.get(h, "fOO") == "bar"
-      
+
       h = Headers.delete(h, "Foo")
       refute Headers.has_key?(h, "foo")
-      
+
       h = Headers.put(h, :atom_key, "val")
       assert Headers.to_list(h) == [{"atom_key", "val"}]
     end

@@ -22,7 +22,7 @@ defmodule Web.Response do
 
   @doc """
   Constructs a new Response structure.
-  
+
   Automatically normalizes the `:ok` boolean based on standard 2xx range (success for both HTTP and NNTP).
 
   ## Examples

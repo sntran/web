@@ -5,7 +5,7 @@ defmodule Web.ResponseTest do
   alias Web.Response
 
   property "new/1 sets ok true for strictly 2xx status codes matching JS Fetch" do
-    check all status <- integer(200..299) do
+    check all(status <- integer(200..299)) do
       resp = Response.new(status: status)
       assert resp.status == status
       assert resp.ok == true
@@ -13,7 +13,7 @@ defmodule Web.ResponseTest do
   end
 
   property "new/1 sets ok false for non 2xx status codes generically" do
-    check all status <- one_of([integer(0..199), integer(300..999)]) do
+    check all(status <- one_of([integer(0..199), integer(300..999)])) do
       resp = Response.new(status: status)
       assert resp.status == status
       assert resp.ok == false

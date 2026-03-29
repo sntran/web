@@ -12,7 +12,7 @@ defmodule Web.Headers do
 
   @doc """
   Creates a new Headers struct.
-  
+
   Supports conversion from Map or Keyword List. All keys are String-downcased.
 
   ## Examples
@@ -26,6 +26,7 @@ defmodule Web.Headers do
   """
   def new(headers \\ %{})
   def new(%__MODULE__{} = headers), do: headers
+
   def new(headers) when is_map(headers) or is_list(headers) do
     normalized = Enum.into(headers, %{}, fn {k, v} -> {normalize_key(k), to_string(v)} end)
     %__MODULE__{headers: normalized}
@@ -72,6 +73,7 @@ defmodule Web.Headers do
   @impl Access
   def get_and_update(struct, key, fun) do
     current = get(struct, key)
+
     case fun.(current) do
       {get_value, new_value} -> {get_value, put(struct, key, new_value)}
       :pop -> {current, delete(struct, key)}

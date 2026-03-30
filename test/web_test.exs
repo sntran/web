@@ -26,6 +26,28 @@ defmodule WebTest do
     end
   end
 
+  defmodule UsingWeb do
+    use Web
+
+    def fetch_with_import(input, init \\ []) do
+      fetch(input, init)
+    end
+
+    def aliases_work? do
+      url = URL.new("mock://success")
+      request = Request.new(url, dispatcher: WebTest.MockDispatcher)
+      response = Response.new(status: 200, headers: Headers.new(%{"x-test" => "1"}), url: URL.href(url))
+      controller = AbortController.new()
+      params = URLSearchParams.new("a=1")
+
+      is_struct(url, URL) and
+        is_struct(request, Request) and
+        is_struct(response, Response) and
+        is_struct(controller.signal, AbortSignal) and
+        is_struct(params, URLSearchParams)
+    end
+  end
+
   test "Web.fetch routes to provided dispatcher directly via options" do
     assert {:ok, %Web.Response{ok: true, url: "mock://success/"}} =
              Web.fetch("mock://success", dispatcher: MockDispatcher)
@@ -43,5 +65,19 @@ defmodule WebTest do
     # Resolver.resolve("tcp://localhost:9999") -> Web.Dispatcher.TCP
     # Attempting a real TCP fetch will result in :econnrefused or :nxdomain
     assert {:error, _} = Web.fetch("tcp://localhost:59999")
+  end
+
+  test "use Web imports fetch/1 and fetch/2" do
+    assert {:ok, %Web.Response{ok: true, url: "mock://success/"}} =
+             UsingWeb.fetch_with_import("mock://success", dispatcher: MockDispatcher)
+
+    assert {:ok, %Web.Response{ok: true, url: "mock://success/"}} =
+             UsingWeb.fetch_with_import(Web.URL.new("mock://success"),
+               dispatcher: MockDispatcher
+             )
+  end
+
+  test "use Web aliases the public Web modules" do
+    assert UsingWeb.aliases_work?()
   end
 end

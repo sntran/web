@@ -10,31 +10,37 @@ You can try `Web` immediately without creating a project using `Mix.install`:
 
 ```elixir
 Mix.install([
-  {:web, "~> 0.1.0"}
+  {:web, "~> 0.2.0"}
 ])
 
-# 1. Construct a new Web.URL
-url = Web.URL.new("https://api.github.com/search/repositories")
+defmodule GitHub do
+  use Web
 
-# 2. Modify properties via URLSearchParams
-params = 
-  Web.URL.search_params(url)
-  |> Web.URLSearchParams.set("q", "elixir")
-  |> Web.URLSearchParams.append("sort", "stars")
+  def repositories(query \\ "elixir") do
+    # 1. Construct a new URL
+    url = URL.new("https://api.github.com/search/repositories")
 
-# 3. Apply params back to the URL
-url = Web.URL.search(url, Web.URLSearchParams.to_string(params))
+    # 2. Modify properties via URLSearchParams
+    params = 
+      URL.search_params(url)
+      |> URLSearchParams.set("q", query)
+      |> URLSearchParams.append("sort", "stars")
 
-# 4. Construct a Web.Request with the URL
-request = Web.Request.new(url, 
-  method: "GET",
-  headers: %{"Accept" => "application/vnd.github.v3+json"}
-)
+    # 3. Apply params back to the URL
+    url = URL.search(url, URLSearchParams.to_string(params))
 
-# 5. Send to Web.fetch
-{:ok, response} = Web.fetch(request)
+    # 4. Construct a Request with the URL
+    request = Request.new(url, 
+      method: "GET",
+      headers: %{"Accept" => "application/vnd.github.v3+json"}
+    )
 
-IO.puts("Fetching: #{Web.URL.href(url)}")
+    # 5. Send to fetch
+    fetch(request) 
+  end
+end
+
+{:ok, response} = GitHub.repositories()
 IO.puts("Status: #{response.status}")
 
 # Stream the body lazily (Zero-Buffer)
@@ -66,6 +72,37 @@ def deps do
   ]
 end
 ```
+
+## Usage with `use Web`
+
+You can easily import the main API and aliases into your module using the `use Web` macro:
+
+```elixir
+defmodule MyClient do
+  use Web
+
+  def fetch_example() do
+    url = URL.new("https://example.com")
+    req = Request.new(url)
+    {:ok, resp} = fetch(req)
+    resp
+  end
+end
+```
+
+This will:
+
+- Import `fetch/1` and `fetch/2`
+- Alias the following modules for convenience:
+  - `Web.URL`
+  - `Web.URLSearchParams`
+  - `Web.Headers`
+  - `Web.Request`
+  - `Web.Response`
+  - `Web.AbortController`
+  - `Web.AbortSignal`
+
+This makes it easy to use the core types and functions without verbose module names.
 
 ## Core Components
 

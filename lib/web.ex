@@ -15,6 +15,22 @@ defmodule Web do
       {:ok, response} = Web.fetch(req)
   """
 
+  defmacro __using__(_opts) do
+    quote do
+      import Web, only: [fetch: 1, fetch: 2]
+
+      alias Web.URL
+      alias Web.URLSearchParams
+      alias Web.Headers
+      alias Web.Request
+      alias Web.Response
+      alias Web.AbortController
+      alias Web.AbortSignal
+
+      :ok
+    end
+  end
+
   @doc """
   Initiates a network fetch.
 

@@ -92,7 +92,7 @@ end
 
 This will:
 
-- Import `fetch/1` and `fetch/2`
+- Import `fetch/1`, `fetch/2`, and the `await/1` macro
 - Alias the following modules for convenience:
   - `Web.URL`
   - `Web.URLSearchParams`
@@ -101,6 +101,22 @@ This will:
   - `Web.Response`
   - `Web.AbortController`
   - `Web.AbortSignal`
+
+### Await Macro
+
+The `await/1` macro allows you to write:
+
+```elixir
+response = await fetch(req)
+```
+
+instead of pattern matching on `{:ok, response}`:
+
+```elixir
+{:ok, response} = fetch(req)
+```
+
+If the result is `{:error, reason}` or not in the expected format, `await` will raise an error. The macro is automatically imported when you `use Web`.
 
 This makes it easy to use the core types and functions without verbose module names.
 

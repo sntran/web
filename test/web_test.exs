@@ -1,6 +1,7 @@
 defmodule WebTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
+  import Web, only: [await: 1]
 
   doctest Web
   doctest Web.AbortController
@@ -79,5 +80,32 @@ defmodule WebTest do
 
   test "use Web aliases the public Web modules" do
     assert UsingWeb.aliases_work?()
+  end
+  test "await macro returns value on {:ok, value}" do
+    response = await Web.fetch("mock://success/", dispatcher: MockDispatcher)
+    assert %Web.Response{ok: true, url: "mock://success/"} = response
+  end
+
+  test "await macro raises on {:error, reason}" do
+    assert_raise RuntimeError, ~r/await: fetch failed: :simulated_error/, fn ->
+      await Web.fetch("mock://error/", dispatcher: MockDispatcher)
+    end
+  end
+
+  test "await macro raises on unexpected result" do
+    assert_raise RuntimeError, ~r/await: unexpected result: :something_else/, fn ->
+      await :something_else
+    end
+  end
+
+  test "use Web imports await macro" do
+    defmodule AwaitTest do
+      use Web
+      def test_await do
+        await fetch("mock://success/", dispatcher: WebTest.MockDispatcher)
+      end
+    end
+    response = AwaitTest.test_await()
+    assert %Web.Response{ok: true, url: "mock://success/"} = response
   end
 end

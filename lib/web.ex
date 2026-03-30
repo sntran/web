@@ -1,10 +1,10 @@
 defmodule Web do
-  @moduledoc """
-  A Universal Fetch Library for Elixir.
+    @moduledoc """
+    A Universal Fetch Library for Elixir.
 
-  Matches the Javascript Fetch API standard with zero-buffer streaming and an extensible dispatcher architecture.
+    Matches the Javascript Fetch API standard with zero-buffer streaming and an extensible dispatcher architecture.
 
-  ## Examples
+    ## Examples
 
       # Simple HTTP GET
       {:ok, response} = Web.fetch("https://api.github.com/zen")
@@ -13,11 +13,19 @@ defmodule Web do
       # Using a Web.Request struct
       req = Web.Request.new("https://example.com")
       {:ok, response} = Web.fetch(req)
-  """
+
+      # Using await macro (Elixir 1.6+)
+      response = await Web.fetch("https://api.github.com/zen")
+      response.body |> Enum.each(&IO.write/1)
+
+      # await raises if fetch fails
+      response = await Web.fetch("https://bad.url") # raises on error
+    """
+
 
   defmacro __using__(_opts) do
     quote do
-      import Web, only: [fetch: 1, fetch: 2]
+      import Web, only: [fetch: 1, fetch: 2, await: 1]
 
       alias Web.URL
       alias Web.URLSearchParams
@@ -28,6 +36,29 @@ defmodule Web do
       alias Web.AbortSignal
 
       :ok
+    end
+  end
+
+  @doc """
+  Awaits a result in the form of `{:ok, value}` or raises on error.
+
+  ## Examples
+
+      response = await Web.fetch(url)
+
+  Equivalent to:
+
+      {:ok, response} = Web.fetch(url)
+
+  Raises if the result is not `{:ok, value}`.
+  """
+  defmacro await(expr) do
+    quote do
+      case unquote(expr) do
+        {:ok, value} -> value
+        {:error, reason} -> raise "await: fetch failed: #{inspect(reason)}"
+        other -> raise "await: unexpected result: #{inspect(other)}"
+      end
     end
   end
 

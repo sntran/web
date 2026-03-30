@@ -1,30 +1,63 @@
-# Web: A Universal Fetch Library for Elixir
+# Web Standard APIs for Elixir
 
-A protocol-agnostic, Web API-compliant `fetch` library for Elixir that mirrors the JavaScript Fetch Standard. 
+A protocol-agnostic, Web API-compliant library for Elixir that mirrors the JavaScript Fetch Standard.
 
 Built with a "Dispatcher" architecture, `Web` provides a unified interface for HTTP, TCP, and connection-string-based protocols while maintaining a zero-buffer, streaming-first approach.
+
+## Quick Start (Script / Livebook)
+
+You can try `Web` immediately without creating a project using `Mix.install`:
+
+```elixir
+Mix.install([
+  {:web, "~> 0.1.0"}
+])
+
+# 1. Construct a new Web.URL
+url = Web.URL.new("https://api.github.com/search/repositories")
+
+# 2. Modify properties via URLSearchParams
+params = 
+  Web.URL.search_params(url)
+  |> Web.URLSearchParams.set("q", "elixir")
+  |> Web.URLSearchParams.append("sort", "stars")
+
+# 3. Apply params back to the URL
+url = Web.URL.search(url, Web.URLSearchParams.to_string(params))
+
+# 4. Construct a Web.Request with the URL
+request = Web.Request.new(url, 
+  method: "GET",
+  headers: %{"Accept" => "application/vnd.github.v3+json"}
+)
+
+# 5. Send to Web.fetch
+{:ok, response} = Web.fetch(request)
+
+IO.puts("Fetching: #{Web.URL.href(url)}")
+IO.puts("Status: #{response.status}")
+
+# Stream the body lazily (Zero-Buffer)
+# The body is an Elixir Stream yielding chunks as they arrive from the socket
+response.body 
+|> Stream.take(5) 
+|> Enum.each(&IO.write/1)
+```
 
 ## Key Features
 
 - **JS Fetch Parity**: Familiar `Request`, `Response`, and `Headers` structs.
-- **Polymorphic Entry**: `Web.fetch/2` accepts a URL string, a `Web.URL`, or a pre-constructed `Web.Request` struct.
-- **Pure URL Value Object**: `Web.URL` is a plain struct with `protocol`, `hostname`, `port`, `pathname`, `hash`, `search_params`, and `kind`.
-- **Pure URLSearchParams**: `Web.URLSearchParams` stores ordered `{key, value}` pairs, preserves duplicates, and implements `Access` and `Enumerable`.
-- **Overloaded URL API**: `Web.URL.href/1,2`, `host/1,2`, `search/1,2`, and `hash/1,2` provide getter/setter style APIs while still returning new immutable structs.
-- **RequestInit Support**: `Web.Request.new/2` accepts a URL string or `Web.URL`, plus `method`, `headers`, `body`, `redirect`, `signal`, and `dispatcher`.
-- **Fetch-Style Redirect Handling**: `Web.Dispatcher.HTTP` supports `"follow"`, `"manual"`, and `"error"` redirect modes with a 20-hop safety limit.
-- **AbortController Support**: `Web.AbortController` and `Web.AbortSignal` can cancel in-flight fetches and active body streams.
-- **AbortSignal Helpers**: Build pre-aborted, timeout-driven, or combined signals with `Web.AbortSignal.abort/1`, `timeout/1`, and `any/1`.
-- **Web-Style Headers API**: `Web.Headers` is case-insensitive, supports multiple values per header, implements `Access` and `Enumerable`, and exposes `append`, `set`, `get`, `delete`, `has`, `entries`, `keys`, `values`, and `getSetCookie`.
-- **Automatic Header Normalization**: `Web.Request` and `Web.Response` always normalize their `:headers` field into a `Web.Headers` struct, whether initialized from a map, tuple list, or an existing `Web.Headers`.
-- **Zero-Buffer Streaming**: `Web.Response.body` is an Elixir `Stream` that yields chunks as they arrive from the socket, ensuring memory safety for large resources.
-- **Extensible Dispatchers**: Plug in custom protocol handlers (HTTP, TCP, NNTP, etc.) via the `Web.Dispatcher` behaviour.
-- **Rclone-Style Resolution**: Supports standard URIs (`https://...`) and connection strings (`remote:path/...`).
-- **Validated & Documented**: 100% test coverage including property-based tests and interactive doctests.
+- **Polymorphic Entry**: `Web.fetch/2` accepts a URL string, a `Web.URL`, or a `Web.Request` struct.
+- **Pure Data Architecture**: `Web.URL` and `Web.URLSearchParams` are pure Elixir structs—no Agents or hidden state. 
+- **Overloaded Functional API**: `Web.URL.href(url, "new_val")` style setters that return new immutable structs.
+- **Fetch-Style Redirects**: `Web.Dispatcher.HTTP` supports `"follow"`, `"manual"`, and `"error"` modes.
+- **AbortController Support**: Standardized cancellation for in-flight fetches and active body streams.
+- **Zero-Buffer Streaming**: `Web.Response.body` is an Elixir `Stream` yielding chunks directly from the socket.
+- **Rclone-Style Resolution**: Native support for connection strings (`remote:path/...`).
 
 ## Installation
 
-Add `:web` to your list of dependencies in `mix.exs`:
+Add `:web` to your dependencies in `mix.exs`:
 
 ```elixir
 def deps do
@@ -34,177 +67,61 @@ def deps do
 end
 ```
 
-## Usage
+## Core Components
 
-### Simple HTTP Fetch
-```elixir
-{:ok, response} = Web.fetch("https://api.github.com/zen")
-response.body |> Enum.each(&IO.write/1)
-```
+### `Request`
 
-### Using a Request Struct
-```elixir
-req =
-  Web.Request.new("https://example.com",
-    method: :post,
-    headers: %{"content-type" => "text/plain"},
-    body: "data",
-    redirect: "follow"
-  )
+The `Request` struct represents a complete I/O operation. It is protocol-agnostic, allowing the same struct to be used for HTTP, TCP, or custom dispatchers.
 
-{:ok, response} = Web.fetch(req)
-```
+* **Normalization**: The `:headers` field is automatically converted into a `Headers` struct.
+* **Signal Support**: Pass a `AbortSignal` via the `:signal` option to enable timeouts or manual cancellation.
+* **Redirect Control**: Supports `follow`, `manual`, and `error` modes.
 
-### Using `Web.URL`
-```elixir
-url =
-  Web.URL.new("https://example.com/search?q=elixir")
-  |> Web.URL.host("api.example.com:8443")
-  |> Web.URL.search("?q=elixir&lang=en")
-  |> Web.URL.hash("docs")
+### `Response`
 
-Web.URL.href(url)
-# "https://api.example.com:8443/search?q=elixir&lang=en#docs"
+The result of a successful `fetch`. 
 
-{:ok, response} = Web.fetch(url)
-```
+* **Streaming Body**: The `:body` is an `Enumerable` (Stream), ensuring large resources are never fully buffered into memory.
+* **Metadata**: Includes the final `url` (post-redirects), `status` code, and a normalized `Headers` container.
 
-### Working with `Web.URLSearchParams`
-```elixir
-params =
-  Web.URLSearchParams.new("tag=one&tag=two")
-  |> Web.URLSearchParams.append("q", "hello world")
-  |> Web.URLSearchParams.set("page", "1")
+### `Headers`
 
-Web.URLSearchParams.get_all(params, "tag")
-# ["one", "two"]
+A case-insensitive, multi-value container for protocol headers.
 
-Web.URLSearchParams.to_string(params)
-# "tag=one&tag=two&q=hello+world&page=1"
-```
+* **Spec Parity**: Implements `append`, `set`, `get`, `delete`, and `has`.
+* **Multi-Value Support**: Correctly handles multiple values for a single key, including the specific `getSetCookie` exception.
+* **Protocols**: Implements `Access` and `Enumerable`, allowing for `headers["content-type"]` and `Enum.map(headers, ...)`.
 
-### Working with Headers
-```elixir
-headers =
-  Web.Headers.new([{"Content-Type", "text/plain"}])
-  |> Web.Headers.append("X-Trace", "a")
-  |> Web.Headers.append("x-trace", "b")
-  |> Web.Headers.append("Set-Cookie", "a=1")
-  |> Web.Headers.append("set-cookie", "b=2")
+### `URL` & `URLSearchParams`
 
-Web.Headers.get(headers, "content-type")
-# "text/plain"
+Pure data structs that handle both standard URIs and rclone-style connection strings.
 
-Web.Headers.get(headers, "X-Trace")
-# "a, b"
+* **Direct Access**: Access `url.protocol`, `url.hostname`, or `url.pathname` directly via dot notation.
+* **Overloaded Getters/Setters**: Use `URL.href(url, "new_url")` to parse and update the entire struct immutably.
+* **Ordered Params**: `URLSearchParams` preserves key order and duplicate keys.
 
-Web.Headers.getSetCookie(headers)
-# ["a=1", "b=2"]
+### AbortController` & AbortSignal`
 
-Enum.to_list(Web.Headers.entries(headers))
-# [{"content-type", "text/plain"}, {"set-cookie", "a=1, b=2"}, {"x-trace", "a, b"}]
-```
+Standardized mechanism for coordinating the cancellation of one or more asynchronous operations.
 
-### Redirect Modes
-```elixir
-# Follow redirects automatically (default)
-{:ok, response} = Web.fetch("https://example.com")
-
-# Return the 3xx response without following
-{:ok, response} = Web.fetch("https://example.com", redirect: "manual")
-
-# Fail if a redirect is encountered
-{:error, :redirect_error} = Web.fetch("https://example.com", redirect: "error")
-```
-
-### TCP / Connection Strings
-```elixir
-# Routes automatically to Web.Dispatcher.TCP
-{:ok, response} = Web.fetch("tcp://localhost:8080")
-
-# Or rclone-style
-{:ok, response} = Web.fetch("myserver:8080/data")
-
-url = Web.URL.new("my_remote:bucket/path/to/file")
-Web.URL.protocol(url)
-# "my_remote:"
-```
-
-### Advanced Options
-```elixir
-Web.fetch("https://example.com", 
-  method: "POST", 
-  headers: %{"Content-Type" => "application/json"},
-  body: "{\"key\": \"value\"}",
-  redirect: "manual",
-  dispatcher: MyCustomDispatcher # Override resolution logic
-)
-```
-
-### AbortController
-```elixir
-controller = Web.AbortController.new()
-
-task =
-  Task.async(fn ->
-    Web.fetch("https://example.com/slow", signal: controller.signal)
-  end)
-
-Process.sleep(50)
-:ok = Web.AbortController.abort(controller, :timeout)
-
-{:error, :aborted} = Task.await(task)
-```
-
-### AbortSignal Helpers
-```elixir
-# Already-aborted signal
-signal = Web.AbortSignal.abort(:manual_cancel)
-{:error, :aborted} = Web.fetch("https://example.com", signal: signal)
-
-# Timeout signal
-timeout_signal = Web.AbortSignal.timeout(1_000)
-Web.fetch("https://example.com/slow", signal: timeout_signal)
-
-# Abort when either source aborts
-controller = Web.AbortController.new()
-combined = Web.AbortSignal.any([controller.signal, Web.AbortSignal.timeout(5_000)])
-
-Web.fetch("https://example.com", signal: combined)
-```
-
-### Abort During Streaming
-```elixir
-controller = Web.AbortController.new()
-{:ok, response} = Web.fetch("tcp://localhost:4000", signal: controller.signal)
-
-consumer =
-  Task.async(fn ->
-    response.body |> Enum.to_list()
-  end)
-
-Process.sleep(50)
-:ok = Web.AbortController.abort(controller, :manual_cancel)
-
-[] = Task.await(consumer)
-```
+* **`AbortController`**: The management object used to trigger cancellation. Create one with AbortController.new()`.
+* **`.signal` Property**: A `AbortSignal` instance linked to the controller. This is the "read-only" observer passed to `fetch` to monitor the aborted state.
+* **`AbortSignal` State**: Signals include an `aborted` boolean and a `reason` for the cancellation.
+* **`AbortSignal.timeout(ms)`**: Static helper that returns a signal that automatically aborts after a specified duration—perfect for handling request timeouts.
+* **`AbortSignal.any(signals)`**: Static helper that combines multiple signals into one; the combined signal aborts if ANY of the provided source signals abort.
+* **`AbortSignal.abort(reason)`**: Static helper that returns a signal that is already in an aborted state.
 
 ## Architecture
 
-- **`Web.Dispatcher`**: The core behavior for all protocol handlers.
-- **`Web.Resolver`**: Logic to map URL schemes and prefixes to Dispatchers.
-- **`Web.URL` / `Web.URLSearchParams`**: Pure, Web API-inspired value structs for URL parsing, reconstruction, and ordered query param storage.
-- **`Web.Headers`**: A case-insensitive, multi-value header container with Web API-style operations, `Access`, and `Enumerable`.
-- **`Web.Request` / `Web.Response`**: Fetch-compatible structs whose `:headers` field is always normalized into `Web.Headers`.
-- **`Web.Dispatcher.HTTP`**: Powered by `Finch`, handles HTTP redirects internally, respects already-aborted signals, and exposes a zero-buffer streaming body.
-- **`Web.Dispatcher.TCP`**: Base TCP implementation using `:gen_tcp`, with abort-aware streaming and immediate socket cleanup.
-- **`Web.AbortController` / `Web.AbortSignal`**: Small cancellation primitives that mirror the browser Fetch API, including timeout and aggregate-signal support.
+- **`Dispatcher`**: The core behavior for all protocol handlers.
+- **`Dispatcher.HTTP`**: Powered by `Finch`, handles connection pooling and redirects internally.
+- **`Dispatcher.TCP`**: Base TCP implementation using `:gen_tcp` with abort-aware streaming.
+- **`Headers`**: A case-insensitive, multi-value header container with `Access` and `Enumerable` support.
 
-## Testing & Coverage
+## Testing
 
-The library is hardened with comprehensive property-based tests and verified doctests.
+`Web` is built with a commitment to reliability, featuring 100% test coverage including property-based tests for URL parsing and header normalization.
 
 ```bash
-# Run tests with coverage
 mix test --cover
 ```

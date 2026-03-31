@@ -1,6 +1,9 @@
 defmodule Web.AbortController do
   @moduledoc """
-  Creates and aborts `Web.AbortSignal` values.
+  An implementation of the WHATWG AbortController standard.
+
+  Allows creating an `AbortSignal` that can be used to cancel asynchronous operations
+  like `fetch/2`.
 
   ## Examples
 

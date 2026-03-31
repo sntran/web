@@ -1,6 +1,8 @@
 defmodule Web.URLSearchParams do
   @moduledoc """
-  Ordered query parameter storage matching the URLSearchParams Web API shape.
+  An implementation of the WHATWG URLSearchParams standard.
+
+  Provides a storage for ordered query parameters.
   """
 
   import Kernel, except: [to_string: 1]
@@ -28,17 +30,47 @@ defmodule Web.URLSearchParams do
     %__MODULE__{pairs: normalize_init(init)}
   end
 
+  @doc """
+  Appends a new name/value pair to the end of the query parameters.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new()
+      iex> params = Web.URLSearchParams.append(params, "foo", "1")
+      iex> params = Web.URLSearchParams.append(params, "foo", "2")
+      iex> Web.URLSearchParams.get_all(params, "foo")
+      ["1", "2"]
+  """
   @spec append(t(), String.t(), String.t()) :: t()
   def append(%__MODULE__{} = params, name, value) do
     %{params | pairs: params.pairs ++ [{Kernel.to_string(name), Kernel.to_string(value)}]}
   end
 
+  @doc """
+  Deletes all occurrences of the given name from the query parameters.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("foo=bar&baz=qux")
+      iex> params = Web.URLSearchParams.delete(params, "foo")
+      iex> Web.URLSearchParams.has(params, "foo")
+      false
+  """
   @spec delete(t(), String.t()) :: t()
   def delete(%__MODULE__{} = params, name) do
     name = Kernel.to_string(name)
     %{params | pairs: Enum.reject(params.pairs, fn {key, _value} -> key == name end)}
   end
 
+  @doc """
+  Returns the first value associated with the given name.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("foo=bar&foo=baz")
+      iex> Web.URLSearchParams.get(params, "foo")
+      "bar"
+  """
   @spec get(t(), String.t()) :: String.t() | nil
   def get(%__MODULE__{} = params, name) do
     name = Kernel.to_string(name)
@@ -49,6 +81,15 @@ defmodule Web.URLSearchParams do
     end)
   end
 
+  @doc """
+  Returns all values associated with the given name.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("foo=bar&foo=baz")
+      iex> Web.URLSearchParams.get_all(params, "foo")
+      ["bar", "baz"]
+  """
   @spec get_all(t(), String.t()) :: [String.t()]
   def get_all(%__MODULE__{} = params, name) do
     name = Kernel.to_string(name)
@@ -59,6 +100,17 @@ defmodule Web.URLSearchParams do
     end)
   end
 
+  @doc """
+  Returns true if the given name exists in the query parameters.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("foo=bar")
+      iex> Web.URLSearchParams.has(params, "foo")
+      true
+      iex> Web.URLSearchParams.has(params, "baz")
+      false
+  """
   @spec has?(t(), String.t()) :: boolean()
   def has?(%__MODULE__{} = params, name) do
     not is_nil(get(params, name))
@@ -67,6 +119,17 @@ defmodule Web.URLSearchParams do
   @spec has(t(), String.t()) :: boolean()
   def has(%__MODULE__{} = params, name), do: has?(params, name)
 
+  @doc """
+  Sets the value associated with the given name. If multiple values exist, it deletes
+  the others and updates the first one.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("foo=bar&foo=baz")
+      iex> params = Web.URLSearchParams.set(params, "foo", "new")
+      iex> Web.URLSearchParams.get_all(params, "foo")
+      ["new"]
+  """
   @spec set(t(), String.t(), String.t()) :: t()
   def set(%__MODULE__{} = params, name, value) do
     name = Kernel.to_string(name)
@@ -83,6 +146,15 @@ defmodule Web.URLSearchParams do
     %{params | pairs: if(seen?, do: pairs, else: pairs ++ [{name, value}])}
   end
 
+  @doc """
+  Sorts the query parameters by name.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("c=3&a=1&b=2")
+      iex> Web.URLSearchParams.sort(params) |> Web.URLSearchParams.to_string()
+      "a=1&b=2&c=3"
+  """
   @spec sort(t()) :: t()
   def sort(%__MODULE__{} = params) do
     pairs =
@@ -94,6 +166,15 @@ defmodule Web.URLSearchParams do
     %{params | pairs: pairs}
   end
 
+  @doc """
+  Returns the serialized query parameters as a string.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new([{"foo", "bar"}, {"baz", "qux"}])
+      iex> Web.URLSearchParams.to_string(params)
+      "foo=bar&baz=qux"
+  """
   @spec to_string(t()) :: String.t()
   def to_string(%__MODULE__{} = params) do
     Enum.map_join(params.pairs, "&", fn {key, value} ->

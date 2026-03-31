@@ -1,6 +1,9 @@
 defmodule Web.URL do
   @moduledoc """
-  Pure URL container matching the core Web URL API concepts.
+  An implementation of the WHATWG URL standard.
+
+  Provides a pure data structure representing a URL, compatible with both standard URLs
+  and RClone-style URLs.
   """
 
   defstruct protocol: "",
@@ -59,6 +62,15 @@ defmodule Web.URL do
     end
   end
 
+  @doc """
+  Returns the serialized URL (href).
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com/search?q=elixir#docs")
+      iex> Web.URL.href(url)
+      "https://example.com/search?q=elixir#docs"
+  """
   @spec href(t()) :: String.t()
   def href(%__MODULE__{} = url) do
     case url.kind do
@@ -86,14 +98,41 @@ defmodule Web.URL do
     new(value)
   end
 
+  @doc """
+  Returns the protocol portion of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com")
+      iex> Web.URL.protocol(url)
+      "https:"
+  """
   @spec protocol(t()) :: String.t()
   def protocol(%__MODULE__{} = url), do: url.protocol
 
+  @doc """
+  Sets the protocol of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com")
+      iex> Web.URL.set_protocol(url, "ftp") |> Web.URL.protocol()
+      "ftp:"
+  """
   @spec set_protocol(t(), String.t()) :: t()
   def set_protocol(%__MODULE__{} = url, value) do
     %{url | protocol: normalize_protocol(value)}
   end
 
+  @doc """
+  Returns the host portion (hostname and port) of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com:4000/api")
+      iex> Web.URL.host(url)
+      "example.com:4000"
+  """
   @spec host(t()) :: String.t()
   def host(%__MODULE__{hostname: "", port: _port}), do: ""
   def host(%__MODULE__{hostname: hostname, port: ""}), do: hostname
@@ -111,18 +150,54 @@ defmodule Web.URL do
     %{normalized | pathname: normalize_path(normalized, url.pathname)}
   end
 
+  @doc """
+  Returns the hostname portion of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com:4000/api")
+      iex> Web.URL.hostname(url)
+      "example.com"
+  """
   @spec hostname(t()) :: String.t()
   def hostname(%__MODULE__{} = url), do: url.hostname
 
+  @doc """
+  Sets the hostname portion of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com")
+      iex> Web.URL.set_hostname(url, "google.com") |> Web.URL.hostname()
+      "google.com"
+  """
   @spec set_hostname(t(), String.t()) :: t()
   def set_hostname(%__MODULE__{} = url, value) do
     normalized = %{url | kind: :standard, hostname: to_string(value)}
     %{normalized | pathname: normalize_path(normalized, url.pathname)}
   end
 
+  @doc """
+  Returns the port portion of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com:4000")
+      iex> Web.URL.port(url)
+      "4000"
+  """
   @spec port(t()) :: String.t()
   def port(%__MODULE__{} = url), do: url.port
 
+  @doc """
+  Sets the port portion of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com")
+      iex> Web.URL.set_port(url, 8080) |> Web.URL.port()
+      "8080"
+  """
   @spec set_port(t(), String.t() | integer() | nil) :: t()
   def set_port(%__MODULE__{} = url, value) do
     port =
@@ -136,14 +211,41 @@ defmodule Web.URL do
     %{url | kind: :standard, port: port}
   end
 
+  @doc """
+  Returns the pathname portion of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com/api/v1")
+      iex> Web.URL.pathname(url)
+      "/api/v1"
+  """
   @spec pathname(t()) :: String.t()
   def pathname(%__MODULE__{} = url), do: url.pathname
 
+  @doc """
+  Sets the pathname portion of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com")
+      iex> Web.URL.set_pathname(url, "new-path") |> Web.URL.pathname()
+      "/new-path"
+  """
   @spec set_pathname(t(), String.t()) :: t()
   def set_pathname(%__MODULE__{} = url, value) do
     %{url | pathname: normalize_path(url, to_string(value))}
   end
 
+  @doc """
+  Returns the search (query) portion of the URL, including the '?'.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com/search?q=elixir")
+      iex> Web.URL.search(url)
+      "?q=elixir"
+  """
   @spec search(t()) :: String.t()
   def search(%__MODULE__{} = url) do
     case Web.URLSearchParams.to_string(url.search_params) do
@@ -158,6 +260,15 @@ defmodule Web.URL do
     %{url | search_params: Web.URLSearchParams.new(query)}
   end
 
+  @doc """
+  Returns the hash portion of the URL, including the '#'.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com/#top")
+      iex> Web.URL.hash(url)
+      "#top"
+  """
   @spec hash(t()) :: String.t()
   def hash(%__MODULE__{} = url), do: url.hash
 
@@ -173,11 +284,30 @@ defmodule Web.URL do
     %{url | hash: normalized}
   end
 
+  @doc """
+  Returns the origin of the URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com:4000/api")
+      iex> Web.URL.origin(url)
+      "https://example.com:4000"
+  """
   @spec origin(t()) :: String.t()
   def origin(%__MODULE__{kind: :rclone}), do: "null"
   def origin(%__MODULE__{hostname: ""}), do: "null"
   def origin(%__MODULE__{} = url), do: url.protocol <> "//" <> host(url)
 
+  @doc """
+  Returns the search params as a Web.URLSearchParams struct.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com/search?q=elixir")
+      iex> params = Web.URL.search_params(url)
+      iex> Web.URLSearchParams.get(params, "q")
+      "elixir"
+  """
   @spec search_params(t()) :: Web.URLSearchParams.t()
   def search_params(%__MODULE__{} = url), do: url.search_params
 

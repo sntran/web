@@ -1,27 +1,32 @@
 defmodule Web do
-    @moduledoc """
-    A Universal Fetch Library for Elixir.
+  @moduledoc """
+  A Universal Fetch Library for Elixir.
 
-    Matches the Javascript Fetch API standard with zero-buffer streaming and an extensible dispatcher architecture.
+  This module provides a Web-compliant Fetch API for Elixir, matching the WHATWG Fetch standard.
+  It supports zero-buffer streaming, abort signals, and an extensible dispatcher architecture.
 
-    ## Examples
+  ## The "Web-First" DSL
+
+  The `Web` module provides a `__using__` macro that imports common functions and aliases:
+
+  ```elixir
+  use Web
+
+  # Now you can use:
+  # fetch/1, fetch/2, await/1
+  # URL.new, Request.new, Response.new, AbortController.new, etc.
+  ```
+
+  ## Examples
 
       # Simple HTTP GET
       {:ok, response} = Web.fetch("https://api.github.com/zen")
       response.body |> Enum.each(&IO.write/1)
 
-      # Using a Web.Request struct
-      req = Web.Request.new("https://example.com")
-      {:ok, response} = Web.fetch(req)
-
-      # Using await macro (Elixir 1.6+)
+      # Using await macro
       response = await Web.fetch("https://api.github.com/zen")
       response.body |> Enum.each(&IO.write/1)
-
-      # await raises if fetch fails
-      response = await Web.fetch("https://bad.url") # raises on error
-    """
-
+  """
 
   defmacro __using__(_opts) do
     quote do
@@ -35,6 +40,8 @@ defmodule Web do
       alias Web.Response
       alias Web.AbortController
       alias Web.AbortSignal
+      alias Web.ReadableStream
+      alias Web.ReadableStreamDefaultController
 
       :ok
     end
@@ -45,13 +52,11 @@ defmodule Web do
 
   ## Examples
 
-      response = await Web.fetch(url)
+      iex> Web.await({:ok, "success"})
+      "success"
 
-  Equivalent to:
-
-      {:ok, response} = Web.fetch(url)
-
-  Raises if the result is not `{:ok, value}`.
+      iex> Web.await({:error, :not_found})
+      ** (RuntimeError) await: fetch failed: :not_found
   """
   defmacro await(expr) do
     quote do

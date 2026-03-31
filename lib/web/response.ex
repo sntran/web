@@ -1,7 +1,9 @@
 defmodule Web.Response do
   @moduledoc """
-  Represents an HTTP, NNTP, TCP or generic Response object.
-  Contains a streamable body matching the zero-buffer rule.
+  An implementation of the WHATWG Response standard.
+
+  Represents an HTTP response, including status, headers, and a streamable body.
+  Matches the zero-buffer streaming rule.
   """
 
   defstruct [

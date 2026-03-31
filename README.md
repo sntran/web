@@ -1,43 +1,46 @@
-# Web Standard APIs for Elixir
 
-A protocol-agnostic, Web API-compliant library for Elixir that mirrors the JavaScript Fetch Standard.
+# 🌐 Web Standard APIs for Elixir
 
-Built with a "Dispatcher" architecture, `Web` provides a unified interface for HTTP, TCP, and connection-string-based protocols while maintaining a zero-buffer, streaming-first approach.
+A protocol-agnostic, Web API-compliant library for Elixir that brings the simplicity and power of the WHATWG Fetch Standard to the BEAM.
 
-## Quick Start (Script / Livebook)
+Built for **Zero-Buffer Streaming**, it ensures your applications remain responsive and low-memory even when handling gigabytes of data.
+
+---
+
+## 🛠 The "Web-First" DSL
 
 You can try `Web` immediately without creating a project using `Mix.install`:
 
 ```elixir
 Mix.install([
-  {:web, "~> 0.2.0"}
+	{:web, "~> 0.2.0"}
 ])
 
 defmodule GitHub do
-  use Web
+	use Web
 
-  def repositories(query \\ "elixir") do
-    # 1. Construct a new URL
-    url = URL.new("https://api.github.com/search/repositories")
+	def repositories(query \\ "elixir") do
+		# 1. Construct a new URL
+		url = URL.new("https://api.github.com/search/repositories")
 
-    # 2. Modify properties via URLSearchParams
-    params = 
-      URL.search_params(url)
-      |> URLSearchParams.set("q", query)
-      |> URLSearchParams.append("sort", "stars")
+		# 2. Modify properties via URLSearchParams
+		params = 
+			URL.search_params(url)
+			|> URLSearchParams.set("q", query)
+			|> URLSearchParams.append("sort", "stars")
 
-    # 3. Apply params back to the URL
-    url = URL.search(url, URLSearchParams.to_string(params))
+		# 3. Apply params back to the URL
+		url = URL.search(url, URLSearchParams.to_string(params))
 
-    # 4. Construct a Request with the URL
-    request = Request.new(url, 
-      method: "GET",
-      headers: %{"Accept" => "application/vnd.github.v3+json"}
-    )
+		# 4. Construct a Request with the URL
+		request = Request.new(url, 
+			method: "GET",
+			headers: %{"Accept" => "application/vnd.github.v3+json"}
+		)
 
-    # 5. Send to fetch
-    fetch(request) 
-  end
+		# 5. Send to fetch
+		fetch(request) 
+	end
 end
 
 {:ok, response} = GitHub.repositories()
@@ -50,131 +53,126 @@ response.body
 |> Enum.each(&IO.write/1)
 ```
 
-## Key Features
+---
 
-- **JS Fetch Parity**: Familiar `Request`, `Response`, and `Headers` structs.
-- **Polymorphic Entry**: `Web.fetch/2` accepts a URL string, a `Web.URL`, or a `Web.Request` struct.
-- **Pure Data Architecture**: `Web.URL` and `Web.URLSearchParams` are pure Elixir structs—no Agents or hidden state. 
-- **Overloaded Functional API**: `Web.URL.href(url, "new_val")` style setters that return new immutable structs.
-- **Fetch-Style Redirects**: `Web.Dispatcher.HTTP` supports `"follow"`, `"manual"`, and `"error"` modes.
-- **AbortController Support**: Standardized cancellation for in-flight fetches and active body streams.
-- **Zero-Buffer Streaming**: `Web.Response.body` is an Elixir `Stream` yielding chunks directly from the socket.
-- **Rclone-Style Resolution**: Native support for connection strings (`remote:path/...`).
+## 📦 Features at a Glance
 
-## Installation
+- **WHATWG-Compliant**: Implements the WHATWG Fetch, URL, Request, Response, ReadableStream, AbortController, and URLSearchParams standards.
+- **Zero-Buffer Streaming**: Streams data directly from the source with no intermediate buffering.
+- **Backpressure-Aware**: Automatically manages flow control for slow consumers.
+- **Unified Cancellation**: Abort any async operation with `AbortController` and `AbortSignal`.
+- **Protocol-Agnostic**: Supports HTTP, TCP, and custom dispatchers.
+- **Immutable Data Structures**: All core types are pure Elixir structs.
+- **Industrial-Grade Testing**: 100% test coverage for all state transitions and edge cases.
 
-Add `:web` to your dependencies in `mix.exs`:
+---
 
-```elixir
-def deps do
-  [
-    {:web, "~> 0.1.0"}
-  ]
-end
-```
+## 🌐 Core Modules & Usage
 
-## Usage with `use Web`
-
-You can easily import the main API and aliases into your module using the `use Web` macro:
+### `Web.URL` — Universal URL Parsing
 
 ```elixir
-defmodule MyClient do
-  use Web
-
-  def fetch_example() do
-    url = URL.new("https://example.com")
-    req = Request.new(url)
-    {:ok, resp} = fetch(req)
-    resp
-  end
-end
+url = Web.URL.new("https://example.com/search?q=elixir#docs")
+url.protocol # => "https:"
+url.pathname # => "/search"
+url.hash     # => "#docs"
+Web.URL.href(url) # => "https://example.com/search?q=elixir#docs"
 ```
 
-This will:
-
-- Import `fetch/1`, `fetch/2`, and the `await/1` macro
-- Alias the following modules for convenience:
-  - `Web.URL`
-  - `Web.URLSearchParams`
-  - `Web.Headers`
-  - `Web.Request`
-  - `Web.Response`
-  - `Web.AbortController`
-  - `Web.AbortSignal`
-
-### Await Macro
-
-The `await/1` macro allows you to write:
+### `Web.Request` — Standardized Request Container
 
 ```elixir
-response = await fetch(req)
+req = Web.Request.new("https://api.github.com/zen", method: :get, headers: %{accept: "text/plain"})
+req.method # => "GET"
+req.url.hostname # => "api.github.com"
 ```
 
-instead of pattern matching on `{:ok, response}`:
+### `Web.Response` — Stream-Native Response
 
 ```elixir
-{:ok, response} = fetch(req)
+{:ok, resp} = Web.fetch("https://api.github.com/zen")
+IO.puts(Enum.to_list(resp.body) |> to_string())
+resp.status # => 200
+resp.ok     # => true
 ```
 
-If the result is `{:error, reason}` or not in the expected format, `await` will raise an error. The macro is automatically imported when you `use Web`.
+### `Web.Headers` — Case-Insensitive, Multi-Value Headers
 
-This makes it easy to use the core types and functions without verbose module names.
+```elixir
+headers = Web.Headers.new(%{"content-type" => "application/json", "set-cookie" => ["a=1", "b=2"]})
+Web.Headers.get(headers, "content-type") # => "application/json"
+Web.Headers.get_set_cookie(headers)      # => ["a=1", "b=2"]
+```
 
-## Core Components
+### `Web.URLSearchParams` — Query Parameter Management
 
-### `Request`
+```elixir
+params = Web.URLSearchParams.new("foo=bar&foo=baz")
+Web.URLSearchParams.get_all(params, "foo") # => ["bar", "baz"]
+params = Web.URLSearchParams.append(params, "foo", "qux")
+Web.URLSearchParams.to_string(params) # => "foo=bar&foo=baz&foo=qux"
+```
 
-The `Request` struct represents a complete I/O operation. It is protocol-agnostic, allowing the same struct to be used for HTTP, TCP, or custom dispatchers.
+### `Web.AbortController` & `Web.AbortSignal` — Unified Cancellation
 
-* **Normalization**: The `:headers` field is automatically converted into a `Headers` struct.
-* **Signal Support**: Pass a `AbortSignal` via the `:signal` option to enable timeouts or manual cancellation.
-* **Redirect Control**: Supports `follow`, `manual`, and `error` modes.
+```elixir
+controller = Web.AbortController.new()
+Task.start(fn ->
+	{:error, :aborted} = Web.fetch("https://slow.site", signal: controller.signal)
+end)
+Web.AbortController.abort(controller)
+```
 
-### `Response`
+### `Web.ReadableStream` — Streaming & Multicasting
 
-The result of a successful `fetch`. 
+With **Zero-Buffer Streaming**, `Web` treats every response body as an Elixir `Stream`. Chunks are yielded directly from the socket as they arrive, enabling processing of massive files with constant memory usage.
 
-* **Streaming Body**: The `:body` is an `Enumerable` (Stream), ensuring large resources are never fully buffered into memory.
-* **Metadata**: Includes the final `url` (post-redirects), `status` code, and a normalized `Headers` container.
+#### Multi-Reader Magic with `tee()`
 
-### `Headers`
+Split a single stream into two independent branches without buffering the entire source. Perfect for logging or computing hashes in parallel while saving data to disk.
 
-A case-insensitive, multi-value container for protocol headers.
+```elixir
+{branch_a, branch_b} = ReadableStream.tee(response.body)
 
-* **Spec Parity**: Implements `append`, `set`, `get`, `delete`, and `has`.
-* **Multi-Value Support**: Correctly handles multiple values for a single key, including the specific `getSetCookie` exception.
-* **Protocols**: Implements `Access` and `Enumerable`, allowing for `headers["content-type"]` and `Enum.map(headers, ...)`.
+# Branch A: Process as fast as possible
+Task.start(fn -> Enum.each(branch_a, &IO.write/1) end)
 
-### `URL` & `URLSearchParams`
+# Branch B: Feed to another process or compute a checksum
+checksum = Enum.reduce(branch_b, 0, fn chunk, acc -> acc + byte_size(chunk) end)
+```
 
-Pure data structs that handle both standard URIs and rclone-style connection strings.
+#### Backpressure Management
 
-* **Direct Access**: Access `url.protocol`, `url.hostname`, or `url.pathname` directly via dot notation.
-* **Overloaded Getters/Setters**: Use `URL.href(url, "new_url")` to parse and update the entire struct immutably.
-* **Ordered Params**: `URLSearchParams` preserves key order and duplicate keys.
+`Web` implementations respect **Backpressure**. The library monitors the consumption speed of its readers and automatically notifies the source to slow down when buffers are full.
 
-### AbortController` & AbortSignal`
+When using `tee()`, the source pulls data at the speed of the **fastest** consumer, but guarantees the **slowest** consumer never overflows its internal queue by using a synchronized multicast strategy.
 
-Standardized mechanism for coordinating the cancellation of one or more asynchronous operations.
+---
 
-* **`AbortController`**: The management object used to trigger cancellation. Create one with AbortController.new()`.
-* **`.signal` Property**: A `AbortSignal` instance linked to the controller. This is the "read-only" observer passed to `fetch` to monitor the aborted state.
-* **`AbortSignal` State**: Signals include an `aborted` boolean and a `reason` for the cancellation.
-* **`AbortSignal.timeout(ms)`**: Static helper that returns a signal that automatically aborts after a specified duration—perfect for handling request timeouts.
-* **`AbortSignal.any(signals)`**: Static helper that combines multiple signals into one; the combined signal aborts if ANY of the provided source signals abort.
-* **`AbortSignal.abort(reason)`**: Static helper that returns a signal that is already in an aborted state.
+## 🧪 Industrial-Grade Testing
 
-## Architecture
+We take reliability seriously. The `Web` library maintains **100% test coverage** ensuring every state transition and edge case is accounted for.
 
-- **`Dispatcher`**: The core behavior for all protocol handlers.
-- **`Dispatcher.HTTP`**: Powered by `Finch`, handles connection pooling and redirects internally.
-- **`Dispatcher.TCP`**: Base TCP implementation using `:gen_tcp` with abort-aware streaming.
-- **`Headers`**: A case-insensitive, multi-value header container with `Access` and `Enumerable` support.
-
-## Testing
-
-`Web` is built with a commitment to reliability, featuring 100% test coverage including property-based tests for URL parsing and header normalization.
+Run the suite yourself:
 
 ```bash
 mix test --cover
 ```
+
+---
+
+## 📖 Module Reference
+
+Every core WHATWG concept is represented as a first-class Elixir citizen:
+
+- **`Web.URL`**: Pure, immutable URL parsing and manipulation.
+- **`Web.Request`**: Standardized HTTP/TCP request containers.
+- **`Web.Response`**: Stream-native response objects.
+- **`Web.Headers`**: Case-insensitive, multi-value HTTP headers.
+- **`Web.URLSearchParams`**: Ordered, mutable query parameter storage.
+- **`Web.ReadableStream`**: Full lifecycle management for streaming data.
+- **`Web.AbortController`**: Unified cancellation mechanism for any async operation.
+
+---
+
+Built with ❤️ for the Elixir community.

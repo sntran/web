@@ -1,7 +1,7 @@
 defmodule Web.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @repo_url "https://github.com/sntran/web"
 
   def project do
@@ -23,7 +23,6 @@ defmodule Web.MixProject do
         main: "Web",
         extras: ["README.md"]
       ],
-
       test_coverage: [tool: ExCoveralls]
     ]
   end

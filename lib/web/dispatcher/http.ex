@@ -300,7 +300,8 @@ defmodule Web.Dispatcher.HTTP do
 
   defp maybe_send_ready(%{ready_sent?: true} = state), do: state
 
-  defp maybe_send_ready(%{status: status, headers_received?: true} = state) when not is_nil(status) do
+  defp maybe_send_ready(%{status: status, headers_received?: true} = state)
+       when not is_nil(status) do
     send(state.owner, {:bridge_ready, state.ref, status, state.headers})
     %{state | ready_sent?: true}
   end

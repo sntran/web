@@ -1,9 +1,9 @@
 defmodule Web.AbortSignal do
   @moduledoc """
-  Represents an abortable signal that can be shared across fetch operations.
+  An implementation of the WHATWG AbortSignal standard.
 
-  Signals are usually created through `Web.AbortController.new/0` and then passed
-  into `Web.fetch/2` or `Web.Request.new/2`.
+  Represents an abortable signal that can be shared across fetch operations.
+  Signals are usually created through `Web.AbortController.new/0`.
 
   ## Examples
 

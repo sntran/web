@@ -1,6 +1,9 @@
 defmodule Web.Request do
   @moduledoc """
-  Represents an HTTP, NNTP, TCP or generic Request object.
+  An implementation of the WHATWG Request standard.
+
+  Represents an HTTP request, including URL, method, headers, and body.
+  Compatible with standard Web API concepts.
   """
 
   defstruct [

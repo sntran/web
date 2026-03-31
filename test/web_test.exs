@@ -12,6 +12,7 @@ defmodule WebTest do
   doctest Web.Resolver
   doctest Web.URL
   doctest Web.URLSearchParams
+  doctest Web.DSL
 
   defmodule MockDispatcher do
     @behaviour Web.Dispatcher
@@ -37,7 +38,10 @@ defmodule WebTest do
     def aliases_work? do
       url = URL.new("mock://success")
       request = Request.new(url, dispatcher: WebTest.MockDispatcher)
-      response = Response.new(status: 200, headers: Headers.new(%{"x-test" => "1"}), url: URL.href(url))
+
+      response =
+        Response.new(status: 200, headers: Headers.new(%{"x-test" => "1"}), url: URL.href(url))
+
       controller = AbortController.new()
       params = URLSearchParams.new("a=1")
 
@@ -81,31 +85,76 @@ defmodule WebTest do
   test "use Web aliases the public Web modules" do
     assert UsingWeb.aliases_work?()
   end
+
   test "await macro returns value on {:ok, value}" do
-    response = await Web.fetch("mock://success/", dispatcher: MockDispatcher)
+    response = await(Web.fetch("mock://success/", dispatcher: MockDispatcher))
     assert %Web.Response{ok: true, url: "mock://success/"} = response
   end
 
   test "await macro raises on {:error, reason}" do
     assert_raise RuntimeError, ~r/await: fetch failed: :simulated_error/, fn ->
-      await Web.fetch("mock://error/", dispatcher: MockDispatcher)
+      await(Web.fetch("mock://error/", dispatcher: MockDispatcher))
     end
   end
 
   test "await macro raises on unexpected result" do
     assert_raise RuntimeError, ~r/await: unexpected result: :something_else/, fn ->
-      await :something_else
+      await(:something_else)
     end
   end
 
   test "use Web imports await macro" do
     defmodule AwaitTest do
       use Web
+
       def test_await do
-        await fetch("mock://success/", dispatcher: WebTest.MockDispatcher)
+        await(fetch("mock://success/", dispatcher: WebTest.MockDispatcher))
       end
     end
+
     response = AwaitTest.test_await()
     assert %Web.Response{ok: true, url: "mock://success/"} = response
+  end
+
+  test "new/2 macro creates a new URL" do
+    defmodule NewUrlDSL do
+      use Web
+
+      def test_new do
+        new(URL, "https://example.com")
+      end
+    end
+
+    url = NewUrlDSL.test_new()
+    assert is_struct(url, Web.URL)
+    assert url.hostname == "example.com"
+  end
+
+  test "new/2 macro creates a new Request" do
+    defmodule NewRequestDSL do
+      use Web
+
+      def test_new do
+        new(Request, "https://example.com")
+      end
+    end
+
+    req = NewRequestDSL.test_new()
+    assert is_struct(req, Web.Request)
+    assert req.url.hostname == "example.com"
+  end
+
+  test "Web.fetch handles already aborted signals" do
+    controller = Web.AbortController.new()
+    Web.AbortController.abort(controller)
+    assert {:error, :aborted} = Web.fetch("https://example.com", signal: controller.signal)
+
+    # Also via Web.URL
+    url = Web.URL.new("https://example.com")
+    assert {:error, :aborted} = Web.fetch(url, signal: controller.signal)
+
+    # Also via Web.Request
+    req = Web.Request.new(url, signal: controller.signal)
+    assert {:error, :aborted} = Web.fetch(req)
   end
 end

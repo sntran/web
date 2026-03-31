@@ -26,6 +26,7 @@ defmodule Web do
   defmacro __using__(_opts) do
     quote do
       import Web, only: [fetch: 1, fetch: 2, await: 1]
+      import Web.DSL, only: [new: 2]
 
       alias Web.URL
       alias Web.URLSearchParams

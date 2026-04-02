@@ -5,7 +5,7 @@ defmodule Web.ReadableStreamDefaultController do
   """
   defstruct [:pid]
 
-  alias Web.ReadableStream.Controller
+  alias Web.ReadableStream
 
   @doc """
   Enqueues a chunk into the stream's internal queue.
@@ -23,7 +23,7 @@ defmodule Web.ReadableStreamDefaultController do
       ["data"]
   """
   def enqueue(%__MODULE__{pid: pid}, chunk) do
-    Controller.enqueue(pid, chunk)
+    ReadableStream.enqueue(pid, chunk)
   end
 
   @doc """
@@ -32,14 +32,14 @@ defmodule Web.ReadableStreamDefaultController do
   Once closed, no more data can be enqueued.
   """
   def close(%__MODULE__{pid: pid}) do
-    Controller.close(pid)
+    ReadableStream.close(pid)
   end
 
   @doc """
   Errors the stream with a reason.
   """
   def error(%__MODULE__{pid: pid}, reason) do
-    Controller.error(pid, reason)
+    ReadableStream.error(pid, reason)
   end
 
   @doc """
@@ -58,6 +58,6 @@ defmodule Web.ReadableStreamDefaultController do
       :ok
   """
   def desired_size(%__MODULE__{pid: pid}) do
-    Controller.get_desired_size(pid)
+    ReadableStream.get_desired_size(pid)
   end
 end

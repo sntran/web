@@ -4,7 +4,7 @@ defmodule Web.ReadableStreamDefaultReader do
   """
   defstruct [:controller_pid]
 
-  alias Web.ReadableStream.Controller
+  alias Web.ReadableStream
   alias Web.TypeError
 
   @doc """
@@ -27,7 +27,7 @@ defmodule Web.ReadableStreamDefaultReader do
       :done
   """
   def read(%__MODULE__{controller_pid: pid}) do
-    case Controller.read(pid) do
+    case ReadableStream.read(pid) do
       {:ok, chunk} ->
         chunk
 
@@ -52,7 +52,7 @@ defmodule Web.ReadableStreamDefaultReader do
   Releases the reader's lock on the stream.
   """
   def release_lock(%__MODULE__{controller_pid: pid}) do
-    case Controller.release_lock(pid) do
+    case ReadableStream.release_lock(pid) do
       :ok ->
         :ok
 
@@ -68,7 +68,7 @@ defmodule Web.ReadableStreamDefaultReader do
   Cancels the stream.
   """
   def cancel(%__MODULE__{controller_pid: pid}) do
-    Controller.cancel(pid)
+    ReadableStream.cancel(pid)
     :ok
   end
 end

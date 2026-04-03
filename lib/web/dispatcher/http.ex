@@ -370,7 +370,6 @@ defmodule Web.Dispatcher.HTTP do
       {:bridge_failed, ^bridge_ref, reason} ->
         {:error, reason}
 
-      # coveralls-ignore-next-line
       {:DOWN, ^bridge_monitor, :process, ^bridge_pid, reason} ->
         {:error, reason}
     after
@@ -415,8 +414,7 @@ defmodule Web.Dispatcher.HTTP do
     else
       case Web.AbortSignal.receive_abort(state.signal_subscription, 0) do
         {:error, :aborted} ->
-          cancel_bridge(state.bridge_pid, state.bridge_ref)
-          {:halt, Map.put(state, :aborted?, true)}
+          abort_and_halt(state)
 
         :ok ->
           send(state.bridge_pid, {:bridge_next, state.bridge_ref, self()})
@@ -443,13 +441,17 @@ defmodule Web.Dispatcher.HTTP do
       50 ->
         case Web.AbortSignal.receive_abort(state.signal_subscription, 0) do
           {:error, :aborted} ->
-            cancel_bridge(state.bridge_pid, state.bridge_ref)
-            {:halt, Map.put(state, :aborted?, true)}
+            abort_and_halt(state)
 
           :ok ->
             await_body_chunk(state)
         end
     end
+  end
+
+  defp abort_and_halt(state) do
+    cancel_bridge(state.bridge_pid, state.bridge_ref)
+    {:halt, Map.put(state, :aborted?, true)}
   end
 
   defp cleanup_stream(state) do

@@ -108,10 +108,6 @@ defmodule Web.ReadableStream do
 
   def from(%__MODULE__{} = stream), do: stream
 
-  def from(%Stream{} = stream), do: stream
-
-  def from(fun) when is_function(fun, 2), do: fun
-
   def from(enumerable) do
     if Enumerable.impl_for(enumerable) do
       enumerator_pid = start_enumerator(enumerable)

@@ -60,8 +60,9 @@ response.body
 - **WHATWG-Compliant**: Implements the WHATWG Fetch, URL, Request, Response, ReadableStream, AbortController, and URLSearchParams standards.
 - **Zero-Buffer Streaming**: Streams data directly from the source with no intermediate buffering.
 - **Backpressure-Aware**: Automatically manages flow control for slow consumers.
-- **Body Helpers**: `Request` and `Response` expose `text/1`, `json/1`, and `arrayBuffer/1` with single-consumption semantics.
+- **Body Helpers**: `Request` and `Response` expose `text/1`, `json/1`, `arrayBuffer/1`, `bytes/1`, and `blob/1` with single-consumption semantics.
 - **Normalized Bodies**: `Request.new/2` and `Response.new/1` normalize strings, binaries, `nil`, and enumerable inputs through `Web.ReadableStream.from/1`.
+- **Cloneable Streams**: `Request.clone/1` and `Response.clone/1` branch body streams with `ReadableStream.tee/1` so both original and clone can be consumed independently.
 - **Redirect-Safe Streaming Requests**: `307` and `308` redirects preserve request method and replayable stream bodies without draining them ahead of time.
 - **Unified Cancellation**: Abort any async operation with `AbortController` and `AbortSignal`.
 - **Protocol-Agnostic**: Supports HTTP, TCP, and custom dispatchers.
@@ -116,6 +117,48 @@ resp = Web.Response.new(body: ~s({"ok":true}))
 {:ok, %{"ok" => true}} = Web.Response.json(resp)
 {:error, %Web.TypeError{message: "body already used"}} =
   Web.Response.text(resp)
+```
+
+Body readers now include typed data helpers:
+
+```elixir
+resp = Web.Response.new(body: "hello", headers: %{"content-type" => "text/plain"})
+
+{:ok, array_buffer} = Web.Response.arrayBuffer(resp)
+array_buffer.byte_length # => 5
+
+resp = Web.Response.new(body: "hello")
+{:ok, bytes} = Web.Response.bytes(resp)
+Web.Uint8Array.to_binary(bytes) # => "hello"
+
+resp = Web.Response.new(body: "hello", headers: %{"content-type" => "text/plain"})
+{:ok, blob} = Web.Response.blob(resp)
+{blob.size, blob.type} # => {5, "text/plain"}
+```
+
+Cloning preserves body availability for both branches:
+
+```elixir
+resp = Web.Response.new(body: "hello")
+{:ok, {resp, clone}} = Web.Response.clone(resp)
+
+{:ok, "hello"} = Web.Response.text(resp)
+{:ok, "hello"} = Web.Response.text(clone)
+```
+
+### `Web.ArrayBuffer`, `Web.Uint8Array`, and `Web.Blob`
+
+The library includes immutable WHATWG-style data types for binary payload handling.
+
+```elixir
+buffer = Web.ArrayBuffer.new("hello")
+buffer.byte_length # => 5
+
+bytes = Web.Uint8Array.new(buffer, 1, 3)
+Web.Uint8Array.to_binary(bytes) # => "ell"
+
+blob = Web.Blob.new(["hello", " ", "world"], type: "text/plain")
+blob.size # => 11
 ```
 
 ### `Web.Headers` — Case-Insensitive, Multi-Value Headers
@@ -204,6 +247,9 @@ Every core WHATWG concept is represented as a first-class Elixir citizen:
 - **`Web.URLSearchParams`**: Ordered, mutable query parameter storage.
 - **`Web.ReadableStream`**: Full lifecycle management for streaming data.
 - **`Web.AbortController`**: Unified cancellation mechanism for any async operation.
+- **`Web.ArrayBuffer`**: Immutable binary buffer with explicit `byte_length`.
+- **`Web.Uint8Array`**: Immutable byte-view over `Web.ArrayBuffer`.
+- **`Web.Blob`**: Immutable binary parts container with typed MIME metadata.
 
 ---
 

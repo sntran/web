@@ -28,4 +28,39 @@ defmodule Web.BodyTest do
     assert ReadableStream.disturbed?(response.body) == true
     assert {:error, %Web.TypeError{message: "body already used"}} = Response.text(response)
   end
+
+  test "Response.clone/1 tees the body and both branches can be consumed" do
+    response = Response.new(body: "hello")
+
+    assert {:ok, {response, clone}} = Response.clone(response)
+    assert {:ok, "hello"} = Response.text(response)
+    assert {:ok, "hello"} = Response.text(clone)
+  end
+
+  test "clone disturbance is isolated between original and clone" do
+    response = Response.new(body: "hello")
+
+    assert {:ok, {response, clone}} = Response.clone(response)
+    assert {:ok, "hello"} = Response.text(response)
+
+    assert ReadableStream.disturbed?(response.body) == true
+    assert ReadableStream.disturbed?(clone.body) == false
+
+    assert {:ok, "hello"} = Response.text(clone)
+  end
+
+  test "Response.clone/1 returns error when stream is locked" do
+    stream = ReadableStream.from("hello")
+    _reader = ReadableStream.get_reader(stream)
+    response = Response.new(body: stream)
+
+    assert {:error, %Web.TypeError{message: "ReadableStream is already locked"}} =
+             Response.clone(response)
+  end
+
+  test "Web.Body.blob/1 uses empty type when headers are missing" do
+    input = %{body: ReadableStream.from("hello")}
+
+    assert {:ok, %Web.Blob{size: 5, type: ""}} = Web.Body.blob(input)
+  end
 end

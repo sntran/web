@@ -76,4 +76,28 @@ defmodule Web.RequestTest do
     assert {:ok, %{"hello" => "world"}} = Request.json(request)
     assert {:error, %Web.TypeError{message: "body already used"}} = Request.text(request)
   end
+
+  test "arrayBuffer/1 returns Web.ArrayBuffer" do
+    req = Request.new("https://example.com", body: "hello")
+    assert {:ok, %Web.ArrayBuffer{data: "hello", byte_length: 5}} = Request.arrayBuffer(req)
+  end
+
+  test "bytes/1 and blob/1 return expected Web types" do
+    req =
+      Request.new("https://example.com",
+        body: "hello",
+        headers: [{"content-type", "text/plain"}]
+      )
+
+    assert {:ok, %Web.Uint8Array{} = bytes} = Request.bytes(req)
+    assert Web.Uint8Array.to_binary(bytes) == "hello"
+
+    req =
+      Request.new("https://example.com",
+        body: "hello",
+        headers: [{"content-type", "text/plain"}]
+      )
+
+    assert {:ok, %Web.Blob{size: 5, type: "text/plain"}} = Request.blob(req)
+  end
 end

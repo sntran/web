@@ -7,6 +7,9 @@ defmodule WebTest do
   doctest Web.AbortController
   doctest Web.AbortSignal
   doctest Web.Body
+  doctest Web.ArrayBuffer
+  doctest Web.Uint8Array
+  doctest Web.Blob
   doctest Web.Headers
   doctest Web.Request
   doctest Web.Response

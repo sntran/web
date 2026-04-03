@@ -53,7 +53,28 @@ defmodule Web.ResponseTest do
     assert {:ok, "hello"} = Response.text(resp)
 
     resp = Response.new(body: "hello")
-    assert {:ok, "hello"} = Response.arrayBuffer(resp)
+    assert {:ok, %Web.ArrayBuffer{data: "hello", byte_length: 5}} = Response.arrayBuffer(resp)
     assert {:error, %Web.TypeError{message: "body already used"}} = Response.text(resp)
+  end
+
+  test "bytes/1 returns a Uint8Array view over the consumed response body" do
+    resp = Response.new(body: "hello")
+
+    assert {:ok, %Web.Uint8Array{byte_length: 5} = bytes} = Response.bytes(resp)
+    assert Web.Uint8Array.to_binary(bytes) == "hello"
+  end
+
+  test "blob/1 uses content-type header for Blob type" do
+    resp = Response.new(body: "hello", headers: [{"content-type", "text/plain"}])
+
+    assert {:ok, %Web.Blob{size: 5, type: "text/plain"}} = Response.blob(resp)
+  end
+
+  test "clone/1 returns updated original and clone with independent streams" do
+    resp = Response.new(body: "hello")
+
+    assert {:ok, {resp, clone}} = Response.clone(resp)
+    assert {:ok, "hello"} = Response.text(resp)
+    assert {:ok, "hello"} = Response.text(clone)
   end
 end

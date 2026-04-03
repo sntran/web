@@ -204,22 +204,13 @@ defmodule Web.ReadableStreamTest do
       assert {:ok, "abc"} = ReadableStream.read_all(stream)
     end
 
-    test "from/1 handles passthroughs, empty enumerables, and invalid values" do
+    test "from/1 normalizes Stream structs and rejects unsupported values" do
       stream_struct = Stream.map(["a"], & &1)
 
-      stream_fun =
-        Stream.resource(
-          fn -> ["a"] end,
-          fn
-            [] -> {:halt, []}
-            [h | t] -> {[h], t}
-          end,
-          fn _ -> :ok end
-        )
-
-      assert ReadableStream.from(stream_struct) == stream_struct
-      assert ReadableStream.from(stream_fun) == stream_fun
+      assert %ReadableStream{} = ReadableStream.from(stream_struct)
+      assert {:ok, "a"} = stream_struct |> ReadableStream.from() |> ReadableStream.read_all()
       assert {:ok, ""} = [] |> ReadableStream.from() |> ReadableStream.read_all()
+      assert %ReadableStream{} = ReadableStream.from(fn acc, fun -> Enumerable.List.reduce(["a"], acc, fun) end)
       assert_raise ArgumentError, ~r/cannot normalize body/, fn -> ReadableStream.from(123) end
     end
 

@@ -347,7 +347,9 @@ defmodule Web.Dispatcher.HTTPTest do
     assert Enum.to_list(resp.body) == []
   end
 
-  test "fetch/1 halts before the first body recv when an abort token is already queued" do
+  test "fetch/1 halts before the first body recv when aborted after headers" do
+    controller = Web.AbortController.new()
+
     port =
       HTTPServer.start_link([
         "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n",
@@ -355,10 +357,10 @@ defmodule Web.Dispatcher.HTTPTest do
         "data"
       ])
 
-    req = Request.new("http://localhost:#{port}/token-precheck", signal: :queued_abort)
+    req = Request.new("http://localhost:#{port}/token-precheck", signal: controller.signal)
     {:ok, resp} = HTTP.fetch(req)
 
-    send(self(), {:abort, :queued_abort})
+    assert :ok = Web.AbortController.abort(controller, :timeout)
     assert Enum.to_list(resp.body) == []
   end
 
@@ -389,5 +391,68 @@ defmodule Web.Dispatcher.HTTPTest do
     send(task.pid, {:abort, :queued_abort})
 
     assert {:ok, []} = Task.yield(task, 1000)
+  end
+
+  test "fetch/1 returns error when bridge process dies before response head" do
+    port =
+      HTTPServer.start_link([
+        {:sleep, 200},
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"
+      ])
+
+    req = Request.new("http://localhost:#{port}/bridge-down")
+
+    task =
+      Task.async(fn ->
+        receive do
+          :go -> HTTP.fetch(req)
+        end
+      end)
+
+    task_pid = task.pid
+
+    :erlang.trace(task_pid, true, [:procs])
+    send(task_pid, :go)
+
+    bridge_pid =
+      receive do
+        {:trace, ^task_pid, :spawn, spawned_pid, _mfa} ->
+          spawned_pid
+      after
+        1000 ->
+          flunk("did not capture bridge spawn")
+      end
+
+    Process.exit(bridge_pid, :kill)
+    :erlang.trace(task_pid, false, [:procs])
+
+    assert {:ok, {:error, :killed}} = Task.yield(task, 2000)
+  end
+
+  test "fetch/1 aborts on next pull after first chunk" do
+    controller = Web.AbortController.new()
+
+    port =
+      HTTPServer.start_link([
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n",
+        "data",
+        {:sleep, 100},
+        "more"
+      ])
+
+    req = Request.new("http://localhost:#{port}/abort-next-pull", signal: controller.signal)
+    {:ok, resp} = HTTP.fetch(req)
+
+    chunks =
+      Enum.reduce(resp.body, [], fn chunk, acc ->
+        if acc == [] do
+          :ok = Web.AbortController.abort(controller, :timeout)
+        end
+
+        [chunk | acc]
+      end)
+
+    # Aborting after the first delivered chunk should stop subsequent pulls.
+    assert Enum.reverse(chunks) == ["data"]
   end
 end

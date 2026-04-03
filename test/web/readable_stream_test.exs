@@ -204,14 +204,94 @@ defmodule Web.ReadableStreamTest do
       assert {:ok, "abc"} = ReadableStream.read_all(stream)
     end
 
+    test "from/1 normalizes URLSearchParams, Blob, ArrayBuffer, and Uint8Array" do
+      params = Web.URLSearchParams.new(%{"a" => "1", "b" => "2"})
+      assert {:ok, "a=1&b=2"} = params |> ReadableStream.from() |> ReadableStream.read_all()
+
+      blob = Web.Blob.new(["he", "ll", "o"])
+      assert {:ok, "hello"} = blob |> ReadableStream.from() |> ReadableStream.read_all()
+
+      buffer = Web.ArrayBuffer.new("hello")
+      assert {:ok, "hello"} = buffer |> ReadableStream.from() |> ReadableStream.read_all()
+
+      bytes = Web.Uint8Array.new(Web.ArrayBuffer.new("hello"), 1, 3)
+      assert {:ok, "ell"} = bytes |> ReadableStream.from() |> ReadableStream.read_all()
+
+      nested_blob = Web.Blob.new(["a", Web.Blob.new(["b", "c"]), "d"])
+      assert {:ok, "abcd"} = nested_blob |> ReadableStream.from() |> ReadableStream.read_all()
+    end
+
+    test "from/1 streams blob parts lazily across multiple pull cycles" do
+      parts = Enum.map(1..1_000, &Integer.to_string/1)
+      blob = Web.Blob.new(parts)
+      stream = ReadableStream.from(blob)
+      reader = ReadableStream.get_reader(stream)
+
+      assert :queue.len(ReadableStream.get_slots(stream.controller_pid).queue) <= 1
+      assert ReadableStreamDefaultReader.read(reader) == "1"
+      assert ReadableStreamDefaultReader.read(reader) == "2"
+
+      remaining =
+        3..1_000
+        |> Enum.map(fn expected ->
+          assert ReadableStreamDefaultReader.read(reader) == Integer.to_string(expected)
+        end)
+
+      assert length(remaining) == 998
+      assert ReadableStreamDefaultReader.read(reader) == :done
+      assert :ok = ReadableStreamDefaultReader.release_lock(reader)
+    end
+
+    test "from/1 traverses nested blobs lazily without preloading controller queue" do
+      chunk_a = :binary.copy("a", 64_000)
+      chunk_b = :binary.copy("b", 64_000)
+      chunk_c = :binary.copy("c", 64_000)
+
+      blob =
+        Web.Blob.new([
+          Web.Blob.new([
+            Web.Blob.new([chunk_a]),
+            Web.Blob.new([chunk_b])
+          ]),
+          Web.Blob.new([chunk_c])
+        ])
+
+      stream = ReadableStream.from(blob)
+      reader = ReadableStream.get_reader(stream)
+
+      assert :queue.len(ReadableStream.get_slots(stream.controller_pid).queue) <= 1
+      assert ReadableStreamDefaultReader.read(reader) == chunk_a
+      assert :queue.len(ReadableStream.get_slots(stream.controller_pid).queue) <= 1
+      assert ReadableStreamDefaultReader.read(reader) == chunk_b
+      assert :queue.len(ReadableStream.get_slots(stream.controller_pid).queue) <= 1
+      assert ReadableStreamDefaultReader.read(reader) == chunk_c
+      assert ReadableStreamDefaultReader.read(reader) == :done
+      assert :ok = ReadableStreamDefaultReader.release_lock(reader)
+    end
+
     test "from/1 normalizes Stream structs and rejects unsupported values" do
       stream_struct = Stream.map(["a"], & &1)
 
       assert %ReadableStream{} = ReadableStream.from(stream_struct)
       assert {:ok, "a"} = stream_struct |> ReadableStream.from() |> ReadableStream.read_all()
       assert {:ok, ""} = [] |> ReadableStream.from() |> ReadableStream.read_all()
-      assert %ReadableStream{} = ReadableStream.from(fn acc, fun -> Enumerable.List.reduce(["a"], acc, fun) end)
+
+      assert %ReadableStream{} =
+               ReadableStream.from(fn acc, fun -> Enumerable.List.reduce(["a"], acc, fun) end)
+
       assert_raise ArgumentError, ~r/cannot normalize body/, fn -> ReadableStream.from(123) end
+    end
+
+    test "from/1 wraps enumerable functions in a readable stream with tee support" do
+      enumerable = fn acc, fun -> Enumerable.List.reduce(["a", "b"], acc, fun) end
+      stream = ReadableStream.from(enumerable)
+
+      assert ReadableStream.disturbed?(stream) == false
+
+      {left, right} = ReadableStream.tee(stream)
+
+      assert {:ok, "ab"} = ReadableStream.read_all(left)
+      assert {:ok, "ab"} = ReadableStream.read_all(right)
     end
 
     test "from/1 enumerable cancellation and nil-source cancel paths do not crash" do
@@ -221,6 +301,14 @@ defmodule Web.ReadableStreamTest do
       {:ok, nil_pid} = ReadableStream.start_link(source: nil)
       ReadableStream.cancel(nil_pid, :noop)
       assert ReadableStream.get_slots(nil_pid).state == :closed
+    end
+
+    test "from/1 blob cancellation stops the lazy parts queue" do
+      stream = ReadableStream.from(Web.Blob.new(["a", "b", "c"]))
+
+      ReadableStream.cancel(stream.controller_pid, :stop_now)
+
+      assert ReadableStream.get_slots(stream.controller_pid).state == :closed
     end
 
     test "helper fallbacks cover pid, enumerable, and non-readable bodies" do

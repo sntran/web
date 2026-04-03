@@ -2,6 +2,7 @@ defmodule Web.BodyTest do
   use ExUnit.Case, async: true
 
   alias Web.ReadableStream
+  alias Web.Request
   alias Web.Response
 
   test "ReadableStream.from/1 normalizes strings and arbitrary binaries" do
@@ -26,7 +27,10 @@ defmodule Web.BodyTest do
     assert ReadableStream.disturbed?(response.body) == false
     assert {:ok, "hello"} = Response.text(response)
     assert ReadableStream.disturbed?(response.body) == true
-    assert {:error, %Web.TypeError{message: "body already used"}} = Response.text(response)
+
+    assert_raise Web.TypeError, "body already used", fn ->
+      Response.text(response)
+    end
   end
 
   test "Response.clone/1 tees the body and both branches can be consumed" do
@@ -47,6 +51,19 @@ defmodule Web.BodyTest do
     assert ReadableStream.disturbed?(clone.body) == false
 
     assert {:ok, "hello"} = Response.text(clone)
+  end
+
+  test "request clone disturbance is isolated between original and clone" do
+    request = Request.new("https://example.com", body: "hello")
+
+    assert {:ok, {request, clone}} = Request.clone(request)
+    assert {:ok, "hello"} = Request.text(request)
+
+    assert ReadableStream.disturbed?(request.body) == true
+    assert ReadableStream.disturbed?(clone.body) == false
+
+    assert {:ok, "hello"} = Request.text(clone)
+    assert ReadableStream.disturbed?(clone.body) == true
   end
 
   test "Response.clone/1 returns error when stream is locked" do

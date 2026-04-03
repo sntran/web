@@ -11,6 +11,13 @@ defmodule Web.Body do
   - `blob/1` reads the body as `%Web.Blob{}`.
   - `clone/1` tees the body stream and returns updated original plus clone.
 
+  It also provides shared `Content-Type` inference used by `Web.Request.new/2` and
+  `Web.Response.new/1` when the caller does not supply that header:
+
+  - `%Web.URLSearchParams{}` defaults to `application/x-www-form-urlencoded;charset=UTF-8`
+  - plain string/binary bodies default to `text/plain;charset=UTF-8`
+  - `%Web.Blob{}` uses the blob's non-empty `type`
+
   The injected functions respect the stream's `[[disturbed]]` slot. Once a body has
   been consumed, subsequent calls return `{:error, Web.TypeError.exception("body already used")}`.
 
@@ -26,7 +33,6 @@ defmodule Web.Body do
 
       iex> response = Web.Response.new(body: "hello")
       iex> {:ok, %Web.ArrayBuffer{byte_length: 5}} = Web.Response.arrayBuffer(response)
-      iex> {:error, %Web.TypeError{message: "body already used"}} = Web.Response.text(response)
 
       iex> request = Web.Request.new("https://example.com", body: "payload")
       iex> {:ok, array_buffer} = Web.Request.arrayBuffer(request)
@@ -39,11 +45,11 @@ defmodule Web.Body do
       iex> {:ok, "hello"} = Web.Response.text(clone)
   """
 
-  @callback text(struct()) :: {:ok, binary()} | {:error, any()}
+  @callback text(struct()) :: {:ok, binary()}
   @callback json(struct()) :: {:ok, any()} | {:error, any()}
-  @callback arrayBuffer(struct()) :: {:ok, Web.ArrayBuffer.t()} | {:error, any()}
-  @callback bytes(struct()) :: {:ok, Web.Uint8Array.t()} | {:error, any()}
-  @callback blob(struct()) :: {:ok, Web.Blob.t()} | {:error, any()}
+  @callback arrayBuffer(struct()) :: {:ok, Web.ArrayBuffer.t()}
+  @callback bytes(struct()) :: {:ok, Web.Uint8Array.t()}
+  @callback blob(struct()) :: {:ok, Web.Blob.t()}
   @callback clone(struct()) :: {:ok, {struct(), struct()}} | {:error, any()}
 
   defmacro __using__(_opts) do
@@ -56,7 +62,7 @@ defmodule Web.Body do
       Returns `{:error, %Web.TypeError{}}` when the body has already been consumed.
       """
       @impl Web.Body
-      def text(struct) do
+      def text(%{body: _} = struct) do
         Web.Body.text(struct)
       end
 
@@ -67,7 +73,7 @@ defmodule Web.Body do
       Decoder failures are returned as `{:error, reason}`.
       """
       @impl Web.Body
-      def json(struct) do
+      def json(%{body: _} = struct) do
         Web.Body.json(struct)
       end
 
@@ -77,7 +83,7 @@ defmodule Web.Body do
       Returns `{:error, %Web.TypeError{}}` when the body has already been consumed.
       """
       @impl Web.Body
-      def arrayBuffer(struct) do
+      def arrayBuffer(%{body: _} = struct) do
         Web.Body.arrayBuffer(struct)
       end
 
@@ -87,7 +93,7 @@ defmodule Web.Body do
       Returns `{:error, %Web.TypeError{}}` when the body has already been consumed.
       """
       @impl Web.Body
-      def bytes(struct) do
+      def bytes(%{body: _} = struct) do
         Web.Body.bytes(struct)
       end
 
@@ -98,7 +104,7 @@ defmodule Web.Body do
       Returns `{:error, %Web.TypeError{}}` when the body has already been consumed.
       """
       @impl Web.Body
-      def blob(struct) do
+      def blob(%{body: _} = struct) do
         Web.Body.blob(struct)
       end
 
@@ -108,7 +114,7 @@ defmodule Web.Body do
       Returns `{:ok, {updated_original, clone}}` where both have independent streams.
       """
       @impl Web.Body
-      def clone(struct) do
+      def clone(%{body: _} = struct) do
         Web.Body.clone(struct)
       end
     end
@@ -116,39 +122,42 @@ defmodule Web.Body do
 
   @doc false
   def text(%{body: body}) do
-    with :ok <- ensure_usable(body) do
-      Web.ReadableStream.read_all(body)
-    end
+    ensure_usable!(body)
+    Web.ReadableStream.read_all(body)
   end
 
   @doc false
   def json(%{body: body}) do
-    with :ok <- ensure_usable(body),
-         {:ok, binary} <- Web.ReadableStream.read_all(body) do
+    ensure_usable!(body)
+
+    with {:ok, binary} <- Web.ReadableStream.read_all(body) do
       Jason.decode(binary)
     end
   end
 
   @doc false
   def arrayBuffer(%{body: body}) do
-    with :ok <- ensure_usable(body),
-         {:ok, binary} <- Web.ReadableStream.read_all(body) do
+    ensure_usable!(body)
+
+    with {:ok, binary} <- Web.ReadableStream.read_all(body) do
       {:ok, Web.ArrayBuffer.new(binary)}
     end
   end
 
   @doc false
   def bytes(%{body: body} = struct) do
-    with :ok <- ensure_usable(body),
-         {:ok, %Web.ArrayBuffer{} = array_buffer} <- arrayBuffer(struct) do
+    ensure_usable!(body)
+
+    with {:ok, %Web.ArrayBuffer{} = array_buffer} <- arrayBuffer(struct) do
       {:ok, Web.Uint8Array.new(array_buffer)}
     end
   end
 
   @doc false
   def blob(%{body: body} = struct) do
-    with :ok <- ensure_usable(body),
-         {:ok, binary} <- Web.ReadableStream.read_all(body) do
+    ensure_usable!(body)
+
+    with {:ok, binary} <- Web.ReadableStream.read_all(body) do
       {:ok, Web.Blob.new([binary], type: content_type(struct))}
     end
   end
@@ -156,22 +165,41 @@ defmodule Web.Body do
   @doc false
   def clone(%{body: body} = struct) do
     try do
-      with :ok <- ensure_usable(body) do
-        {branch_a, branch_b} = Web.ReadableStream.tee(body)
-        {:ok, {%{struct | body: branch_a}, %{struct | body: branch_b}}}
-      end
+      ensure_usable!(body)
+
+      {branch_a, branch_b} = Web.ReadableStream.tee(body)
+      {:ok, {%{struct | body: branch_a}, %{struct | body: branch_b}}}
     rescue
       e in Web.TypeError -> {:error, e}
     end
   end
 
-  defp ensure_usable(body) do
-    if Web.ReadableStream.disturbed?(body) do
-      {:error, Web.TypeError.exception("body already used")}
-    else
-      :ok
+  @doc false
+  def put_inferred_content_type(%Web.Headers{} = headers, body) do
+    cond do
+      Web.Headers.has(headers, "content-type") ->
+        headers
+
+      inferred = infer_content_type(body) ->
+        Web.Headers.set(headers, "content-type", inferred)
+
+      true ->
+        headers
     end
   end
+
+  defp ensure_usable!(body) do
+    if Web.ReadableStream.disturbed?(body) do
+      raise Web.TypeError, "body already used"
+    end
+  end
+
+  defp infer_content_type(%Web.URLSearchParams{}),
+    do: "application/x-www-form-urlencoded;charset=UTF-8"
+
+  defp infer_content_type(%Web.Blob{type: type}) when type != "", do: type
+  defp infer_content_type(body) when is_binary(body), do: "text/plain;charset=UTF-8"
+  defp infer_content_type(_body), do: nil
 
   defp content_type(%{headers: %Web.Headers{} = headers}) do
     Web.Headers.get(headers, "content-type", "")

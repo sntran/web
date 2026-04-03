@@ -412,21 +412,27 @@ defmodule Web.Dispatcher.HTTPTest do
     task_pid = task.pid
 
     :erlang.trace(task_pid, true, [:procs])
-    send(task_pid, :go)
 
-    bridge_pid =
-      receive do
-        {:trace, ^task_pid, :spawn, spawned_pid, _mfa} ->
-          spawned_pid
-      after
-        1000 ->
-          flunk("did not capture bridge spawn")
+    try do
+      send(task_pid, :go)
+
+      bridge_pid =
+        receive do
+          {:trace, ^task_pid, :spawn, spawned_pid, _mfa} ->
+            spawned_pid
+        after
+          1000 ->
+            flunk("did not capture bridge spawn")
+        end
+
+      Process.exit(bridge_pid, :kill)
+
+      assert {:ok, {:error, :killed}} = Task.yield(task, 2000)
+    after
+      if Process.alive?(task_pid) do
+        :erlang.trace(task_pid, false, [:procs])
       end
-
-    Process.exit(bridge_pid, :kill)
-    :erlang.trace(task_pid, false, [:procs])
-
-    assert {:ok, {:error, :killed}} = Task.yield(task, 2000)
+    end
   end
 
   test "fetch/1 aborts on next pull after first chunk" do

@@ -3,6 +3,7 @@ defmodule Web.RequestTest do
   use ExUnitProperties
 
   alias Web.Request
+  alias Web.TypeError
 
   property "new/2 defaults methodology handles varied URLs correctly" do
     check all(url <- string(:ascii, min_length: 1)) do
@@ -36,7 +37,13 @@ defmodule Web.RequestTest do
     assert Web.URL.href(req.url) == "http://example.com/"
     assert req.method == "POST"
     assert {:ok, "data"} = Web.Request.text(req)
-    assert req.headers == Web.Headers.new(%{"x" => "y"})
+
+    assert req.headers ==
+             Web.Headers.new(%{
+               "x" => "y",
+               "content-type" => "text/plain;charset=UTF-8"
+             })
+
     assert req.dispatcher == MyDispatcher
     assert req.redirect == "manual"
     assert req.signal == self()
@@ -74,7 +81,10 @@ defmodule Web.RequestTest do
     request = Request.new("https://example.com", body: ~s({"hello":"world"}))
 
     assert {:ok, %{"hello" => "world"}} = Request.json(request)
-    assert {:error, %Web.TypeError{message: "body already used"}} = Request.text(request)
+
+    assert_raise TypeError, "body already used", fn ->
+      Request.text(request)
+    end
   end
 
   test "arrayBuffer/1 returns Web.ArrayBuffer" do
@@ -99,5 +109,25 @@ defmodule Web.RequestTest do
       )
 
     assert {:ok, %Web.Blob{size: 5, type: "text/plain"}} = Request.blob(req)
+  end
+
+  test "new/2 infers content-type for URLSearchParams bodies" do
+    params = Web.URLSearchParams.new(%{"hello" => "world"})
+    req = Request.new("https://example.com", body: params)
+
+    assert Web.Headers.get(req.headers, "content-type") ==
+             "application/x-www-form-urlencoded;charset=UTF-8"
+
+    assert {:ok, "hello=world"} = Request.text(req)
+  end
+
+  test "new/2 does not overwrite an explicit content-type header" do
+    req =
+      Request.new("https://example.com",
+        body: Web.URLSearchParams.new(%{"hello" => "world"}),
+        headers: [{"content-type", "text/custom"}]
+      )
+
+    assert Web.Headers.get(req.headers, "content-type") == "text/custom"
   end
 end

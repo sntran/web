@@ -31,8 +31,12 @@ defmodule Web.ReadableStream do
 
   defstruct [:controller_pid]
 
+  alias Web.ArrayBuffer
+  alias Web.Blob
   alias Web.ReadableStreamDefaultReader
+  alias Web.Uint8Array
   alias Web.TypeError
+  alias Web.URLSearchParams
 
   defmodule Data do
     defstruct [
@@ -97,6 +101,39 @@ defmodule Web.ReadableStream do
     new(%{start: &Web.ReadableStreamDefaultController.close/1})
   end
 
+  def from(%URLSearchParams{} = params) do
+    from(URLSearchParams.to_string(params))
+  end
+
+  def from(%Blob{parts: parts}) do
+    blob_parts_pid = start_blob_parts_queue(parts)
+
+    new(%{
+      pull: fn controller ->
+        case ask_blob_parts_queue(blob_parts_pid) do
+          :done ->
+            Web.ReadableStreamDefaultController.close(controller)
+
+          part ->
+            Web.ReadableStreamDefaultController.enqueue(controller, part)
+        end
+      end,
+      cancel: fn _reason ->
+        if Process.alive?(blob_parts_pid) do
+          send(blob_parts_pid, :stop)
+        end
+      end
+    })
+  end
+
+  def from(%ArrayBuffer{data: data}) do
+    from(data)
+  end
+
+  def from(%Uint8Array{} = bytes) do
+    from(Uint8Array.to_binary(bytes))
+  end
+
   def from(data) when is_binary(data) do
     new(%{
       start: fn controller ->
@@ -129,11 +166,50 @@ defmodule Web.ReadableStream do
           if Process.alive?(enumerator_pid) do
             send(enumerator_pid, :stop)
           end
+
           # coveralls-ignore-stop
         end
       })
     else
       raise ArgumentError, "cannot normalize body from #{inspect(enumerable)}"
+    end
+  end
+
+  defp start_blob_parts_queue(parts) do
+    spawn(fn -> blob_parts_queue_loop(parts) end)
+  end
+
+  defp blob_parts_queue_loop(parts) do
+    receive do
+      {:next, from, ref} ->
+        case next_blob_part(parts) do
+          {:ok, part, rest} ->
+            send(from, {ref, part})
+            blob_parts_queue_loop(rest)
+
+          :done ->
+            send(from, {ref, :done})
+            :ok
+        end
+
+      :stop ->
+        :ok
+    end
+  end
+
+  defp next_blob_part([part | rest]) when is_binary(part), do: {:ok, part, rest}
+
+  defp next_blob_part([%Blob{parts: nested_parts} | rest]),
+    do: next_blob_part(nested_parts ++ rest)
+
+  defp next_blob_part([]), do: :done
+
+  defp ask_blob_parts_queue(pid) do
+    ref = make_ref()
+    send(pid, {:next, self(), ref})
+
+    receive do
+      {^ref, result} -> result
     end
   end
 
@@ -691,6 +767,7 @@ defmodule Web.ReadableStream do
         _ ->
           {:keep_state, %{data | task_ref: nil, active_task: nil, pulling: false},
            [{:next_event, :internal, :maybe_pull}]}
+
           # coveralls-ignore-stop
       end
     else

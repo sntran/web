@@ -69,8 +69,13 @@ defmodule Web.Request do
 
   defp build_request(url, init) do
     method = Keyword.get(init, :method, "GET") |> to_string() |> String.upcase()
-    headers = Web.Headers.new(Keyword.get(init, :headers, %{}))
-    body = Keyword.get(init, :body) |> Web.ReadableStream.from()
+    raw_body = Keyword.get(init, :body)
+    headers =
+      Keyword.get(init, :headers, %{})
+      |> Web.Headers.new()
+      |> Web.Body.put_inferred_content_type(raw_body)
+
+    body = Web.ReadableStream.from(raw_body)
     dispatcher = Keyword.get(init, :dispatcher)
     redirect = Keyword.get(init, :redirect, "follow") |> to_string()
     signal = Keyword.get(init, :signal)

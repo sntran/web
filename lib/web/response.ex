@@ -12,6 +12,7 @@ defmodule Web.Response do
     :status,
     :ok,
     :url,
+    :type,
     headers: Web.Headers.new()
   ]
 
@@ -20,8 +21,11 @@ defmodule Web.Response do
           headers: Web.Headers.t(),
           status: non_neg_integer(),
           ok: boolean(),
-          url: String.t()
+          url: String.t(),
+          type: String.t()
         }
+
+  @redirect_statuses [301, 302, 303, 307, 308]
 
   @doc """
   Constructs a new Response structure.
@@ -41,18 +45,79 @@ defmodule Web.Response do
       iex> resp.ok
       true
   """
-  def new(opts \\ []) do
+  def new(opts) when is_list(opts) do
     status = Keyword.get(opts, :status, 200)
+    raw_body = Keyword.get(opts, :body)
+
+    headers =
+      Keyword.get(opts, :headers, %{})
+      |> Web.Headers.new()
+      |> Web.Body.put_inferred_content_type(raw_body)
+
     # JS fetch normalizes 2xx as ok: true
     # NNTP standard 2xx codes and HTTP 2xx codes both specify success.
     ok = status >= 200 and status <= 299
 
     %__MODULE__{
-      body: Keyword.get(opts, :body) |> Web.ReadableStream.from(),
-      headers: Web.Headers.new(Keyword.get(opts, :headers, %{})),
+      body: Web.ReadableStream.from(raw_body),
+      headers: headers,
       status: status,
       ok: ok,
-      url: Keyword.get(opts, :url)
+      url: Keyword.get(opts, :url),
+      type: Keyword.get(opts, :type, "default")
     }
+  end
+
+  def new(), do: new([])
+
+  @doc """
+  Constructs a new Response using a body and init options.
+  """
+  def new(body, init) when is_list(init) do
+    init
+    |> Keyword.put(:body, body)
+    |> new()
+  end
+
+  @doc """
+  Returns a network-error style response.
+  """
+  @spec error() :: t()
+  def error do
+    new(body: nil, status: 0, type: "error")
+  end
+
+  @doc """
+  Creates a JSON response and sets the content type.
+  """
+  @spec json(any(), keyword()) :: t()
+  def json(data, init \\ []) do
+    encoded = Jason.encode!(data)
+
+    headers =
+      init
+      |> Keyword.get(:headers, %{})
+      |> Web.Headers.new()
+      |> Web.Headers.set("content-type", "application/json")
+
+    init
+    |> Keyword.put(:headers, headers)
+    |> then(&new(encoded, &1))
+  end
+
+  @doc """
+  Creates a redirect response with an empty body and Location header.
+  """
+  @spec redirect(String.t(), non_neg_integer()) :: t()
+  def redirect(url, status \\ 302) when is_integer(status) do
+    if status not in @redirect_statuses do
+      raise Web.TypeError, "Invalid redirect status #{status}"
+    end
+
+    new(
+      body: nil,
+      status: status,
+      headers: %{"location" => to_string(url)}
+    )
   end
 end

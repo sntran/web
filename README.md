@@ -60,8 +60,10 @@ response.body
 - **WHATWG-Compliant**: Implements the WHATWG Fetch, URL, Request, Response, ReadableStream, AbortController, and URLSearchParams standards.
 - **Zero-Buffer Streaming**: Streams data directly from the source with no intermediate buffering.
 - **Backpressure-Aware**: Automatically manages flow control for slow consumers.
-- **Body Helpers**: `Request` and `Response` expose `text/1`, `json/1`, `arrayBuffer/1`, `bytes/1`, and `blob/1` with single-consumption semantics.
-- **Normalized Bodies**: `Request.new/2` and `Response.new/1` normalize strings, binaries, `nil`, and enumerable inputs through `Web.ReadableStream.from/1`.
+- **Body Helpers**: `Request` and `Response` expose `text/1`, `json/1`, `arrayBuffer/1`, `bytes/1`, and `blob/1`; re-reading a consumed body raises `Web.TypeError`.
+- **Normalized Bodies**: `Request.new/2` and `Response.new/1` normalize strings, binaries, `nil`, `URLSearchParams`, `Blob`, `ArrayBuffer`, `Uint8Array`, and enumerable inputs through `Web.ReadableStream.from/1`.
+- **Smart Content-Type Defaults**: `Request.new/2` and `Response.new/1` infer `content-type` when missing (strings, `URLSearchParams`, and typed `Blob`s).
+- **Response Factories**: `Response.json/2`, `Response.redirect/2`, and `Response.error/0` provide ergonomic, standards-aligned constructors.
 - **Cloneable Streams**: `Request.clone/1` and `Response.clone/1` branch body streams with `ReadableStream.tee/1` so both original and clone can be consumed independently.
 - **Redirect-Safe Streaming Requests**: `307` and `308` redirects preserve request method and replayable stream bodies without draining them ahead of time.
 - **Unified Cancellation**: Abort any async operation with `AbortController` and `AbortSignal`.
@@ -92,12 +94,18 @@ req.url.hostname # => "api.github.com"
 ```
 
 Request bodies are normalized through `Web.ReadableStream.from/1`, so
-plain strings, binaries, `nil`, and enumerable inputs all behave like
+plain strings, binaries, `nil`, `URLSearchParams`, `Blob`,
+`ArrayBuffer`, `Uint8Array`, and enumerable inputs all behave like
 Web-style bodies.
 
 ```elixir
 req = Web.Request.new("https://api.example.com/items", body: ["he", "llo"])
 {:ok, "hello"} = Web.Request.text(req)
+
+params = Web.URLSearchParams.new(%{"q" => "elixir"})
+req = Web.Request.new("https://api.example.com/search", body: params)
+Web.Headers.get(req.headers, "content-type")
+# => "application/x-www-form-urlencoded;charset=UTF-8"
 ```
 
 ### `Web.Response` — Stream-Native Response
@@ -115,8 +123,9 @@ stream's `[[disturbed]]` state.
 ```elixir
 resp = Web.Response.new(body: ~s({"ok":true}))
 {:ok, %{"ok" => true}} = Web.Response.json(resp)
-{:error, %Web.TypeError{message: "body already used"}} =
-  Web.Response.text(resp)
+
+Web.Response.text(resp)
+# => ** (Web.TypeError) body already used
 ```
 
 Body readers now include typed data helpers:
@@ -134,6 +143,22 @@ Web.Uint8Array.to_binary(bytes) # => "hello"
 resp = Web.Response.new(body: "hello", headers: %{"content-type" => "text/plain"})
 {:ok, blob} = Web.Response.blob(resp)
 {blob.size, blob.type} # => {5, "text/plain"}
+```
+
+`Web.Response` also includes convenient constructors:
+
+```elixir
+json_resp = Web.Response.json(%{ok: true})
+Web.Headers.get(json_resp.headers, "content-type")
+# => "application/json"
+
+redirect_resp = Web.Response.redirect("https://example.com", 302)
+redirect_resp.status # => 302
+Web.Headers.get(redirect_resp.headers, "location")
+# => "https://example.com"
+
+error_resp = Web.Response.error()
+{error_resp.status, error_resp.type} # => {0, "error"}
 ```
 
 Cloning preserves body availability for both branches:
@@ -194,7 +219,11 @@ With **Zero-Buffer Streaming**, `Web` treats every response body as an Elixir `S
 
 `Web.ReadableStream.from/1` is the normalization boundary for body-like
 values. It accepts `nil`, binaries, existing `ReadableStream`s, and
-enumerable inputs and turns them into a consistent body representation.
+enumerable inputs, plus `URLSearchParams`, `Blob`, `ArrayBuffer`, and
+`Uint8Array`, and turns them into a consistent body representation.
+
+For `Blob`, normalization is lazy: parts are pulled across read cycles,
+including nested `Blob`s, rather than pre-buffered into memory.
 
 #### Multi-Reader Magic with `tee()`
 
@@ -242,10 +271,10 @@ Every core WHATWG concept is represented as a first-class Elixir citizen:
 
 - **`Web.URL`**: Pure, immutable URL parsing and manipulation.
 - **`Web.Request`**: Standardized HTTP/TCP request containers.
-- **`Web.Response`**: Stream-native response objects.
+- **`Web.Response`**: Stream-native response objects with `json/2`, `redirect/2`, and `error/0` factories.
 - **`Web.Headers`**: Case-insensitive, multi-value HTTP headers.
 - **`Web.URLSearchParams`**: Ordered, mutable query parameter storage.
-- **`Web.ReadableStream`**: Full lifecycle management for streaming data.
+- **`Web.ReadableStream`**: Full lifecycle management for streaming data and body normalization.
 - **`Web.AbortController`**: Unified cancellation mechanism for any async operation.
 - **`Web.ArrayBuffer`**: Immutable binary buffer with explicit `byte_length`.
 - **`Web.Uint8Array`**: Immutable byte-view over `Web.ArrayBuffer`.

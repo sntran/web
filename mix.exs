@@ -3,6 +3,7 @@ defmodule Web.MixProject do
 
   @version "0.2.0"
   @repo_url "https://github.com/sntran/web"
+  @description "A protocol-agnostic, zero-buffer suite of Web Standard APIs for Elixir."
 
   def project do
     [
@@ -13,7 +14,7 @@ defmodule Web.MixProject do
       deps: deps(),
 
       # Hex Metadata
-      description: "Web API-compliant library for Elixir.",
+      description: @description,
       package: package(),
 
       # Docs
@@ -38,6 +39,7 @@ defmodule Web.MixProject do
   defp package do
     [
       licenses: ["Apache-2.0"],
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md),
       links: %{
         "GitHub" => @repo_url,
         "JS Fetch Spec" => "https://fetch.spec.whatwg.org/"

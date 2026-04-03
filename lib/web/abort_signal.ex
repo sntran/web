@@ -270,6 +270,15 @@ defmodule Web.AbortSignal do
   end
 
   @doc false
+  def handle_call({:abort, reason}, _from, %{ref: ref, subscribers: subscribers} = state) do
+    Enum.each(Map.keys(subscribers), fn subscriber ->
+      send(subscriber, {:abort, ref, reason})
+    end)
+
+    {:stop, {:shutdown, {:aborted, reason}}, :ok, state}
+  end
+
+  @doc false
   def handle_cast({:abort, reason}, %{ref: ref, subscribers: subscribers} = state) do
     Enum.each(Map.keys(subscribers), fn subscriber ->
       send(subscriber, {:abort, ref, reason})

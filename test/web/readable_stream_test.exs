@@ -336,6 +336,19 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStream.locked?(%{}) == false
     end
 
+    test "pid wrapper helpers for disturbed and locked reflect the stream state" do
+      stream = ReadableStream.from("hello")
+
+      assert ReadableStream.disturbed?(stream.controller_pid) == false
+      assert ReadableStream.locked?(stream.controller_pid) == false
+
+      reader = ReadableStream.get_reader(stream)
+      assert ReadableStream.locked?(stream.controller_pid) == true
+      assert Web.ReadableStreamDefaultReader.read(reader) == "hello"
+      assert ReadableStream.disturbed?(stream.controller_pid) == true
+      assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
+    end
+
     test "tee/1 raises when called on a locked struct stream" do
       stream = ReadableStream.new()
       _reader = ReadableStream.get_reader(stream)
@@ -386,6 +399,20 @@ defmodule Web.ReadableStreamTest do
       send(error_pid, {:internal, :maybe_pull})
       Process.sleep(50)
       assert ReadableStream.get_slots(error_pid).state == :errored
+    end
+
+    test "start callbacks that throw transition the stream to errored" do
+      {:ok, pid} =
+        ReadableStream.start_link(
+          source: %{
+            start: fn _controller ->
+              throw(:start_thrown)
+            end
+          }
+        )
+
+      Process.sleep(50)
+      assert ReadableStream.get_slots(pid).state == :errored
     end
 
     test "task down paths handle normal and abnormal exits" do

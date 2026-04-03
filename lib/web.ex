@@ -42,6 +42,9 @@ defmodule Web do
       alias Web.AbortSignal
       alias Web.ReadableStream
       alias Web.ReadableStreamDefaultController
+      alias Web.WritableStream
+      alias Web.WritableStreamDefaultController
+      alias Web.WritableStreamDefaultWriter
       alias Web.ArrayBuffer
       alias Web.Uint8Array
       alias Web.Blob

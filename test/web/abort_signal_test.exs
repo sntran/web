@@ -193,6 +193,20 @@ defmodule Web.AbortSignalTest do
     assert :ok = Web.AbortSignal.unsubscribe(pid_subscription)
   end
 
+  test "AbortController.abort/2 tolerates a process exiting during the synchronous abort call" do
+    pid =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", _from, {:abort, _reason}} ->
+            exit(:not_a_genserver)
+        end
+      end)
+
+    controller = %Web.AbortController{signal: %Web.AbortSignal{pid: pid}}
+
+    assert :ok = Web.AbortController.abort(controller, :boom)
+  end
+
   defp wait_for_abort({:error, :aborted} = result), do: result
 
   defp wait_for_abort({:ok, subscription}) do

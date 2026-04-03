@@ -10,6 +10,7 @@ defmodule Web.Body do
   - `bytes/1` reads the body as `%Web.Uint8Array{}`.
   - `blob/1` reads the body as `%Web.Blob{}`.
   - `clone/1` tees the body stream and returns updated original plus clone.
+  - `pipe_to/2` streams chunks from an enumerable or readable body into a writable stream.
 
   It also provides shared `Content-Type` inference used by `Web.Request.new/2` and
   `Web.Response.new/1` when the caller does not supply that header:
@@ -174,6 +175,36 @@ defmodule Web.Body do
     end
   end
 
+  @doc """
+  Pipes an enumerable or readable stream into a `Web.WritableStream`.
+  """
+  def pipe_to(readable, %Web.WritableStream{} = writable) do
+    source = Web.ReadableStream.from(readable)
+    writer = Web.WritableStream.get_writer(writable)
+
+    try do
+      Enum.each(source, fn chunk ->
+        Web.WritableStreamDefaultWriter.write(writer, chunk)
+      end)
+
+      Web.WritableStreamDefaultWriter.close(writer)
+    rescue
+      error ->
+        safe_cancel_source(source, error)
+        safe_abort_writer(writer, error)
+        reraise error, __STACKTRACE__
+        # coveralls-ignore-start
+    catch
+      kind, reason ->
+        safe_cancel_source(source, {kind, reason})
+        safe_abort_writer(writer, {kind, reason})
+        :erlang.raise(kind, reason, __STACKTRACE__)
+        # coveralls-ignore-stop
+    after
+      safe_release_writer(writer)
+    end
+  end
+
   @doc false
   def put_inferred_content_type(%Web.Headers{} = headers, body) do
     cond do
@@ -206,4 +237,30 @@ defmodule Web.Body do
   end
 
   defp content_type(_), do: ""
+
+  defp safe_abort_writer(writer, reason) do
+    Web.WritableStreamDefaultWriter.abort(writer, reason)
+  rescue
+    _ -> :ok
+  end
+
+  defp safe_cancel_source(%Web.ReadableStream{} = source, reason) do
+    Web.ReadableStream.cancel(source.controller_pid, reason)
+    # coveralls-ignore-start
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+    # coveralls-ignore-stop
+  end
+
+  # coveralls-ignore-start
+  defp safe_cancel_source(_source, _reason), do: :ok
+  # coveralls-ignore-stop
+
+  defp safe_release_writer(writer) do
+    Web.WritableStreamDefaultWriter.release_lock(writer)
+  rescue
+    _ -> :ok
+  end
 end

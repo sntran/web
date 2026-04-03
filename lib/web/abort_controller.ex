@@ -53,7 +53,11 @@ defmodule Web.AbortController do
   """
   def abort(%__MODULE__{signal: %Web.AbortSignal{pid: pid}}, reason \\ :aborted) do
     if Process.alive?(pid) do
-      GenServer.cast(pid, {:abort, reason})
+      try do
+        GenServer.call(pid, {:abort, reason}, :infinity)
+      catch
+        :exit, _ -> :ok
+      end
     end
 
     :ok

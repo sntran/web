@@ -60,10 +60,13 @@ response.body
 - **WHATWG-Compliant**: Implements the WHATWG Fetch, URL, Request, Response, ReadableStream, AbortController, and URLSearchParams standards.
 - **Zero-Buffer Streaming**: Streams data directly from the source with no intermediate buffering.
 - **Backpressure-Aware**: Automatically manages flow control for slow consumers.
+- **Body Helpers**: `Request` and `Response` expose `text/1`, `json/1`, and `arrayBuffer/1` with single-consumption semantics.
+- **Normalized Bodies**: `Request.new/2` and `Response.new/1` normalize strings, binaries, `nil`, and enumerable inputs through `Web.ReadableStream.from/1`.
+- **Redirect-Safe Streaming Requests**: `307` and `308` redirects preserve request method and replayable stream bodies without draining them ahead of time.
 - **Unified Cancellation**: Abort any async operation with `AbortController` and `AbortSignal`.
 - **Protocol-Agnostic**: Supports HTTP, TCP, and custom dispatchers.
 - **Immutable Data Structures**: All core types are pure Elixir structs.
-- **Industrial-Grade Testing**: 100% test coverage for all state transitions and edge cases.
+- **Industrial-Grade Testing**: Broad coverage across stream lifecycle, redirect handling, cancellation, and edge cases.
 
 ---
 
@@ -87,6 +90,15 @@ req.method # => "GET"
 req.url.hostname # => "api.github.com"
 ```
 
+Request bodies are normalized through `Web.ReadableStream.from/1`, so
+plain strings, binaries, `nil`, and enumerable inputs all behave like
+Web-style bodies.
+
+```elixir
+req = Web.Request.new("https://api.example.com/items", body: ["he", "llo"])
+{:ok, "hello"} = Web.Request.text(req)
+```
+
 ### `Web.Response` — Stream-Native Response
 
 ```elixir
@@ -94,6 +106,16 @@ req.url.hostname # => "api.github.com"
 IO.puts(Enum.to_list(resp.body) |> to_string())
 resp.status # => 200
 resp.ok     # => true
+```
+
+`Web.Response` also exposes body readers that honor the underlying
+stream's `[[disturbed]]` state.
+
+```elixir
+resp = Web.Response.new(body: ~s({"ok":true}))
+{:ok, %{"ok" => true}} = Web.Response.json(resp)
+{:error, %Web.TypeError{message: "body already used"}} =
+  Web.Response.text(resp)
 ```
 
 ### `Web.Headers` — Case-Insensitive, Multi-Value Headers
@@ -127,6 +149,10 @@ Web.AbortController.abort(controller)
 
 With **Zero-Buffer Streaming**, `Web` treats every response body as an Elixir `Stream`. Chunks are yielded directly from the socket as they arrive, enabling processing of massive files with constant memory usage.
 
+`Web.ReadableStream.from/1` is the normalization boundary for body-like
+values. It accepts `nil`, binaries, existing `ReadableStream`s, and
+enumerable inputs and turns them into a consistent body representation.
+
 #### Multi-Reader Magic with `tee()`
 
 Split a single stream into two independent branches without buffering the entire source. Perfect for logging or computing hashes in parallel while saving data to disk.
@@ -147,11 +173,17 @@ checksum = Enum.reduce(branch_b, 0, fn chunk, acc -> acc + byte_size(chunk) end)
 
 When using `tee()`, the source pulls data at the speed of the **fastest** consumer, but guarantees the **slowest** consumer never overflows its internal queue by using a synchronized multicast strategy.
 
+This is also what makes replayable `307` and `308` redirect handling
+work for request bodies: the outgoing body can be duplicated without
+consuming the redirect branch up front.
+
 ---
 
 ## 🧪 Industrial-Grade Testing
 
-We take reliability seriously. The `Web` library maintains **100% test coverage** ensuring every state transition and edge case is accounted for.
+We take reliability seriously. The `Web` library has thorough coverage
+for stream state transitions, body consumption, redirect handling, and
+cancellation behavior.
 
 Run the suite yourself:
 

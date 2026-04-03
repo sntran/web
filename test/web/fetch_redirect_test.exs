@@ -48,6 +48,9 @@ defmodule Web.FetchRedirectTest do
             "/redir-relative" ->
               send_response(socket, 307, %{"location" => "/keep-method"}, "")
 
+            "/redir-308" ->
+              send_response(socket, 308, %{"location" => "/stream-target"}, "")
+
             "/redir-no-location" ->
               send_response(socket, 301, %{}, "")
 
@@ -61,6 +64,10 @@ defmodule Web.FetchRedirectTest do
               send_response(socket, 200, %{}, "#{method}:#{body}")
 
             "/keep-method" ->
+              send_response(socket, 200, %{}, "#{method}:#{body}")
+
+            "/stream-target" ->
+              send(parent, {:stream_target_body, body})
               send_response(socket, 200, %{}, "#{method}:#{body}")
 
             "/redirect-stream" ->
@@ -134,6 +141,7 @@ defmodule Web.FetchRedirectTest do
           302 -> "Found"
           303 -> "See Other"
           307 -> "Temporary Redirect"
+          308 -> "Permanent Redirect"
           404 -> "Not Found"
         end
 
@@ -203,10 +211,53 @@ defmodule Web.FetchRedirectTest do
     assert Enum.to_list(resp.body) == ["POST:payload"]
   end
 
+  test "307 preserves a streaming request body through redirect follow", %{port: port} do
+    body =
+      Web.ReadableStream.new(%{
+        start: fn controller ->
+          Web.ReadableStreamDefaultController.enqueue(controller, "pay")
+          Web.ReadableStreamDefaultController.enqueue(controller, "load")
+          Web.ReadableStreamDefaultController.close(controller)
+        end
+      })
+
+    assert {:ok, resp} =
+             Web.fetch("http://localhost:#{port}/redir-relative",
+               method: "POST",
+               headers: %{"content-length" => "7"},
+               body: body
+             )
+
+    assert resp.status == 200
+    assert Enum.to_list(resp.body) == ["POST:payload"]
+  end
+
   test "follow closes the previous response body before opening the next request", %{port: port} do
     assert {:ok, resp} = Web.fetch("http://localhost:#{port}/redirect-stream", redirect: "follow")
 
     assert Enum.to_list(resp.body) == ["success"]
+  end
+
+  test "308 preserves a streaming request body through redirect follow", %{port: port} do
+    body =
+      Web.ReadableStream.new(%{
+        start: fn controller ->
+          Web.ReadableStreamDefaultController.enqueue(controller, "pay")
+          Web.ReadableStreamDefaultController.enqueue(controller, "load")
+          Web.ReadableStreamDefaultController.close(controller)
+        end
+      })
+
+    assert {:ok, resp} =
+             Web.fetch("http://localhost:#{port}/redir-308",
+               method: "POST",
+               headers: %{"content-length" => "7"},
+               body: body
+             )
+
+    assert resp.status == 200
+    assert_receive {:stream_target_body, "payload"}
+    assert Enum.to_list(resp.body) == ["POST:payload"]
   end
 
   test "redirect with no location returns the original response", %{port: port} do

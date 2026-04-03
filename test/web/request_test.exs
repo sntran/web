@@ -10,7 +10,8 @@ defmodule Web.RequestTest do
       assert match?(%Web.URL{}, req.url)
       assert req.method == "GET"
       assert req.headers == Web.Headers.new()
-      assert req.body == nil
+      assert match?(%Web.ReadableStream{}, req.body)
+      assert {:ok, ""} = Web.ReadableStream.read_all(req.body)
       assert req.dispatcher == nil
       assert req.redirect == "follow"
       assert req.signal == nil
@@ -34,7 +35,7 @@ defmodule Web.RequestTest do
 
     assert Web.URL.href(req.url) == "http://example.com/"
     assert req.method == "POST"
-    assert req.body == "data"
+    assert {:ok, "data"} = Web.Request.text(req)
     assert req.headers == Web.Headers.new(%{"x" => "y"})
     assert req.dispatcher == MyDispatcher
     assert req.redirect == "manual"
@@ -61,5 +62,18 @@ defmodule Web.RequestTest do
 
     assert req.url == url
     assert req.method == "PUT"
+  end
+
+  test "new/2 normalizes enumerable request bodies through ReadableStream.from/1" do
+    req = Request.new("http://example.com", body: ["he", "llo"])
+
+    assert {:ok, "hello"} = Web.Request.text(req)
+  end
+
+  test "text/json/arrayBuffer consume the request body once" do
+    request = Request.new("https://example.com", body: ~s({"hello":"world"}))
+
+    assert {:ok, %{"hello" => "world"}} = Request.json(request)
+    assert {:error, %Web.TypeError{message: "body already used"}} = Request.text(request)
   end
 end

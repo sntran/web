@@ -169,6 +169,181 @@ defmodule Web.ReadableStreamTest do
       assert {:error, :not_locked_by_reader} = ReadableStream.release_lock(pid)
     end
 
+    test "disturbed?/1, locked?/1, and read_all/1 helpers" do
+      stream =
+        ReadableStream.new(%{
+          start: fn controller ->
+            Web.ReadableStreamDefaultController.enqueue(controller, "he")
+            Web.ReadableStreamDefaultController.enqueue(controller, "llo")
+            Web.ReadableStreamDefaultController.close(controller)
+          end
+        })
+
+      assert ReadableStream.disturbed?(stream) == false
+      assert ReadableStream.locked?(stream) == false
+      reader = ReadableStream.get_reader(stream)
+      assert ReadableStream.locked?(stream) == true
+      assert Web.ReadableStreamDefaultReader.read(reader) == "he"
+      assert ReadableStream.disturbed?(stream) == true
+      assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
+
+      stream =
+        ReadableStream.new(%{
+          start: fn controller ->
+            Web.ReadableStreamDefaultController.enqueue(controller, "hello")
+            Web.ReadableStreamDefaultController.close(controller)
+          end
+        })
+
+      assert {:ok, "hello"} = ReadableStream.read_all(stream)
+      assert ReadableStream.disturbed?(stream) == true
+    end
+
+    test "from/1 normalizes enumerables using pull" do
+      stream = ReadableStream.from(["a", "b", "c"])
+      assert {:ok, "abc"} = ReadableStream.read_all(stream)
+    end
+
+    test "from/1 handles passthroughs, empty enumerables, and invalid values" do
+      stream_struct = Stream.map(["a"], & &1)
+
+      stream_fun =
+        Stream.resource(
+          fn -> ["a"] end,
+          fn
+            [] -> {:halt, []}
+            [h | t] -> {[h], t}
+          end,
+          fn _ -> :ok end
+        )
+
+      assert ReadableStream.from(stream_struct) == stream_struct
+      assert ReadableStream.from(stream_fun) == stream_fun
+      assert {:ok, ""} = [] |> ReadableStream.from() |> ReadableStream.read_all()
+      assert_raise ArgumentError, ~r/cannot normalize body/, fn -> ReadableStream.from(123) end
+    end
+
+    test "from/1 enumerable cancellation and nil-source cancel paths do not crash" do
+      stream = ReadableStream.from(1..10)
+      ReadableStream.cancel(stream.controller_pid, :stop_now)
+
+      {:ok, nil_pid} = ReadableStream.start_link(source: nil)
+      ReadableStream.cancel(nil_pid, :noop)
+      assert ReadableStream.get_slots(nil_pid).state == :closed
+    end
+
+    test "helper fallbacks cover pid, enumerable, and non-readable bodies" do
+      pid_stream =
+        ReadableStream.new(%{start: fn c -> Web.ReadableStreamDefaultController.close(c) end})
+
+      locked_stream = ReadableStream.new()
+      _reader = ReadableStream.get_reader(locked_stream)
+
+      assert ReadableStream.disturbed?(nil) == false
+      assert ReadableStream.disturbed?("abc") == false
+      assert ReadableStream.locked?(nil) == false
+      assert ReadableStream.locked?(["a"]) == false
+      assert {:ok, ""} = ReadableStream.read_all(nil)
+      assert {:ok, "abc"} = ReadableStream.read_all("abc")
+      assert {:ok, "ab"} = ReadableStream.read_all(["a", "b"])
+      assert {:ok, ""} = ReadableStream.read_all(pid_stream.controller_pid)
+      assert {:ok, "ab"} = ReadableStream.read_all(Stream.map(["a", "b"], & &1))
+      assert {:error, %TypeError{message: "body is not readable"}} = ReadableStream.read_all(123)
+
+      assert {:error, %TypeError{message: "ReadableStream is already locked"}} =
+               ReadableStream.read_all(locked_stream)
+
+      assert ReadableStream.disturbed?(%{}) == false
+      assert ReadableStream.locked?(%{}) == false
+    end
+
+    test "tee/1 raises when called on a locked struct stream" do
+      stream = ReadableStream.new()
+      _reader = ReadableStream.get_reader(stream)
+
+      assert_raise TypeError, ~r/already locked/, fn ->
+        ReadableStream.tee(stream)
+      end
+    end
+
+    test "tee/1 propagates errored state to its branches" do
+      {:ok, pid} = ReadableStream.start_link()
+      stream = %ReadableStream{controller_pid: pid}
+      ReadableStream.error(pid, :boom)
+
+      {left, right} = ReadableStream.tee(stream)
+
+      assert_raise TypeError, "The stream is errored.", fn -> Enum.to_list(left) end
+      assert_raise TypeError, "The stream is errored.", fn -> Enum.to_list(right) end
+    end
+
+    test "pull tasks cover normal and errored completion paths" do
+      parent = self()
+
+      {:ok, ok_pid} =
+        ReadableStream.start_link(
+          source: %{
+            pull: fn _controller ->
+              send(parent, :pull_completed)
+              :ok
+            end
+          }
+        )
+
+      send(ok_pid, {:internal, :maybe_pull})
+      assert_receive :pull_completed
+      Process.sleep(50)
+      assert ReadableStream.get_slots(ok_pid).state == :readable
+
+      {:ok, error_pid} =
+        ReadableStream.start_link(
+          source: %{
+            pull: fn _controller ->
+              raise "pull failed"
+            end
+          }
+        )
+
+      send(error_pid, {:internal, :maybe_pull})
+      Process.sleep(50)
+      assert ReadableStream.get_slots(error_pid).state == :errored
+    end
+
+    test "task down paths handle normal and abnormal exits" do
+      sleeper = fn _controller -> Process.sleep(5_000) end
+
+      {:ok, normal_pid} = ReadableStream.start_link(source: %{pull: sleeper})
+      send(normal_pid, {:internal, :maybe_pull})
+      Process.sleep(50)
+      normal_ref = ReadableStream.get_slots(normal_pid).task_ref
+      send(normal_pid, {:DOWN, normal_ref, :process, self(), :normal})
+      Process.sleep(50)
+      assert ReadableStream.get_slots(normal_pid).state == :readable
+
+      {:ok, abnormal_pid} = ReadableStream.start_link(source: %{pull: sleeper})
+      send(abnormal_pid, {:internal, :maybe_pull})
+      Process.sleep(50)
+      abnormal_ref = ReadableStream.get_slots(abnormal_pid).task_ref
+      send(abnormal_pid, {:DOWN, abnormal_ref, :process, self(), :kaboom})
+      Process.sleep(50)
+      assert ReadableStream.get_slots(abnormal_pid).state == :errored
+    end
+
+    test "read_all/1 releases the lock when the stream errors mid-read" do
+      stream = ReadableStream.new()
+
+      task =
+        Task.async(fn ->
+          ReadableStream.read_all(stream)
+        end)
+
+      Process.sleep(50)
+      ReadableStream.error(stream.controller_pid, :boom)
+
+      assert {:ok, {:error, {:errored, :boom}}} = Task.yield(task, 1000)
+      assert ReadableStream.locked?(stream) == false
+    end
+
     test "fulfillment", %{controller_pid: pid} do
       parent = self()
 
@@ -203,7 +378,7 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStream.get_slots(p3).disturbed == false
       assert ReadableStream.get_desired_size(p3) == 5
       ReadableStream.enqueue(p3, "a")
-      assert ReadableStream.get_slots(p3).disturbed == true
+      assert ReadableStream.get_slots(p3).disturbed == false
       assert ReadableStream.get_desired_size(p3) == 4
 
       # HWM else branch coverage (read when queue still >= hwm)

@@ -32,7 +32,10 @@ defmodule Web.Dispatcher.TCP do
     case :gen_tcp.connect(host, port, opts, 5000) do
       {:ok, socket} ->
         if request.body do
-          :gen_tcp.send(socket, request.body)
+          case Web.ReadableStream.read_all(request.body) do
+            {:ok, body} -> :gen_tcp.send(socket, body)
+            {:error, reason} -> raise reason
+          end
         end
 
         stream =

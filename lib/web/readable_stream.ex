@@ -77,6 +77,215 @@ defmodule Web.ReadableStream do
   end
 
   @doc """
+  Normalizes body-like input into a `ReadableStream`.
+
+  ## Examples
+
+      iex> stream = Web.ReadableStream.from("hello")
+      iex> Web.ReadableStream.read_all(stream)
+      {:ok, "hello"}
+
+      iex> stream = Web.ReadableStream.from(nil)
+      iex> Web.ReadableStream.read_all(stream)
+      {:ok, ""}
+
+      iex> existing = Web.ReadableStream.new()
+      iex> Web.ReadableStream.from(existing) == existing
+      true
+  """
+  def from(nil) do
+    new(%{start: &Web.ReadableStreamDefaultController.close/1})
+  end
+
+  def from(data) when is_binary(data) do
+    new(%{
+      start: fn controller ->
+        Web.ReadableStreamDefaultController.enqueue(controller, data)
+        Web.ReadableStreamDefaultController.close(controller)
+      end
+    })
+  end
+
+  def from(%__MODULE__{} = stream), do: stream
+
+  def from(%Stream{} = stream), do: stream
+
+  def from(fun) when is_function(fun, 2), do: fun
+
+  def from(enumerable) do
+    if Enumerable.impl_for(enumerable) do
+      enumerator_pid = start_enumerator(enumerable)
+
+      new(%{
+        pull: fn controller ->
+          next_chunk = ask_enumerator(enumerator_pid)
+
+          case next_chunk do
+            :done ->
+              Web.ReadableStreamDefaultController.close(controller)
+
+            chunk ->
+              Web.ReadableStreamDefaultController.enqueue(controller, chunk)
+          end
+        end,
+        cancel: fn _reason ->
+          # coveralls-ignore-start
+          if Process.alive?(enumerator_pid) do
+            send(enumerator_pid, :stop)
+          end
+          # coveralls-ignore-stop
+        end
+      })
+    else
+      raise ArgumentError, "cannot normalize body from #{inspect(enumerable)}"
+    end
+  end
+
+  defp next_enumerable_chunk(enumerable) when is_function(enumerable, 1) do
+    case enumerable.({:cont, nil}) do
+      {:suspended, chunk, continuation} -> {chunk, {:continuation, continuation}}
+      {:done, nil} -> {:done, :done}
+      # coveralls-ignore-next-line
+      {:halted, nil} -> {:done, :done}
+    end
+  end
+
+  defp next_enumerable_chunk(enumerable) do
+    reducer = fn chunk, _acc -> {:suspend, chunk} end
+
+    case Enumerable.reduce(enumerable, {:cont, nil}, reducer) do
+      {:suspended, chunk, continuation} -> {chunk, {:continuation, continuation}}
+      {:done, nil} -> {:done, :done}
+      # coveralls-ignore-next-line
+      {:halted, nil} -> {:done, :done}
+    end
+  end
+
+  defp start_enumerator(enumerable) do
+    spawn(fn -> enumerator_loop({:initial, enumerable}) end)
+  end
+
+  defp enumerator_loop(state) do
+    receive do
+      {:next, from, ref} ->
+        case state do
+          :done ->
+            # coveralls-ignore-start
+            send(from, {ref, :done})
+            :ok
+
+          # coveralls-ignore-stop
+
+          {:initial, current_enumerable} ->
+            case next_enumerable_chunk(current_enumerable) do
+              {:done, :done} ->
+                # coveralls-ignore-start
+                send(from, {ref, :done})
+                :ok
+
+              # coveralls-ignore-stop
+
+              {chunk, next_state} ->
+                send(from, {ref, chunk})
+                enumerator_loop(next_state)
+            end
+
+          {:continuation, continuation} ->
+            case next_enumerable_chunk(continuation) do
+              {:done, :done} ->
+                # coveralls-ignore-start
+                send(from, {ref, :done})
+                :ok
+
+              # coveralls-ignore-stop
+
+              {chunk, next_state} ->
+                send(from, {ref, chunk})
+                enumerator_loop(next_state)
+            end
+        end
+
+      # coveralls-ignore-next-line
+      :stop ->
+        :ok
+    end
+  end
+
+  defp ask_enumerator(pid) do
+    ref = make_ref()
+    send(pid, {:next, self(), ref})
+
+    receive do
+      {^ref, result} -> result
+    end
+  end
+
+  @doc """
+  Returns whether the stream's `[[disturbed]]` slot has been set.
+  """
+  def disturbed?(nil), do: false
+  def disturbed?(body) when is_binary(body) or is_list(body), do: false
+
+  def disturbed?(%__MODULE__{controller_pid: pid}) do
+    disturbed?(pid)
+  end
+
+  def disturbed?(pid) when is_pid(pid) do
+    :gen_statem.call(pid, :disturbed?)
+  end
+
+  def disturbed?(_body), do: false
+
+  @doc """
+  Returns `true` when the stream currently has an active reader lock.
+  """
+  def locked?(nil), do: false
+  def locked?(body) when is_binary(body) or is_list(body), do: false
+
+  def locked?(%__MODULE__{controller_pid: pid}) do
+    locked?(pid)
+  end
+
+  def locked?(pid) when is_pid(pid) do
+    :gen_statem.call(pid, :locked?)
+  end
+
+  def locked?(_body), do: false
+
+  @doc """
+  Reads a body to completion and returns the concatenated binary.
+  """
+  def read_all(nil), do: {:ok, ""}
+  def read_all(body) when is_binary(body), do: {:ok, body}
+  def read_all(body) when is_list(body), do: {:ok, IO.iodata_to_binary(body)}
+
+  def read_all(%__MODULE__{} = stream) do
+    case get_reader(stream.controller_pid) do
+      :ok ->
+        do_read_all(stream.controller_pid, [])
+
+      {:error, :already_locked} ->
+        {:error, TypeError.exception("ReadableStream is already locked")}
+    end
+  end
+
+  def read_all(pid) when is_pid(pid) do
+    read_all(%__MODULE__{controller_pid: pid})
+  end
+
+  def read_all(body) do
+    if Enumerable.impl_for(body) do
+      {:ok,
+       body
+       |> Enum.reduce([], fn chunk, acc -> [IO.iodata_to_binary(chunk) | acc] end)
+       |> Enum.reverse()
+       |> IO.iodata_to_binary()}
+    else
+      {:error, TypeError.exception("body is not readable")}
+    end
+  end
+
+  @doc """
   Locks the stream and returns a reader.
 
   ## Examples
@@ -214,7 +423,7 @@ defmodule Web.ReadableStream do
           {:cast, {:enqueue, chunk}} ->
             Enum.each(data.branches, &enqueue(&1, chunk))
 
-            new_data = %{data | queue: :queue.in(chunk, data.queue), disturbed: true}
+            new_data = %{data | queue: :queue.in(chunk, data.queue)}
 
             case :queue.out(new_data.read_requests) do
               {{:value, from}, new_requests} ->
@@ -259,8 +468,10 @@ defmodule Web.ReadableStream do
               :keep_state_and_data
             end
 
+          # coveralls-ignore-start
           _ ->
             {:keep_state_and_data, [:postpone]}
+            # coveralls-ignore-stop
         end
 
       result ->
@@ -286,8 +497,10 @@ defmodule Web.ReadableStream do
               :keep_state_and_data
             end
 
+          # coveralls-ignore-start
           _ ->
             {:keep_state_and_data, [:postpone]}
+            # coveralls-ignore-stop
         end
 
       result ->
@@ -306,8 +519,10 @@ defmodule Web.ReadableStream do
 
             {:keep_state, %{data | read_requests: :queue.new()}}
 
+          # coveralls-ignore-start
           _ ->
             {:keep_state_and_data, [:postpone]}
+            # coveralls-ignore-stop
         end
 
       result ->
@@ -406,6 +621,14 @@ defmodule Web.ReadableStream do
     {:keep_state_and_data, [{:reply, from, size}]}
   end
 
+  defp handle_common({:call, from}, :disturbed?, _state, data) do
+    {:keep_state_and_data, [{:reply, from, data.disturbed}]}
+  end
+
+  defp handle_common({:call, from}, :locked?, _state, data) do
+    {:keep_state_and_data, [{:reply, from, not is_nil(data.reader_pid)}]}
+  end
+
   defp handle_common({:call, from}, :tee, state, %{reader_pid: nil, branches: []} = data) do
     parent_pid = self()
 
@@ -436,6 +659,7 @@ defmodule Web.ReadableStream do
     case state do
       :closed -> Enum.each(new_branches, &close/1)
       :errored -> Enum.each(new_branches, &error(&1, data.error_reason))
+      # coveralls-ignore-next-line
       _ -> :ok
     end
 
@@ -467,9 +691,11 @@ defmodule Web.ReadableStream do
           {:next_state, :errored, %{data | error_reason: reason, task_ref: nil, pulling: false},
            [{:next_event, :internal, :flush_requests}]}
 
+        # coveralls-ignore-start
         _ ->
           {:keep_state, %{data | task_ref: nil, active_task: nil, pulling: false},
            [{:next_event, :internal, :maybe_pull}]}
+          # coveralls-ignore-stop
       end
     else
       :keep_state_and_data
@@ -599,9 +825,25 @@ defmodule Web.ReadableStream do
       data.hwm - :queue.len(data.queue)
     else
       case Map.values(data.branch_desired_sizes) do
+        # coveralls-ignore-next-line
         [] -> 0
         vals -> Enum.max(vals)
       end
+    end
+  end
+
+  defp do_read_all(pid, chunks) do
+    case read(pid) do
+      {:ok, chunk} ->
+        do_read_all(pid, [chunk | chunks])
+
+      :done ->
+        release_lock(pid)
+        {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
+
+      {:error, reason} ->
+        release_lock(pid)
+        {:error, reason}
     end
   end
 end
@@ -618,6 +860,7 @@ defimpl Enumerable, for: Web.ReadableStream do
     try do
       ReadableStreamDefaultReader.release_lock(reader)
     rescue
+      # coveralls-ignore-next-line
       _ -> :ok
     end
 
@@ -634,6 +877,7 @@ defimpl Enumerable, for: Web.ReadableStream do
         try do
           ReadableStreamDefaultReader.release_lock(reader)
         rescue
+          # coveralls-ignore-next-line
           _ -> :ok
         end
 
@@ -647,6 +891,7 @@ defimpl Enumerable, for: Web.ReadableStream do
             try do
               ReadableStreamDefaultReader.release_lock(reader)
             rescue
+              # coveralls-ignore-next-line
               _ -> :ok
             end
 

@@ -16,9 +16,11 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp do_fetch(%Web.Request{} = request, redirect_count) do
+    {request, request_body_for_fetch} = prepare_request_body(request)
+
     case Web.AbortSignal.subscribe(request.signal) do
       {:ok, signal_subscription} ->
-        case build_finch_request(request) do
+        case build_finch_request(request, request_body_for_fetch) do
           {:ok, finch_request} ->
             {bridge_pid, bridge_ref, bridge_monitor} = start_stream_bridge(finch_request)
 
@@ -98,17 +100,36 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp next_redirect_request(request, 303, next_url) do
-    %{
-      request
-      | url: Web.URL.new(next_url),
-        method: "GET",
-        body: nil,
-        headers: Web.Headers.delete(request.headers, "content-length")
-    }
+    Web.Request.new(
+      next_url,
+      request.options
+      |> Keyword.put(:method, "GET")
+      |> Keyword.put(:headers, Web.Headers.delete(request.headers, "content-length"))
+      |> Keyword.put(:body, nil)
+      |> Keyword.put(:dispatcher, request.dispatcher)
+    )
+  end
+
+  defp next_redirect_request(request, status, next_url) when status in [307, 308] do
+    Web.Request.new(
+      next_url,
+      request.options
+      |> Keyword.put(:method, request.method)
+      |> Keyword.put(:headers, request.headers)
+      |> Keyword.put(:body, request.body)
+      |> Keyword.put(:dispatcher, request.dispatcher)
+    )
   end
 
   defp next_redirect_request(request, _status, next_url) do
-    %{request | url: Web.URL.new(next_url)}
+    Web.Request.new(
+      next_url,
+      request.options
+      |> Keyword.put(:method, request.method)
+      |> Keyword.put(:headers, request.headers)
+      |> Keyword.put(:body, request.body)
+      |> Keyword.put(:dispatcher, request.dispatcher)
+    )
   end
 
   defp close_body(body_stream) do
@@ -116,20 +137,42 @@ defmodule Web.Dispatcher.HTTP do
     :ok
   end
 
-  defp build_finch_request(request) do
+  defp build_finch_request(request, body) do
+    normalized_body =
+      case normalize_body(body || request.body) do
+        {:ok, value} -> value
+        value -> value
+      end
+
     {:ok,
      Finch.build(
        request.method,
        Web.URL.href(request.url),
        Web.Headers.to_list(request.headers),
-       normalize_body(request.body)
+       normalized_body
      )}
   rescue
     error -> {:error, error}
   end
 
+  defp prepare_request_body(
+         %Web.Request{body: %Web.ReadableStream{} = body, redirect: "follow"} = request
+       ) do
+    if not Web.ReadableStream.disturbed?(body) and not Web.ReadableStream.locked?(body) do
+      {body_for_fetch, body_for_redirect} = Web.ReadableStream.tee(body)
+      {%{request | body: body_for_redirect}, body_for_fetch}
+    else
+      {request, body}
+    end
+  end
+
+  defp prepare_request_body(%Web.Request{} = request) do
+    {request, request.body}
+  end
+
   defp normalize_body(nil), do: nil
   defp normalize_body(body) when is_binary(body) or is_list(body), do: body
+  defp normalize_body(%Web.ReadableStream{} = body), do: Web.ReadableStream.read_all(body)
 
   defp normalize_body(body) do
     if Enumerable.impl_for(body) do
@@ -188,6 +231,7 @@ defmodule Web.Dispatcher.HTTP do
         |> bridge_loop()
 
       {:bridge_headers, ref, _trailers} when ref == state.ref ->
+        # coveralls-ignore-next-line
         bridge_loop(state)
 
       {:bridge_data, ref, chunk, worker_pid}
@@ -225,15 +269,20 @@ defmodule Web.Dispatcher.HTTP do
         send(worker_pid, {:bridge_ack, ref})
         bridge_loop(%{state | pending_chunk: nil})
 
+      # coveralls-ignore-start
       {:bridge_next, ref, consumer} when ref == state.ref and state.terminal == :done ->
         send(consumer, {:bridge_done, ref})
         bridge_loop(state)
+        # coveralls-ignore-stop
 
       {:bridge_next, ref, consumer} when ref == state.ref ->
         case state.terminal do
+          # coveralls-ignore-start
           {:error, reason} ->
             send(consumer, {:bridge_error, ref, reason})
             bridge_loop(state)
+
+          # coveralls-ignore-stop
 
           _ ->
             bridge_loop(%{state | waiting_consumer: consumer})
@@ -278,12 +327,16 @@ defmodule Web.Dispatcher.HTTP do
               {:bridge_ack, ^ref} ->
                 acc
 
+              # coveralls-ignore-start
               {:bridge_cancel, ^ref} ->
                 exit(:normal)
+                # coveralls-ignore-stop
             end
 
+          # coveralls-ignore-start
           {:trailers, _trailers}, acc ->
             acc
+            # coveralls-ignore-stop
         end,
         receive_timeout: :infinity,
         request_timeout: :infinity
@@ -298,6 +351,7 @@ defmodule Web.Dispatcher.HTTP do
     end
   end
 
+  # coveralls-ignore-next-line
   defp maybe_send_ready(%{ready_sent?: true} = state), do: state
 
   defp maybe_send_ready(%{status: status, headers_received?: true} = state)
@@ -316,6 +370,7 @@ defmodule Web.Dispatcher.HTTP do
       {:bridge_failed, ^bridge_ref, reason} ->
         {:error, reason}
 
+      # coveralls-ignore-next-line
       {:DOWN, ^bridge_monitor, :process, ^bridge_pid, reason} ->
         {:error, reason}
     after

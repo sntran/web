@@ -24,7 +24,8 @@ defmodule Web.ResponseTest do
     resp = Response.new()
     assert resp.status == 200
     assert resp.ok == true
-    assert resp.body == nil
+    assert match?(%Web.ReadableStream{}, resp.body)
+    assert {:ok, ""} = Web.ReadableStream.read_all(resp.body)
     assert resp.url == nil
     assert resp.headers == Web.Headers.new()
   end
@@ -38,5 +39,21 @@ defmodule Web.ResponseTest do
 
   test "struct defaults include a Web.Headers container" do
     assert %Response{}.headers == Web.Headers.new()
+  end
+
+  test "new/1 normalizes enumerable response bodies through ReadableStream.from/1" do
+    resp = Response.new(body: ["he", "llo"])
+
+    assert {:ok, "hello"} = Response.text(resp)
+  end
+
+  test "text/1 and arrayBuffer/1 drain the response body" do
+    resp = Response.new(body: "hello")
+
+    assert {:ok, "hello"} = Response.text(resp)
+
+    resp = Response.new(body: "hello")
+    assert {:ok, "hello"} = Response.arrayBuffer(resp)
+    assert {:error, %Web.TypeError{message: "body already used"}} = Response.text(resp)
   end
 end

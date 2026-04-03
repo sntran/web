@@ -5,6 +5,7 @@ defmodule Web.Request do
   Represents an HTTP request, including URL, method, headers, and body.
   Compatible with standard Web API concepts.
   """
+  use Web.Body
 
   defstruct [
     :url,
@@ -69,7 +70,7 @@ defmodule Web.Request do
   defp build_request(url, init) do
     method = Keyword.get(init, :method, "GET") |> to_string() |> String.upcase()
     headers = Web.Headers.new(Keyword.get(init, :headers, %{}))
-    body = Keyword.get(init, :body)
+    body = Keyword.get(init, :body) |> Web.ReadableStream.from()
     dispatcher = Keyword.get(init, :dispatcher)
     redirect = Keyword.get(init, :redirect, "follow") |> to_string()
     signal = Keyword.get(init, :signal)

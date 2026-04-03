@@ -6,6 +6,7 @@ defmodule WebTest do
   doctest Web
   doctest Web.AbortController
   doctest Web.AbortSignal
+  doctest Web.Body
   doctest Web.Headers
   doctest Web.Request
   doctest Web.Response

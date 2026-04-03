@@ -1,6 +1,8 @@
 defmodule Web.Dispatcher.HTTPTest do
   use ExUnit.Case, async: true
 
+  @moduletag capture_log: true
+
   alias Web.Request
   alias Web.Dispatcher.HTTP
 
@@ -46,8 +48,8 @@ defmodule Web.Dispatcher.HTTPTest do
           if drop_on_body? do
             :gen_tcp.close(socket)
           else
-            # Small delay for finalization
-            Process.sleep(10)
+            # Give the client enough time to consume the final buffered bytes under suite load.
+            Process.sleep(50)
             :gen_tcp.close(socket)
           end
 
@@ -81,6 +83,90 @@ defmodule Web.Dispatcher.HTTPTest do
 
     chunks = resp.body |> Enum.to_list()
     assert Enum.join(chunks) == "hello"
+  end
+
+  test "fetch/1 accepts a raw request with a nil body" do
+    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"])
+
+    req = %Request{
+      url: Web.URL.new("http://localhost:#{port}/raw-nil"),
+      method: "GET",
+      headers: Web.Headers.new(),
+      body: nil,
+      dispatcher: nil,
+      redirect: "follow",
+      signal: nil,
+      options: [redirect: "follow", signal: nil]
+    }
+
+    assert {:ok, resp} = HTTP.fetch(req)
+    assert Enum.to_list(resp.body) == ["ok"]
+  end
+
+  test "fetch/1 streams enumerable request bodies without normalizing them to readable streams" do
+    headers_packet = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+    port = HTTPServer.start_link([headers_packet])
+
+    req =
+      Request.new("http://localhost:#{port}/stream-body",
+        method: :post,
+        body: Stream.map(["da", "ta"], & &1)
+      )
+
+    assert {:ok, resp} = HTTP.fetch(req)
+    assert Enum.to_list(resp.body) == ["ok"]
+  end
+
+  test "fetch/1 accepts raw iodata list bodies" do
+    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"])
+
+    req = %Request{
+      url: Web.URL.new("http://localhost:#{port}/raw-list"),
+      method: "POST",
+      headers: Web.Headers.new(),
+      body: ["da", "ta"],
+      dispatcher: nil,
+      redirect: "follow",
+      signal: nil,
+      options: [redirect: "follow", signal: nil]
+    }
+
+    assert {:ok, resp} = HTTP.fetch(req)
+    assert Enum.to_list(resp.body) == ["ok"]
+  end
+
+  test "fetch/1 surfaces raw invalid body types as request build errors" do
+    port = HTTPServer.start_link([])
+
+    req = %Request{
+      url: Web.URL.new("http://localhost:#{port}/raw-invalid"),
+      method: "POST",
+      headers: Web.Headers.new(),
+      body: %{bad: :body},
+      dispatcher: nil,
+      redirect: "follow",
+      signal: nil,
+      options: [redirect: "follow", signal: nil]
+    }
+
+    assert {:error, _} = HTTP.fetch(req)
+  end
+
+  test "fetch/1 surfaces non-enumerable raw body types as request build errors" do
+    port = HTTPServer.start_link([])
+
+    req = %Request{
+      url: Web.URL.new("http://localhost:#{port}/raw-atom"),
+      method: "POST",
+      headers: Web.Headers.new(),
+      body: :bad,
+      dispatcher: nil,
+      redirect: "follow",
+      signal: nil,
+      options: [redirect: "follow", signal: nil]
+    }
+
+    assert {:error, _} = HTTP.fetch(req)
   end
 
   test "fetch/1 handles unified packets cleanly routing data remainder payload" do

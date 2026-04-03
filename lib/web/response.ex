@@ -5,6 +5,7 @@ defmodule Web.Response do
   Represents an HTTP response, including status, headers, and a streamable body.
   Matches the zero-buffer streaming rule.
   """
+  use Web.Body
 
   defstruct [
     :body,
@@ -47,7 +48,7 @@ defmodule Web.Response do
     ok = status >= 200 and status <= 299
 
     %__MODULE__{
-      body: Keyword.get(opts, :body),
+      body: Keyword.get(opts, :body) |> Web.ReadableStream.from(),
       headers: Web.Headers.new(Keyword.get(opts, :headers, %{})),
       status: status,
       ok: ok,

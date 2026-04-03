@@ -138,4 +138,34 @@ defmodule Web.Dispatcher.TCPTest do
     assert :ok = Web.AbortController.abort(controller, :timeout)
     assert Enum.to_list(resp.body) == []
   end
+
+  test "fetch/1 returns an empty body when the signal is already aborted before fetch" do
+    controller = Web.AbortController.new()
+    assert :ok = Web.AbortController.abort(controller, :timeout)
+    port = TCPServer.start_link("data")
+
+    req = Request.new("tcp://localhost:#{port}", signal: controller.signal)
+    {:ok, resp} = TCP.fetch(req)
+
+    assert Enum.to_list(resp.body) == []
+  end
+
+  test "fetch/1 raises for unreadable raw request bodies" do
+    port = TCPServer.start_link("data")
+
+    req = %Request{
+      url: Web.URL.new("tcp://localhost:#{port}"),
+      method: "POST",
+      headers: Web.Headers.new(),
+      body: 123,
+      dispatcher: nil,
+      redirect: "follow",
+      signal: nil,
+      options: [redirect: "follow", signal: nil]
+    }
+
+    assert_raise Web.TypeError, "body is not readable", fn ->
+      TCP.fetch(req)
+    end
+  end
 end

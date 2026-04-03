@@ -148,4 +148,10 @@ defmodule Web.URLTest do
     assert URL.search(url) == "?q=1"
     assert URL.hash(url) == "#frag"
   end
+
+  test "href/1 adds a trailing slash for host urls with an empty pathname" do
+    url = %URL{protocol: "https:", hostname: "example.com", pathname: "", kind: :standard}
+
+    assert URL.href(url) == "https://example.com/"
+  end
 end

@@ -48,6 +48,7 @@ defmodule Web.Dispatcher.TCP do
         {:ok,
          Web.Response.new(
            status: 200,
+           status_text: "Connected",
            body: stream,
            url: Web.URL.href(request.url)
          )}

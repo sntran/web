@@ -25,6 +25,7 @@ defmodule Web.ResponseTest do
     resp = Response.new()
     assert resp.status == 200
     assert resp.ok == true
+    assert resp.status_text == ""
     assert resp.type == "default"
     assert match?(%Web.ReadableStream{}, resp.body)
     assert {:ok, ""} = Web.ReadableStream.read_all(resp.body)
@@ -109,8 +110,38 @@ defmodule Web.ResponseTest do
     resp = Response.error()
 
     assert resp.status == 0
+    assert resp.ok == false
+    assert resp.status_text == ""
     assert resp.type == "error"
     assert {:ok, ""} = Response.text(resp)
+  end
+
+  test "new/1 defaults status_text to empty string for unknown status" do
+    resp = Response.new(status: 799)
+    assert resp.status_text == ""
+  end
+
+  test "new/1 allows explicitly setting status_text" do
+    resp = Response.new(status: 250, status_text: "Custom")
+    assert resp.status_text == "Custom"
+  end
+
+  test "json/2 creates an ok response with OK status_text" do
+    resp = Response.json(%{id: 1})
+    assert resp.ok == true
+    assert resp.status_text == "OK"
+  end
+
+  test "redirect/2 sets appropriate status_text for each redirect status" do
+    assert Response.redirect("https://example.com", 301).status_text == "Moved Permanently"
+    assert Response.redirect("https://example.com", 302).status_text == "Found"
+    assert Response.redirect("https://example.com", 303).status_text == "See Other"
+    assert Response.redirect("https://example.com", 307).status_text == "Temporary Redirect"
+    assert Response.redirect("https://example.com", 308).status_text == "Permanent Redirect"
+  end
+
+  test "error/0 creates a non-ok response" do
+    assert Response.error().ok == false
   end
 
   test "new/1 infers content-type from Blob body type" do

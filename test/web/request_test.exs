@@ -130,4 +130,10 @@ defmodule Web.RequestTest do
 
     assert Web.Headers.get(req.headers, "content-type") == "text/custom"
   end
+
+  test "new/2 raises when input is not a URL struct or string" do
+    assert_raise TypeError, ~r/Request input must be a Web.URL struct or URL string/, fn ->
+      Request.new(123, [])
+    end
+  end
 end

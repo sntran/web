@@ -68,6 +68,52 @@ defmodule Web.Blob do
     |> IO.iodata_to_binary()
   end
 
+  @doc """
+  Returns a readable stream view over Blob parts.
+  """
+  @spec stream(t()) :: Web.ReadableStream.t()
+  def stream(%__MODULE__{} = blob) do
+    Web.ReadableStream.from(blob)
+  end
+
+  @doc """
+  Reads Blob contents as text.
+  """
+  @spec text(t()) :: {:ok, binary()}
+  def text(%__MODULE__{} = blob) do
+    {:ok, to_binary(blob)}
+  end
+
+  @doc """
+  Reads Blob contents and decodes JSON.
+  """
+  @spec json(t()) :: {:ok, any()} | {:error, any()}
+  def json(%__MODULE__{} = blob) do
+    with {:ok, binary} <- text(blob) do
+      Jason.decode(binary)
+    end
+  end
+
+  @doc """
+  Reads Blob contents as ArrayBuffer.
+  """
+  @spec arrayBuffer(t()) :: {:ok, Web.ArrayBuffer.t()}
+  def arrayBuffer(%__MODULE__{} = blob) do
+    with {:ok, binary} <- text(blob) do
+      {:ok, Web.ArrayBuffer.new(binary)}
+    end
+  end
+
+  @doc """
+  Reads Blob contents as Uint8Array.
+  """
+  @spec bytes(t()) :: {:ok, Web.Uint8Array.t()}
+  def bytes(%__MODULE__{} = blob) do
+    with {:ok, array_buffer} <- arrayBuffer(blob) do
+      {:ok, Web.Uint8Array.new(array_buffer)}
+    end
+  end
+
   defp part_size(part) when is_binary(part), do: byte_size(part)
   defp part_size(%__MODULE__{size: size}), do: size
 

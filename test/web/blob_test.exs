@@ -169,4 +169,23 @@ defmodule Web.BlobTest do
     assert sliced.size == 4
     assert Blob.to_binary(sliced) == "bcde"
   end
+
+  test "stream/1 returns a readable stream over blob contents" do
+    blob = Blob.new(["hel", "lo"])
+
+    assert {:ok, "hello"} = blob |> Blob.stream() |> Web.ReadableStream.read_all()
+  end
+
+  test "text/json/arrayBuffer/bytes can be called multiple times" do
+    blob = Blob.new([~s({"id":1})], type: "application/json")
+
+    assert {:ok, ~s({"id":1})} = Blob.text(blob)
+    assert {:ok, %{"id" => 1}} = Blob.json(blob)
+    assert {:ok, %Web.ArrayBuffer{byte_length: 8}} = Blob.arrayBuffer(blob)
+
+    assert {:ok, %Web.Uint8Array{} = bytes} = Blob.bytes(blob)
+    assert Web.Uint8Array.to_binary(bytes) == ~s({"id":1})
+
+    assert {:ok, ~s({"id":1})} = Blob.text(blob)
+  end
 end

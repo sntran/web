@@ -11,6 +11,7 @@ defmodule Web.Response do
     :body,
     :status,
     :ok,
+    :status_text,
     :url,
     :type,
     headers: Web.Headers.new()
@@ -21,6 +22,7 @@ defmodule Web.Response do
           headers: Web.Headers.t(),
           status: non_neg_integer(),
           ok: boolean(),
+          status_text: String.t(),
           url: String.t(),
           type: String.t()
         }
@@ -56,13 +58,15 @@ defmodule Web.Response do
 
     # JS fetch normalizes 2xx as ok: true
     # NNTP standard 2xx codes and HTTP 2xx codes both specify success.
-    ok = status >= 200 and status <= 299
+    ok = status >= 200 and status < 300
+    status_text = Keyword.get(opts, :status_text, "")
 
     %__MODULE__{
       body: Web.ReadableStream.from(raw_body),
       headers: headers,
       status: status,
       ok: ok,
+      status_text: status_text,
       url: Keyword.get(opts, :url),
       type: Keyword.get(opts, :type, "default")
     }
@@ -102,6 +106,7 @@ defmodule Web.Response do
 
     init
     |> Keyword.put(:headers, headers)
+    |> Keyword.put_new(:status_text, "OK")
     |> then(&new(encoded, &1))
   end
 
@@ -114,9 +119,19 @@ defmodule Web.Response do
       raise Web.TypeError, "Invalid redirect status #{status}"
     end
 
+    status_text =
+      case status do
+        301 -> "Moved Permanently"
+        302 -> "Found"
+        303 -> "See Other"
+        307 -> "Temporary Redirect"
+        308 -> "Permanent Redirect"
+      end
+
     new(
       body: nil,
       status: status,
+      status_text: status_text,
       headers: %{"location" => to_string(url)}
     )
   end

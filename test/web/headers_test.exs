@@ -158,4 +158,25 @@ defmodule Web.HeadersTest do
       assert impl.slice(headers) == {:error, impl}
     end
   end
+
+  describe "inspect" do
+    test "redacts sensitive header values" do
+      output =
+        Headers.new(%{
+          "authorization" => "secret",
+          "cookie" => "a=1",
+          "set-cookie" => "b=2",
+          "proxy-authorization" => "token",
+          "x-safe" => "ok"
+        })
+        |> Kernel.inspect()
+
+      assert output =~ "[REDACTED]"
+      refute output =~ "secret"
+      refute output =~ "a=1"
+      refute output =~ "b=2"
+      refute output =~ "token"
+      assert output =~ "ok"
+    end
+  end
 end

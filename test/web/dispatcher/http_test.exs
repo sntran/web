@@ -79,6 +79,7 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert resp.status == 200
+    assert resp.status_text == "OK"
     assert Web.Headers.get(resp.headers, "content-length") == "5"
 
     chunks = resp.body |> Enum.to_list()
@@ -460,5 +461,25 @@ defmodule Web.Dispatcher.HTTPTest do
 
     # Aborting after the first delivered chunk should stop subsequent pulls.
     assert Enum.reverse(chunks) == ["data"]
+  end
+
+  test "fetch/1 populates status_text from HTTP status code map" do
+    # Test 200 OK
+    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"])
+    req = Request.new("http://localhost:#{port}/200", method: :get)
+    {:ok, resp} = HTTP.fetch(req)
+    assert resp.status_text == "OK"
+
+    # Test 404 Not Found
+    port = HTTPServer.start_link(["HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"])
+    req = Request.new("http://localhost:#{port}/404", method: :get)
+    {:ok, resp} = HTTP.fetch(req)
+    assert resp.status_text == "Not Found"
+
+    # Test 500 Internal Server Error
+    port = HTTPServer.start_link(["HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"])
+    req = Request.new("http://localhost:#{port}/500", method: :get)
+    {:ok, resp} = HTTP.fetch(req)
+    assert resp.status_text == "Internal Server Error"
   end
 end

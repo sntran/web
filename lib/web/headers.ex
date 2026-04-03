@@ -202,3 +202,24 @@ defimpl Enumerable, for: Web.Headers do
     Enumerable.List.reduce(Web.Headers.enumerable_entries(headers), acc, fun)
   end
 end
+
+defimpl Inspect, for: Web.Headers do
+  import Inspect.Algebra
+
+  @redacted_names MapSet.new(["authorization", "cookie", "set-cookie", "proxy-authorization"])
+
+  def inspect(%Web.Headers{} = headers, opts) do
+    entries =
+      headers
+      |> Web.Headers.enumerable_entries()
+      |> Enum.map(fn {name, value} ->
+        if MapSet.member?(@redacted_names, name) do
+          {name, "[REDACTED]"}
+        else
+          {name, value}
+        end
+      end)
+
+    concat(["#Web.Headers<", to_doc(entries, opts), ">"])
+  end
+end

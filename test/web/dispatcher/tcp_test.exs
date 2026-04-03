@@ -168,4 +168,14 @@ defmodule Web.Dispatcher.TCPTest do
       TCP.fetch(req)
     end
   end
+
+  test "fetch/1 returns response with protocol-specific status_text" do
+    port = TCPServer.start_link("test data", false)
+
+    req = Request.new("tcp://localhost:#{port}")
+    {:ok, resp} = TCP.fetch(req)
+
+    assert resp.status == 200
+    assert resp.status_text == "Connected"
+  end
 end

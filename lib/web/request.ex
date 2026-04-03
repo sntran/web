@@ -48,14 +48,18 @@ defmodule Web.Request do
   """
   def new(%__MODULE__{} = request, _init), do: request
 
-  def new(%Web.URL{} = input, init) do
+  def new(%Web.URL{} = input, init) when is_list(init) do
     build_request(input, init)
   end
 
-  def new(input, init) do
+  def new(input, init) when is_binary(input) and is_list(init) do
     input
     |> Web.URL.new()
     |> build_request(init)
+  end
+
+  def new(input, _init) do
+    raise Web.TypeError, "Request input must be a Web.URL struct or URL string, got: #{inspect(input)}"
   end
 
   @doc """

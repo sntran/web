@@ -194,6 +194,17 @@ Web.Headers.get(headers, "content-type") # => "application/json"
 Web.Headers.get_set_cookie(headers)      # => ["a=1", "b=2"]
 ```
 
+`Web.Headers` implements the `Enumerable` protocol, allowing headers to be used with Enum functions:
+
+```elixir
+headers = Web.Headers.new(%{"x-custom" => "value", "content-type" => "application/json"})
+Enum.count(headers)           # => 2
+Enum.member?(headers, {"x-custom", "value"}) # => true
+Enum.each(headers, &IO.inspect/1)
+```
+
+Sensitive headers (`authorization`, `cookie`, `set-cookie`, `proxy-authorization`) are automatically redacted in `inspect/1` output for security.
+
 ### `Web.URLSearchParams` — Query Parameter Management
 
 ```elixir
@@ -222,8 +233,9 @@ values. It accepts `nil`, binaries, existing `ReadableStream`s, and
 enumerable inputs, plus `URLSearchParams`, `Blob`, `ArrayBuffer`, and
 `Uint8Array`, and turns them into a consistent body representation.
 
-For `Blob`, normalization is lazy: parts are pulled across read cycles,
-including nested `Blob`s, rather than pre-buffered into memory.
+**Lazy Blob Traversal**: For `Blob`, normalization is lazy: parts are pulled across read cycles,
+including nested `Blob`s, rather than pre-buffered into memory. This ensures a single `Blob` tree
+can be streamed through multiple consumers without materialization overhead.
 
 #### Multi-Reader Magic with `tee()`
 
@@ -248,6 +260,14 @@ When using `tee()`, the source pulls data at the speed of the **fastest** consum
 This is also what makes replayable `307` and `308` redirect handling
 work for request bodies: the outgoing body can be duplicated without
 consuming the redirect branch up front.
+
+---
+
+## 🔒 Security & Privacy
+
+**Sensitive Header Redaction**: The `Web.Headers` module automatically redacts sensitive headers (`authorization`, `cookie`, `set-cookie`, `proxy-authorization`) in `inspect/1` output, preventing accidental credential leakage in logs and debugging.
+
+**Protocol Separation**: HTTP status code mappings are isolated in `Web.Dispatcher.HTTP`, keeping `Web.Response` protocol-agnostic. Response objects are pure data structures that don't embed protocol concerns, enabling reuse across HTTP, TCP, and custom dispatchers.
 
 ---
 

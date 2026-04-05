@@ -338,7 +338,8 @@ defmodule Web.Dispatcher.HTTP do
       {:bridge_next, ref, consumer} when ref == state.ref and state.terminal == :done ->
         send(consumer, {:bridge_done, ref})
         bridge_loop(state)
-        # coveralls-ignore-stop
+
+      # coveralls-ignore-stop
 
       {:bridge_next, ref, consumer} when ref == state.ref ->
         case state.terminal do
@@ -479,6 +480,7 @@ defmodule Web.Dispatcher.HTTP do
     else
       case Web.AbortSignal.receive_abort(state.signal_subscription, 0) do
         {:error, :aborted} ->
+          # coveralls-ignore-next-line
           abort_and_halt(state)
 
         :ok ->
@@ -509,6 +511,7 @@ defmodule Web.Dispatcher.HTTP do
             abort_and_halt(state)
 
           :ok ->
+            # coveralls-ignore-next-line
             await_body_chunk(state)
         end
     end

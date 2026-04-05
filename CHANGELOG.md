@@ -9,6 +9,7 @@ All notable changes to this project are documented in this file.
 - `Web.Stream` behaviour that abstracts streaming state machine.
 - `use Web.Stream` macro.
 - `Web.TransformStream` that uses `use Web.Stream`
+- `Web.ReadableStream.pipe_to/3` and `Web.ReadableStream.pipe_through/3` for composable, backpressure-aware stream pipelines with optional `AbortSignal` interruption.
 - `examples/stream/byte_counter_stream.exs` demo showing a custom `use Web.Stream` byte counter and a `Web.TransformStream` byte counter producing the same byte total.
 
 ## Changed

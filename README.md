@@ -117,6 +117,34 @@ Enum.to_list(ReadableStream)
 # => ["FOO", "BAR"]
 ```
 
+### `ReadableStream.pipe_to/3` & `ReadableStream.pipe_through/3`
+Use `pipe_to/3` to connect a source to any writable sink with backpressure-awareness, and `pipe_through/3` to attach transforms while returning the next readable stage.
+
+```elixir
+source = ReadableStream.from(["hello", " world"])
+
+transform = TransformStream.new(%{
+  transform: fn chunk, controller, state ->
+    ReadableStreamDefaultController.enqueue(controller, String.upcase(chunk))
+    {:ok, state}
+  end,
+  flush: fn controller, state ->
+    ReadableStreamDefaultController.close(controller)
+    {:ok, state}
+  end
+})
+
+# pipe_through returns the transformed readable side
+upper = ReadableStream.pipe_through(source, transform)
+{:ok, output} = ReadableStream.read_all(upper)
+# => {:ok, "HELLO WORLD"}
+
+# pipe_to returns a task you can await
+sink = WritableStream.new(%{})
+task = ReadableStream.pipe_to(ReadableStream.from(["a"]), sink)
+:ok = Task.await(task)
+```
+
 ### `Web.Request` & `Web.Response`
 First-class containers for network data with high-level factories and standard body readers.
 

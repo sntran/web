@@ -109,21 +109,21 @@ defmodule Web do
   def fetch(%Web.Request{} = request, _init) do
     do_fetch(request)
   catch
-    :throw, {:abort, :aborted} -> {:error, :aborted}
+    :throw, {:abort, _reason} -> {:error, :aborted}
   end
 
   def fetch(%Web.URL{} = input, init) do
     request = Web.Request.new(input, init)
     do_fetch(request)
   catch
-    :throw, {:abort, :aborted} -> {:error, :aborted}
+    :throw, {:abort, _reason} -> {:error, :aborted}
   end
 
   def fetch(input, init) when is_binary(input) do
     request = Web.Request.new(input, init)
     do_fetch(request)
   catch
-    :throw, {:abort, :aborted} -> {:error, :aborted}
+    :throw, {:abort, _reason} -> {:error, :aborted}
   end
 
   defp do_fetch(request) do

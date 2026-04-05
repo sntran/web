@@ -28,14 +28,20 @@ defmodule Web.Dispatcher.HTTPTest do
           :gen_tcp.close(socket)
           :gen_tcp.close(listen_socket)
         else
-          {:ok, _req} = :gen_tcp.recv(socket, 0)
+          case :gen_tcp.recv(socket, 0) do
+            {:ok, _req} -> :ok
+            {:error, :closed} -> :ok
+          end
 
           Enum.each(responses, fn
             {:sleep, ms} ->
               Process.sleep(ms)
 
             chunk ->
-              :gen_tcp.send(socket, chunk)
+              case :gen_tcp.send(socket, chunk) do
+                :ok -> :ok
+                {:error, :closed} -> :ok
+              end
           end)
 
           if observer do
@@ -304,7 +310,7 @@ defmodule Web.Dispatcher.HTTPTest do
 
     port =
       HTTPServer.start_link(
-        ["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", {:sleep, 200}, "data"],
+        ["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", {:sleep, 500}, "data"],
         false,
         false,
         self()
@@ -320,7 +326,7 @@ defmodule Web.Dispatcher.HTTPTest do
       end)
 
     assert_receive :http_body_started
-    Process.sleep(100)
+    Process.sleep(20)
     assert :ok = Web.AbortController.abort(controller, :timeout)
 
     assert {:ok, []} = Task.yield(task, 1000)
@@ -363,6 +369,22 @@ defmodule Web.Dispatcher.HTTPTest do
 
     assert :ok = Web.AbortController.abort(controller, :timeout)
     assert Enum.to_list(resp.body) == []
+  end
+
+  test "fetch/1 keeps waiting for delayed body chunks while the signal stays alive" do
+    controller = Web.AbortController.new()
+
+    port =
+      HTTPServer.start_link([
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n",
+        {:sleep, 200},
+        "data"
+      ])
+
+    req = Request.new("http://localhost:#{port}/delayed-body", signal: controller.signal)
+    {:ok, resp} = HTTP.fetch(req)
+
+    assert Enum.to_list(resp.body) == ["data"]
   end
 
   test "fetch/1 normalizes transport closure to aborted when abort arrives during recv" do
@@ -477,7 +499,9 @@ defmodule Web.Dispatcher.HTTPTest do
     assert resp.status_text == "Not Found"
 
     # Test 500 Internal Server Error
-    port = HTTPServer.start_link(["HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"])
+    port =
+      HTTPServer.start_link(["HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"])
+
     req = Request.new("http://localhost:#{port}/500", method: :get)
     {:ok, resp} = HTTP.fetch(req)
     assert resp.status_text == "Internal Server Error"

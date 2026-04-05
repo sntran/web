@@ -33,7 +33,9 @@ defmodule Web.ReadableStream do
   defstruct [:controller_pid]
 
   alias Web.ArrayBuffer
+  alias Web.AbortSignal
   alias Web.Blob
+  alias Web.WritableStream
   alias Web.Uint8Array
   alias Web.TypeError
   alias Web.URLSearchParams
@@ -51,8 +53,7 @@ defmodule Web.ReadableStream do
       ctrl = %Web.ReadableStreamDefaultController{pid: pid}
       fun = source.start
 
-      {:producer, state,
-       [{:next_event, :internal, {:start_task, fn -> fun.(ctrl) end}}]}
+      {:producer, state, [{:next_event, :internal, {:start_task, fn -> fun.(ctrl) end}}]}
     else
       {:producer, state}
     end
@@ -305,7 +306,7 @@ defmodule Web.ReadableStream do
                 send(from, {ref, :done})
                 :ok
 
-                # coveralls-ignore-stop
+              # coveralls-ignore-stop
 
               {chunk, next_state} ->
                 send(from, {ref, chunk})
@@ -319,7 +320,7 @@ defmodule Web.ReadableStream do
                 send(from, {ref, :done})
                 :ok
 
-                # coveralls-ignore-stop
+              # coveralls-ignore-stop
 
               {chunk, next_state} ->
                 send(from, {ref, chunk})
@@ -467,7 +468,9 @@ defmodule Web.ReadableStream do
     :gen_statem.cast(pid, {:error, reason})
   end
 
-  def cancel(pid, reason \\ :cancelled) do
+  def cancel(target, reason \\ :cancelled)
+
+  def cancel(pid, reason) do
     :gen_statem.cast(pid, {:cancel, reason})
   end
 
@@ -506,6 +509,69 @@ defmodule Web.ReadableStream do
     end
   end
 
+  @doc """
+  Pipes a readable stream into a writable stream.
+
+  Returns a `%Task{}` that runs the pump lifecycle asynchronously.
+
+  ## Options
+
+  - `:preventClose` - do not close the writable side when the source is done
+  - `:preventAbort` - do not abort the writable side when the source errors
+  - `:preventCancel` - do not cancel the readable side when the sink errors
+  - `:signal` - optional `%Web.AbortSignal{}` to interrupt piping
+  """
+  def pipe_to(readable, writable, options \\ []) do
+    Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
+      reader = nil
+      writer = nil
+
+      try do
+        try do
+          reader = acquire_reader_for_pipe(readable)
+          writer = acquire_writer_for_pipe(writable)
+
+          case pump(reader, writer, options) do
+            :done ->
+              maybe_close_writer(writer, options)
+              :ok
+
+            {:source_error, reason} ->
+              maybe_abort_writer(writer, reason, options)
+              {:error, reason}
+
+            {:sink_error, reason} ->
+              maybe_cancel_reader(reader, reason, options)
+              {:error, reason}
+
+            {:aborted, reason} ->
+              maybe_cancel_reader(reader, reason, options)
+              maybe_abort_writer(writer, reason, options)
+              {:error, {:aborted, reason}}
+          end
+        rescue
+          error in TypeError ->
+            {:error, error}
+        end
+      after
+        if reader != nil, do: release_reader_lock(reader)
+        if writer != nil, do: release_writer_lock(writer)
+      end
+    end)
+  end
+
+  @doc """
+  Pipes this stream through a transform and returns the transform's readable side.
+  """
+  def pipe_through(
+        readable,
+        %{readable: transformed_readable, writable: transformed_writable},
+        options \\ []
+      ) do
+    _task = pipe_to(readable, transformed_writable, options)
+    transformed_readable
+  end
+
   # coveralls-ignore-start
   def branch_cancelled(pid, child_pid) do
     :gen_statem.cast(pid, {:branch_cancelled, child_pid})
@@ -514,6 +580,7 @@ defmodule Web.ReadableStream do
   def report_desired_size(pid, child_pid, size) do
     :gen_statem.cast(pid, {:branch_desired_size, child_pid, size})
   end
+
   # coveralls-ignore-stop
 
   # ---------------------------------------------------------------------------
@@ -534,6 +601,168 @@ defmodule Web.ReadableStream do
         {:error, reason}
     end
   end
+
+  defp pump(reader, writer, options) do
+    owner_pid = self()
+
+    try do
+      AbortSignal.check!(options[:signal])
+
+      with :ok <-
+             await_pipe_step(
+               fn -> WritableStream.ready(writer.controller_pid, writer.owner_pid) end,
+               options
+             ),
+           :ok <- AbortSignal.check!(options[:signal]),
+           read_result <-
+             await_pipe_step(fn -> read_for_pipe(reader.controller_pid, owner_pid) end, options) do
+        case read_result do
+          {:ok, chunk} ->
+            case WritableStream.write(writer.controller_pid, writer.owner_pid, chunk) do
+              :ok ->
+                pump(reader, writer, options)
+
+              {:error, reason} ->
+                {:sink_error, reason}
+            end
+
+          :done ->
+            :done
+
+          {:error, reason} ->
+            {:source_error, reason}
+        end
+      else
+        # coveralls-ignore-next-line
+        {:error, reason} -> {:sink_error, reason}
+      end
+    catch
+      {:abort, reason} -> {:aborted, reason}
+    end
+  end
+
+  defp await_pipe_step(fun, options) do
+    signal = Keyword.get(options, :signal)
+
+    if signal == nil do
+      fun.()
+    else
+      case AbortSignal.subscribe(signal) do
+        {:error, :aborted} ->
+          # coveralls-ignore-next-line
+          AbortSignal.check!(signal)
+
+        {:ok, subscription} ->
+          task = Task.async(fun)
+
+          try do
+            await_pipe_step_result(task, subscription, signal)
+          after
+            AbortSignal.unsubscribe(subscription)
+            Task.shutdown(task, :brutal_kill)
+          end
+      end
+    end
+  end
+
+  defp await_pipe_step_result(task, subscription, signal) do
+    case Task.yield(task, 10) do
+      {:ok, result} ->
+        result
+
+      # coveralls-ignore-start
+      nil ->
+        case AbortSignal.receive_abort(subscription, 0, true) do
+          {:error, :aborted, reason} ->
+            throw({:abort, normalize_abort_reason(signal, reason)})
+
+          :ok ->
+            await_pipe_step_result(task, subscription, signal)
+        end
+
+        # coveralls-ignore-stop
+    end
+  end
+
+  defp read_for_pipe(pid, owner_pid) do
+    :gen_statem.call(pid, {:read, owner_pid})
+  end
+
+  # coveralls-ignore-start
+  defp normalize_abort_reason(signal, :aborted), do: AbortSignal.reason(signal) || :aborted
+  defp normalize_abort_reason(_signal, reason), do: reason
+  # coveralls-ignore-stop
+
+  defp maybe_close_writer(writer, options) do
+    if Keyword.get(options, :preventClose, false) do
+      :ok
+    else
+      _ = WritableStream.close(writer.controller_pid, writer.owner_pid)
+      :ok
+    end
+  end
+
+  defp maybe_abort_writer(writer, reason, options) do
+    if Keyword.get(options, :preventAbort, false) do
+      :ok
+    else
+      _ = WritableStream.abort(writer.controller_pid, writer.owner_pid, reason)
+      :ok
+    end
+  end
+
+  defp maybe_cancel_reader(reader, reason, options) do
+    if Keyword.get(options, :preventCancel, false) do
+      :ok
+    else
+      cancel(reader.controller_pid, reason)
+      :ok
+    end
+  end
+
+  defp acquire_reader_for_pipe(%__MODULE__{} = readable), do: get_reader(readable)
+
+  defp acquire_reader_for_pipe(pid) when is_pid(pid) do
+    case get_reader(pid) do
+      :ok -> %Web.ReadableStreamDefaultReader{controller_pid: pid}
+      {:error, :already_locked} -> raise TypeError, "ReadableStream is already locked"
+    end
+  end
+
+  defp acquire_writer_for_pipe(%WritableStream{} = writable),
+    do: WritableStream.get_writer(writable)
+
+  defp acquire_writer_for_pipe(pid) when is_pid(pid) do
+    case WritableStream.get_writer(pid) do
+      :ok -> %Web.WritableStreamDefaultWriter{controller_pid: pid, owner_pid: self()}
+      {:error, :already_locked} -> raise TypeError, "WritableStream is already locked"
+    end
+  end
+
+  # coveralls-ignore-start
+  defp release_reader_lock(reader) do
+    try do
+      case release_lock(reader.controller_pid) do
+        :ok -> :ok
+        _ -> :ok
+      end
+    catch
+      :exit, _ -> :ok
+    end
+  end
+
+  defp release_writer_lock(writer) do
+    try do
+      case WritableStream.release_lock(writer.controller_pid, writer.owner_pid) do
+        :ok -> :ok
+        _ -> :ok
+      end
+    catch
+      :exit, _ -> :ok
+    end
+  end
+
+  # coveralls-ignore-stop
 end
 
 defimpl Enumerable, for: Web.ReadableStream do

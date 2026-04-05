@@ -52,6 +52,12 @@ defmodule Web.AbortSignalTest do
              Web.AbortSignal.receive_abort(token_subscription, 0, true)
   end
 
+  test "check!/1 throws custom token abort reasons" do
+    send(self(), {:abort, :token, :token_abort})
+
+    assert catch_throw(Web.AbortSignal.check!(:token)) == {:abort, :token_abort}
+  end
+
   test "abort signal subscriptions observe both abort messages and process down" do
     controller = Web.AbortController.new()
     {:ok, subscription} = Web.AbortSignal.subscribe(controller.signal)
@@ -82,6 +88,32 @@ defmodule Web.AbortSignalTest do
 
     assert signal.aborted
     assert signal.reason == :aborted
+  end
+
+  test "aborted?/1 and reason/1 helper fallbacks" do
+    controller = Web.AbortController.new()
+
+    assert Web.AbortSignal.aborted?(nil) == false
+    assert Web.AbortSignal.aborted?(:not_a_signal) == false
+    assert Web.AbortSignal.reason(nil) == nil
+    assert Web.AbortSignal.reason(:not_a_signal) == nil
+    assert Web.AbortSignal.aborted?(controller.signal) == false
+    assert Web.AbortSignal.reason(controller.signal) == nil
+
+    assert :ok = Web.AbortController.abort(controller, :boom)
+    assert Web.AbortSignal.aborted?(controller.signal) == true
+    assert Web.AbortSignal.reason(controller.signal) == :boom
+
+    pre_aborted = Web.AbortSignal.abort(:manual)
+    assert Web.AbortSignal.aborted?(pre_aborted) == true
+    assert Web.AbortSignal.reason(pre_aborted) == :manual
+  end
+
+  test "reason/1 can read a queued reason from a live signal subscription" do
+    controller = Web.AbortController.new()
+    send(self(), {:abort, controller.signal.ref, :queued_reason})
+
+    assert Web.AbortSignal.reason(controller.signal) == :queued_reason
   end
 
   test "timeout/1 aborts the signal after the requested delay" do

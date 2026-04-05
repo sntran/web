@@ -26,6 +26,7 @@ defmodule Web.AbortSignal do
   """
 
   use GenServer
+  @reason_key __MODULE__
 
   defstruct aborted: false, reason: nil, pid: nil, ref: nil
 
@@ -174,16 +175,91 @@ defmodule Web.AbortSignal do
             :ok ->
               :ok
 
-            {:error, :aborted, _reason} ->
-              throw({:abort, :aborted})
+            {:error, :aborted, reason} ->
+              throw({:abort, normalize_reason(signal, reason)})
           end
         after
           unsubscribe(subscription)
         end
 
       {:error, :aborted} ->
-        throw({:abort, :aborted})
+        throw({:abort, normalize_reason(signal, :aborted)})
     end
+  end
+
+  @doc """
+  Returns whether a signal has already aborted.
+  """
+  def aborted?(nil), do: false
+  def aborted?(%__MODULE__{aborted: true}), do: true
+
+  def aborted?(%__MODULE__{pid: pid} = signal) when is_pid(pid) do
+    case subscribe(signal) do
+      {:error, :aborted} ->
+        true
+
+      {:ok, subscription} ->
+        try do
+          match?({:error, :aborted, _reason}, receive_abort(subscription, 0, true))
+        after
+          unsubscribe(subscription)
+        end
+    end
+  end
+
+  def aborted?(_), do: false
+
+  @doc """
+  Returns the abort reason when available, otherwise `nil`.
+  """
+  def reason(nil), do: nil
+  def reason(%__MODULE__{aborted: true, reason: reason}), do: reason
+
+  def reason(%__MODULE__{pid: pid} = signal) when is_pid(pid) do
+    case subscribe(signal) do
+      {:error, :aborted} ->
+        receive_signal_reason(signal)
+
+      {:ok, subscription} ->
+        try do
+          case receive_abort(subscription, 0, true) do
+            {:error, :aborted, reason} -> reason
+            :ok -> nil
+          end
+        after
+          unsubscribe(subscription)
+        end
+    end
+  end
+
+  def reason(_), do: nil
+
+  defp normalize_reason(signal, :aborted), do: reason(signal) || :aborted
+  defp normalize_reason(_signal, reason), do: reason
+
+  defp receive_signal_reason(%__MODULE__{pid: pid, ref: ref, reason: fallback}) do
+    subscription = %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: Process.monitor(pid)}
+
+    try do
+      case receive_abort(subscription, 0, true) do
+        {:error, :aborted, reason} ->
+          reason
+
+        :ok ->
+          remembered_reason(ref) || fallback || if(Process.alive?(pid), do: nil, else: :aborted)
+      end
+    after
+      Process.demonitor(subscription.monitor_ref, [:flush])
+    end
+  end
+
+  defp remember_reason(ref, reason) when is_reference(ref) do
+    :persistent_term.put({@reason_key, ref}, reason)
+    :ok
+  end
+
+  defp remembered_reason(ref) when is_reference(ref) do
+    :persistent_term.get({@reason_key, ref}, nil)
   end
 
   @doc false
@@ -271,6 +347,8 @@ defmodule Web.AbortSignal do
 
   @doc false
   def handle_call({:abort, reason}, _from, %{ref: ref, subscribers: subscribers} = state) do
+    remember_reason(ref, reason)
+
     Enum.each(Map.keys(subscribers), fn subscriber ->
       send(subscriber, {:abort, ref, reason})
     end)
@@ -280,6 +358,8 @@ defmodule Web.AbortSignal do
 
   @doc false
   def handle_cast({:abort, reason}, %{ref: ref, subscribers: subscribers} = state) do
+    remember_reason(ref, reason)
+
     Enum.each(Map.keys(subscribers), fn subscriber ->
       send(subscriber, {:abort, ref, reason})
     end)

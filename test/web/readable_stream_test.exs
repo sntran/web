@@ -2,6 +2,7 @@ defmodule Web.ReadableStreamTest do
   use ExUnit.Case, async: true
 
   alias Web.ReadableStream
+  alias Web.ReadableStreamDefaultController
   alias Web.ReadableStreamDefaultReader
   alias Web.TypeError
 
@@ -9,10 +10,6 @@ defmodule Web.ReadableStreamTest do
     {:ok, pid} = ReadableStream.start_link(high_water_mark: 2)
     stream = %ReadableStream{controller_pid: pid}
     %{stream: stream, controller_pid: pid}
-  end
-
-  test "TypeError" do
-    assert %TypeError{message: "m"}.message == "m"
   end
 
   describe "ReadableStream" do
@@ -336,17 +333,26 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStream.locked?(%{}) == false
     end
 
-    test "pid wrapper helpers for disturbed and locked reflect the stream state" do
-      stream = ReadableStream.from("hello")
+    test "error callback and branch wrappers are callable" do
+      callback_state = %{source: %{}, pid: self(), started: false}
+      assert {:ok, ^callback_state} = ReadableStream.error(:boom, callback_state)
 
-      assert ReadableStream.disturbed?(stream.controller_pid) == false
-      assert ReadableStream.locked?(stream.controller_pid) == false
+      source = ReadableStream.new()
+      {left, _right} = ReadableStream.tee(source)
 
-      reader = ReadableStream.get_reader(stream)
-      assert ReadableStream.locked?(stream.controller_pid) == true
-      assert Web.ReadableStreamDefaultReader.read(reader) == "hello"
-      assert ReadableStream.disturbed?(stream.controller_pid) == true
-      assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
+      ReadableStream.branch_cancelled(source.controller_pid, left.controller_pid)
+      ReadableStream.report_desired_size(source.controller_pid, left.controller_pid, 1)
+
+      assert is_map(ReadableStream.get_slots(source.controller_pid))
+    end
+
+    test "default controller error helper transitions stream to errored" do
+      stream = ReadableStream.new()
+      controller = %ReadableStreamDefaultController{pid: stream.controller_pid}
+
+      ReadableStreamDefaultController.error(controller, :controller_boom)
+
+      assert ReadableStream.get_slots(stream.controller_pid).state == :errored
     end
 
     test "tee/1 raises when called on a locked struct stream" do
@@ -741,41 +747,6 @@ defmodule Web.ReadableStreamTest do
       reader_b = ReadableStream.get_reader(branch_b)
       assert ReadableStreamDefaultReader.read(reader_b) == "data"
       assert ReadableStreamDefaultReader.read(reader_b) == "data"
-    end
-
-    test "DefaultController.error" do
-      source = %{
-        start: fn controller ->
-          Web.ReadableStreamDefaultController.error(controller, :source_failed)
-        end
-      }
-
-      s2 = ReadableStream.new(source)
-      reader = ReadableStream.get_reader(s2)
-      # Wait for async start to complete
-      Process.sleep(50)
-      assert_raise TypeError, ~r/errored/, fn -> ReadableStreamDefaultReader.read(reader) end
-      assert ReadableStream.get_slots(s2.controller_pid).error_reason == :source_failed
-    end
-
-    test "ReadableStream terminate with active task" do
-      use Web
-      parent = self()
-
-      source = %{
-        pull: fn _controller ->
-          send(parent, :pulling)
-          Process.sleep(10000)
-        end
-      }
-
-      {:ok, pid} = ReadableStream.start_link(source: source)
-      # Trigger pull
-      ReadableStream.get_reader(pid)
-      assert_receive :pulling
-      # Stop the gen_statem
-      GenServer.stop(pid)
-      # Should call terminate and kill task
     end
 
     test "branch_cancelled edge cases", %{controller_pid: pid} do

@@ -64,6 +64,7 @@ defmodule Web.MixProject do
     [
       {:finch, "~> 0.16"},
       {:castore, "~> 1.0"},
+      {:jason, "~> 1.4"},
       {:stream_data, "~> 1.0", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
       {:ex_doc, "~> 0.14", only: :dev, runtime: false}

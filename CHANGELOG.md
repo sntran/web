@@ -2,12 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased] - 2026-04-03
+## [Unreleased] - 2026-04-04
+
+### Added
+
+- `Web.Stream` behaviour that abstracts streaming state machine.
+- `use Web.Stream` macro.
+- `Web.TransformStream` that uses `use Web.Stream`
+- `examples/stream/byte_counter_stream.exs` demo showing a custom `use Web.Stream` byte counter and a `Web.TransformStream` byte counter producing the same byte total.
+
+## Changed
+
+- `Web.ReadableStream`, `Web.WritableStream` now use `use Web.Stream`.
+
+## [0.2.0] - 2026-04-03
 
 ### Added
 
 - `use Web` macro for easier API usage and module aliasing.
 - `await` macro in `Web`.
+- `Web.Stream.__using__/1` macro for reusable stream module setup (`@behaviour` + `start_link/1`).
 - Spec-compliant `Web.ReadableStream` built on `:gen_statem`.
 - Constructor-style `new/2` DSL macro.
 - `ReadableStream.new/1`, `ReadableStream.tee/1`, and `ReadableStream.from/1`.

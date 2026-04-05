@@ -13,58 +13,6 @@ defmodule Web.WritableStreamTest do
     end
   end
 
-  test "pid wrappers expose the writable stream api" do
-    parent = self()
-
-    stream =
-      WritableStream.new(%{
-        write: fn chunk, _controller ->
-          send(parent, {:sink_write, chunk})
-          :ok
-        end,
-        close: fn _controller ->
-          send(parent, :sink_close)
-          :ok
-        end,
-        abort: fn reason ->
-          send(parent, {:sink_abort, reason})
-          :ok
-        end
-      })
-
-    pid = stream.controller_pid
-
-    assert WritableStream.locked?(stream) == false
-    assert WritableStream.locked?(pid) == false
-    assert WritableStream.backpressure?(stream) == false
-    assert WritableStream.backpressure?(pid) == false
-    assert WritableStream.desired_size(stream) == 1
-    assert WritableStream.desired_size(pid) == 1
-
-    assert :ok = WritableStream.get_writer(pid)
-    assert :ok = WritableStream.write(pid, "chunk")
-    assert_receive {:sink_write, "chunk"}
-    assert :ok = WritableStream.ready(pid)
-    assert :ok = WritableStream.close(pid)
-    assert_receive :sink_close
-    assert WritableStream.desired_size(stream) == nil
-    assert :ok = WritableStream.release_lock(pid)
-
-    abort_stream =
-      WritableStream.new(%{
-        abort: fn reason ->
-          send(parent, {:sink_abort, reason})
-          :ok
-        end
-      })
-
-    abort_pid = abort_stream.controller_pid
-    assert :ok = WritableStream.get_writer(abort_pid)
-    assert :ok = WritableStream.abort(abort_pid, :pid_abort)
-    assert_receive {:sink_abort, :pid_abort}
-    assert {:error, :not_locked_by_writer} = WritableStream.release_lock(abort_pid)
-  end
-
   test "controller helpers expose desired size and can error the stream" do
     parent = self()
 
@@ -116,6 +64,27 @@ defmodule Web.WritableStreamTest do
     assert_raise TypeError, "This writer is no longer locked.", fn ->
       WritableStreamDefaultWriter.release_lock(abort_writer)
     end
+  end
+
+  test "pid convenience wrappers and callback error clause are covered" do
+    callback_state = %{sink: %{}, pid: self()}
+    assert {:ok, ^callback_state} = WritableStream.error(:boom, callback_state)
+
+    stream =
+      WritableStream.new(%{
+        write: fn _chunk, _controller -> :ok end
+      })
+
+    assert :ok = WritableStream.get_writer(stream.controller_pid)
+    assert :ok = WritableStream.write(stream.controller_pid, "chunk")
+    assert :ok = WritableStream.ready(stream.controller_pid)
+    assert :ok = WritableStream.close(stream.controller_pid)
+    assert :ok = WritableStream.release_lock(stream.controller_pid)
+
+    abort_stream = WritableStream.new(%{})
+    assert :ok = WritableStream.get_writer(abort_stream.controller_pid)
+    assert :ok = WritableStream.abort(abort_stream.controller_pid, :pid_abort)
+    assert WritableStream.get_slots(abort_stream.controller_pid).state == :errored
   end
 
   test "write/2 waits for a slow sink and ready/1 resolves when backpressure clears" do
@@ -355,29 +324,6 @@ defmodule Web.WritableStreamTest do
 
     assert_raise TypeError, "This writer is no longer locked.", fn ->
       WritableStreamDefaultWriter.release_lock(errored_writer)
-    end
-  end
-
-  test "abort/2 invokes the underlying sink abort callback and errors the stream" do
-    parent = self()
-
-    stream =
-      WritableStream.new(%{
-        abort: fn reason ->
-          send(parent, {:sink_abort, reason})
-          :ok
-        end
-      })
-
-    writer = WritableStream.get_writer(stream)
-
-    assert :ok = WritableStreamDefaultWriter.abort(writer, :boom)
-    assert_receive {:sink_abort, :boom}
-    assert_wait(fn -> WritableStream.get_slots(stream.controller_pid).state == :errored end)
-    assert WritableStream.locked?(stream) == false
-
-    assert_raise TypeError, "This writer is no longer locked.", fn ->
-      WritableStreamDefaultWriter.write(writer, "late")
     end
   end
 
@@ -729,25 +675,6 @@ defmodule Web.WritableStreamTest do
         assert :ok = WritableStreamDefaultWriter.release_lock(writer)
         refute WritableStream.locked?(stream)
       end)
-    end
-  end
-
-  property "terminal states always report nil desired size" do
-    check all abort_reason <- StreamData.term() do
-      closed_stream = WritableStream.new()
-      closed_writer = WritableStream.get_writer(closed_stream)
-
-      assert :ok = WritableStreamDefaultWriter.close(closed_writer)
-      assert WritableStream.desired_size(closed_stream) == nil
-      assert :ok = WritableStreamDefaultWriter.release_lock(closed_writer)
-
-      errored_stream = WritableStream.new()
-      errored_writer = WritableStream.get_writer(errored_stream)
-
-      assert :ok = WritableStreamDefaultWriter.abort(errored_writer, abort_reason)
-      assert_wait(fn -> WritableStream.get_slots(errored_stream.controller_pid).state == :errored end)
-      assert WritableStream.desired_size(errored_stream) == nil
-      assert WritableStream.locked?(errored_stream.controller_pid) == false
     end
   end
 

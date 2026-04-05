@@ -54,8 +54,8 @@ response.body
 
 ## 📖 API Usage & Examples
 
-### `Web.ReadableStream` — The Streaming Engine
-The heart of the library. Every stream is a managed process that handles **Backpressure**, **Locking**, and **Teeing**.
+### `Web.ReadableStream` — The Source
+The source of every streaming pipeline. A `ReadableStream` is a managed process that provides data to consumers, handling **Backpressure** (throttling producers when consumers are slow), **Locking** (ensuring exclusive access), and **Teeing** (splitting streams for multiple consumers) in a zero-copy, process-safe way.
 
 ```elixir
 # Create a stream from any enumerable (List, File.stream, etc.)
@@ -66,6 +66,55 @@ stream = ReadableStream.from(["chunk1", "chunk2"])
 
 Task.start(fn -> Enum.each(branch_a, &process_data/1) end)
 Task.start(fn -> Enum.each(branch_b, &log_data/1) end)
+```
+
+### `Web.WritableStream` — The Sink
+Writable streams are endpoints for consuming data, supporting backpressure and lock management. Use them to write data from readable streams or directly from your application.
+
+```elixir
+# Get a writable stream (for example, from a custom stream or a network response)
+writable = WritableStream.new()
+writer = WritableStream.get_writer(writable)
+
+# Write chunks to the stream
+:ok = WritableStreamDefaultWriter.write(writer, "hello ")
+:ok = WritableStreamDefaultWriter.write(writer, "world!")
+
+# Close and release
+:ok = WritableStreamDefaultWriter.close(writer)
+:ok = WritableStreamDefaultWriter.release_lock(writer)
+```
+
+### `Web.TransformStream` — Stream Processing
+Transform streams allow you to process, modify, or filter data as it flows through a pipeline. They are ideal for tasks like compression, encryption, or counting bytes.
+
+```elixir
+transform = TransformStream.new(%{
+  transform: fn chunk, controller, state ->
+    # Example: uppercase transformation
+    upper = String.upcase(IO.iodata_to_binary(chunk))
+    ReadableStreamDefaultController.enqueue(controller, upper)
+    {:ok, state}
+  end,
+  flush: fn controller, state ->
+    ReadableStreamDefaultController.close(controller)
+    {:ok, state}
+  end
+})
+
+# Pipe data through the transform
+source = ReadableStream.from(["foo", "bar"])
+WritableStream = transform.writable
+ReadableStream = transform.readable
+
+Enum.each(source, fn chunk ->
+  :ok = WritableStreamDefaultWriter.write(WritableStream.get_writer(WritableStream), chunk)
+end)
+:ok = WritableStreamDefaultWriter.close(WritableStream.get_writer(WritableStream))
+
+# Collect transformed output
+Enum.to_list(ReadableStream)
+# => ["FOO", "BAR"]
 ```
 
 ### `Web.Request` & `Web.Response`

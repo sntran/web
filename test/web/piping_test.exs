@@ -39,25 +39,21 @@ defmodule Web.PipingTest do
 
     upcase_transform =
       TransformStream.new(%{
-        transform: fn chunk, controller, state ->
+        transform: fn chunk, controller ->
           ReadableStreamDefaultController.enqueue(controller, String.upcase(chunk))
-          {:ok, state}
         end,
-        flush: fn controller, state ->
+        flush: fn controller ->
           ReadableStreamDefaultController.close(controller)
-          {:ok, state}
         end
       })
 
     suffix_transform =
       TransformStream.new(%{
-        transform: fn chunk, controller, state ->
+        transform: fn chunk, controller ->
           ReadableStreamDefaultController.enqueue(controller, chunk <> "!")
-          {:ok, state}
         end,
-        flush: fn controller, state ->
+        flush: fn controller ->
           ReadableStreamDefaultController.close(controller)
-          {:ok, state}
         end
       })
 

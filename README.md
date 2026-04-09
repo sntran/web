@@ -192,6 +192,25 @@ await(Response.text(Response.new(body: encoded)))
 # => "Hello, 🌍"
 ```
 
+### `Web.CompressionStream` and `Web.DecompressionStream`
+Use the compression stream wrappers to compress or decompress byte streams
+inside the same `ReadableStream.pipe_through/3` pipelines.
+
+```elixir
+source = ReadableStream.from(["hello world"])
+
+compressed =
+  source
+  |> ReadableStream.pipe_through(CompressionStream.new("gzip"))
+
+round_tripped =
+  compressed
+  |> ReadableStream.pipe_through(DecompressionStream.new("gzip"))
+
+await(Response.text(Response.new(body: round_tripped)))
+# => "hello world"
+```
+
 ### `Web.Request` & `Web.Response`
 First-class containers for network data with high-level factories and standard body readers.
 

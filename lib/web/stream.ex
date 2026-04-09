@@ -100,6 +100,8 @@ defmodule Web.Stream do
     pending_close_request: nil,
     queued_write_requests: :queue.new(),
     ready_waiters: :queue.new(),
+    # Transform-side readable backpressure (transform task parks here until readable has space)
+    enqueue_waiters: :queue.new(),
     backpressure: false,
     # Shared
     timeout_ms: 30_000,
@@ -434,7 +436,8 @@ defmodule Web.Stream do
               if data.type == :producer_consumer do
                 new_data = refresh_backpressure(new_data)
                 {new_data, ready_actions} = maybe_resolve_ready_waiters(new_data)
-                {new_data, actions ++ ready_actions}
+                {new_data, enqueue_actions} = maybe_resolve_enqueue_waiters(new_data)
+                {new_data, actions ++ ready_actions ++ enqueue_actions}
               else
                 {new_data, actions}
               end
@@ -534,6 +537,20 @@ defmodule Web.Stream do
       true ->
         new_waiters = :queue.in(from, data.ready_waiters)
         {:keep_state, %{data | ready_waiters: new_waiters}}
+    end
+  end
+
+  # Enqueue-ready: transform task parks here until the readable queue has capacity
+  defp handle_common({:call, from}, :enqueue_ready, state, %{type: :producer_consumer} = data) do
+    cond do
+      state in [:closed, :errored] ->
+        {:keep_state_and_data, [{:reply, from, :ok}]}
+
+      readable_capacity(data) > 0 ->
+        {:keep_state_and_data, [{:reply, from, :ok}]}
+
+      true ->
+        {:keep_state, %{data | enqueue_waiters: :queue.in(from, data.enqueue_waiters)}}
     end
   end
 
@@ -981,15 +998,7 @@ defmodule Web.Stream do
   defp extract_new_state_from_result({:ok, new_state}, _old_state) do
     new_state
   end
-
-  defp extract_new_state_from_result({:ok, new_state, _}, _old_state) do
-    new_state
-  end
-
   # coveralls-ignore-stop
-  defp extract_new_state_from_result(_, old_state) do
-    old_state
-  end
 
   defp continue_after_consumer_completion(data, state, actions) do
     cond do
@@ -1045,7 +1054,8 @@ defmodule Web.Stream do
       pending_write_error_actions(data, reason) ++
         queued_write_error_actions(data, reason) ++
         close_error_actions(data, reason) ++
-        ready_error_actions(data, reason)
+        ready_error_actions(data, reason) ++
+        enqueue_error_actions(data, reason)
 
     new_data =
       data
@@ -1055,6 +1065,7 @@ defmodule Web.Stream do
       |> Map.put(:queued_write_requests, :queue.new())
       |> Map.put(:pending_close_request, nil)
       |> Map.put(:ready_waiters, :queue.new())
+      |> Map.put(:enqueue_waiters, :queue.new())
       |> Map.put(:backpressure, false)
       |> Map.put(:error_reason, reason)
 
@@ -1087,6 +1098,12 @@ defmodule Web.Stream do
 
   defp ready_error_actions(data, reason) do
     data.ready_waiters
+    |> :queue.to_list()
+    |> Enum.map(fn from -> {:reply, from, {:error, {:errored, reason}}} end)
+  end
+
+  defp enqueue_error_actions(data, reason) do
+    data.enqueue_waiters
     |> :queue.to_list()
     |> Enum.map(fn from -> {:reply, from, {:error, {:errored, reason}}} end)
   end
@@ -1247,6 +1264,20 @@ defmodule Web.Stream do
       {%{data | ready_waiters: :queue.new()}, actions}
     else
       {data, []}
+    end
+  end
+
+  # Resolve transform tasks that are parked waiting for readable capacity.
+  defp maybe_resolve_enqueue_waiters(data) do
+    if :queue.is_empty(data.enqueue_waiters) or readable_capacity(data) <= 0 do
+      {data, []}
+    else
+      actions =
+        data.enqueue_waiters
+        |> :queue.to_list()
+        |> Enum.map(fn from -> {:reply, from, :ok} end)
+
+      {%{data | enqueue_waiters: :queue.new()}, actions}
     end
   end
 

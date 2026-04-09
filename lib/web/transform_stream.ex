@@ -13,9 +13,8 @@ defmodule Web.TransformStream do
   Pass a transformer map with an optional `transform` key:
 
       iex> ts = Web.TransformStream.new(%{
-      ...>   transform: fn chunk, controller, state ->
+      ...>   transform: fn chunk, controller ->
       ...>     Web.ReadableStreamDefaultController.enqueue(controller, String.upcase(chunk))
-      ...>     {:ok, state}
       ...>   end
       ...> })
       iex> writer = Web.WritableStream.get_writer(ts.writable)
@@ -36,10 +35,26 @@ defmodule Web.TransformStream do
   @impl Web.Stream
   def start(pid, opts) do
     transformer = Keyword.get(opts, :transformer, %{})
-    writable_strategy = Keyword.get(opts, :writable_strategy, Keyword.get(opts, :strategy, Web.CountQueuingStrategy.new(1)))
-    readable_strategy = Keyword.get(opts, :readable_strategy, Web.CountQueuingStrategy.new(1))
     state = %{transformer: transformer, pid: pid}
-    {:producer_consumer, Map.merge(state, %{writable_strategy: writable_strategy, readable_strategy: readable_strategy})}
+
+    # If the transformer provides a `start` callback, invoke it now (in the
+    # gen_statem's init process) so any resources it opens — e.g. Agent or
+    # GenServer — are linked to the stream process and follow its lifecycle.
+    # Per the WHATWG spec, start(controller) returns :ok or a Promise; no state.
+    case Map.get(transformer, :start) do
+      start_fn when is_function(start_fn, 1) ->
+        ctrl = %Web.ReadableStreamDefaultController{pid: pid}
+
+        case start_fn.(ctrl) do
+          %Web.Promise{task: task} -> Task.await(task, :infinity)
+          _ -> :ok
+        end
+
+      _ ->
+        :ok
+    end
+
+    {:producer_consumer, state}
   end
 
   @impl Web.Stream
@@ -48,23 +63,21 @@ defmodule Web.TransformStream do
 
     result =
       case Map.get(transformer, :transform) do
-        transform when is_function(transform, 3) ->
-          transform.(chunk, ctrl, state)
-
         transform when is_function(transform, 2) ->
           transform.(chunk, ctrl)
-          {:ok, state}
 
         _ ->
           # Default passthrough: enqueue chunk as-is
           Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
-          {:ok, state}
+          :ok
       end
 
     case result do
       %Web.Promise{task: task} -> Task.await(task, :infinity)
-      other -> other
+      _ -> :ok
     end
+
+    {:ok, state}
   end
 
   @impl Web.Stream
@@ -73,21 +86,19 @@ defmodule Web.TransformStream do
 
     result =
       case Map.get(transformer, :flush) do
-        flush_fn when is_function(flush_fn, 2) ->
-          flush_fn.(ctrl, state)
-
         flush_fn when is_function(flush_fn, 1) ->
           flush_fn.(ctrl)
-          {:ok, state}
 
         _ ->
-          {:ok, state}
+          :ok
       end
 
     case result do
       %Web.Promise{task: task} -> Task.await(task, :infinity)
-      other -> other
+      _ -> :ok
     end
+
+    {:ok, state}
   end
 
   @impl Web.Stream
@@ -127,8 +138,9 @@ defmodule Web.TransformStream do
 
   ## Transformer keys
 
-  - `transform: fn chunk, ctrl, state -> {:ok, new_state} end` — called for each written chunk
-  - `flush: fn ctrl, state -> {:ok, new_state} end` — called before the stream closes
+  - `transform: fn chunk, ctrl -> :ok end` — called for each written chunk; must return `:ok` or a `Web.Promise.t()`
+  - `flush: fn ctrl -> :ok end` — called before the stream closes; must return `:ok` or a `Web.Promise.t()`
+  - `start: fn ctrl -> :ok end` — called at stream creation; must return `:ok` or a `Web.Promise.t()`
   - `cancel: fn reason -> :ok end` — called if the stream is cancelled
   """
   def new(transformer \\ %{}, opts \\ []) do

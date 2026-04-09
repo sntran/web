@@ -54,6 +54,8 @@ defmodule Web do
       alias Web.TextDecoder
       alias Web.TextEncoderStream
       alias Web.TextDecoderStream
+      alias Web.CompressionStream
+      alias Web.DecompressionStream
 
       :ok
     end

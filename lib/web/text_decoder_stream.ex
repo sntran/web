@@ -20,23 +20,19 @@ defmodule Web.TextDecoderStream do
 
     stream =
       TransformStream.new(%{
-        transform: fn chunk, controller, state ->
+        transform: fn chunk, controller ->
           decoded = TextDecoder.decode(decoder, chunk, %{stream: true})
 
           if decoded != "" do
             ReadableStreamDefaultController.enqueue(controller, decoded)
           end
-
-          {:ok, state}
         end,
-        flush: fn controller, state ->
+        flush: fn controller ->
           decoded = TextDecoder.decode(decoder, <<>>, %{stream: false})
 
           if decoded != "" do
             ReadableStreamDefaultController.enqueue(controller, decoded)
           end
-
-          {:ok, state}
         end
       })
 

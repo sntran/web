@@ -262,9 +262,8 @@ defmodule Web.StreamTest do
     test "transform function maps chunks" do
       ts =
         TransformStream.new(%{
-          transform: fn chunk, ctrl, state ->
+          transform: fn chunk, ctrl ->
             Web.ReadableStreamDefaultController.enqueue(ctrl, String.upcase(chunk))
-            {:ok, state}
           end
         })
 
@@ -294,13 +293,11 @@ defmodule Web.StreamTest do
     test "flush function enqueues final data before close" do
       ts =
         TransformStream.new(%{
-          transform: fn chunk, ctrl, state ->
+          transform: fn chunk, ctrl ->
             Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
-            {:ok, state}
           end,
-          flush: fn ctrl, state ->
+          flush: fn ctrl ->
             Web.ReadableStreamDefaultController.enqueue(ctrl, "END")
-            {:ok, state}
           end
         })
 
@@ -344,9 +341,8 @@ defmodule Web.StreamTest do
     test "TransformStream can be enumerated" do
       ts =
         TransformStream.new(%{
-          transform: fn chunk, ctrl, state ->
+          transform: fn chunk, ctrl ->
             Web.ReadableStreamDefaultController.enqueue(ctrl, chunk * 2)
-            {:ok, state}
           end
         })
 
@@ -384,7 +380,7 @@ defmodule Web.StreamTest do
     test "error during transform transitions to errored on read" do
       ts =
         TransformStream.new(%{
-          transform: fn _chunk, _ctrl, _state ->
+          transform: fn _chunk, _ctrl ->
             raise "transform failed"
           end
         })
@@ -402,6 +398,22 @@ defmodule Web.StreamTest do
       assert :ok = Task.await(ReadableStream.cancel(ts.readable.controller_pid).task, 1_000)
       slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
       assert slots.state == :closed
+    end
+
+    test "start callback returning :ok works with WHATWG-compliant callbacks" do
+      # start/1 returns :ok per the WHATWG spec (no state merging).
+      ts =
+        TransformStream.new(%{
+          start: fn _ctrl -> :ok end,
+          transform: fn chunk, ctrl ->
+            Web.ReadableStreamDefaultController.enqueue(ctrl, String.upcase(chunk))
+          end
+        })
+
+      writer = WritableStream.get_writer(ts.writable)
+      await(WritableStreamDefaultWriter.write(writer, "hello"))
+      await(WritableStreamDefaultWriter.close(writer))
+      assert Enum.join(ts.readable, "") == "HELLO"
     end
   end
 
@@ -574,36 +586,23 @@ defmodule Web.StreamTest do
       end)
     end
 
-    test "write callback can return {:ok, state, extra} and preserve flow" do
+    test "transform callback uses the current two-argument signature" do
       parent = self()
 
-      stream =
-        WritableStream.new(%{
-          write: fn chunk, _controller ->
-            send(parent, {:triple_ok_write, chunk})
-            {:ok, %{seen: chunk}, :metadata}
-          end
-        })
-
-      writer = WritableStream.get_writer(stream)
-
-      assert :ok = await(WritableStreamDefaultWriter.write(writer, "triple"))
-      assert_receive {:triple_ok_write, "triple"}
-    end
-
-    test "transform callback can return {:ok, state, extra}" do
       ts =
         TransformStream.new(%{
-          transform: fn chunk, ctrl, state ->
-            Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
-            {:ok, state, :extra}
+          transform: fn chunk, ctrl ->
+            send(parent, {:transform_chunk, chunk})
+            Web.ReadableStreamDefaultController.enqueue(ctrl, String.upcase(chunk))
+            :ok
           end
         })
 
       writer = WritableStream.get_writer(ts.writable)
       assert :ok = await(WritableStreamDefaultWriter.write(writer, "x"))
       assert :ok = await(WritableStreamDefaultWriter.close(writer))
-      assert "x" == Enum.join(ts.readable, "")
+      assert_receive {:transform_chunk, "x"}
+      assert "X" == Enum.join(ts.readable, "")
     end
 
     test "timeout check transitions to errored with task timeout reason for flush" do
@@ -733,10 +732,27 @@ defmodule Web.StreamTest do
       assert result == {:error, :not_locked_by_writer}
     end
 
-    test "transform callback with non-standard return preserves previous state" do
-      ts = TransformStream.new(%{transform: fn _chunk, _ctrl, _state -> :not_an_ok_tuple end})
+    test "transform callback with non-standard return preserves flow" do
+      ts = TransformStream.new(%{transform: fn _chunk, _ctrl -> :not_an_ok_tuple end})
       writer = WritableStream.get_writer(ts.writable)
       assert :ok = await(WritableStreamDefaultWriter.write(writer, "test"))
+    end
+
+    test "write callback with non-standard return preserves flow" do
+      parent = self()
+
+      stream =
+        WritableStream.new(%{
+          write: fn chunk, _controller ->
+            send(parent, {:nonstandard_write, chunk})
+            :not_an_ok_tuple
+          end
+        })
+
+      writer = WritableStream.get_writer(stream)
+
+      assert :ok = await(WritableStreamDefaultWriter.write(writer, "test"))
+      assert_receive {:nonstandard_write, "test"}
     end
   end
 
@@ -768,10 +784,10 @@ defmodule Web.StreamTest do
     test "transform callback can return a %Web.Promise{}" do
       ts =
         TransformStream.new(%{
-          transform: fn chunk, ctrl, state ->
+          transform: fn chunk, ctrl ->
             Web.Promise.new(fn resolve, _reject ->
               Web.ReadableStreamDefaultController.enqueue(ctrl, chunk <> "!")
-              resolve.({:ok, state})
+              resolve.(:ok)
             end)
           end
         })
@@ -785,10 +801,10 @@ defmodule Web.StreamTest do
     test "flush callback can return a %Web.Promise{}" do
       ts =
         TransformStream.new(%{
-          flush: fn ctrl, state ->
+          flush: fn ctrl ->
             Web.Promise.new(fn resolve, _reject ->
               Web.ReadableStreamDefaultController.enqueue(ctrl, "flushed_promise")
-              resolve.({:ok, state})
+              resolve.(:ok)
             end)
           end
         })
@@ -796,6 +812,24 @@ defmodule Web.StreamTest do
       writer = WritableStream.get_writer(ts.writable)
       assert :ok = await(WritableStreamDefaultWriter.close(writer))
       assert "flushed_promise" == Enum.join(ts.readable, "")
+    end
+
+    test "start callback can return a %Web.Promise{}" do
+      parent = self()
+
+      ts =
+        TransformStream.new(%{
+          start: fn ctrl ->
+            Web.Promise.new(fn resolve, _reject ->
+              send(parent, {:transform_started, ctrl.pid})
+              resolve.(:ok)
+            end)
+          end
+        })
+
+      assert_receive {:transform_started, pid}
+      assert pid == ts.readable.controller_pid
+      assert ts.readable.controller_pid == ts.writable.controller_pid
     end
 
     # --- writable_stream.ex line 41: start callback returning a Promise ---

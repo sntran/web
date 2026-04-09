@@ -20,9 +20,8 @@ defmodule Web.TextEncoderStream do
 
     stream =
       TransformStream.new(%{
-        transform: fn chunk, controller, state ->
+        transform: fn chunk, controller ->
           ReadableStreamDefaultController.enqueue(controller, TextEncoder.encode(encoder, chunk))
-          {:ok, state}
         end
       })
 

@@ -43,6 +43,25 @@ defmodule Web.ReadableStreamDefaultController do
   end
 
   @doc """
+  Blocks the calling process until the stream's readable queue has capacity.
+
+  Used by `TransformStream` implementations that produce multiple output chunks
+  per input to implement signal-driven (non-polling) backpressure. Returns `:ok`
+  immediately if capacity is already available, or parks the caller until a
+  reader drains the queue below the High-Water Mark.
+
+  If the stream is closed or errored the call also returns `:ok` so the
+  transform task can complete cleanly.
+  """
+  def wait_for_capacity(%__MODULE__{pid: pid}) do
+    case :gen_statem.call(pid, :enqueue_ready, :infinity) do
+      :ok -> :ok
+      # On error the stream is already broken; let the task proceed and exit.
+      {:error, _} -> :ok
+    end
+  end
+
+  @doc """
   Returns the desired size to fill the stream's internal queue.
 
   ## Examples

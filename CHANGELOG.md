@@ -16,10 +16,15 @@ All notable changes to this project are documented in this file.
   `Web.TextEncoderStream`, and `Web.TextDecoderStream`.
 - `Web.ByteLengthQueuingStrategy` and `Web.CountQueuingStrategy` for
   strategy-aware stream buffering.
+- `Web.CompressionStream` and `Web.DecompressionStream` for
+  WHATWG-style gzip, deflate, and deflate-raw stream transforms.
 
 ## Changed
 
 - `Web.ReadableStream`, `Web.WritableStream` now use `use Web.Stream`.
+- `Web.TransformStream` now follows WHATWG-style transformer callbacks:
+  `start/1`, `transform/2`, and `flush/1`, with support for `:ok` or
+  `%Web.Promise{}` returns.
 - `examples/stream/byte_counter_stream.exs` now uses `ReadableStream.pipe_to/3` and `ReadableStream.pipe_through/3` instead of manual pump logic.
 - `Web.fetch/2` now returns `%Web.Promise{}` and `await/1` now unwraps fulfilled values or exits with the rejection reason.
 - Body readers such as `Response.text/1`, `Response.json/1`, `Request.arrayBuffer/1`, and writer operations such as `WritableStreamDefaultWriter.write/2` now return `%Web.Promise{}` values.
@@ -30,6 +35,8 @@ All notable changes to this project are documented in this file.
 - `Web.ReadableStream.tee/1` now uses bounded branch buffering so a fast branch
   can progress independently of a slower branch up to the configured queue
   size.
+- `Web.Stream` now parks transform writes on readable backpressure instead of
+  over-buffering producer-consumer queues.
 
 ## [0.2.0] - 2026-04-03
 

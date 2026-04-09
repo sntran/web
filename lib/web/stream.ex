@@ -86,6 +86,8 @@ defmodule Web.Stream do
     # Producer (readable) side
     queue: :queue.new(),
     hwm: 1,
+    total_queued_size: 0,
+    strategy: %Web.CountQueuingStrategy{},
     pulling: false,
     reader_pid: nil,
     reader_ref: nil,
@@ -97,7 +99,7 @@ defmodule Web.Stream do
     pending_write_request: nil,
     pending_close_request: nil,
     queued_write_requests: :queue.new(),
-    ready_requests: :queue.new(),
+    ready_waiters: :queue.new(),
     backpressure: false,
     # Shared
     timeout_ms: 30_000,
@@ -123,6 +125,7 @@ defmodule Web.Stream do
   @impl true
   def init({module, opts}) do
     hwm = Keyword.get(opts, :high_water_mark, 1)
+    strategy = normalize_strategy(Keyword.get(opts, :strategy, %Web.CountQueuingStrategy{}))
     timeout_ms = Keyword.get(opts, :timeout_ms, 30_000)
 
     {type, impl_state, extra_actions} =
@@ -136,6 +139,8 @@ defmodule Web.Stream do
       type: type,
       impl_state: impl_state,
       hwm: hwm,
+      total_queued_size: 0,
+      strategy: strategy,
       timeout_ms: timeout_ms
     }
 
@@ -418,13 +423,17 @@ defmodule Web.Stream do
         _ ->
           if not :queue.is_empty(data.queue) do
             {{:value, chunk}, new_queue} = :queue.out(data.queue)
-            new_data = %{data | queue: new_queue}
+            new_data = %{
+              data
+              | queue: new_queue,
+                total_queued_size: data.total_queued_size - queue_chunk_size(data, chunk)
+            }
             actions = [{:reply, from, {:ok, chunk}}]
 
             {new_data, actions} =
               if data.type == :producer_consumer do
                 new_data = refresh_backpressure(new_data)
-                {new_data, ready_actions} = maybe_resolve_ready_requests(new_data)
+                {new_data, ready_actions} = maybe_resolve_ready_waiters(new_data)
                 {new_data, actions ++ ready_actions}
               else
                 {new_data, actions}
@@ -516,11 +525,15 @@ defmodule Web.Stream do
       pid != data.writer_pid ->
         {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
 
-      state == :closed or not data.backpressure ->
+      state == :closed ->
+        {:keep_state_and_data, [{:reply, from, :ok}]}
+
+      internal_desired_size(data) > 0 ->
         {:keep_state_and_data, [{:reply, from, :ok}]}
 
       true ->
-        {:keep_state, %{data | ready_requests: :queue.in(from, data.ready_requests)}}
+        new_waiters = :queue.in(from, data.ready_waiters)
+        {:keep_state, %{data | ready_waiters: new_waiters}}
     end
   end
 
@@ -676,16 +689,33 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   defp handle_producer_enqueue(chunk, _state, data) do
-    new_data = %{data | queue: :queue.in(chunk, data.queue)}
+    chunk_size = queue_chunk_size(data, chunk)
+
+    new_data = %{
+      data
+      | queue: :queue.in(chunk, data.queue),
+        total_queued_size: data.total_queued_size + chunk_size
+    }
 
     case :queue.out(new_data.read_requests) do
       {{:value, from}, new_requests} ->
         {{:value, c}, new_queue} = :queue.out(new_data.queue)
-        new_data = %{new_data | read_requests: new_requests, queue: new_queue}
+        # The chunk is consumed immediately — undo the size increment so
+        # total_queued_size stays accurate (chunk never resided in the queue).
+        new_data = %{
+          new_data
+          | read_requests: new_requests,
+            queue: new_queue,
+            total_queued_size: new_data.total_queued_size - chunk_size
+        }
+
+        new_data = refresh_backpressure(new_data)
         :gen_statem.reply(from, {:ok, c})
+
         {:keep_state, new_data, [{:next_event, :internal, :maybe_pull}]}
 
       {:empty, _} ->
+        new_data = refresh_backpressure(new_data)
         {:keep_state, new_data}
     end
   end
@@ -980,7 +1010,7 @@ defmodule Web.Stream do
         end
 
       true ->
-        {new_data, ready_actions} = maybe_resolve_ready_requests(data)
+        {new_data, ready_actions} = maybe_resolve_ready_waiters(data)
         {:keep_state, new_data, actions ++ ready_actions}
     end
   end
@@ -989,7 +1019,7 @@ defmodule Web.Stream do
     {new_data, ready_actions} =
       data
       |> Map.put(:backpressure, false)
-      |> maybe_resolve_ready_requests(force?: true)
+      |> maybe_resolve_ready_waiters(force?: true)
 
     {:next_state, :closed, new_data,
      actions ++ ready_actions ++ [{:next_event, :internal, :flush_requests}]}
@@ -1024,7 +1054,7 @@ defmodule Web.Stream do
       |> Map.put(:pending_write_request, nil)
       |> Map.put(:queued_write_requests, :queue.new())
       |> Map.put(:pending_close_request, nil)
-      |> Map.put(:ready_requests, :queue.new())
+      |> Map.put(:ready_waiters, :queue.new())
       |> Map.put(:backpressure, false)
       |> Map.put(:error_reason, reason)
 
@@ -1056,7 +1086,7 @@ defmodule Web.Stream do
   defp close_error_actions(_data, _reason), do: []
 
   defp ready_error_actions(data, reason) do
-    data.ready_requests
+    data.ready_waiters
     |> :queue.to_list()
     |> Enum.map(fn from -> {:reply, from, {:error, {:errored, reason}}} end)
   end
@@ -1088,7 +1118,7 @@ defmodule Web.Stream do
         pending_write_request: nil,
         pending_close_request: nil,
         queued_write_requests: :queue.new(),
-        ready_requests: :queue.new(),
+        ready_waiters: :queue.new(),
         backpressure: false,
         error_reason: nil
     }
@@ -1108,7 +1138,7 @@ defmodule Web.Stream do
       | pending_write_request: nil,
         queued_write_requests: :queue.new(),
         pending_close_request: nil,
-        ready_requests: :queue.new(),
+        ready_waiters: :queue.new(),
         backpressure: false,
         error_reason: reason
     }
@@ -1155,7 +1185,7 @@ defmodule Web.Stream do
   defp close_ok_actions(_data), do: []
 
   defp ready_ok_actions(data) do
-    data.ready_requests
+    data.ready_waiters
     |> :queue.to_list()
     |> Enum.map(fn from -> {:reply, from, :ok} end)
   end
@@ -1179,7 +1209,7 @@ defmodule Web.Stream do
   end
 
   defp readable_capacity(data) do
-    data.hwm - :queue.len(data.queue)
+    strategy_high_water_mark(data) - data.total_queued_size
   end
 
   defp pending_write_count(data) do
@@ -1205,16 +1235,16 @@ defmodule Web.Stream do
   defp preserve_abort_task(%{active_operation: :abort} = data), do: data
   defp preserve_abort_task(data), do: clear_active_operation(data)
 
-  defp maybe_resolve_ready_requests(data, opts \\ []) do
+  defp maybe_resolve_ready_waiters(data, opts \\ []) do
     force? = Keyword.get(opts, :force?, false)
 
     if force? or not data.backpressure do
       actions =
-        data.ready_requests
+        data.ready_waiters
         |> :queue.to_list()
         |> Enum.map(fn from -> {:reply, from, :ok} end)
 
-      {%{data | ready_requests: :queue.new()}, actions}
+      {%{data | ready_waiters: :queue.new()}, actions}
     else
       {data, []}
     end
@@ -1223,6 +1253,18 @@ defmodule Web.Stream do
   defp reply_keep_state(data) do
     {:keep_state, data, []}
   end
+
+  defp queue_chunk_size(%{strategy: strategy}, chunk) do
+    strategy_size(strategy, chunk)
+  end
+
+  defp strategy_size(%{__struct__: strategy}, chunk), do: apply(strategy, :size, [chunk])
+
+  defp strategy_high_water_mark(%{strategy: %{high_water_mark: hwm}}), do: hwm
+
+  defp normalize_strategy(%{__struct__: _} = strategy), do: strategy
+  # coveralls-ignore-next-line
+  defp normalize_strategy(_), do: %Web.CountQueuingStrategy{}
 
   defp timeout_operation(operation) do
     case operation do

@@ -123,6 +123,19 @@ output = await(Response.text(Response.new(body: upper)))
 # => "FOOBAR"
 ```
 
+### `Web.ByteLengthQueuingStrategy` and `Web.CountQueuingStrategy`
+Use queuing strategies to control how stream backpressure is measured.
+`CountQueuingStrategy` counts each chunk as `1`, while
+`ByteLengthQueuingStrategy` measures buffered chunks by their byte size.
+
+```elixir
+count_strategy = Web.CountQueuingStrategy.new(16)
+byte_strategy = Web.ByteLengthQueuingStrategy.new(1024)
+
+stream = ReadableStream.new(%{strategy: count_strategy})
+sink = WritableStream.new(%{high_water_mark: 16})
+```
+
 ### `ReadableStream.pipe_to/3` & `ReadableStream.pipe_through/3`
 Use `pipe_to/3` to connect a source to any writable sink with backpressure-awareness, and `pipe_through/3` to attach transforms while returning the next readable stage.
 

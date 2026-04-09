@@ -214,7 +214,7 @@ defmodule Web.WritableStreamTest do
 
       slots.state == :closing and
         not is_nil(slots.pending_close_request) and
-        :queue.len(slots.ready_requests) == 1
+        :queue.len(slots.ready_waiters) == 1
     end)
 
     WritableStream.error(pid, :boom)

@@ -30,6 +30,7 @@ defmodule Web.ReadableStream do
   alias Web.ArrayBuffer
   alias Web.AbortSignal
   alias Web.Blob
+  alias Web.Promise
   alias Web.WritableStream
   alias Web.Uint8Array
   alias Web.TypeError
@@ -61,7 +62,7 @@ defmodule Web.ReadableStream do
         ctrl = %Web.ReadableStreamDefaultController{pid: pid}
 
         case pull.(ctrl) do
-          %Web.Promise{task: task} -> Task.await(task, :infinity)
+          %Promise{task: task} -> Task.await(task, :infinity)
           _ -> :ok
         end
 
@@ -80,7 +81,7 @@ defmodule Web.ReadableStream do
         ctrl = %Web.ReadableStreamDefaultController{pid: pid}
 
         case fun.(ctrl) do
-          %Web.Promise{task: task} -> Task.await(task, :infinity)
+          %Promise{task: task} -> Task.await(task, :infinity)
           _ -> :ok
         end
 
@@ -140,7 +141,7 @@ defmodule Web.ReadableStream do
       ["hello"]
   """
   def new(underlying_source \\ %{}) do
-    {:ok, pid} = start_link(source: underlying_source)
+    {:ok, pid} = start_link(source: underlying_source, strategy: Web.CountQueuingStrategy.new(1))
     %__MODULE__{controller_pid: pid}
   end
 
@@ -454,7 +455,7 @@ defmodule Web.ReadableStream do
   end
 
   def cancel(pid, reason) do
-    Web.Promise.new(fn resolve, _reject ->
+    Promise.new(fn resolve, _reject ->
       if Process.alive?(pid) do
         cancel_now(pid, reason)
         await_stream_state(pid, :closed)
@@ -527,7 +528,7 @@ defmodule Web.ReadableStream do
   @doc """
   Pipes a readable stream into a writable stream.
 
-  Returns a `%Web.Promise{}` that runs the pump lifecycle asynchronously.
+  Returns a `%Promise{}` that runs the pump lifecycle asynchronously.
 
   ## Options
 
@@ -537,7 +538,7 @@ defmodule Web.ReadableStream do
   - `:signal` - optional `%Web.AbortSignal{}` to interrupt piping
   """
   def pipe_to(readable, writable, options \\ []) do
-    Web.Promise.new(fn resolve, reject ->
+    Promise.new(fn resolve, reject ->
       reader = nil
       writer = nil
 
@@ -753,8 +754,9 @@ defmodule Web.ReadableStream do
   end
 
   defp do_tee(%__MODULE__{} = source) do
-    ts1 = Web.TransformStream.new()
-    ts2 = Web.TransformStream.new()
+    strategy = Web.CountQueuingStrategy.new(16)
+    ts1 = Web.TransformStream.new(%{}, writable_strategy: strategy)
+    ts2 = Web.TransformStream.new(%{}, writable_strategy: strategy)
 
     writer1 = Web.WritableStream.get_writer(ts1.writable)
     writer2 = Web.WritableStream.get_writer(ts2.writable)
@@ -762,31 +764,29 @@ defmodule Web.ReadableStream do
     sink =
       WritableStream.new(%{
         write: fn chunk, _controller ->
-          _results =
-            tee_await_all([
-              Web.WritableStreamDefaultWriter.ready(writer1)
-              |> Web.Promise.then(fn :ok ->
-                Web.WritableStreamDefaultWriter.write(writer1, chunk)
-              end)
-              |> Web.Promise.catch(fn _ -> :ok end),
-              Web.WritableStreamDefaultWriter.ready(writer2)
-              |> Web.Promise.then(fn :ok ->
-                Web.WritableStreamDefaultWriter.write(writer2, chunk)
-              end)
-              |> Web.Promise.catch(fn _ -> :ok end)
+          Promise.all([
+            Web.WritableStreamDefaultWriter.ready(writer1)
+            |> Promise.catch(fn _ -> :ok end),
+            Web.WritableStreamDefaultWriter.ready(writer2)
+            |> Promise.catch(fn _ -> :ok end)
+          ]) |> Promise.then(fn _ ->
+            Promise.all([
+              Web.WritableStreamDefaultWriter.write(writer1, chunk)
+              |> Promise.catch(fn _ -> :ok end),
+              Web.WritableStreamDefaultWriter.write(writer2, chunk)
+              |> Promise.catch(fn _ -> :ok end)
             ])
-
-          :ok
+          end)
         end,
         close: fn _controller ->
           _ =
             tee_await_all([
               Web.WritableStreamDefaultWriter.close(writer1)
               # coveralls-ignore-next-line
-              |> Web.Promise.catch(fn _ -> :ok end),
+              |> Promise.catch(fn _ -> :ok end),
               Web.WritableStreamDefaultWriter.close(writer2)
               # coveralls-ignore-next-line
-              |> Web.Promise.catch(fn _ -> :ok end)
+              |> Promise.catch(fn _ -> :ok end)
             ])
 
           :ok
@@ -796,10 +796,10 @@ defmodule Web.ReadableStream do
             tee_await_all([
               Web.WritableStreamDefaultWriter.abort(writer1, reason)
               # coveralls-ignore-next-line
-              |> Web.Promise.catch(fn _ -> :ok end),
+              |> Promise.catch(fn _ -> :ok end),
               Web.WritableStreamDefaultWriter.abort(writer2, reason)
               # coveralls-ignore-next-line
-              |> Web.Promise.catch(fn _ -> :ok end)
+              |> Promise.catch(fn _ -> :ok end)
             ])
 
           :ok
@@ -813,7 +813,7 @@ defmodule Web.ReadableStream do
   end
 
   defp tee_await_all(promises) do
-    %Web.Promise{task: task} = Web.Promise.all(promises)
+    %Promise{task: task} = Promise.all(promises)
     Task.await(task, :infinity)
   end
 

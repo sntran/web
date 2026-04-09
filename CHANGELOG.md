@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased] - 2026-04-04
+## [Unreleased] - 2026-04-09
 
 ### Added
 
@@ -14,6 +14,8 @@ All notable changes to this project are documented in this file.
 - `examples/stream/byte_counter_stream.exs` demo showing a custom `use Web.Stream` byte counter and a `Web.TransformStream` byte counter producing the same byte total.
 - WHATWG-style text encoding APIs: `Web.TextEncoder`, `Web.TextDecoder`,
   `Web.TextEncoderStream`, and `Web.TextDecoderStream`.
+- `Web.ByteLengthQueuingStrategy` and `Web.CountQueuingStrategy` for
+  strategy-aware stream buffering.
 
 ## Changed
 
@@ -25,6 +27,9 @@ All notable changes to this project are documented in this file.
 - `Web.Body.text/1` now decodes through `Web.TextDecoder`, preserving UTF-8
   correctness across streamed chunk boundaries and honoring replacement or
   fatal decoding semantics.
+- `Web.ReadableStream.tee/1` now uses bounded branch buffering so a fast branch
+  can progress independently of a slower branch up to the configured queue
+  size.
 
 ## [0.2.0] - 2026-04-03
 

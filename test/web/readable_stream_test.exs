@@ -756,11 +756,11 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStreamDefaultReader.read(reader_b) == "data"
     end
 
-    test "tee/1 propagates slow branch backpressure to the source pump" do
+    test "tee/1 allows 16 chunks to queue on the fast branch" do
       check all(
-              chunk_count <- StreamData.integer(3..6),
-              delay_ms <- StreamData.integer(15..40),
-              max_runs: 20
+              chunk_count <- StreamData.integer(16..16),
+              delay_ms <- StreamData.integer(50..80),
+              max_runs: 10
             ) do
         {:ok, counter} = Agent.start_link(fn -> 1 end)
 
@@ -787,11 +787,16 @@ defmodule Web.ReadableStreamTest do
           slow_task = Task.async(fn -> Enum.each(slow_branch, fn _ -> Process.sleep(delay_ms) end) end)
 
           assert {:ok, ^expected} = Task.yield(fast_task, 10_000)
-          elapsed_ms = System.monotonic_time(:millisecond) - started_at
+          fast_elapsed_ms = System.monotonic_time(:millisecond) - started_at
           assert :ok = Task.await(slow_task, 10_000)
+          slow_elapsed_ms = System.monotonic_time(:millisecond) - started_at
 
-          min_elapsed_ms = max(delay_ms, (chunk_count - 2) * delay_ms)
-          assert elapsed_ms >= min_elapsed_ms
+          # The fast branch must complete long before the slow branch finishes.
+          # With HWM=16, all chunks buffer into the fast branch so it completes
+          # without waiting for the slow branch to process each chunk.
+          # The slow branch takes ~chunk_count * delay_ms. The fast branch
+          # should finish in a fraction of that time.
+          assert fast_elapsed_ms < slow_elapsed_ms / 4
         after
           if Process.alive?(counter), do: Agent.stop(counter)
         end

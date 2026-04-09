@@ -94,7 +94,12 @@ defmodule Web.WritableStream do
 
   def new(underlying_sink) when is_map(underlying_sink) do
     hwm = Map.get(underlying_sink, :high_water_mark, 1)
-    {:ok, pid} = start_link(underlying_sink: underlying_sink, high_water_mark: hwm)
+    {:ok, pid} =
+      start_link(
+        underlying_sink: underlying_sink,
+        high_water_mark: hwm,
+        strategy: Web.CountQueuingStrategy.new(hwm)
+      )
     %__MODULE__{controller_pid: pid}
   end
 

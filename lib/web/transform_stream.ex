@@ -36,8 +36,10 @@ defmodule Web.TransformStream do
   @impl Web.Stream
   def start(pid, opts) do
     transformer = Keyword.get(opts, :transformer, %{})
+    writable_strategy = Keyword.get(opts, :writable_strategy, Keyword.get(opts, :strategy, Web.CountQueuingStrategy.new(1)))
+    readable_strategy = Keyword.get(opts, :readable_strategy, Web.CountQueuingStrategy.new(1))
     state = %{transformer: transformer, pid: pid}
-    {:producer_consumer, state}
+    {:producer_consumer, Map.merge(state, %{writable_strategy: writable_strategy, readable_strategy: readable_strategy})}
   end
 
   @impl Web.Stream
@@ -130,7 +132,16 @@ defmodule Web.TransformStream do
   - `cancel: fn reason -> :ok end` — called if the stream is cancelled
   """
   def new(transformer \\ %{}, opts \\ []) do
-    {:ok, pid} = start_link(Keyword.put(opts, :transformer, transformer))
+    hwm = Keyword.get(opts, :high_water_mark, 1)
+    opts =
+      opts
+      |> Keyword.put(:transformer, transformer)
+      |> Keyword.put_new(
+        :strategy,
+        Keyword.get(opts, :writable_strategy, Web.CountQueuingStrategy.new(hwm))
+      )
+
+    {:ok, pid} = start_link(opts)
 
     %{
       readable: %Web.ReadableStream{controller_pid: pid},

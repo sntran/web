@@ -50,6 +50,10 @@ defmodule Web do
       alias Web.ArrayBuffer
       alias Web.Uint8Array
       alias Web.Blob
+      alias Web.TextEncoder
+      alias Web.TextDecoder
+      alias Web.TextEncoderStream
+      alias Web.TextDecoderStream
 
       :ok
     end

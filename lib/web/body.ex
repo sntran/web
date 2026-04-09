@@ -54,6 +54,7 @@ defmodule Web.Body do
   @callback blob(struct()) :: Web.Promise.t()
   @callback clone(struct()) :: {struct(), struct()}
   defmacro __using__(_opts) do
+    # coveralls-ignore-start
     quote do
       @behaviour Web.Body
 
@@ -110,10 +111,20 @@ defmodule Web.Body do
         Web.Body.clone(struct)
       end
     end
+
+    # coveralls-ignore-stop
   end
+
   @doc false
   def text(%{body: body}) do
-    consume_body(body, fn binary -> binary end)
+    Web.Promise.new(fn resolve, reject ->
+      ensure_usable!(body)
+
+      case read_body_to_text(body) do
+        {:ok, text} -> resolve.(text)
+        {:error, reason} -> reject.(reason)
+      end
+    end)
   end
 
   @doc false
@@ -173,14 +184,18 @@ defmodule Web.Body do
 
   defp read_body_to_binary(%Web.ReadableStream{controller_pid: pid}) do
     case Web.ReadableStream.get_reader(pid) do
-      :ok -> read_stream_chunks(pid, [])
-      {:error, :already_locked} -> {:error, Web.TypeError.exception("ReadableStream is already locked")}
+      :ok ->
+        read_stream_chunks(pid, [])
+
+      {:error, :already_locked} ->
+        {:error, Web.TypeError.exception("ReadableStream is already locked")}
     end
   end
 
   defp read_stream_chunks(pid, acc) do
     case Web.ReadableStream.read(pid) do
-      {:ok, chunk} -> read_stream_chunks(pid, [chunk | acc])
+      {:ok, chunk} ->
+        read_stream_chunks(pid, [chunk | acc])
 
       :done ->
         Web.ReadableStream.release_lock(pid)
@@ -190,6 +205,66 @@ defmodule Web.Body do
         Web.ReadableStream.release_lock(pid)
         {:error, reason}
     end
+  end
+
+  defp read_body_to_text(nil), do: {:ok, ""}
+
+  defp read_body_to_text(body) when is_binary(body) or is_list(body) do
+    decode_text_body(body)
+  end
+
+  defp read_body_to_text(%Web.ReadableStream{controller_pid: pid}) do
+    decoder = Web.TextDecoder.new()
+
+    case Web.ReadableStream.get_reader(pid) do
+      :ok ->
+        read_stream_text_chunks(pid, decoder, [])
+
+      {:error, :already_locked} ->
+        {:error, Web.TypeError.exception("ReadableStream is already locked")}
+    end
+  end
+
+  defp read_stream_text_chunks(pid, decoder, acc) do
+    case Web.ReadableStream.read(pid) do
+      {:ok, chunk} ->
+        with {:ok, binary} <- normalize_text_chunk(chunk),
+             decoded <- Web.TextDecoder.decode(decoder, binary, %{stream: true}) do
+          read_stream_text_chunks(pid, decoder, [decoded | acc])
+        else
+          {:error, reason} ->
+            Web.ReadableStream.release_lock(pid)
+            {:error, reason}
+        end
+
+      :done ->
+        Web.ReadableStream.release_lock(pid)
+
+        final = Web.TextDecoder.decode(decoder, "", %{stream: false})
+        {:ok, acc |> Enum.reverse() |> Kernel.++([final]) |> IO.iodata_to_binary()}
+
+      {:error, reason} ->
+        Web.ReadableStream.release_lock(pid)
+        {:error, reason}
+    end
+  end
+
+  defp decode_text_body(body) do
+    binary =
+      cond do
+        is_binary(body) -> body
+        is_list(body) -> IO.iodata_to_binary(body)
+      end
+
+    {:ok, Web.TextDecoder.decode(Web.TextDecoder.new(), binary)}
+  end
+
+  defp normalize_text_chunk(chunk) when is_binary(chunk), do: {:ok, chunk}
+  defp normalize_text_chunk(%Web.Uint8Array{} = chunk), do: {:ok, Web.Uint8Array.to_binary(chunk)}
+  defp normalize_text_chunk(chunk) when is_list(chunk), do: {:ok, IO.iodata_to_binary(chunk)}
+
+  defp normalize_text_chunk(_chunk) do
+    {:error, Web.TypeError.exception("Body stream chunk must be binary, Uint8Array, or iodata")}
   end
 
   @doc false

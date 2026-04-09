@@ -149,6 +149,36 @@ pipe = ReadableStream.pipe_to(ReadableStream.from(["a"]), sink)
 :ok = await(pipe)
 ```
 
+### `Web.TextEncoder`, `Web.TextDecoder`, and Their Stream Variants
+Use the text encoding helpers to move between Elixir strings and UTF-8 byte
+views while keeping streamed decoding safe across chunk boundaries.
+
+```elixir
+encoder = TextEncoder.new()
+bytes = TextEncoder.encode(encoder, "Hello, 🌍")
+Web.Uint8Array.to_binary(bytes)
+# => "Hello, 🌍"
+
+decoder = TextDecoder.new("utf-8", %{fatal: false})
+TextDecoder.decode(decoder, bytes)
+# => "Hello, 🌍"
+```
+
+The stream wrappers compose directly with `ReadableStream.pipe_through/3`
+pipelines.
+
+```elixir
+source = ReadableStream.from(["Hello, ", "🌍"])
+
+encoded =
+  source
+  |> ReadableStream.pipe_through(TextEncoderStream.new())
+  |> ReadableStream.pipe_through(TextDecoderStream.new())
+
+await(Response.text(Response.new(body: encoded)))
+# => "Hello, 🌍"
+```
+
 ### `Web.Request` & `Web.Response`
 First-class containers for network data with high-level factories and standard body readers.
 

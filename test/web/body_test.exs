@@ -5,6 +5,12 @@ defmodule Web.BodyTest do
   alias Web.ReadableStream
   alias Web.Request
   alias Web.Response
+  alias Web.Uint8Array
+
+  defmodule BodyHarness do
+    use Web.Body
+    defstruct [:body, headers: Web.Headers.new()]
+  end
 
   test "ReadableStream.from/1 normalizes strings and arbitrary binaries" do
     assert "hello" == "hello" |> ReadableStream.from() |> Enum.join("")
@@ -131,5 +137,113 @@ defmodule Web.BodyTest do
     # read_body_to_binary(list) branch — covers body.ex line 171
     response = %Response{Response.new() | body: ["io", "list"]}
     assert "iolist" = await(Response.text(response))
+  end
+
+  test "Response.arrayBuffer/1 handles nil body through consume_body" do
+    response = %Response{Response.new() | body: nil}
+    assert %Web.ArrayBuffer{data: "", byte_length: 0} = await(Response.arrayBuffer(response))
+  end
+
+  test "Response.bytes/1 handles iolist bodies through consume_body" do
+    response = %Response{Response.new() | body: ["he", "llo"]}
+    bytes = await(Response.bytes(response))
+    assert Web.Uint8Array.to_binary(bytes) == "hello"
+  end
+
+  test "Response.arrayBuffer/1 rejects when body stream is already locked" do
+    stream = ReadableStream.from("hello")
+    _reader = ReadableStream.get_reader(stream)
+    response = Response.new(body: stream)
+
+    assert %Web.TypeError{message: "ReadableStream is already locked"} =
+             catch_exit(await(Response.arrayBuffer(response)))
+  end
+
+  test "Response.arrayBuffer/1 rejects when stream errors during binary read" do
+    {:ok, pid} = ReadableStream.start_link()
+    stream = %ReadableStream{controller_pid: pid}
+    ReadableStream.error(pid, :stream_fail)
+    response = Response.new(body: stream)
+
+    assert {:errored, :stream_fail} = catch_exit(await(Response.arrayBuffer(response)))
+  end
+
+  test "Response.text/1 replaces invalid direct UTF-8 body bytes" do
+    response = %Response{Response.new() | body: <<0xF0>>}
+
+    assert <<0xEF, 0xBF, 0xBD>> == await(Response.text(response))
+  end
+
+  test "Response.text/1 decodes Uint8Array chunks from a stream" do
+    bytes =
+      "A🌍"
+      |> Web.ArrayBuffer.new()
+      |> Uint8Array.new()
+
+    response =
+      Response.new(body: [Uint8Array.new(bytes.buffer, 0, 1), Uint8Array.new(bytes.buffer, 1, 4)])
+
+    assert "A🌍" == await(Response.text(response))
+  end
+
+  test "Response.text/1 decodes iodata chunks from a stream" do
+    response = Response.new(body: [["hel"], ["lo"]])
+    assert "hello" == await(Response.text(response))
+  end
+
+  test "Response.text/1 rejects invalid stream chunk types" do
+    response = Response.new(body: [123])
+
+    assert %Web.TypeError{message: "Body stream chunk must be binary, Uint8Array, or iodata"} =
+             catch_exit(await(Response.text(response)))
+  end
+
+  test "Web.Body.put_inferred_content_type preserves explicit header" do
+    headers = Web.Headers.new([{"content-type", "text/custom"}])
+    result = Web.Body.put_inferred_content_type(headers, "hello")
+    assert Web.Headers.get(result, "content-type") == "text/custom"
+  end
+
+  test "Web.Body.put_inferred_content_type infers URLSearchParams and binary bodies" do
+    params_headers =
+      Web.Body.put_inferred_content_type(Web.Headers.new(), Web.URLSearchParams.new("a=1"))
+
+    assert Web.Headers.get(params_headers, "content-type") ==
+             "application/x-www-form-urlencoded;charset=UTF-8"
+
+    binary_headers = Web.Body.put_inferred_content_type(Web.Headers.new(), "hello")
+    assert Web.Headers.get(binary_headers, "content-type") == "text/plain;charset=UTF-8"
+  end
+
+  test "Web.Body.put_inferred_content_type only uses non-empty Blob types and leaves unknown bodies alone" do
+    empty_blob_headers =
+      Web.Body.put_inferred_content_type(Web.Headers.new(), Web.Blob.new(["x"], type: ""))
+
+    assert Web.Headers.has(empty_blob_headers, "content-type") == false
+
+    unknown_headers = Web.Body.put_inferred_content_type(Web.Headers.new(), 123)
+    assert unknown_headers == Web.Headers.new()
+  end
+
+  test "use Web.Body delegates through injected functions" do
+    assert %{"ok" => true} = await(BodyHarness.json(%BodyHarness{body: ~s({"ok":true})}))
+
+    assert %Web.ArrayBuffer{data: "hello", byte_length: 5} =
+             await(BodyHarness.arrayBuffer(%BodyHarness{body: "hello"}))
+
+    assert %Web.Uint8Array{} = bytes = await(BodyHarness.bytes(%BodyHarness{body: "hello"}))
+    assert Web.Uint8Array.to_binary(bytes) == "hello"
+
+    assert %Web.Blob{size: 5, type: "text/plain"} =
+             await(
+               BodyHarness.blob(%BodyHarness{
+                 body: "hello",
+                 headers: Web.Headers.new([{"content-type", "text/plain"}])
+               })
+             )
+
+    assert {original, clone} = BodyHarness.clone(%BodyHarness{body: ReadableStream.from("hello")})
+    assert "hello" == await(BodyHarness.text(original))
+    assert "hello" == await(BodyHarness.text(clone))
   end
 end

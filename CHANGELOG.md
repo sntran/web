@@ -12,6 +12,8 @@ All notable changes to this project are documented in this file.
 - `Web.ReadableStream.pipe_to/3` and `Web.ReadableStream.pipe_through/3` for composable, backpressure-aware stream pipelines with optional `AbortSignal` interruption.
 - `Web.Promise` with `resolve/1`, `reject/1`, `then/2`, `catch/2`, `all/1`, `allSettled/1`, `any/1`, and `race/1` helpers for composing async workflows.
 - `examples/stream/byte_counter_stream.exs` demo showing a custom `use Web.Stream` byte counter and a `Web.TransformStream` byte counter producing the same byte total.
+- WHATWG-style text encoding APIs: `Web.TextEncoder`, `Web.TextDecoder`,
+  `Web.TextEncoderStream`, and `Web.TextDecoderStream`.
 
 ## Changed
 
@@ -20,6 +22,9 @@ All notable changes to this project are documented in this file.
 - `Web.fetch/2` now returns `%Web.Promise{}` and `await/1` now unwraps fulfilled values or exits with the rejection reason.
 - Body readers such as `Response.text/1`, `Response.json/1`, `Request.arrayBuffer/1`, and writer operations such as `WritableStreamDefaultWriter.write/2` now return `%Web.Promise{}` values.
 - `Web.Body.clone/1` now returns `{original, clone}` directly instead of an `{:ok, ...}` tuple.
+- `Web.Body.text/1` now decodes through `Web.TextDecoder`, preserving UTF-8
+  correctness across streamed chunk boundaries and honoring replacement or
+  fatal decoding semantics.
 
 ## [0.2.0] - 2026-04-03
 

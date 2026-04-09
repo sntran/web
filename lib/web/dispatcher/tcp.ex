@@ -32,10 +32,14 @@ defmodule Web.Dispatcher.TCP do
     case :gen_tcp.connect(host, port, opts, 5000) do
       {:ok, socket} ->
         if request.body do
-          case Web.ReadableStream.read_all(request.body) do
-            {:ok, body} -> :gen_tcp.send(socket, body)
-            {:error, reason} -> raise reason
-          end
+          body_binary =
+            try do
+              request.body |> Enum.to_list() |> IO.iodata_to_binary()
+            rescue
+              Protocol.UndefinedError -> raise Web.TypeError, "body is not readable"
+            end
+
+          :gen_tcp.send(socket, body_binary)
         end
 
         stream =

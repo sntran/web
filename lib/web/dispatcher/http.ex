@@ -224,8 +224,8 @@ defmodule Web.Dispatcher.HTTP do
          %Web.Request{body: %Web.ReadableStream{} = body, redirect: "follow"} = request
        ) do
     if not Web.ReadableStream.disturbed?(body) and not Web.ReadableStream.locked?(body) do
-      {body_for_fetch, body_for_redirect} = Web.ReadableStream.tee(body)
-      {%{request | body: body_for_redirect}, body_for_fetch}
+      binary = body |> Enum.to_list() |> IO.iodata_to_binary()
+      {%{request | body: binary}, binary}
     else
       {request, body}
     end
@@ -237,7 +237,10 @@ defmodule Web.Dispatcher.HTTP do
 
   defp normalize_body(nil), do: nil
   defp normalize_body(body) when is_binary(body) or is_list(body), do: body
-  defp normalize_body(%Web.ReadableStream{} = body), do: Web.ReadableStream.read_all(body)
+
+  defp normalize_body(%Web.ReadableStream{} = body) do
+    {:ok, body |> Enum.to_list() |> IO.iodata_to_binary()}
+  end
 
   defp normalize_body(body) do
     if Enumerable.impl_for(body) do

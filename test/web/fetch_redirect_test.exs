@@ -1,5 +1,6 @@
 defmodule Web.FetchRedirectTest do
   use ExUnit.Case, async: false
+  import Web, only: [await: 1]
 
   defmodule RedirectServer do
     def start_link do
@@ -163,7 +164,7 @@ defmodule Web.FetchRedirectTest do
   end
 
   test "301 redirect following resolves to the successful target", %{port: port} do
-    assert {:ok, resp} = Web.fetch("http://localhost:#{port}/redir-301", redirect: "follow")
+    resp = await(Web.fetch("http://localhost:#{port}/redir-301", redirect: "follow"))
 
     assert resp.status == 200
     assert resp.url == "http://localhost:#{port}/success"
@@ -171,40 +172,45 @@ defmodule Web.FetchRedirectTest do
   end
 
   test "redirect loop stops after the fetch maximum", %{port: port} do
-    assert {:error, :too_many_redirects} = Web.fetch("http://localhost:#{port}/loop")
+    assert :too_many_redirects =
+             catch_exit(await(Web.fetch("http://localhost:#{port}/loop")))
   end
 
   test "redirect manual returns the original 301 response", %{port: port} do
-    assert {:ok, resp} = Web.fetch("http://localhost:#{port}/redir-301", redirect: "manual")
+    resp = await(Web.fetch("http://localhost:#{port}/redir-301", redirect: "manual"))
 
     assert resp.status == 301
     assert Web.Headers.get(resp.headers, "location") == "http://localhost:#{port}/success"
   end
 
   test "redirect error returns redirect_error", %{port: port} do
-    assert {:error, :redirect_error} =
-             Web.fetch("http://localhost:#{port}/redir-301", redirect: "error")
+    assert :redirect_error =
+             catch_exit(await(Web.fetch("http://localhost:#{port}/redir-301", redirect: "error")))
   end
 
   test "303 switches to GET and strips the request body", %{port: port} do
-    assert {:ok, resp} =
-             Web.fetch("http://localhost:#{port}/redir-303",
-               method: "POST",
-               headers: %{"content-length" => "7"},
-               body: "payload"
-             )
+    resp =
+      await(
+        Web.fetch("http://localhost:#{port}/redir-303",
+          method: "POST",
+          headers: %{"content-length" => "7"},
+          body: "payload"
+        )
+      )
 
     assert resp.status == 200
     assert Enum.to_list(resp.body) == ["GET:"]
   end
 
   test "307 keeps method and body while following a relative location", %{port: port} do
-    assert {:ok, resp} =
-             Web.fetch("http://localhost:#{port}/redir-relative",
-               method: "POST",
-               headers: %{"content-length" => "7"},
-               body: "payload"
-             )
+    resp =
+      await(
+        Web.fetch("http://localhost:#{port}/redir-relative",
+          method: "POST",
+          headers: %{"content-length" => "7"},
+          body: "payload"
+        )
+      )
 
     assert resp.status == 200
     assert resp.url == "http://localhost:#{port}/keep-method"
@@ -221,19 +227,21 @@ defmodule Web.FetchRedirectTest do
         end
       })
 
-    assert {:ok, resp} =
-             Web.fetch("http://localhost:#{port}/redir-relative",
-               method: "POST",
-               headers: %{"content-length" => "7"},
-               body: body
-             )
+    resp =
+      await(
+        Web.fetch("http://localhost:#{port}/redir-relative",
+          method: "POST",
+          headers: %{"content-length" => "7"},
+          body: body
+        )
+      )
 
     assert resp.status == 200
     assert Enum.to_list(resp.body) == ["POST:payload"]
   end
 
   test "follow closes the previous response body before opening the next request", %{port: port} do
-    assert {:ok, resp} = Web.fetch("http://localhost:#{port}/redirect-stream", redirect: "follow")
+    resp = await(Web.fetch("http://localhost:#{port}/redirect-stream", redirect: "follow"))
 
     assert Enum.to_list(resp.body) == ["success"]
   end
@@ -248,12 +256,14 @@ defmodule Web.FetchRedirectTest do
         end
       })
 
-    assert {:ok, resp} =
-             Web.fetch("http://localhost:#{port}/redir-308",
-               method: "POST",
-               headers: %{"content-length" => "7"},
-               body: body
-             )
+    resp =
+      await(
+        Web.fetch("http://localhost:#{port}/redir-308",
+          method: "POST",
+          headers: %{"content-length" => "7"},
+          body: body
+        )
+      )
 
     assert resp.status == 200
     assert_receive {:stream_target_body, "payload"}
@@ -261,8 +271,7 @@ defmodule Web.FetchRedirectTest do
   end
 
   test "redirect with no location returns the original response", %{port: port} do
-    assert {:ok, resp} =
-             Web.fetch("http://localhost:#{port}/redir-no-location", redirect: "follow")
+    resp = await(Web.fetch("http://localhost:#{port}/redir-no-location", redirect: "follow"))
 
     assert resp.status == 301
     assert Enum.to_list(resp.body) == []

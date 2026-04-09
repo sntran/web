@@ -19,13 +19,13 @@ defmodule Web do
 
   ## Examples
 
-      # Simple HTTP GET
-      {:ok, response} = Web.fetch("https://api.github.com/zen")
-      response.body |> Enum.each(&IO.write/1)
+      promise = Web.fetch("https://api.github.com/zen")
+      response = Web.await(promise)
+      is_struct(response, Web.Response)
+      true
 
-      # Using await macro
-      response = await Web.fetch("https://api.github.com/zen")
-      response.body |> Enum.each(&IO.write/1)
+      catch_exit(Web.await(Web.Promise.reject(:boom)))
+      :boom
   """
 
   defmacro __using__(_opts) do
@@ -40,8 +40,10 @@ defmodule Web do
       alias Web.Response
       alias Web.AbortController
       alias Web.AbortSignal
+      alias Web.Promise
       alias Web.ReadableStream
       alias Web.ReadableStreamDefaultController
+      alias Web.TransformStream
       alias Web.WritableStream
       alias Web.WritableStreamDefaultController
       alias Web.WritableStreamDefaultWriter
@@ -54,22 +56,32 @@ defmodule Web do
   end
 
   @doc """
-  Awaits a result in the form of `{:ok, value}` or raises on error.
+  Awaits a `Web.Promise` and returns its fulfilled value.
 
   ## Examples
 
-      iex> Web.await({:ok, "success"})
+      iex> Web.await(Web.Promise.resolve("success"))
       "success"
 
-      iex> Web.await({:error, :not_found})
-      ** (RuntimeError) await: fetch failed: :not_found
+      iex> catch_exit(Web.await(Web.Promise.reject(:not_found)))
+      :not_found
   """
   defmacro await(expr) do
     quote do
       case unquote(expr) do
-        {:ok, value} -> value
-        {:error, reason} -> raise "await: fetch failed: #{inspect(reason)}"
-        other -> raise "await: unexpected result: #{inspect(other)}"
+        %Web.Promise{task: task} ->
+          try do
+            Task.await(task, :infinity)
+          catch
+            :exit, {{:shutdown, reason}, {Task, :await, _details}} ->
+              exit(reason)
+
+            :exit, reason ->
+              exit(reason)
+          end
+
+        other ->
+          raise "await: unexpected result: #{inspect(other)}"
       end
     end
   end
@@ -90,40 +102,50 @@ defmodule Web do
       - `:dispatcher` (module) - Optional override for the request handler.
 
   ## Returns
-    - `{:ok, Web.Response.t()}` on success.
-    - `{:error, any()}` on failure.
+    - `%Web.Promise{}` resolving to `Web.Response.t()` on success.
+    - The promise rejects with `reason` on failure.
 
   ## Examples
 
-      iex> {:error, _} = Web.fetch("http://localhost_nxdomain")
-      iex> is_tuple(Web.fetch("http://localhost_nxdomain"))
+      iex> promise = Web.fetch("http://localhost_nxdomain")
+      iex> is_struct(promise, Web.Promise)
       true
 
       iex> req = Web.Request.new("http://localhost_nxdomain")
-      iex> {:error, _} = Web.fetch(req)
+      iex> is_struct(Web.fetch(req), Web.Promise)
+      true
   """
   @spec fetch(String.t() | Web.URL.t() | Web.Request.t(), keyword()) ::
-          {:ok, Web.Response.t()} | {:error, any()}
+          Web.Promise.t()
   def fetch(input, init \\ [])
 
   def fetch(%Web.Request{} = request, _init) do
-    do_fetch(request)
-  catch
-    :throw, {:abort, _reason} -> {:error, :aborted}
+    try do
+      Web.AbortSignal.check!(request.signal)
+
+      Web.Promise.new(fn resolve, reject ->
+        try do
+          case do_fetch(request) do
+            {:ok, response} -> resolve.(response)
+            {:error, reason} -> reject.(reason)
+          end
+        catch
+          # coveralls-ignore-next-line
+          :throw, {:abort, reason} -> reject.(reason)
+        end
+      end)
+    catch
+      :throw, {:abort, reason} ->
+        Web.Promise.reject(reason)
+    end
   end
 
   def fetch(%Web.URL{} = input, init) do
-    request = Web.Request.new(input, init)
-    do_fetch(request)
-  catch
-    :throw, {:abort, _reason} -> {:error, :aborted}
+    fetch(Web.Request.new(input, init))
   end
 
   def fetch(input, init) when is_binary(input) do
-    request = Web.Request.new(input, init)
-    do_fetch(request)
-  catch
-    :throw, {:abort, _reason} -> {:error, :aborted}
+    fetch(Web.Request.new(input, init))
   end
 
   defp do_fetch(request) do

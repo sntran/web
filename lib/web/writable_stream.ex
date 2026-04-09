@@ -36,7 +36,12 @@ defmodule Web.WritableStream do
   @impl Web.Stream
   def write(chunk, _ctrl, %{sink: sink, pid: pid} = state) do
     ctrl = %WritableStreamDefaultController{pid: pid}
-    invoke_sink_callback(sink, :write, [chunk, ctrl])
+
+    case invoke_sink_callback(sink, :write, [chunk, ctrl]) do
+      %Web.Promise{task: task} -> Task.await(task, :infinity)
+      _ -> :ok
+    end
+
     {:ok, state}
   end
 
@@ -47,11 +52,24 @@ defmodule Web.WritableStream do
   @impl Web.Stream
   def flush(_ctrl, %{sink: sink, pid: pid} = state) do
     ctrl = %WritableStreamDefaultController{pid: pid}
-    invoke_sink_callback(sink, :close, [ctrl])
+
+    case invoke_sink_callback(sink, :close, [ctrl]) do
+      %Web.Promise{task: task} -> Task.await(task, :infinity)
+      _ -> :ok
+    end
+
     {:ok, state}
   end
 
   @impl Web.Stream
+  def terminate({:close, _reason}, %{sink: sink, pid: pid}) do
+    invoke_sink_callback(sink, :close, [%WritableStreamDefaultController{pid: pid}])
+  end
+
+  def terminate({type, reason}, %{sink: sink}) when type in [:abort, :error] do
+    invoke_abort(sink, reason)
+  end
+
   def terminate(reason, %{sink: sink}) do
     invoke_abort(sink, reason)
   end
@@ -134,16 +152,32 @@ defmodule Web.WritableStream do
     :gen_statem.call(pid, {:ready, owner_pid}, :infinity)
   end
 
+  def close(%__MODULE__{controller_pid: pid}) do
+    close(pid)
+  end
+
   def close(pid) when is_pid(pid) do
-    :gen_statem.call(pid, {:close, self()}, :infinity)
+    Web.Promise.new(fn resolve, _reject ->
+      Web.Stream.terminate(pid, :close)
+      await_settled_state(pid, :closed)
+      resolve.(:ok)
+    end)
   end
 
   def close(pid, owner_pid) when is_pid(pid) and is_pid(owner_pid) do
     :gen_statem.call(pid, {:close, owner_pid}, :infinity)
   end
 
+  def abort(%__MODULE__{controller_pid: pid}, reason) do
+    abort(pid, reason)
+  end
+
   def abort(pid, reason) when is_pid(pid) do
-    :gen_statem.call(pid, {:abort, self(), reason}, :infinity)
+    Web.Promise.new(fn resolve, _reject ->
+      Web.Stream.terminate(pid, :abort, reason)
+      await_abort_completion(pid)
+      resolve.(:ok)
+    end)
   end
 
   def abort(pid, owner_pid, reason) when is_pid(pid) and is_pid(owner_pid) do
@@ -158,7 +192,8 @@ defmodule Web.WritableStream do
     :gen_statem.call(pid, {:release_lock, owner_pid})
   end
 
-  def get_slots(pid) when is_pid(pid) do
+  @doc false
+  def __get_slots__(pid) when is_pid(pid) do
     :gen_statem.call(pid, :get_slots)
   end
 
@@ -188,4 +223,36 @@ defmodule Web.WritableStream do
   end
 
   defp invoke_abort(_sink, _reason), do: :ok
+
+  defp await_settled_state(pid, expected_state) do
+    case safe_get_slots(pid) do
+      %{state: ^expected_state, active_operation: nil} ->
+        :ok
+
+      _ ->
+        # coveralls-ignore-next-line
+        Process.sleep(10)
+        # coveralls-ignore-next-line
+        await_settled_state(pid, expected_state)
+    end
+  end
+
+  defp await_abort_completion(pid) do
+    case safe_get_slots(pid) do
+      %{state: :errored, active_operation: nil} ->
+        :ok
+
+      _ ->
+        # coveralls-ignore-next-line
+        Process.sleep(10)
+        # coveralls-ignore-next-line
+        await_abort_completion(pid)
+    end
+  end
+
+  defp safe_get_slots(pid) do
+    __get_slots__(pid)
+  catch
+    :exit, _reason -> %{state: :errored, active_operation: nil}
+  end
 end

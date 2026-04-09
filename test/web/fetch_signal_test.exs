@@ -1,5 +1,6 @@
 defmodule Web.FetchSignalTest do
   use ExUnit.Case, async: true
+  import Web, only: [await: 1]
 
   defmodule SlowDispatcher do
     @behaviour Web.Dispatcher
@@ -73,14 +74,13 @@ defmodule Web.FetchSignalTest do
   test "fetch stops immediately if message received before fetch" do
     req = Web.Request.new("mock://slow", signal: :my_ref, dispatcher: SlowDispatcher)
     send(self(), {:abort, :my_ref})
-    assert {:error, :aborted} = Web.fetch(req)
-  end
-
-  test "fetch stops immediately for string input when the abort message is already queued" do
+    assert :aborted = catch_exit(await(Web.fetch(req)))
     send(self(), {:abort, :my_ref})
 
-    assert {:error, :aborted} =
-             Web.fetch("mock://slow", signal: :my_ref, dispatcher: SlowDispatcher)
+    assert :aborted =
+             catch_exit(
+               await(Web.fetch("mock://slow", signal: :my_ref, dispatcher: SlowDispatcher))
+             )
   end
 
   test "fetch stops immediately if signal PID is dead before fetch" do
@@ -88,7 +88,7 @@ defmodule Web.FetchSignalTest do
     Process.sleep(10)
 
     req = Web.Request.new("mock://slow", signal: dead_pid, dispatcher: SlowDispatcher)
-    assert {:error, :aborted} = Web.fetch(req)
+    assert :aborted = catch_exit(await(Web.fetch(req)))
   end
 
   test "fetch aborts when a pid signal dies during http header I/O" do
@@ -101,16 +101,16 @@ defmodule Web.FetchSignalTest do
         end
       end)
 
-    task =
-      Task.async(fn ->
-        Web.fetch("http://localhost:#{server.port}/slow", signal: signal_pid)
-      end)
+    promise = Web.fetch("http://localhost:#{server.port}/slow", signal: signal_pid)
 
     Process.sleep(50)
     send(signal_pid, :die)
 
-    assert {:ok, {:error, reason}} = Task.yield(task, 1000)
-    assert reason == :aborted or match?(%Mint.TransportError{reason: :closed}, reason)
+    shutdown = catch_exit(await(promise))
+
+    assert shutdown == :aborted or
+             match?(%Mint.TransportError{reason: :closed}, shutdown)
+
     Process.exit(server.pid, :kill)
   end
 
@@ -118,17 +118,21 @@ defmodule Web.FetchSignalTest do
     alive_pid = spawn(fn -> Process.sleep(5000) end)
     req = Web.Request.new("mock://slow", signal: alive_pid, dispatcher: SlowDispatcher)
 
-    assert {:ok, resp} = Web.fetch(req)
+    resp = await(Web.fetch(req))
     assert resp.status == 200
 
     Process.exit(alive_pid, :kill)
   end
 
   test "fetch returns aborted immediately when given an already-aborted signal" do
-    assert {:error, :aborted} =
-             Web.fetch("mock://never",
-               signal: Web.AbortSignal.abort(:manual_cancel),
-               dispatcher: NeverDispatcher
+    assert :manual_cancel =
+             catch_exit(
+               await(
+                 Web.fetch("mock://never",
+                   signal: Web.AbortSignal.abort(:manual_cancel),
+                   dispatcher: NeverDispatcher
+                 )
+               )
              )
 
     refute_received :dispatcher_called
@@ -138,14 +142,11 @@ defmodule Web.FetchSignalTest do
     server = DelayedHTTPServer.start_link(200)
     controller = Web.AbortController.new()
 
-    task =
-      Task.async(fn ->
-        Web.fetch("http://localhost:#{server.port}/slow", signal: controller.signal)
-      end)
+    promise = Web.fetch("http://localhost:#{server.port}/slow", signal: controller.signal)
 
     Process.sleep(50)
     assert :ok = Web.AbortController.abort(controller, :timeout)
-    assert {:error, :aborted} = Task.await(task, 2000)
+    assert catch_exit(await(promise)) in [:aborted, :timeout]
 
     refute Process.alive?(controller.signal.pid)
     Process.exit(server.pid, :kill)

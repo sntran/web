@@ -1,5 +1,4 @@
 defmodule ByteCounterStream do
-
   @moduledoc """
   A custom stream that counts the total number of bytes written through it.
   Used to demonstrate streaming and byte counting in the Web.Stream API.
@@ -73,11 +72,7 @@ defmodule StreamByteCounterDemo do
   If no URL is provided, defaults to https://example.com
   """
 
-  alias Web.ReadableStream
-  alias Web.ReadableStreamDefaultController
-  alias Web.TransformStream
-  alias Web.WritableStream
-  alias Web.WritableStreamDefaultWriter
+  use Web
 
   @doc """
   Entry point. Accepts an optional URL argument, fetches the resource, and counts the bytes of the response body.
@@ -98,55 +93,52 @@ defmodule StreamByteCounterDemo do
   defp do_count(url) do
     parent = self()
     IO.puts("Fetching: #{url}")
-    case Web.fetch(url) do
-      {:ok, %Web.Response{body: body_stream}} ->
-        # Assume body_stream is a ReadableStream
-        {left, right} = ReadableStream.tee(body_stream)
 
-        custom_counter = ByteCounterStream.new(notify: self())
-        transform_counter =
-          TransformStream.new(%{
-            transform: fn chunk, controller, state ->
-              binary = IO.iodata_to_binary(chunk)
-              ReadableStreamDefaultController.enqueue(controller, binary)
-              total = Map.get(state, :total_bytes, 0) + byte_size(binary)
-              {:ok, Map.put(state, :total_bytes, total)}
-            end,
-            flush: fn controller, state ->
-              ReadableStreamDefaultController.close(controller)
-              send(parent, {:transform_counter_total, Map.get(state, :total_bytes, 0)})
-              {:ok, state}
-            end
-          })
+    try do
+      %Response{body: body_stream} = await fetch(url)
+      [left, right] = ReadableStream.tee(body_stream)
 
-        pump(left, custom_counter.writable)
-        pump(right, transform_counter.writable)
+      custom_counter = ByteCounterStream.new(notify: self())
 
-        # Read and discard payloads, only care about byte counts
-        _ = ReadableStream.read_all(custom_counter.readable)
-        _ = ReadableStream.read_all(transform_counter.readable)
+      transform_counter =
+        TransformStream.new(%{
+          transform: fn chunk, controller, state ->
+            binary = IO.iodata_to_binary(chunk)
+            ReadableStreamDefaultController.enqueue(controller, binary)
+            total = Map.get(state, :total_bytes, 0) + byte_size(binary)
+            {:ok, Map.put(state, :total_bytes, total)}
+          end,
+          flush: fn controller, state ->
+            ReadableStreamDefaultController.close(controller)
+            send(parent, {:transform_counter_total, Map.get(state, :total_bytes, 0)})
+            {:ok, state}
+          end
+        })
 
-        custom_total = await_total(:custom_counter_total)
-        transform_total = await_total(:transform_counter_total)
+      custom_pipe_task = ReadableStream.pipe_to(left, custom_counter.writable)
+      transformed_readable = ReadableStream.pipe_through(right, transform_counter)
 
-        IO.puts("URL: #{url}")
-        IO.puts("Custom bytes:    #{custom_total}")
-        IO.puts("Transform bytes: #{transform_total}")
-        IO.puts("Totals match?:   #{custom_total == transform_total}")
-      {:error, reason} ->
-        IO.puts("Failed to fetch #{url}: #{inspect(reason)}")
+      # Drain both output streams concurrently so backpressure does not stall the pipes.
+      combined =
+        Promise.all([
+          custom_pipe_task,
+          Response.text(Response.new(body: custom_counter.readable)),
+          Response.text(Response.new(body: transformed_readable))
+        ])
+
+      [_pipe_ok, _custom_body, _transform_body] = await(combined)
+
+      custom_total = await_total(:custom_counter_total)
+      transform_total = await_total(:transform_counter_total)
+
+      IO.puts("URL: #{url}")
+      IO.puts("Custom bytes:    #{custom_total}")
+      IO.puts("Transform bytes: #{transform_total}")
+      IO.puts("Totals match?:   #{custom_total == transform_total}")
+    rescue
+      e ->
+        IO.puts("Failed to fetch #{url}: #{Exception.message(e)}")
     end
-  end
-
-  defp pump(readable, writable) do
-    writer = WritableStream.get_writer(writable)
-
-    Enum.each(readable, fn chunk ->
-      :ok = WritableStreamDefaultWriter.write(writer, chunk)
-    end)
-
-    :ok = WritableStreamDefaultWriter.close(writer)
-    :ok = WritableStreamDefaultWriter.release_lock(writer)
   end
 
   defp await_total(tag) do

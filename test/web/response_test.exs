@@ -1,6 +1,7 @@
 defmodule Web.ResponseTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
+  import Web, only: [await: 1]
 
   alias Web.Response
   alias Web.TypeError
@@ -28,7 +29,7 @@ defmodule Web.ResponseTest do
     assert resp.status_text == ""
     assert resp.type == "default"
     assert match?(%Web.ReadableStream{}, resp.body)
-    assert {:ok, ""} = Web.ReadableStream.read_all(resp.body)
+    assert "" == Enum.join(resp.body, "")
     assert resp.url == nil
     assert resp.headers == Web.Headers.new()
   end
@@ -47,33 +48,32 @@ defmodule Web.ResponseTest do
   test "new/1 normalizes enumerable response bodies through ReadableStream.from/1" do
     resp = Response.new(body: ["he", "llo"])
 
-    assert {:ok, "hello"} = Response.text(resp)
+    assert "hello" = await(Response.text(resp))
   end
 
   test "text/1 and arrayBuffer/1 drain the response body" do
     resp = Response.new(body: "hello")
 
-    assert {:ok, "hello"} = Response.text(resp)
+    assert "hello" = await(Response.text(resp))
 
     resp = Response.new(body: "hello")
-    assert {:ok, %Web.ArrayBuffer{data: "hello", byte_length: 5}} = Response.arrayBuffer(resp)
+    assert %Web.ArrayBuffer{data: "hello", byte_length: 5} = await(Response.arrayBuffer(resp))
 
-    assert_raise TypeError, "body already used", fn ->
-      Response.text(resp)
-    end
+    assert %TypeError{message: "body already used"} =
+             catch_exit(await(Response.text(resp)))
   end
 
   test "bytes/1 returns a Uint8Array view over the consumed response body" do
     resp = Response.new(body: "hello")
 
-    assert {:ok, %Web.Uint8Array{byte_length: 5} = bytes} = Response.bytes(resp)
+    assert %Web.Uint8Array{byte_length: 5} = bytes = await(Response.bytes(resp))
     assert Web.Uint8Array.to_binary(bytes) == "hello"
   end
 
   test "blob/1 uses content-type header for Blob type" do
     resp = Response.new(body: "hello", headers: [{"content-type", "text/plain"}])
 
-    assert {:ok, %Web.Blob{size: 5, type: "text/plain"}} = Response.blob(resp)
+    assert %Web.Blob{size: 5, type: "text/plain"} = await(Response.blob(resp))
   end
 
   test "new/1 defaults string bodies to text/plain;charset=UTF-8" do
@@ -85,9 +85,9 @@ defmodule Web.ResponseTest do
   test "clone/1 returns updated original and clone with independent streams" do
     resp = Response.new(body: "hello")
 
-    assert {:ok, {resp, clone}} = Response.clone(resp)
-    assert {:ok, "hello"} = Response.text(resp)
-    assert {:ok, "hello"} = Response.text(clone)
+    assert {resp, clone} = Response.clone(resp)
+    assert "hello" = await(Response.text(resp))
+    assert "hello" = await(Response.text(clone))
   end
 
   test "json/2 returns JSON body and content-type header" do
@@ -95,7 +95,7 @@ defmodule Web.ResponseTest do
 
     assert resp.status == 200
     assert Web.Headers.get(resp.headers, "content-type") == "application/json"
-    assert {:ok, %{"ok" => true}} = Response.json(resp)
+    assert %{"ok" => true} = await(Response.json(resp))
   end
 
   test "redirect/2 defaults to 302 and sets location header" do
@@ -103,7 +103,7 @@ defmodule Web.ResponseTest do
 
     assert resp.status == 302
     assert Web.Headers.get(resp.headers, "location") == "https://example.com"
-    assert {:ok, ""} = Response.text(resp)
+    assert "" = await(Response.text(resp))
   end
 
   test "error/0 returns an error response with status 0" do
@@ -113,7 +113,7 @@ defmodule Web.ResponseTest do
     assert resp.ok == false
     assert resp.status_text == ""
     assert resp.type == "error"
-    assert {:ok, ""} = Response.text(resp)
+    assert "" = await(Response.text(resp))
   end
 
   test "new/1 defaults status_text to empty string for unknown status" do
@@ -149,7 +149,7 @@ defmodule Web.ResponseTest do
     resp = Response.new(body: blob)
 
     assert Web.Headers.get(resp.headers, "content-type") == "text/plain"
-    assert {:ok, "hello"} = Response.text(resp)
+    assert "hello" = await(Response.text(resp))
   end
 
   test "new/1 does not overwrite an explicit content-type header" do

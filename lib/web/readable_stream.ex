@@ -17,15 +17,10 @@ defmodule Web.ReadableStream do
   operations like `tee/1` if the stream has already been interacted with.
 
   ### Teeing and Backpressure
-  The `tee/1` implementation uses a "multicast" strategy. The original stream's backpressure
-  signal (the `desired_size`) is calculated as `max(branch_a.desired_size, branch_b.desired_size)`.
-  This ensures that the source continues to pull data as long as at least one branch has capacity.
-
-  ### Buffer Bloat Warning
-  When using `tee/1`, be aware that a significantly slower consumer on one branch will NOT
-  stop the other branch from receiving data. This can lead to "Buffer Bloat" (unbounded memory usage)
-  on the slower branch's internal queue. If consumers have vastly different speeds, consider
-  implementing custom branch-level backpressure or using a different distribution strategy.
+  The `tee/1` implementation is built via stream composition: data is piped into a multicaster
+  writable sink that forwards each chunk into two identity `TransformStream` branches.
+  Because each multicaster write waits for both branch writes to settle, branch backpressure
+  naturally throttles upstream pulling.
   """
 
   use Web.Stream
@@ -64,7 +59,12 @@ defmodule Web.ReadableStream do
     case source do
       %{pull: pull} when is_function(pull, 1) ->
         ctrl = %Web.ReadableStreamDefaultController{pid: pid}
-        pull.(ctrl)
+
+        case pull.(ctrl) do
+          %Web.Promise{task: task} -> Task.await(task, :infinity)
+          _ -> :ok
+        end
+
         {:ok, %{state | started: true}}
 
       src when is_pid(src) ->
@@ -78,7 +78,12 @@ defmodule Web.ReadableStream do
 
       fun when is_function(fun, 1) ->
         ctrl = %Web.ReadableStreamDefaultController{pid: pid}
-        fun.(ctrl)
+
+        case fun.(ctrl) do
+          %Web.Promise{task: task} -> Task.await(task, :infinity)
+          _ -> :ok
+        end
+
         {:ok, %{state | started: true}}
 
       _ ->
@@ -88,7 +93,15 @@ defmodule Web.ReadableStream do
   end
 
   @impl Web.Stream
+  def terminate({:cancel, reason}, %{source: source}) do
+    do_terminate(reason, source)
+  end
+
   def terminate(reason, %{source: source}) do
+    do_terminate(reason, source)
+  end
+
+  defp do_terminate(reason, source) do
     case source do
       %{cancel: cancel} when is_function(cancel, 1) ->
         cancel.(reason)
@@ -137,12 +150,12 @@ defmodule Web.ReadableStream do
   ## Examples
 
       iex> stream = Web.ReadableStream.from("hello")
-      iex> Web.ReadableStream.read_all(stream)
-      {:ok, "hello"}
+      iex> Enum.join(stream, "")
+      "hello"
 
       iex> stream = Web.ReadableStream.from(nil)
-      iex> Web.ReadableStream.read_all(stream)
-      {:ok, ""}
+      iex> Enum.join(stream, "")
+      ""
 
       iex> existing = Web.ReadableStream.new()
       iex> Web.ReadableStream.from(existing) == existing
@@ -343,9 +356,7 @@ defmodule Web.ReadableStream do
     end
   end
 
-  @doc """
-  Returns whether the stream's `[[disturbed]]` slot has been set.
-  """
+  @doc false
   def disturbed?(nil), do: false
   def disturbed?(body) when is_binary(body) or is_list(body), do: false
 
@@ -375,39 +386,7 @@ defmodule Web.ReadableStream do
 
   def locked?(_body), do: false
 
-  @doc """
-  Reads a body to completion and returns the concatenated binary.
-  """
-  def read_all(nil), do: {:ok, ""}
-  def read_all(body) when is_binary(body), do: {:ok, body}
-  def read_all(body) when is_list(body), do: {:ok, IO.iodata_to_binary(body)}
-
-  def read_all(%__MODULE__{} = stream) do
-    case get_reader(stream.controller_pid) do
-      :ok ->
-        do_read_all(stream.controller_pid, [])
-
-      {:error, :already_locked} ->
-        {:error, TypeError.exception("ReadableStream is already locked")}
-    end
-  end
-
-  def read_all(pid) when is_pid(pid) do
-    read_all(%__MODULE__{controller_pid: pid})
-  end
-
-  def read_all(body) do
-    if Enumerable.impl_for(body) do
-      {:ok,
-       body
-       |> Enum.reduce([], fn chunk, acc -> [IO.iodata_to_binary(chunk) | acc] end)
-       |> Enum.reverse()
-       |> IO.iodata_to_binary()}
-    else
-      {:error, TypeError.exception("body is not readable")}
-    end
-  end
-
+  # Private helper — reads all chunks from a stream to a binary.
   @doc """
   Locks the stream and returns a reader.
 
@@ -470,20 +449,45 @@ defmodule Web.ReadableStream do
 
   def cancel(target, reason \\ :cancelled)
 
-  def cancel(pid, reason) do
-    :gen_statem.cast(pid, {:cancel, reason})
+  def cancel(%__MODULE__{controller_pid: pid}, reason) do
+    cancel(pid, reason)
   end
 
-  def get_slots(pid) do
+  def cancel(pid, reason) do
+    Web.Promise.new(fn resolve, _reject ->
+      if Process.alive?(pid) do
+        cancel_now(pid, reason)
+        await_stream_state(pid, :closed)
+      end
+
+      resolve.(:ok)
+    end)
+  end
+
+  @doc false
+  def __get_slots__(pid) do
     :gen_statem.call(pid, :get_slots)
   end
 
   def tee(pid) when is_pid(pid) do
-    :gen_statem.call(pid, :tee)
+    cond do
+      locked?(pid) ->
+        {:error, :already_locked}
+
+      disturbed?(pid) ->
+        {:error, :already_locked}
+
+      true ->
+        do_tee(%__MODULE__{controller_pid: pid})
+    end
   end
 
   @doc """
-  Tees the current readable stream, returning two new readable stream branches.
+  Tees the current readable stream into two passive branches via composition.
+
+  Internally this uses two identity `TransformStream`s plus a multicaster
+  `WritableStream`: each source chunk is written to both branch writers,
+  then the branch readable ends are returned.
 
   ## Examples
 
@@ -493,16 +497,27 @@ defmodule Web.ReadableStream do
       ...>     Web.ReadableStreamDefaultController.close(c)
       ...>   end
       ...> })
-      iex> {s1, s2} = Web.ReadableStream.tee(stream)
+      iex> [s1, s2] = Web.ReadableStream.tee(stream)
       iex> Enum.to_list(s1)
       ["a"]
       iex> Enum.to_list(s2)
       ["a"]
+
+  This pattern can be reused manually:
+
+      iex> ts = Web.TransformStream.new()
+      iex> writer = Web.WritableStream.get_writer(ts.writable)
+      iex> Web.await(Web.WritableStreamDefaultWriter.write(writer, "x"))
+      :ok
+      iex> Web.await(Web.WritableStreamDefaultWriter.close(writer))
+      :ok
+      iex> Enum.to_list(ts.readable)
+      ["x"]
   """
   def tee(%__MODULE__{controller_pid: pid}) do
     case tee(pid) do
-      {:ok, {s1, s2}} ->
-        {s1, s2}
+      branches when is_list(branches) ->
+        branches
 
       {:error, :already_locked} ->
         raise TypeError, "ReadableStream is already locked"
@@ -512,7 +527,7 @@ defmodule Web.ReadableStream do
   @doc """
   Pipes a readable stream into a writable stream.
 
-  Returns a `%Task{}` that runs the pump lifecycle asynchronously.
+  Returns a `%Web.Promise{}` that runs the pump lifecycle asynchronously.
 
   ## Options
 
@@ -522,7 +537,7 @@ defmodule Web.ReadableStream do
   - `:signal` - optional `%Web.AbortSignal{}` to interrupt piping
   """
   def pipe_to(readable, writable, options \\ []) do
-    Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
+    Web.Promise.new(fn resolve, reject ->
       reader = nil
       writer = nil
 
@@ -534,24 +549,24 @@ defmodule Web.ReadableStream do
           case pump(reader, writer, options) do
             :done ->
               maybe_close_writer(writer, options)
-              :ok
+              resolve.(:ok)
 
             {:source_error, reason} ->
               maybe_abort_writer(writer, reason, options)
-              {:error, reason}
+              reject.(reason)
 
             {:sink_error, reason} ->
               maybe_cancel_reader(reader, reason, options)
-              {:error, reason}
+              reject.(reason)
 
             {:aborted, reason} ->
               maybe_cancel_reader(reader, reason, options)
               maybe_abort_writer(writer, reason, options)
-              {:error, {:aborted, reason}}
+              reject.({:aborted, reason})
           end
         rescue
           error in TypeError ->
-            {:error, error}
+            reject.(error)
         end
       after
         if reader != nil, do: release_reader_lock(reader)
@@ -568,39 +583,13 @@ defmodule Web.ReadableStream do
         %{readable: transformed_readable, writable: transformed_writable},
         options \\ []
       ) do
-    _task = pipe_to(readable, transformed_writable, options)
+    _promise = pipe_to(readable, transformed_writable, options)
     transformed_readable
   end
 
-  # coveralls-ignore-start
-  def branch_cancelled(pid, child_pid) do
-    :gen_statem.cast(pid, {:branch_cancelled, child_pid})
-  end
-
-  def report_desired_size(pid, child_pid, size) do
-    :gen_statem.cast(pid, {:branch_desired_size, child_pid, size})
-  end
-
-  # coveralls-ignore-stop
-
   # ---------------------------------------------------------------------------
-  # Private read_all helpers
+  # Private pipe helpers
   # ---------------------------------------------------------------------------
-
-  defp do_read_all(pid, chunks) do
-    case read(pid) do
-      {:ok, chunk} ->
-        do_read_all(pid, [chunk | chunks])
-
-      :done ->
-        release_lock(pid)
-        {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
-
-      {:error, reason} ->
-        release_lock(pid)
-        {:error, reason}
-    end
-  end
 
   defp pump(reader, writer, options) do
     owner_pid = self()
@@ -715,9 +704,13 @@ defmodule Web.ReadableStream do
     if Keyword.get(options, :preventCancel, false) do
       :ok
     else
-      cancel(reader.controller_pid, reason)
+      cancel_now(reader.controller_pid, reason)
       :ok
     end
+  end
+
+  defp cancel_now(pid, reason) do
+    Web.Stream.terminate(pid, :cancel, reason)
   end
 
   defp acquire_reader_for_pipe(%__MODULE__{} = readable), do: get_reader(readable)
@@ -736,6 +729,105 @@ defmodule Web.ReadableStream do
     case WritableStream.get_writer(pid) do
       :ok -> %Web.WritableStreamDefaultWriter{controller_pid: pid, owner_pid: self()}
       {:error, :already_locked} -> raise TypeError, "WritableStream is already locked"
+    end
+  end
+
+  defp await_stream_state(pid, expected_state) do
+    case safe_get_slots(pid) do
+      %{state: ^expected_state} ->
+        :ok
+
+      _ ->
+        # coveralls-ignore-next-line
+        Process.sleep(10)
+        # coveralls-ignore-next-line
+        await_stream_state(pid, expected_state)
+    end
+  end
+
+  defp safe_get_slots(pid) do
+    __get_slots__(pid)
+  catch
+    # coveralls-ignore-next-line
+    :exit, _reason -> %{state: :closed}
+  end
+
+  defp do_tee(%__MODULE__{} = source) do
+    ts1 = Web.TransformStream.new()
+    ts2 = Web.TransformStream.new()
+
+    writer1 = Web.WritableStream.get_writer(ts1.writable)
+    writer2 = Web.WritableStream.get_writer(ts2.writable)
+
+    sink =
+      WritableStream.new(%{
+        write: fn chunk, _controller ->
+          _results =
+            tee_await_all([
+              Web.WritableStreamDefaultWriter.ready(writer1)
+              |> Web.Promise.then(fn :ok ->
+                Web.WritableStreamDefaultWriter.write(writer1, chunk)
+              end)
+              |> Web.Promise.catch(fn _ -> :ok end),
+              Web.WritableStreamDefaultWriter.ready(writer2)
+              |> Web.Promise.then(fn :ok ->
+                Web.WritableStreamDefaultWriter.write(writer2, chunk)
+              end)
+              |> Web.Promise.catch(fn _ -> :ok end)
+            ])
+
+          :ok
+        end,
+        close: fn _controller ->
+          _ =
+            tee_await_all([
+              Web.WritableStreamDefaultWriter.close(writer1)
+              # coveralls-ignore-next-line
+              |> Web.Promise.catch(fn _ -> :ok end),
+              Web.WritableStreamDefaultWriter.close(writer2)
+              # coveralls-ignore-next-line
+              |> Web.Promise.catch(fn _ -> :ok end)
+            ])
+
+          :ok
+        end,
+        abort: fn reason ->
+          _ =
+            tee_await_all([
+              Web.WritableStreamDefaultWriter.abort(writer1, reason)
+              # coveralls-ignore-next-line
+              |> Web.Promise.catch(fn _ -> :ok end),
+              Web.WritableStreamDefaultWriter.abort(writer2, reason)
+              # coveralls-ignore-next-line
+              |> Web.Promise.catch(fn _ -> :ok end)
+            ])
+
+          :ok
+        end
+      })
+
+    _promise = pipe_to(source, sink)
+    tee_await_source_lock(source.controller_pid)
+
+    [ts1.readable, ts2.readable]
+  end
+
+  defp tee_await_all(promises) do
+    %Web.Promise{task: task} = Web.Promise.all(promises)
+    Task.await(task, :infinity)
+  end
+
+  defp tee_await_source_lock(pid) do
+    cond do
+      locked?(pid) ->
+        :ok
+
+      disturbed?(pid) ->
+        :ok
+
+      true ->
+        Process.sleep(10)
+        tee_await_source_lock(pid)
     end
   end
 

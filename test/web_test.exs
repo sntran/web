@@ -58,32 +58,33 @@ defmodule WebTest do
   end
 
   test "Web.fetch routes to provided dispatcher directly via options" do
-    assert {:ok, %Web.Response{ok: true, url: "mock://success/"}} =
-             Web.fetch("mock://success", dispatcher: MockDispatcher)
+    assert %Web.Response{ok: true, url: "mock://success/"} =
+             await(Web.fetch("mock://success", dispatcher: MockDispatcher))
 
-    assert {:error, :simulated_error} =
-             Web.fetch("mock://error", dispatcher: MockDispatcher)
+    assert :simulated_error =
+             catch_exit(await(Web.fetch("mock://error", dispatcher: MockDispatcher)))
   end
 
   test "Web.fetch accepts a Web.URL input" do
-    assert {:ok, %Web.Response{ok: true, url: "mock://success/"}} =
-             Web.fetch(Web.URL.new("mock://success"), dispatcher: MockDispatcher)
+    assert %Web.Response{ok: true, url: "mock://success/"} =
+             await(Web.fetch(Web.URL.new("mock://success"), dispatcher: MockDispatcher))
   end
 
   test "Web.fetch routes to resolved dispatcher when missing from options" do
     # Resolver.resolve("tcp://localhost:9999") -> Web.Dispatcher.TCP
     # Attempting a real TCP fetch will result in :econnrefused or :nxdomain
-    assert {:error, _} = Web.fetch("tcp://localhost:59999")
+    assert _reason = catch_exit(await(Web.fetch("tcp://localhost:59999")))
   end
 
   test "use Web imports fetch/1 and fetch/2" do
-    assert {:ok, %Web.Response{ok: true, url: "mock://success/"}} =
-             UsingWeb.fetch_with_import("mock://success", dispatcher: MockDispatcher)
+    assert %Web.Response{ok: true, url: "mock://success/"} =
+             UsingWeb.fetch_with_import("mock://success", dispatcher: MockDispatcher) |> await()
 
-    assert {:ok, %Web.Response{ok: true, url: "mock://success/"}} =
+    assert %Web.Response{ok: true, url: "mock://success/"} =
              UsingWeb.fetch_with_import(Web.URL.new("mock://success"),
                dispatcher: MockDispatcher
              )
+             |> await()
   end
 
   test "use Web aliases the public Web modules" do
@@ -95,10 +96,9 @@ defmodule WebTest do
     assert %Web.Response{ok: true, url: "mock://success/"} = response
   end
 
-  test "await macro raises on {:error, reason}" do
-    assert_raise RuntimeError, ~r/await: fetch failed: :simulated_error/, fn ->
-      await(Web.fetch("mock://error/", dispatcher: MockDispatcher))
-    end
+  test "await macro exits on promise rejection" do
+    assert :simulated_error =
+             catch_exit(await(Web.fetch("mock://error/", dispatcher: MockDispatcher)))
   end
 
   test "await macro raises on unexpected result" do
@@ -151,14 +151,16 @@ defmodule WebTest do
   test "Web.fetch handles already aborted signals" do
     controller = Web.AbortController.new()
     Web.AbortController.abort(controller)
-    assert {:error, :aborted} = Web.fetch("https://example.com", signal: controller.signal)
+
+    assert :aborted =
+             catch_exit(await(Web.fetch("https://example.com", signal: controller.signal)))
 
     # Also via Web.URL
     url = Web.URL.new("https://example.com")
-    assert {:error, :aborted} = Web.fetch(url, signal: controller.signal)
+    assert :aborted = catch_exit(await(Web.fetch(url, signal: controller.signal)))
 
     # Also via Web.Request
     req = Web.Request.new(url, signal: controller.signal)
-    assert {:error, :aborted} = Web.fetch(req)
+    assert :aborted = catch_exit(await(Web.fetch(req)))
   end
 end

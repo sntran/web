@@ -37,17 +37,34 @@ defmodule GitHub do
       headers: %{"Accept" => "application/vnd.github.v3+json"}
     )
 
-    # 3. Fetch and stream the results lazily
-    fetch(request) 
+    # 3. Fetch via Promise and await the response
+    await fetch(request)
   end
 end
 
-{:ok, response} = GitHub.repositories()
+response = GitHub.repositories()
 
 # Zero-buffer streaming: chunks are written to stdout as they arrive
 response.body 
 |> Stream.take(5) 
 |> Enum.each(&IO.write/1)
+```
+
+### `Web.Promise` and `await/1`
+Async APIs now return `%Web.Promise{}` values so you can compose fetches, body
+reads, and stream writes before awaiting the final result.
+
+```elixir
+use Web
+
+response = await fetch("https://api.github.com/zen")
+
+text = await Response.text(response)
+
+pair = await Promise.all([
+    Promise.resolve(:ok),
+    Promise.resolve(text)
+  ])
 ```
 
 ---
@@ -77,11 +94,11 @@ writable = WritableStream.new()
 writer = WritableStream.get_writer(writable)
 
 # Write chunks to the stream
-:ok = WritableStreamDefaultWriter.write(writer, "hello ")
-:ok = WritableStreamDefaultWriter.write(writer, "world!")
+:ok = await(WritableStreamDefaultWriter.write(writer, "hello "))
+:ok = await(WritableStreamDefaultWriter.write(writer, "world!"))
 
 # Close and release
-:ok = WritableStreamDefaultWriter.close(writer)
+:ok = await(WritableStreamDefaultWriter.close(writer))
 :ok = WritableStreamDefaultWriter.release_lock(writer)
 ```
 
@@ -90,31 +107,20 @@ Transform streams allow you to process, modify, or filter data as it flows throu
 
 ```elixir
 transform = TransformStream.new(%{
-  transform: fn chunk, controller, state ->
+  transform: fn chunk, controller ->
     # Example: uppercase transformation
     upper = String.upcase(IO.iodata_to_binary(chunk))
     ReadableStreamDefaultController.enqueue(controller, upper)
-    {:ok, state}
   end,
-  flush: fn controller, state ->
+  flush: fn controller ->
     ReadableStreamDefaultController.close(controller)
-    {:ok, state}
   end
 })
 
-# Pipe data through the transform
 source = ReadableStream.from(["foo", "bar"])
-WritableStream = transform.writable
-ReadableStream = transform.readable
-
-Enum.each(source, fn chunk ->
-  :ok = WritableStreamDefaultWriter.write(WritableStream.get_writer(WritableStream), chunk)
-end)
-:ok = WritableStreamDefaultWriter.close(WritableStream.get_writer(WritableStream))
-
-# Collect transformed output
-Enum.to_list(ReadableStream)
-# => ["FOO", "BAR"]
+upper = ReadableStream.pipe_through(source, transform)
+output = await(Response.text(Response.new(body: upper)))
+# => "FOOBAR"
 ```
 
 ### `ReadableStream.pipe_to/3` & `ReadableStream.pipe_through/3`
@@ -124,25 +130,23 @@ Use `pipe_to/3` to connect a source to any writable sink with backpressure-aware
 source = ReadableStream.from(["hello", " world"])
 
 transform = TransformStream.new(%{
-  transform: fn chunk, controller, state ->
+  transform: fn chunk, controller ->
     ReadableStreamDefaultController.enqueue(controller, String.upcase(chunk))
-    {:ok, state}
   end,
-  flush: fn controller, state ->
+  flush: fn controller ->
     ReadableStreamDefaultController.close(controller)
-    {:ok, state}
   end
 })
 
 # pipe_through returns the transformed readable side
 upper = ReadableStream.pipe_through(source, transform)
-{:ok, output} = ReadableStream.read_all(upper)
-# => {:ok, "HELLO WORLD"}
+output = await(Response.text(Response.new(body: upper)))
+# => "HELLO WORLD"
 
-# pipe_to returns a task you can await
+# pipe_to returns a %Web.Promise{} you can await
 sink = WritableStream.new(%{})
-task = ReadableStream.pipe_to(ReadableStream.from(["a"]), sink)
-:ok = Task.await(task)
+pipe = ReadableStream.pipe_to(ReadableStream.from(["a"]), sink)
+:ok = await(pipe)
 ```
 
 ### `Web.Request` & `Web.Response`
@@ -155,7 +159,7 @@ redirect = Response.redirect("https://elixir-lang.org")
 
 # Automatic status and body readers
 if res.ok do
-  {:ok, data} = Response.json(res) # Terminal consumer
+  data = await(Response.json(res))
 end
 
 # Multi-protocol support (HTTP/TCP)

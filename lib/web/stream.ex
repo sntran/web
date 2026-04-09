@@ -16,7 +16,7 @@ defmodule Web.Stream do
   - `write(chunk, ctrl, state)` — **Optional.** Called to process an incoming write.
   - `flush(ctrl, state)` — **Optional.** Called just before the stream closes.
   - `error(reason, state)` — **Optional.** Called when the stream encounters an error.
-  - `terminate(reason, state)` — **Optional.** Called when the stream is aborted or cancelled.
+  - `terminate(event, state)` — **Optional.** Called when the stream terminates.
 
   ## Stream Types
 
@@ -52,8 +52,8 @@ defmodule Web.Stream do
   @doc "Called by the engine to notify the module of a stream error."
   @callback error(reason :: term(), state :: term()) :: {:ok, new_state :: term()}
 
-  @doc "Called by the engine when the stream is aborted or cancelled."
-  @callback terminate(reason :: term(), state :: term()) :: :ok
+  @doc "Called by the engine when the stream terminates."
+  @callback terminate(event :: term(), state :: term()) :: :ok
 
   @optional_callbacks [pull: 2, write: 3, flush: 2, error: 2, terminate: 2]
 
@@ -91,8 +91,6 @@ defmodule Web.Stream do
     reader_ref: nil,
     read_requests: :queue.new(),
     disturbed: false,
-    branches: [],
-    branch_desired_sizes: %{},
     # Consumer (writable) side
     writer_pid: nil,
     writer_ref: nil,
@@ -168,6 +166,13 @@ defmodule Web.Stream do
   end
 
   @impl true
+  @doc "Terminates a stream engine process with a unified terminal event."
+  def terminate(pid, type, reason \\ nil)
+
+  def terminate(pid, type, reason) when is_pid(pid) do
+    :gen_statem.cast(pid, {:terminate, type, reason})
+  end
+
   def terminate(_reason, _state, data) do
     if data.active_task, do: Task.shutdown(data.active_task, :brutal_kill)
     :ok
@@ -367,7 +372,7 @@ defmodule Web.Stream do
          {:call, from},
          {:get_reader, pid},
          _state,
-         %{reader_pid: nil, branches: []} = data
+         %{reader_pid: nil} = data
        )
        when data.type in [:producer, :producer_consumer] do
     ref = Process.monitor(pid)
@@ -519,63 +524,6 @@ defmodule Web.Stream do
     end
   end
 
-  # Tee
-  defp handle_common(
-         {:call, from},
-         :tee,
-         state,
-      %{reader_pid: nil, branches: [], disturbed: false} = data
-       )
-       when data.type == :producer do
-    parent_pid = self()
-
-    create_branch = fn ->
-      child_source = %{
-        pull: fn controller ->
-          child_pid = controller.pid
-          ds = Web.ReadableStreamDefaultController.desired_size(controller)
-          :gen_statem.cast(parent_pid, {:branch_desired_size, child_pid, ds})
-        end,
-        cancel: fn _reason ->
-          :gen_statem.cast(parent_pid, {:branch_cancelled, self()})
-        end
-      }
-
-      Web.ReadableStream.new(child_source)
-    end
-
-    stream_a = create_branch.()
-    stream_b = create_branch.()
-
-    new_branches = [stream_a.controller_pid, stream_b.controller_pid]
-
-    for chunk <- :queue.to_list(data.queue) do
-      Enum.each(new_branches, &:gen_statem.cast(&1, {:enqueue, chunk}))
-    end
-
-    case state do
-      :closed -> Enum.each(new_branches, &:gen_statem.cast(&1, :close))
-      :errored -> Enum.each(new_branches, &:gen_statem.cast(&1, {:error, data.error_reason}))
-      # coveralls-ignore-next-line
-      _ -> :ok
-    end
-
-    new_data = %{
-      data
-      | branches: new_branches,
-        disturbed: true,
-        reader_pid: :teed,
-        queue: :queue.new(),
-        branch_desired_sizes: %{stream_a.controller_pid => 1, stream_b.controller_pid => 1}
-    }
-
-    {:keep_state, new_data, [{:reply, from, {:ok, {stream_a, stream_b}}}]}
-  end
-
-  defp handle_common({:call, from}, :tee, _state, data) when data.type == :producer do
-    {:keep_state_and_data, [{:reply, from, {:error, :already_locked}}]}
-  end
-
   # Query helpers
   defp handle_common({:call, from}, :disturbed?, _state, data) do
     {:keep_state_and_data, [{:reply, from, data.disturbed}]}
@@ -607,7 +555,7 @@ defmodule Web.Stream do
   end
 
   defp handle_common({:call, from}, :get_desired_size, _state, data) do
-    {:keep_state_and_data, [{:reply, from, get_effective_desired_size(data)}]}
+    {:keep_state_and_data, [{:reply, from, data.hwm - :queue.len(data.queue)}]}
   end
 
   defp handle_common({:call, from}, :get_slots, state, data) do
@@ -636,49 +584,24 @@ defmodule Web.Stream do
     end
   end
 
+  defp handle_common(:cast, {:terminate, type, reason}, state, data)
+       when type in [:cancel, :close, :abort, :error] do
+    cond do
+      type == :cancel and state == :closed ->
+        _ = signal_terminate(data, type, reason)
+        :keep_state_and_data
+
+      state in [:closed, :errored] ->
+        :keep_state_and_data
+
+      true ->
+        handle_termination(type, reason, data)
+    end
+  end
+
   # Cancel
   defp handle_common(:cast, {:cancel, reason}, _state, data) do
-    if data.active_task, do: Task.shutdown(data.active_task, :brutal_kill)
-    data = clear_active_operation(data)
-    Enum.each(data.branches, &:gen_statem.cast(&1, {:cancel, reason}))
-    signal_terminate(data, reason)
-
-    new_data = %{
-      data
-      | disturbed: true,
-        queue: :queue.new(),
-        pulling: false,
-        active_task: nil,
-        task_ref: nil,
-        task_timeout_ref: nil,
-        branches: []
-    }
-
-    {:next_state, :closed, new_data, [{:next_event, :internal, :flush_requests}]}
-  end
-
-  # Branch desired size update (for tee)
-  defp handle_common(:cast, {:branch_desired_size, pid, size}, _state, data) do
-    new_sizes = Map.put(data.branch_desired_sizes, pid, size)
-
-    {:keep_state, %{data | branch_desired_sizes: new_sizes},
-     [{:next_event, :internal, :maybe_pull}]}
-  end
-
-  # Branch cancelled (for tee)
-  defp handle_common(:cast, {:branch_cancelled, pid}, _state, data) do
-    new_branches = List.delete(data.branches, pid)
-    new_sizes = Map.delete(data.branch_desired_sizes, pid)
-
-    if new_branches == [] and data.branches != [] do
-      signal_terminate(data, :all_branches_cancelled)
-
-      {:next_state, :closed,
-       %{data | branches: [], branch_desired_sizes: %{}, pulling: false},
-       [{:next_event, :internal, :flush_requests}]}
-    else
-      {:keep_state, %{data | branches: new_branches, branch_desired_sizes: new_sizes}}
-    end
+    handle_termination(:cancel, reason, data)
   end
 
   # Task result (info message: {ref, result})
@@ -753,7 +676,6 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   defp handle_producer_enqueue(chunk, _state, data) do
-    Enum.each(data.branches, &:gen_statem.cast(&1, {:enqueue, chunk}))
     new_data = %{data | queue: :queue.in(chunk, data.queue)}
 
     case :queue.out(new_data.read_requests) do
@@ -769,10 +691,7 @@ defmodule Web.Stream do
   end
 
   defp handle_producer_close(data) do
-    Enum.each(data.branches, &:gen_statem.cast(&1, :close))
-
-    {:next_state, :closed, %{data | pulling: false},
-     [{:next_event, :internal, :flush_requests}]}
+    {:next_state, :closed, %{data | pulling: false}, [{:next_event, :internal, :flush_requests}]}
   end
 
   defp flush_read_requests(data) do
@@ -800,7 +719,7 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   defp handle_maybe_pull(data) do
-    effective_ds = get_effective_desired_size(data)
+    effective_ds = data.hwm - :queue.len(data.queue)
 
     if not data.pulling and effective_ds > 0 do
       do_trigger_pull(data)
@@ -816,7 +735,7 @@ defmodule Web.Stream do
       task =
         start_task(fn ->
           try do
-            module.pull(ctrl, impl_state)
+            module.pull(ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
           rescue
             e -> {:error, e}
           catch
@@ -827,14 +746,6 @@ defmodule Web.Stream do
       {:keep_state, set_active_task(data, task, :pull, pulling: true)}
     else
       :keep_state_and_data
-    end
-  end
-
-  defp get_effective_desired_size(data) do
-    if data.branches == [] do
-      data.hwm - :queue.len(data.queue)
-    else
-      Enum.max(Map.values(data.branch_desired_sizes))
     end
   end
 
@@ -908,7 +819,7 @@ defmodule Web.Stream do
     task =
       start_task(fn ->
         try do
-          module.write(chunk, ctrl, impl_state)
+          module.write(chunk, ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
         rescue
           e -> {:error, e}
         catch
@@ -931,7 +842,7 @@ defmodule Web.Stream do
       start_task(fn ->
         try do
           if function_exported?(module, :flush, 2) do
-            module.flush(ctrl, impl_state)
+            module.flush(ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
           else
             {:ok, impl_state}
           end
@@ -942,8 +853,7 @@ defmodule Web.Stream do
         end
       end)
 
-    {:next_state, :closing,
-     set_active_task(data, task, {:flush, data.pending_close_request})}
+    {:next_state, :closing, set_active_task(data, task, {:flush, data.pending_close_request})}
   end
 
   defp start_abort_task(data, reason) do
@@ -977,7 +887,11 @@ defmodule Web.Stream do
   end
 
   # Producer pull completed
-  defp handle_task_result({:ok, new_impl_state, :pause}, _state, %{active_operation: :pull} = data) do
+  defp handle_task_result(
+         {:ok, new_impl_state, :pause},
+         _state,
+         %{active_operation: :pull} = data
+       ) do
     new_data =
       data
       |> Map.put(:impl_state, new_impl_state)
@@ -1041,6 +955,7 @@ defmodule Web.Stream do
   defp extract_new_state_from_result({:ok, new_state, _}, _old_state) do
     new_state
   end
+
   # coveralls-ignore-stop
   defp extract_new_state_from_result(_, old_state) do
     old_state
@@ -1055,6 +970,7 @@ defmodule Web.Stream do
           data
           |> Map.put(:queued_write_requests, remaining)
           |> start_write_task(request)
+
         {:keep_state, new_data, actions}
 
       state == :closing and data.pending_close_request ->
@@ -1084,8 +1000,6 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   defp fail_stream(reason, data, actions \\ []) do
-    Enum.each(data.branches, &:gen_statem.cast(&1, {:error, reason}))
-
     cond do
       data.active_operation == :abort ->
         :ok
@@ -1112,8 +1026,6 @@ defmodule Web.Stream do
       |> Map.put(:pending_close_request, nil)
       |> Map.put(:ready_requests, :queue.new())
       |> Map.put(:backpressure, false)
-      |> Map.put(:branches, [])
-      |> Map.put(:branch_desired_sizes, %{})
       |> Map.put(:error_reason, reason)
 
     {:next_state, :errored, new_data,
@@ -1153,10 +1065,99 @@ defmodule Web.Stream do
   # Helper utilities
   # ---------------------------------------------------------------------------
 
-  defp signal_terminate(%{module: module, impl_state: impl_state}, reason) do
+  defp handle_termination(type, reason, data) do
+    data
+    |> clear_owner()
+    |> clear_task()
+    |> signal_terminate(type, reason)
+    |> finalize_termination(type, reason)
+  end
+
+  defp finalize_termination(data, type, _reason) when type in [:cancel, :close] do
+    actions =
+      pending_write_closed_actions(data) ++
+        queued_write_closed_actions(data) ++
+        close_ok_actions(data) ++
+        ready_ok_actions(data)
+
+    new_data = %{
+      data
+      | disturbed: type == :cancel or data.disturbed,
+        queue: if(type == :cancel, do: :queue.new(), else: data.queue),
+        pulling: false,
+        pending_write_request: nil,
+        pending_close_request: nil,
+        queued_write_requests: :queue.new(),
+        ready_requests: :queue.new(),
+        backpressure: false,
+        error_reason: nil
+    }
+
+    {:next_state, :closed, new_data, actions ++ [{:next_event, :internal, :flush_requests}]}
+  end
+
+  defp finalize_termination(data, _type, reason) do
+    error_actions =
+      pending_write_error_actions(data, reason) ++
+        queued_write_error_actions(data, reason) ++
+        close_error_actions(data, reason) ++
+        ready_error_actions(data, reason)
+
+    new_data = %{
+      data
+      | pending_write_request: nil,
+        queued_write_requests: :queue.new(),
+        pending_close_request: nil,
+        ready_requests: :queue.new(),
+        backpressure: false,
+        error_reason: reason
+    }
+
+    {:next_state, :errored, new_data,
+     error_actions ++ [{:next_event, :internal, :flush_requests}]}
+  end
+
+  defp signal_terminate(%{module: module, impl_state: impl_state} = data, type, reason) do
     if function_exported?(module, :terminate, 2) do
-      module.terminate(reason, impl_state)
+      module.terminate({type, reason}, impl_state)
     end
+
+    data
+  end
+
+  defp clear_owner(%{reader_ref: reader_ref, writer_ref: writer_ref} = data) do
+    if reader_ref, do: Process.demonitor(reader_ref, [:flush])
+    if writer_ref, do: Process.demonitor(writer_ref, [:flush])
+    %{data | reader_pid: nil, reader_ref: nil, writer_pid: nil, writer_ref: nil}
+  end
+
+  defp clear_task(data) do
+    if data.active_task, do: Task.shutdown(data.active_task, :brutal_kill)
+    data |> clear_active_operation() |> Map.put(:pulling, false)
+  end
+
+  defp pending_write_closed_actions(%{pending_write_request: {from, _pid, _chunk}}) do
+    [{:reply, from, {:error, :closed}}]
+  end
+
+  defp pending_write_closed_actions(_data), do: []
+
+  defp queued_write_closed_actions(data) do
+    data.queued_write_requests
+    |> :queue.to_list()
+    |> Enum.map(fn {from, _pid, _chunk} -> {:reply, from, {:error, :closed}} end)
+  end
+
+  defp close_ok_actions(%{pending_close_request: from}) when not is_nil(from) do
+    [{:reply, from, :ok}]
+  end
+
+  defp close_ok_actions(_data), do: []
+
+  defp ready_ok_actions(data) do
+    data.ready_requests
+    |> :queue.to_list()
+    |> Enum.map(fn from -> {:reply, from, :ok} end)
   end
 
   defp refresh_backpressure(data) do
@@ -1178,11 +1179,7 @@ defmodule Web.Stream do
   end
 
   defp readable_capacity(data) do
-    if map_size(data.branch_desired_sizes) == 0 do
-      data.hwm - :queue.len(data.queue)
-    else
-      Enum.max(Map.values(data.branch_desired_sizes))
-    end
+    data.hwm - :queue.len(data.queue)
   end
 
   defp pending_write_count(data) do
@@ -1238,6 +1235,30 @@ defmodule Web.Stream do
   defp start_task(fun) do
     Task.Supervisor.async_nolink(Web.TaskSupervisor, fun)
   end
+
+  # Resolve a callback result that may be a %Web.Promise{}, awaiting it and
+  # adopting its state. Falls back to `fallback` if the promise resolves to
+  # something unexpected. Non-promise values pass through unchanged.
+  # coveralls-ignore-start
+  defp resolve_if_promise(%Web.Promise{task: task}, fallback) do
+    try do
+      result = Task.await(task, :infinity)
+
+      case result do
+        {:ok, _} -> result
+        {:ok, _, _} -> result
+        {:error, _} -> result
+        _ -> fallback
+      end
+    catch
+      :exit, {:shutdown, reason} -> {:error, reason}
+      :exit, {{:shutdown, reason}, _} -> {:error, reason}
+      :exit, reason -> {:error, reason}
+    end
+  end
+  # coveralls-ignore-stop
+
+  defp resolve_if_promise(result, _fallback), do: result
 
   defp set_active_task(data, task, operation, updates \\ []) do
     timeout_ref = Process.send_after(self(), {:task_timeout, task.ref}, data.timeout_ms)

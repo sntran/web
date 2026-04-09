@@ -19,12 +19,12 @@ defmodule Web.TransformStream do
       ...>   end
       ...> })
       iex> writer = Web.WritableStream.get_writer(ts.writable)
-      iex> Web.WritableStreamDefaultWriter.write(writer, "hello")
+      iex> Web.await(Web.WritableStreamDefaultWriter.write(writer, "hello"))
       :ok
-      iex> Web.WritableStreamDefaultWriter.close(writer)
+      iex> Web.await(Web.WritableStreamDefaultWriter.close(writer))
       :ok
-      iex> Web.ReadableStream.read_all(ts.readable)
-      {:ok, "HELLO"}
+      iex> Enum.join(ts.readable, "")
+      "HELLO"
   """
 
   use Web.Stream
@@ -44,18 +44,24 @@ defmodule Web.TransformStream do
   def write(chunk, _ctrl, %{transformer: transformer, pid: pid} = state) do
     ctrl = %Web.ReadableStreamDefaultController{pid: pid}
 
-    case Map.get(transformer, :transform) do
-      transform when is_function(transform, 3) ->
-        transform.(chunk, ctrl, state)
+    result =
+      case Map.get(transformer, :transform) do
+        transform when is_function(transform, 3) ->
+          transform.(chunk, ctrl, state)
 
-      transform when is_function(transform, 2) ->
-        transform.(chunk, ctrl)
-        {:ok, state}
+        transform when is_function(transform, 2) ->
+          transform.(chunk, ctrl)
+          {:ok, state}
 
-      _ ->
-        # Default passthrough: enqueue chunk as-is
-        Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
-        {:ok, state}
+        _ ->
+          # Default passthrough: enqueue chunk as-is
+          Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
+          {:ok, state}
+      end
+
+    case result do
+      %Web.Promise{task: task} -> Task.await(task, :infinity)
+      other -> other
     end
   end
 
@@ -63,25 +69,40 @@ defmodule Web.TransformStream do
   def flush(_ctrl, %{transformer: transformer, pid: pid} = state) do
     ctrl = %Web.ReadableStreamDefaultController{pid: pid}
 
-    case Map.get(transformer, :flush) do
-      flush_fn when is_function(flush_fn, 2) ->
-        flush_fn.(ctrl, state)
+    result =
+      case Map.get(transformer, :flush) do
+        flush_fn when is_function(flush_fn, 2) ->
+          flush_fn.(ctrl, state)
 
-      flush_fn when is_function(flush_fn, 1) ->
-        flush_fn.(ctrl)
-        {:ok, state}
+        flush_fn when is_function(flush_fn, 1) ->
+          flush_fn.(ctrl)
+          {:ok, state}
 
-      _ ->
-        {:ok, state}
+        _ ->
+          {:ok, state}
+      end
+
+    case result do
+      %Web.Promise{task: task} -> Task.await(task, :infinity)
+      other -> other
     end
   end
 
   @impl Web.Stream
+  def terminate({:cancel, reason}, %{transformer: transformer}) do
+    do_terminate(reason, transformer)
+  end
+
   def terminate(reason, %{transformer: transformer}) do
+    do_terminate(reason, transformer)
+  end
+
+  defp do_terminate(reason, transformer) do
     case Map.get(transformer, :cancel) do
       # coveralls-ignore-start
       cancel when is_function(cancel, 1) ->
         cancel.(reason)
+
       # coveralls-ignore-stop
       _ ->
         :ok

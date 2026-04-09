@@ -72,8 +72,7 @@ task_b =
     IO.puts("[Branch B] Finished.")
   end)
 
-# 5. Wait for both tasks to finish
-Task.await(task_a, 20_000)
-Task.await(task_b, 20_000)
+# 5. Wait for both tasks to finish via Promise.all/1
+_results = await(Promise.all([task_a, task_b]))
 
 IO.puts("--- Demo Completed Successfully ---")

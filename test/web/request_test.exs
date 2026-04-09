@@ -1,6 +1,7 @@
 defmodule Web.RequestTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
+  import Web, only: [await: 1]
 
   alias Web.Request
   alias Web.TypeError
@@ -12,7 +13,7 @@ defmodule Web.RequestTest do
       assert req.method == "GET"
       assert req.headers == Web.Headers.new()
       assert match?(%Web.ReadableStream{}, req.body)
-      assert {:ok, ""} = Web.ReadableStream.read_all(req.body)
+      assert "" == Enum.join(req.body, "")
       assert req.dispatcher == nil
       assert req.redirect == "follow"
       assert req.signal == nil
@@ -36,7 +37,7 @@ defmodule Web.RequestTest do
 
     assert Web.URL.href(req.url) == "http://example.com/"
     assert req.method == "POST"
-    assert {:ok, "data"} = Web.Request.text(req)
+    assert "data" = await(Web.Request.text(req))
 
     assert req.headers ==
              Web.Headers.new(%{
@@ -74,22 +75,21 @@ defmodule Web.RequestTest do
   test "new/2 normalizes enumerable request bodies through ReadableStream.from/1" do
     req = Request.new("http://example.com", body: ["he", "llo"])
 
-    assert {:ok, "hello"} = Web.Request.text(req)
+    assert "hello" = await(Web.Request.text(req))
   end
 
   test "text/json/arrayBuffer consume the request body once" do
     request = Request.new("https://example.com", body: ~s({"hello":"world"}))
 
-    assert {:ok, %{"hello" => "world"}} = Request.json(request)
+    assert %{"hello" => "world"} = await(Request.json(request))
 
-    assert_raise TypeError, "body already used", fn ->
-      Request.text(request)
-    end
+    assert %TypeError{message: "body already used"} =
+             catch_exit(await(Request.text(request)))
   end
 
   test "arrayBuffer/1 returns Web.ArrayBuffer" do
     req = Request.new("https://example.com", body: "hello")
-    assert {:ok, %Web.ArrayBuffer{data: "hello", byte_length: 5}} = Request.arrayBuffer(req)
+    assert %Web.ArrayBuffer{data: "hello", byte_length: 5} = await(Request.arrayBuffer(req))
   end
 
   test "bytes/1 and blob/1 return expected Web types" do
@@ -99,7 +99,7 @@ defmodule Web.RequestTest do
         headers: [{"content-type", "text/plain"}]
       )
 
-    assert {:ok, %Web.Uint8Array{} = bytes} = Request.bytes(req)
+    assert %Web.Uint8Array{} = bytes = await(Request.bytes(req))
     assert Web.Uint8Array.to_binary(bytes) == "hello"
 
     req =
@@ -108,7 +108,7 @@ defmodule Web.RequestTest do
         headers: [{"content-type", "text/plain"}]
       )
 
-    assert {:ok, %Web.Blob{size: 5, type: "text/plain"}} = Request.blob(req)
+    assert %Web.Blob{size: 5, type: "text/plain"} = await(Request.blob(req))
   end
 
   test "new/2 infers content-type for URLSearchParams bodies" do
@@ -118,7 +118,7 @@ defmodule Web.RequestTest do
     assert Web.Headers.get(req.headers, "content-type") ==
              "application/x-www-form-urlencoded;charset=UTF-8"
 
-    assert {:ok, "hello=world"} = Request.text(req)
+    assert "hello=world" = await(Request.text(req))
   end
 
   test "new/2 does not overwrite an explicit content-type header" do

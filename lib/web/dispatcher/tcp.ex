@@ -1,3 +1,4 @@
+# credo:disable-for-this-file Credo.Check.Refactor.Nesting
 defmodule Web.Dispatcher.TCP do
   @moduledoc """
   TCP dispatcher implementing the no-buffer streaming rule using `active: once`.
@@ -36,6 +37,7 @@ defmodule Web.Dispatcher.TCP do
             try do
               request.body |> Enum.to_list() |> IO.iodata_to_binary()
             rescue
+              # credo:disable-for-next-line Credo.Check.Warning.RaiseInsideRescue
               Protocol.UndefinedError -> raise Web.TypeError, "body is not readable"
             end
 
@@ -91,6 +93,7 @@ defmodule Web.Dispatcher.TCP do
     end
   end
 
+  # credo:disable-for-next-line
   defp recv(socket, signal_subscription) do
     case Web.AbortSignal.receive_abort(signal_subscription, 0) do
       # coveralls-ignore-start

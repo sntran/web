@@ -105,8 +105,8 @@ defmodule Web.Promise do
     end
   end
 
-  @spec allSettled(Enumerable.t()) :: t()
-  def allSettled(enumerable) do
+  @spec all_settled(Enumerable.t()) :: t()
+  def all_settled(enumerable) do
     tasks =
       enumerable
       |> Enum.map(&__MODULE__.resolve/1)
@@ -131,41 +131,49 @@ defmodule Web.Promise do
   @spec any(Enumerable.t()) :: t()
   def any(enumerable) do
     new(fn resolve, reject ->
-      tasks =
-        enumerable
-        |> Enum.map(&__MODULE__.resolve/1)
-        |> Enum.map(fn %__MODULE__{task: task} -> task end)
-
-      if Enum.empty?(tasks) do
-        reject.(%Web.Promise.AggregateError{errors: []})
-      else
-        case do_any(tasks, []) do
-          {:ok, value} -> resolve.(value)
-          {:error, errors} -> reject.(%Web.Promise.AggregateError{errors: errors})
-        end
-      end
+      enumerable
+      |> promise_tasks()
+      |> settle_any(resolve, reject)
     end)
   end
 
   @spec race(Enumerable.t()) :: t()
   def race(enumerable) do
     new(fn resolve, reject ->
-      tasks =
-        enumerable
-        |> Enum.map(&__MODULE__.resolve/1)
-        |> Enum.map(fn %__MODULE__{task: task} -> task end)
-
-      if Enum.empty?(tasks) do
-        # JS Promise.race([]) hangs forever in a pending state
-        # coveralls-ignore-next-line
-        Process.sleep(:infinity)
-      else
-        case do_race(tasks) do
-          {:ok, value} -> resolve.(value)
-          {:error, reason} -> reject.(reason)
-        end
-      end
+      enumerable
+      |> promise_tasks()
+      |> settle_race(resolve, reject)
     end)
+  end
+
+  defp promise_tasks(enumerable) do
+    enumerable
+    |> Enum.map(&__MODULE__.resolve/1)
+    |> Enum.map(fn %__MODULE__{task: task} -> task end)
+  end
+
+  defp settle_any([], _resolve, reject) do
+    reject.(%Web.Promise.AggregateError{errors: []})
+  end
+
+  defp settle_any(tasks, resolve, reject) do
+    case do_any(tasks, []) do
+      {:ok, value} -> resolve.(value)
+      {:error, errors} -> reject.(%Web.Promise.AggregateError{errors: errors})
+    end
+  end
+
+  defp settle_race([], _resolve, _reject) do
+    # JS Promise.race([]) hangs forever in a pending state
+    # coveralls-ignore-next-line
+    Process.sleep(:infinity)
+  end
+
+  defp settle_race(tasks, resolve, reject) do
+    case do_race(tasks) do
+      {:ok, value} -> resolve.(value)
+      {:error, reason} -> reject.(reason)
+    end
   end
 
   defp run_executor(executor) do
@@ -283,12 +291,10 @@ defimpl Inspect, for: Web.Promise do
   import Inspect.Algebra
 
   def inspect(%Web.Promise{task: task}, opts) do
-    cond do
-      is_pid(task.pid) and Process.alive?(task.pid) ->
-        "#Web.Promise<pending>"
-
-      true ->
-        inspect_completed_from_mailbox(task, opts)
+    if is_pid(task.pid) and Process.alive?(task.pid) do
+      "#Web.Promise<pending>"
+    else
+      inspect_completed_from_mailbox(task, opts)
     end
   end
 

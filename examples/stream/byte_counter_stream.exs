@@ -95,23 +95,28 @@ defmodule StreamByteCounterDemo do
     IO.puts("Fetching: #{url}")
 
     try do
-      %Response{body: body_stream} = await fetch(url)
+      %Response{body: body_stream} = await(fetch(url))
       [left, right] = ReadableStream.tee(body_stream)
 
       custom_counter = ByteCounterStream.new(notify: self())
+      {:ok, transform_counter_pid} = Agent.start_link(fn -> 0 end)
 
       transform_counter =
         TransformStream.new(%{
-          transform: fn chunk, controller, state ->
+          transform: fn chunk, controller ->
             binary = IO.iodata_to_binary(chunk)
             ReadableStreamDefaultController.enqueue(controller, binary)
-            total = Map.get(state, :total_bytes, 0) + byte_size(binary)
-            {:ok, Map.put(state, :total_bytes, total)}
+
+            Agent.update(transform_counter_pid, fn total ->
+              total + byte_size(binary)
+            end)
+
+            :ok
           end,
-          flush: fn controller, state ->
+          flush: fn controller ->
             ReadableStreamDefaultController.close(controller)
-            send(parent, {:transform_counter_total, Map.get(state, :total_bytes, 0)})
-            {:ok, state}
+            send(parent, {:transform_counter_total, Agent.get(transform_counter_pid, & &1)})
+            :ok
           end
         })
 
@@ -135,6 +140,8 @@ defmodule StreamByteCounterDemo do
       IO.puts("Custom bytes:    #{custom_total}")
       IO.puts("Transform bytes: #{transform_total}")
       IO.puts("Totals match?:   #{custom_total == transform_total}")
+
+      Agent.stop(transform_counter_pid)
     rescue
       e ->
         IO.puts("Failed to fetch #{url}: #{Exception.message(e)}")

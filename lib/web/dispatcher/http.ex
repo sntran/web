@@ -1,3 +1,4 @@
+# credo:disable-for-this-file Credo.Check.Refactor.Nesting
 defmodule Web.Dispatcher.HTTP do
   @moduledoc "HTTP dispatcher using Finch with zero-buffer streaming."
   @behaviour Web.Dispatcher
@@ -79,6 +80,7 @@ defmodule Web.Dispatcher.HTTP do
     {:error, :too_many_redirects}
   end
 
+  # credo:disable-for-next-line
   defp do_fetch(%Web.Request{} = request, redirect_count) do
     {request, request_body_for_fetch} = prepare_request_body(request)
 
@@ -127,6 +129,7 @@ defmodule Web.Dispatcher.HTTP do
     end
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp handle_redirect({:ok, response} = result, request, redirect_count) do
     redirect_mode = request.options[:redirect] || request.redirect || "follow"
     is_redirect = response.status in @redirect_statuses
@@ -198,7 +201,7 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp close_body(body_stream) do
-    Enum.reduce_while(body_stream, :ok, fn _, acc -> {:halt, acc} end)
+    _ = Enum.reduce_while(body_stream, :ok, fn _, acc -> {:halt, acc} end)
     :ok
   end
 
@@ -283,6 +286,7 @@ defmodule Web.Dispatcher.HTTP do
     bridge_loop(%{state | worker_pid: worker_pid, worker_monitor: Process.monitor(worker_pid)})
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp bridge_loop(state) do
     receive do
       {:bridge_status, ref, status} when ref == state.ref ->

@@ -81,7 +81,7 @@ defmodule Web.HeadersTest do
 
       assert Headers.get(headers, "set-cookie") == "a=1, b=2"
       assert Headers.get_set_cookie(headers) == ["a=1", "b=2"]
-      assert apply(Headers, :getSetCookie, [headers]) == ["a=1", "b=2"]
+      assert Headers.getSetCookie(headers) == ["a=1", "b=2"]
     end
 
     test "missing headers return nil by default" do

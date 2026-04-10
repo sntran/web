@@ -303,29 +303,23 @@ defmodule Web.Stream do
   def closing(type, content, data) do
     with :not_handled <- maybe_handle_producer_side(type, content, :closing, data),
          :not_handled <- handle_common(type, content, :closing, data) do
-      case {type, content} do
-        {{:call, from}, {:write, pid, _chunk}} ->
-          if pid == data.writer_pid do
-            {:keep_state_and_data, [{:reply, from, {:error, :closing}}]}
-          else
-            {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
-          end
-
-        {{:call, from}, {:close, pid}} ->
-          if pid == data.writer_pid do
-            {:keep_state_and_data, [{:reply, from, {:error, :closing}}]}
-          else
-            {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
-          end
-
-        {{:call, from}, {:abort, pid, reason}} ->
-          handle_abort(from, pid, reason, data)
-
-        _ ->
-          :keep_state_and_data
-      end
+      handle_closing_event(type, content, data)
     end
   end
+
+  defp handle_closing_event({:call, from}, {:write, pid, _chunk}, data) do
+    reply_to_writer(from, pid, data.writer_pid, {:error, :closing})
+  end
+
+  defp handle_closing_event({:call, from}, {:close, pid}, data) do
+    reply_to_writer(from, pid, data.writer_pid, {:error, :closing})
+  end
+
+  defp handle_closing_event({:call, from}, {:abort, pid, reason}, data) do
+    handle_abort(from, pid, reason, data)
+  end
+
+  defp handle_closing_event(_type, _content, _data), do: :keep_state_and_data
 
   # ---------------------------------------------------------------------------
   # State: closed
@@ -333,39 +327,7 @@ defmodule Web.Stream do
 
   def closed(type, content, data) do
     with :not_handled <- handle_common(type, content, :closed, data) do
-      case {type, content} do
-        {:cast, {:enqueue, _chunk}} ->
-          :keep_state_and_data
-
-        {:internal, :flush_requests} ->
-          flush_read_requests(data)
-
-        {{:call, from}, {:write, pid, _chunk}} ->
-          if pid == data.writer_pid do
-            {:keep_state_and_data, [{:reply, from, {:error, :closed}}]}
-          else
-            {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
-          end
-
-        {{:call, from}, {:close, pid}} ->
-          if pid == data.writer_pid do
-            {:keep_state_and_data, [{:reply, from, :ok}]}
-          else
-            {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
-          end
-
-        {{:call, from}, {:abort, pid, _reason}} ->
-          if pid == data.writer_pid do
-            {:keep_state_and_data, [{:reply, from, :ok}]}
-          else
-            {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
-          end
-
-        # coveralls-ignore-start
-        _ ->
-          {:keep_state_and_data, [:postpone]}
-          # coveralls-ignore-stop
-      end
+      handle_closed_event(type, content, data)
     end
   end
 
@@ -440,55 +402,7 @@ defmodule Web.Stream do
   # Read a chunk
   defp handle_common({:call, from}, {:read, pid}, state, data)
        when data.type in [:producer, :producer_consumer] do
-    if pid != data.reader_pid do
-      {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
-    else
-      data = %{data | disturbed: true}
-
-      case state do
-        :errored ->
-          {:keep_state, data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
-
-        _ ->
-          if not :queue.is_empty(data.queue) do
-            {{:value, chunk}, new_queue} = :queue.out(data.queue)
-
-            new_data = %{
-              data
-              | queue: new_queue,
-                total_queued_size: data.total_queued_size - queue_chunk_size(data, chunk)
-            }
-
-            actions = [{:reply, from, {:ok, chunk}}]
-
-            {new_data, actions} =
-              if data.type == :producer_consumer do
-                new_data = refresh_backpressure(new_data)
-                {new_data, ready_actions} = maybe_resolve_ready_waiters(new_data)
-                {new_data, enqueue_actions} = maybe_resolve_enqueue_waiters(new_data)
-                {new_data, actions ++ ready_actions ++ enqueue_actions}
-              else
-                {new_data, actions}
-              end
-
-            actions =
-              if :queue.len(new_queue) < data.hwm,
-                do: [{:next_event, :internal, :maybe_pull} | actions],
-                else: actions
-
-            {:keep_state, new_data, actions}
-          else
-            if state == :closed do
-              {:keep_state, data, [{:reply, from, :done}]}
-            else
-              new_requests = :queue.in(from, data.read_requests)
-
-              {:keep_state, %{data | read_requests: new_requests},
-               [{:next_event, :internal, :maybe_pull}]}
-            end
-          end
-      end
-    end
+    handle_read_request(from, pid, state, data)
   end
 
   # Release force-error for release_lock
@@ -763,6 +677,93 @@ defmodule Web.Stream do
   end
 
   defp handle_common(_type, _content, _state, _data), do: :not_handled
+
+  defp handle_closed_event(:cast, {:enqueue, _chunk}, _data), do: :keep_state_and_data
+  defp handle_closed_event(:internal, :flush_requests, data), do: flush_read_requests(data)
+
+  defp handle_closed_event({:call, from}, {:write, pid, _chunk}, data) do
+    reply_to_writer(from, pid, data.writer_pid, {:error, :closed})
+  end
+
+  defp handle_closed_event({:call, from}, {:close, pid}, data) do
+    reply_to_writer(from, pid, data.writer_pid, :ok)
+  end
+
+  defp handle_closed_event({:call, from}, {:abort, pid, _reason}, data) do
+    reply_to_writer(from, pid, data.writer_pid, :ok)
+  end
+
+  # coveralls-ignore-start
+  defp handle_closed_event(_type, _content, _data), do: {:keep_state_and_data, [:postpone]}
+  # coveralls-ignore-stop
+
+  defp reply_to_writer(from, pid, writer_pid, success_reply) when pid == writer_pid do
+    {:keep_state_and_data, [{:reply, from, success_reply}]}
+  end
+
+  defp reply_to_writer(from, _pid, _writer_pid, _success_reply) do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
+  end
+
+  defp handle_read_request(from, pid, _state, data) when pid != data.reader_pid do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
+  end
+
+  defp handle_read_request(from, _pid, :errored, data) do
+    disturbed_data = %{data | disturbed: true}
+    {:keep_state, disturbed_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
+  end
+
+  defp handle_read_request(from, _pid, state, data) do
+    data = %{data | disturbed: true}
+
+    if :queue.is_empty(data.queue) do
+      queue_or_complete_read(from, state, data)
+    else
+      pop_queued_chunk(from, data)
+    end
+  end
+
+  defp queue_or_complete_read(from, :closed, data) do
+    {:keep_state, data, [{:reply, from, :done}]}
+  end
+
+  defp queue_or_complete_read(from, _state, data) do
+    new_requests = :queue.in(from, data.read_requests)
+
+    {:keep_state, %{data | read_requests: new_requests}, [{:next_event, :internal, :maybe_pull}]}
+  end
+
+  defp pop_queued_chunk(from, data) do
+    {{:value, chunk}, new_queue} = :queue.out(data.queue)
+
+    new_data = %{
+      data
+      | queue: new_queue,
+        total_queued_size: data.total_queued_size - queue_chunk_size(data, chunk)
+    }
+
+    actions = [{:reply, from, {:ok, chunk}}]
+    {new_data, actions} = maybe_refresh_read_actions(new_data, actions)
+    {:keep_state, new_data, maybe_request_pull(new_queue, data.hwm, actions)}
+  end
+
+  defp maybe_refresh_read_actions(%{type: :producer_consumer} = data, actions) do
+    data = refresh_backpressure(data)
+    {data, ready_actions} = maybe_resolve_ready_waiters(data)
+    {data, enqueue_actions} = maybe_resolve_enqueue_waiters(data)
+    {data, actions ++ ready_actions ++ enqueue_actions}
+  end
+
+  defp maybe_refresh_read_actions(data, actions), do: {data, actions}
+
+  defp maybe_request_pull(new_queue, hwm, actions) do
+    if :queue.len(new_queue) < hwm do
+      [{:next_event, :internal, :maybe_pull} | actions]
+    else
+      actions
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Producer-side helpers (for producer_consumer, used in non-readable states)
@@ -1403,7 +1404,7 @@ defmodule Web.Stream do
     strategy_size(strategy, chunk)
   end
 
-  defp strategy_size(%{__struct__: strategy}, chunk), do: apply(strategy, :size, [chunk])
+  defp strategy_size(%{__struct__: strategy}, chunk), do: strategy.size(chunk)
 
   defp strategy_high_water_mark(%{strategy: %{high_water_mark: hwm}}), do: hwm
 
@@ -1428,20 +1429,18 @@ defmodule Web.Stream do
   # something unexpected. Non-promise values pass through unchanged.
   # coveralls-ignore-start
   defp resolve_if_promise(%Web.Promise{task: task}, fallback) do
-    try do
-      result = Task.await(task, :infinity)
+    result = Task.await(task, :infinity)
 
-      case result do
-        {:ok, _} -> result
-        {:ok, _, _} -> result
-        {:error, _} -> result
-        _ -> fallback
-      end
-    catch
-      :exit, {:shutdown, reason} -> {:error, reason}
-      :exit, {{:shutdown, reason}, _} -> {:error, reason}
-      :exit, reason -> {:error, reason}
+    case result do
+      {:ok, _} -> result
+      {:ok, _, _} -> result
+      {:error, _} -> result
+      _ -> fallback
     end
+  catch
+    :exit, {:shutdown, reason} -> {:error, reason}
+    :exit, {{:shutdown, reason}, _} -> {:error, reason}
+    :exit, reason -> {:error, reason}
   end
 
   # coveralls-ignore-stop

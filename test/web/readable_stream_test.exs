@@ -371,8 +371,7 @@ defmodule Web.ReadableStreamTest do
 
       send(ok_pid, {:internal, :maybe_pull})
       assert_receive :pull_completed
-      Process.sleep(50)
-      assert ReadableStream.__get_slots__(ok_pid).state == :readable
+      wait_for_stream_state(ok_pid, :readable)
 
       {:ok, error_pid} =
         ReadableStream.start_link(
@@ -384,8 +383,7 @@ defmodule Web.ReadableStreamTest do
         )
 
       send(error_pid, {:internal, :maybe_pull})
-      Process.sleep(50)
-      assert ReadableStream.__get_slots__(error_pid).state == :errored
+      wait_for_stream_state(error_pid, :errored)
     end
 
     test "start callbacks that throw transition the stream to errored" do
@@ -784,7 +782,9 @@ defmodule Web.ReadableStreamTest do
           started_at = System.monotonic_time(:millisecond)
 
           fast_task = Task.async(fn -> Enum.to_list(fast_branch) end)
-          slow_task = Task.async(fn -> Enum.each(slow_branch, fn _ -> Process.sleep(delay_ms) end) end)
+
+          slow_task =
+            Task.async(fn -> Enum.each(slow_branch, fn _ -> Process.sleep(delay_ms) end) end)
 
           assert {:ok, ^expected} = Task.yield(fast_task, 10_000)
           fast_elapsed_ms = System.monotonic_time(:millisecond) - started_at
@@ -915,16 +915,32 @@ defmodule Web.ReadableStreamTest do
     # --- desired_size/1 (ReadableStreamDefaultController line 61) ---
 
     test "desired_size/1 returns positive size for new controller" do
-      pid = ReadableStream.new(%{
-        start: fn controller ->
-          size = Web.ReadableStreamDefaultController.desired_size(controller)
-          assert is_integer(size)
-          Web.ReadableStreamDefaultController.close(controller)
-        end
-      }).controller_pid
+      pid =
+        ReadableStream.new(%{
+          start: fn controller ->
+            size = Web.ReadableStreamDefaultController.desired_size(controller)
+            assert is_integer(size)
+            Web.ReadableStreamDefaultController.close(controller)
+          end
+        }).controller_pid
 
       Process.sleep(50)
       assert ReadableStream.__get_slots__(pid).state == :closed
     end
+  end
+
+  defp wait_for_stream_state(pid, expected_state, attempts \\ 20)
+
+  defp wait_for_stream_state(pid, expected_state, attempts) when attempts > 0 do
+    if ReadableStream.__get_slots__(pid).state == expected_state do
+      :ok
+    else
+      Process.sleep(25)
+      wait_for_stream_state(pid, expected_state, attempts - 1)
+    end
+  end
+
+  defp wait_for_stream_state(pid, expected_state, 0) do
+    assert ReadableStream.__get_slots__(pid).state == expected_state
   end
 end

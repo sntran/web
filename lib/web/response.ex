@@ -72,7 +72,7 @@ defmodule Web.Response do
     }
   end
 
-  def new(), do: new([])
+  def new, do: new([])
 
   @doc """
   Constructs a new Response using a body and init options.

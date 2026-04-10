@@ -139,9 +139,9 @@ defmodule Web.BodyTest do
     assert "iolist" = await(Response.text(response))
   end
 
-  test "Response.arrayBuffer/1 handles nil body through consume_body" do
+  test "Response.array_buffer/1 handles nil body through consume_body" do
     response = %Response{Response.new() | body: nil}
-    assert %Web.ArrayBuffer{data: "", byte_length: 0} = await(Response.arrayBuffer(response))
+    assert %Web.ArrayBuffer{data: "", byte_length: 0} = await(Response.array_buffer(response))
   end
 
   test "Response.bytes/1 handles iolist bodies through consume_body" do
@@ -150,22 +150,22 @@ defmodule Web.BodyTest do
     assert Web.Uint8Array.to_binary(bytes) == "hello"
   end
 
-  test "Response.arrayBuffer/1 rejects when body stream is already locked" do
+  test "Response.array_buffer/1 rejects when body stream is already locked" do
     stream = ReadableStream.from("hello")
     _reader = ReadableStream.get_reader(stream)
     response = Response.new(body: stream)
 
     assert %Web.TypeError{message: "ReadableStream is already locked"} =
-             catch_exit(await(Response.arrayBuffer(response)))
+             catch_exit(await(Response.array_buffer(response)))
   end
 
-  test "Response.arrayBuffer/1 rejects when stream errors during binary read" do
+  test "Response.array_buffer/1 rejects when stream errors during binary read" do
     {:ok, pid} = ReadableStream.start_link()
     stream = %ReadableStream{controller_pid: pid}
     ReadableStream.error(pid, :stream_fail)
     response = Response.new(body: stream)
 
-    assert {:errored, :stream_fail} = catch_exit(await(Response.arrayBuffer(response)))
+    assert {:errored, :stream_fail} = catch_exit(await(Response.array_buffer(response)))
   end
 
   test "Response.text/1 replaces invalid direct UTF-8 body bytes" do
@@ -229,7 +229,7 @@ defmodule Web.BodyTest do
     assert %{"ok" => true} = await(BodyHarness.json(%BodyHarness{body: ~s({"ok":true})}))
 
     assert %Web.ArrayBuffer{data: "hello", byte_length: 5} =
-             await(BodyHarness.arrayBuffer(%BodyHarness{body: "hello"}))
+             await(BodyHarness.array_buffer(%BodyHarness{body: "hello"}))
 
     assert %Web.Uint8Array{} = bytes = await(BodyHarness.bytes(%BodyHarness{body: "hello"}))
     assert Web.Uint8Array.to_binary(bytes) == "hello"

@@ -6,7 +6,7 @@ defmodule Web.Body do
 
   - `text/1` reads the body as a binary.
   - `json/1` reads the body as text and decodes it with `Jason`.
-  - `arrayBuffer/1` reads the body as `%Web.ArrayBuffer{}`.
+  - `array_buffer/1` reads the body as `%Web.ArrayBuffer{}`.
   - `bytes/1` reads the body as `%Web.Uint8Array{}`.
   - `blob/1` reads the body as `%Web.Blob{}`.
   - `clone/1` tees the body stream and returns updated original plus clone.
@@ -32,10 +32,10 @@ defmodule Web.Body do
       %{"ok" => true}
 
       iex> response = Web.Response.new(body: "hello")
-      iex> %Web.ArrayBuffer{byte_length: 5} = Web.await(Web.Response.arrayBuffer(response))
+      iex> %Web.ArrayBuffer{byte_length: 5} = Web.await(Web.Response.array_buffer(response))
 
       iex> request = Web.Request.new("https://example.com", body: "payload")
-      iex> array_buffer = Web.await(Web.Request.arrayBuffer(request))
+      iex> array_buffer = Web.await(Web.Request.array_buffer(request))
       iex> {array_buffer.byte_length, array_buffer.data}
       {7, "payload"}
 
@@ -49,7 +49,7 @@ defmodule Web.Body do
 
   @callback text(struct()) :: Web.Promise.t()
   @callback json(struct()) :: Web.Promise.t()
-  @callback arrayBuffer(struct()) :: Web.Promise.t()
+  @callback array_buffer(struct()) :: Web.Promise.t()
   @callback bytes(struct()) :: Web.Promise.t()
   @callback blob(struct()) :: Web.Promise.t()
   @callback clone(struct()) :: {struct(), struct()}
@@ -78,8 +78,8 @@ defmodule Web.Body do
       Reads the body to completion and resolves with a `Web.ArrayBuffer`.
       """
       @impl Web.Body
-      def arrayBuffer(%{body: _} = struct) do
-        Web.Body.arrayBuffer(struct)
+      def array_buffer(%{body: _} = struct) do
+        Web.Body.array_buffer(struct)
       end
 
       @doc """
@@ -133,7 +133,7 @@ defmodule Web.Body do
   end
 
   @doc false
-  def arrayBuffer(%{body: body}) do
+  def array_buffer(%{body: body}) do
     consume_body(body, &Web.ArrayBuffer.new/1)
   end
 
@@ -166,17 +166,17 @@ defmodule Web.Body do
 
       case read_body_to_binary(body) do
         {:ok, binary} ->
-          case mapper.(binary) do
-            {:ok, value} -> resolve.(value)
-            {:error, reason} -> reject.(reason)
-            value -> resolve.(value)
-          end
+          handle_consumed_body(mapper.(binary), resolve, reject)
 
         {:error, reason} ->
           reject.(reason)
       end
     end)
   end
+
+  defp handle_consumed_body({:ok, value}, resolve, _reject), do: resolve.(value)
+  defp handle_consumed_body({:error, reason}, _resolve, reject), do: reject.(reason)
+  defp handle_consumed_body(value, resolve, _reject), do: resolve.(value)
 
   defp read_body_to_binary(nil), do: {:ok, ""}
   defp read_body_to_binary(body) when is_binary(body), do: {:ok, body}

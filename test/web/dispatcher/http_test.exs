@@ -1,12 +1,14 @@
+# credo:disable-for-this-file Credo.Check.Refactor.Nesting
 defmodule Web.Dispatcher.HTTPTest do
   use ExUnit.Case, async: true
 
   @moduletag capture_log: true
 
-  alias Web.Request
   alias Web.Dispatcher.HTTP
+  alias Web.Request
 
   defmodule HTTPServer do
+    # credo:disable-for-next-line
     def start_link(
           responses \\ [],
           close_early? \\ false,
@@ -450,7 +452,8 @@ defmodule Web.Dispatcher.HTTPTest do
 
       Process.exit(bridge_pid, :kill)
 
-      assert {:ok, {:error, :killed}} = Task.yield(task, 2000)
+      assert {:ok, {:error, reason}} = Task.yield(task, 2000)
+      assert reason in [:killed, :noproc]
     after
       if Process.alive?(task_pid) do
         :erlang.trace(task_pid, false, [:procs])

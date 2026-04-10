@@ -4,12 +4,12 @@ defmodule Web.CompressionPBTTest do
 
   import Web, only: [await: 1]
 
+  alias Web.ArrayBuffer
   alias Web.CompressionStream
   alias Web.DecompressionStream
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController
   alias Web.Uint8Array
-  alias Web.ArrayBuffer
   alias Web.WritableStream
   alias Web.WritableStreamDefaultWriter
 

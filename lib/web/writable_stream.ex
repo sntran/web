@@ -232,14 +232,12 @@ defmodule Web.WritableStream do
   end
 
   defp invoke_abort(%{abort: abort}, reason) when is_function(abort, 1) do
-    try do
-      abort.(reason)
-      :ok
-    rescue
-      _error -> :ok
-    catch
-      _kind, _abort_reason -> :ok
-    end
+    abort.(reason)
+    :ok
+  rescue
+    _error -> :ok
+  catch
+    _kind, _abort_reason -> :ok
   end
 
   defp invoke_abort(_sink, _reason), do: :ok

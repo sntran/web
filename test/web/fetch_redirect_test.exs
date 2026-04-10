@@ -39,52 +39,7 @@ defmodule Web.FetchRedirectTest do
     defp handle_requests(socket, port, parent) do
       case read_request(socket) do
         {:ok, {method, path, body}} ->
-          case path do
-            "/redir-301" ->
-              send_response(socket, 301, %{"location" => url(port, "/success")}, "")
-
-            "/redir-303" ->
-              send_response(socket, 303, %{"location" => url(port, "/see-other-target")}, "")
-
-            "/redir-relative" ->
-              send_response(socket, 307, %{"location" => "/keep-method"}, "")
-
-            "/redir-308" ->
-              send_response(socket, 308, %{"location" => "/stream-target"}, "")
-
-            "/redir-no-location" ->
-              send_response(socket, 301, %{}, "")
-
-            "/loop" ->
-              send_response(socket, 302, %{"location" => url(port, "/loop")}, "")
-
-            "/success" ->
-              send_response(socket, 200, %{}, "success")
-
-            "/see-other-target" ->
-              send_response(socket, 200, %{}, "#{method}:#{body}")
-
-            "/keep-method" ->
-              send_response(socket, 200, %{}, "#{method}:#{body}")
-
-            "/stream-target" ->
-              send(parent, {:stream_target_body, body})
-              send_response(socket, 200, %{}, "#{method}:#{body}")
-
-            "/redirect-stream" ->
-              send_response(socket, 301, %{"location" => url(port, "/success")}, "chunk")
-
-              Task.start(fn ->
-                case :gen_tcp.recv(socket, 0, 2000) do
-                  {:error, :closed} -> send(parent, :redirect_body_closed)
-                  _ -> :ok
-                end
-              end)
-
-            _ ->
-              send_response(socket, 404, %{}, "missing")
-          end
-
+          handle_request_path(socket, port, parent, method, path, body)
           handle_requests(socket, port, parent)
 
         :closed ->
@@ -92,38 +47,122 @@ defmodule Web.FetchRedirectTest do
       end
     end
 
+    defp handle_request_path(socket, port, _parent, _method, "/redir-301", _body) do
+      send_redirect(socket, 301, url(port, "/success"))
+    end
+
+    defp handle_request_path(socket, port, _parent, _method, "/redir-303", _body) do
+      send_redirect(socket, 303, url(port, "/see-other-target"))
+    end
+
+    defp handle_request_path(socket, _port, _parent, _method, "/redir-relative", _body) do
+      send_redirect(socket, 307, "/keep-method")
+    end
+
+    defp handle_request_path(socket, _port, _parent, _method, "/redir-308", _body) do
+      send_redirect(socket, 308, "/stream-target")
+    end
+
+    defp handle_request_path(socket, _port, _parent, _method, "/redir-no-location", _body) do
+      send_response(socket, 301, %{}, "")
+    end
+
+    defp handle_request_path(socket, port, _parent, _method, "/loop", _body) do
+      send_redirect(socket, 302, url(port, "/loop"))
+    end
+
+    defp handle_request_path(socket, _port, _parent, _method, "/success", _body) do
+      send_response(socket, 200, %{}, "success")
+    end
+
+    defp handle_request_path(socket, _port, _parent, method, "/see-other-target", body) do
+      send_echo_response(socket, method, body)
+    end
+
+    defp handle_request_path(socket, _port, _parent, method, "/keep-method", body) do
+      send_echo_response(socket, method, body)
+    end
+
+    defp handle_request_path(socket, _port, parent, method, "/stream-target", body) do
+      send(parent, {:stream_target_body, body})
+      send_echo_response(socket, method, body)
+    end
+
+    defp handle_request_path(socket, port, parent, _method, "/redirect-stream", _body) do
+      send_response(socket, 301, %{"location" => url(port, "/success")}, "chunk")
+      watch_for_redirect_body_close(socket, parent)
+    end
+
+    defp handle_request_path(socket, _port, _parent, _method, _path, _body) do
+      send_response(socket, 404, %{}, "missing")
+    end
+
+    defp send_redirect(socket, status, location) do
+      send_response(socket, status, %{"location" => location}, "")
+    end
+
+    defp send_echo_response(socket, method, body) do
+      send_response(socket, 200, %{}, "#{method}:#{body}")
+    end
+
+    defp watch_for_redirect_body_close(socket, parent) do
+      Task.start(fn ->
+        case :gen_tcp.recv(socket, 0, 2000) do
+          {:error, :closed} -> send(parent, :redirect_body_closed)
+          _ -> :ok
+        end
+      end)
+    end
+
     defp read_request(socket, data \\ "") do
       case String.split(data, "\r\n\r\n", parts: 2) do
         [headers, rest] ->
-          [request_line | header_lines] = String.split(headers, "\r\n", trim: true)
-          [method, path, _version] = String.split(request_line, " ", parts: 3)
-
-          content_length =
-            header_lines
-            |> parse_headers()
-            |> Map.get("content-length", "0")
-            |> String.to_integer()
-
-          cond do
-            byte_size(rest) >= content_length ->
-              {:ok, {method, path, binary_part(rest, 0, content_length)}}
-
-            content_length == 0 ->
-              {:ok, {method, path, ""}}
-
-            true ->
-              case :gen_tcp.recv(socket, 0, 5000) do
-                {:ok, chunk} -> read_request(socket, data <> chunk)
-                {:error, :timeout} -> {:ok, {method, path, rest}}
-                {:error, :closed} -> :closed
-              end
-          end
+          handle_complete_request(socket, data, headers, rest)
 
         [_incomplete] ->
-          case :gen_tcp.recv(socket, 0, 5000) do
-            {:ok, chunk} -> read_request(socket, data <> chunk)
-            {:error, :closed} -> :closed
-          end
+          recv_request_chunk(socket, data)
+      end
+    end
+
+    defp handle_complete_request(socket, data, headers, rest) do
+      {method, path, content_length} = parse_request_head(headers)
+      finalize_request(socket, data, method, path, rest, content_length)
+    end
+
+    defp parse_request_head(headers) do
+      [request_line | header_lines] = String.split(headers, "\r\n", trim: true)
+      [method, path, _version] = String.split(request_line, " ", parts: 3)
+
+      content_length =
+        header_lines
+        |> parse_headers()
+        |> Map.get("content-length", "0")
+        |> String.to_integer()
+
+      {method, path, content_length}
+    end
+
+    defp finalize_request(_socket, _data, method, path, rest, content_length)
+         when byte_size(rest) >= content_length do
+      {:ok, {method, path, binary_part(rest, 0, content_length)}}
+    end
+
+    defp finalize_request(_socket, _data, method, path, _rest, 0) do
+      {:ok, {method, path, ""}}
+    end
+
+    defp finalize_request(socket, data, method, path, rest, _content_length) do
+      case :gen_tcp.recv(socket, 0, 5000) do
+        {:ok, chunk} -> read_request(socket, data <> chunk)
+        {:error, :timeout} -> {:ok, {method, path, rest}}
+        {:error, :closed} -> :closed
+      end
+    end
+
+    defp recv_request_chunk(socket, data) do
+      case :gen_tcp.recv(socket, 0, 5000) do
+        {:ok, chunk} -> read_request(socket, data <> chunk)
+        {:error, :closed} -> :closed
       end
     end
 

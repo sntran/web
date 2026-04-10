@@ -97,8 +97,8 @@ defmodule Web.Blob do
   @doc """
   Reads Blob contents as ArrayBuffer.
   """
-  @spec arrayBuffer(t()) :: {:ok, Web.ArrayBuffer.t()}
-  def arrayBuffer(%__MODULE__{} = blob) do
+  @spec array_buffer(t()) :: {:ok, Web.ArrayBuffer.t()}
+  def array_buffer(%__MODULE__{} = blob) do
     with {:ok, binary} <- text(blob) do
       {:ok, Web.ArrayBuffer.new(binary)}
     end
@@ -109,7 +109,7 @@ defmodule Web.Blob do
   """
   @spec bytes(t()) :: {:ok, Web.Uint8Array.t()}
   def bytes(%__MODULE__{} = blob) do
-    with {:ok, array_buffer} <- arrayBuffer(blob) do
+    with {:ok, array_buffer} <- array_buffer(blob) do
       {:ok, Web.Uint8Array.new(array_buffer)}
     end
   end
@@ -131,29 +131,33 @@ defmodule Web.Blob do
     end_pos = start + span
 
     parts
-    |> Enum.reduce({0, []}, fn part, {offset, acc} ->
-      part_len = part_size(part)
-      part_start = offset
-      part_end = offset + part_len
-
-      if part_end <= start or part_start >= end_pos do
-        {part_end, acc}
-      else
-        local_start = max(start - part_start, 0)
-        local_end = min(end_pos - part_start, part_len)
-        len = local_end - local_start
-
-        sliced_part =
-          case part do
-            bin when is_binary(bin) -> binary_part(bin, local_start, len)
-            %__MODULE__{} = blob -> slice(blob, local_start, local_start + len, blob.type)
-          end
-
-        {part_end, [sliced_part | acc]}
-      end
-    end)
+    |> Enum.reduce({0, []}, &slice_part(&1, &2, start, end_pos))
     |> elem(1)
     |> Enum.reverse()
+  end
+
+  defp slice_part(part, {offset, acc}, start, end_pos) do
+    part_len = part_size(part)
+    part_start = offset
+    part_end = offset + part_len
+
+    if part_end <= start or part_start >= end_pos do
+      {part_end, acc}
+    else
+      sliced_part = build_sliced_part(part, part_start, part_len, start, end_pos)
+      {part_end, [sliced_part | acc]}
+    end
+  end
+
+  defp build_sliced_part(part, part_start, part_len, start, end_pos) do
+    local_start = max(start - part_start, 0)
+    local_end = min(end_pos - part_start, part_len)
+    len = local_end - local_start
+
+    case part do
+      bin when is_binary(bin) -> binary_part(bin, local_start, len)
+      %__MODULE__{} = blob -> slice(blob, local_start, local_start + len, blob.type)
+    end
   end
 
   defp normalize_index(index, size) when index < 0, do: max(size + index, 0)

@@ -59,7 +59,8 @@ defmodule Web.Request do
   end
 
   def new(input, _init) do
-    raise Web.TypeError, "Request input must be a Web.URL struct or URL string, got: #{inspect(input)}"
+    raise Web.TypeError,
+          "Request input must be a Web.URL struct or URL string, got: #{inspect(input)}"
   end
 
   @doc """
@@ -74,6 +75,7 @@ defmodule Web.Request do
   defp build_request(url, init) do
     method = Keyword.get(init, :method, "GET") |> to_string() |> String.upcase()
     raw_body = Keyword.get(init, :body)
+
     headers =
       Keyword.get(init, :headers, %{})
       |> Web.Headers.new()

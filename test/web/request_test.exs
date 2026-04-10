@@ -78,7 +78,7 @@ defmodule Web.RequestTest do
     assert "hello" = await(Web.Request.text(req))
   end
 
-  test "text/json/arrayBuffer consume the request body once" do
+  test "text/json/array_buffer consume the request body once" do
     request = Request.new("https://example.com", body: ~s({"hello":"world"}))
 
     assert %{"hello" => "world"} = await(Request.json(request))
@@ -87,9 +87,9 @@ defmodule Web.RequestTest do
              catch_exit(await(Request.text(request)))
   end
 
-  test "arrayBuffer/1 returns Web.ArrayBuffer" do
+  test "array_buffer/1 returns Web.ArrayBuffer" do
     req = Request.new("https://example.com", body: "hello")
-    assert %Web.ArrayBuffer{data: "hello", byte_length: 5} = await(Request.arrayBuffer(req))
+    assert %Web.ArrayBuffer{data: "hello", byte_length: 5} = await(Request.array_buffer(req))
   end
 
   test "bytes/1 and blob/1 return expected Web types" do

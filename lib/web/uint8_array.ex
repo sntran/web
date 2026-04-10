@@ -49,7 +49,11 @@ defmodule Web.Uint8Array do
   Returns the binary represented by this Uint8Array view.
   """
   @spec to_binary(t()) :: binary()
-  def to_binary(%__MODULE__{buffer: %ArrayBuffer{data: data}, byte_offset: offset, byte_length: len}) do
+  def to_binary(%__MODULE__{
+        buffer: %ArrayBuffer{data: data},
+        byte_offset: offset,
+        byte_length: len
+      }) do
     binary_part(data, offset, len)
   end
 end

@@ -26,6 +26,7 @@ defmodule Web.URLSearchParamsTest do
       |> URLSearchParams.set("a", "9")
 
     assert params["a"] == "9"
+    assert Enum.count(params) == 3
     assert Enum.to_list(params) == [{"b", "2"}, {"a", "9"}, {"c", "4"}]
 
     params = URLSearchParams.sort(params)
@@ -63,7 +64,7 @@ defmodule Web.URLSearchParamsTest do
 
     params = URLSearchParams.delete(params, "foo")
     assert Access.pop(params, "foo") == {nil, params}
-    assert Enum.count(params) == 0
+    assert Enum.empty?(params)
     refute Enum.member?(params, {"foo", "baz"})
     assert Enumerable.impl_for(params).slice(params) == {:error, Enumerable.Web.URLSearchParams}
     assert Kernel.to_string(empty) == ""

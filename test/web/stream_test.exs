@@ -10,9 +10,9 @@ defmodule Web.StreamTest do
   end
 
   alias Web.ReadableStream
+  alias Web.TransformStream
   alias Web.TypeError
   alias Web.WritableStream
-  alias Web.TransformStream
   alias Web.WritableStreamDefaultWriter
 
   describe "Web.Stream engine basics" do

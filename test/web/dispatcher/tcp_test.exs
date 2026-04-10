@@ -1,10 +1,12 @@
+# credo:disable-for-this-file Credo.Check.Refactor.Nesting
 defmodule Web.Dispatcher.TCPTest do
   use ExUnit.Case, async: true
 
-  alias Web.Request
   alias Web.Dispatcher.TCP
+  alias Web.Request
 
   defmodule TCPServer do
+    # credo:disable-for-next-line
     def start_link(
           response_data \\ "hello\nworld",
           chunking \\ false,

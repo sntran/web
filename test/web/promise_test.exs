@@ -111,28 +111,28 @@ defmodule Web.PromiseTest do
   end
 
   # ---------------------------------------------------------------------------
-  # allSettled/1
+  # all_settled/1
   # ---------------------------------------------------------------------------
 
-  test "allSettled/1 collects all results regardless of outcome" do
+  test "all_settled/1 collects all results regardless of outcome" do
     promises = [Promise.resolve(:ok), Promise.reject(:err), Promise.resolve(:also_ok)]
-    results = await(Promise.allSettled(promises))
+    results = await(Promise.all_settled(promises))
 
     assert Enum.any?(results, &match?(%{status: "fulfilled", value: :ok}, &1))
     assert Enum.any?(results, &match?(%{status: "rejected", reason: :err}, &1))
     assert Enum.any?(results, &match?(%{status: "fulfilled", value: :also_ok}, &1))
   end
 
-  test "allSettled/1 maps internal {:error, reason} resolutions to rejected" do
+  test "all_settled/1 maps internal {:error, reason} resolutions to rejected" do
     # A promise that resolves to {:error, reason} is treated as rejected
     promise_with_error = Promise.new(fn resolve, _reject -> resolve.({:error, :nested_err}) end)
-    results = await(Promise.allSettled([promise_with_error]))
+    results = await(Promise.all_settled([promise_with_error]))
     assert [%{status: "rejected", reason: :nested_err}] = results
   end
 
-  test "allSettled/1 handles exit-based rejections" do
+  test "all_settled/1 handles exit-based rejections" do
     rejection = Promise.reject(:exit_reason)
-    results = await(Promise.allSettled([rejection]))
+    results = await(Promise.all_settled([rejection]))
     assert [%{status: "rejected", reason: :exit_reason}] = results
   end
 
@@ -282,12 +282,14 @@ defmodule Web.PromiseTest do
 
   test "normalize_await_exit_reason handles plain reason (passthrough)" do
     # then/2 should propagate non-shutdown exits through normalize passthrough
-    outer = Promise.new(fn resolve, _reject ->
-      # Build a then-chain where the upstream task exits with a non-shutdown reason.
-      # We can't easily force that from outside, but calling reject.(:x) exercises
-      # the {shutdown, x} clause. Verify end result is still correct.
-      resolve.(:ok)
-    end)
+    outer =
+      Promise.new(fn resolve, _reject ->
+        # Build a then-chain where the upstream task exits with a non-shutdown reason.
+        # We can't easily force that from outside, but calling reject.(:x) exercises
+        # the {shutdown, x} clause. Verify end result is still correct.
+        resolve.(:ok)
+      end)
+
     assert :ok == await(outer)
   end
 
@@ -304,10 +306,10 @@ defmodule Web.PromiseTest do
     assert result == :plain_fail
   end
 
-  test "allSettled/1 maps plain exit to rejected status" do
+  test "all_settled/1 maps plain exit to rejected status" do
     # Similar to all/1 - test via standard rejection (Task.yield_many ownership constraint)
     result_p = Promise.reject(:plain_settled_exit)
-    results = await(Promise.allSettled([result_p]))
+    results = await(Promise.all_settled([result_p]))
     assert [%{status: "rejected", reason: :plain_settled_exit}] = results
   end
 

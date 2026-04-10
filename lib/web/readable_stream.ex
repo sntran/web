@@ -27,14 +27,14 @@ defmodule Web.ReadableStream do
 
   defstruct [:controller_pid]
 
-  alias Web.ArrayBuffer
   alias Web.AbortSignal
+  alias Web.ArrayBuffer
   alias Web.Blob
   alias Web.Promise
-  alias Web.WritableStream
-  alias Web.Uint8Array
   alias Web.TypeError
+  alias Web.Uint8Array
   alias Web.URLSearchParams
+  alias Web.WritableStream
 
   # ---------------------------------------------------------------------------
   # Web.Stream behavior callbacks
@@ -56,41 +56,40 @@ defmodule Web.ReadableStream do
   end
 
   @impl Web.Stream
-  def pull(_ctrl, %{source: source, pid: pid} = state) do
-    case source do
-      %{pull: pull} when is_function(pull, 1) ->
-        ctrl = %Web.ReadableStreamDefaultController{pid: pid}
+  def pull(_ctrl, %{source: %{pull: pull}, pid: pid} = state) when is_function(pull, 1) do
+    pid
+    |> controller()
+    |> pull.()
+    |> await_pull_result()
 
-        case pull.(ctrl) do
-          %Promise{task: task} -> Task.await(task, :infinity)
-          _ -> :ok
-        end
+    {:ok, %{state | started: true}}
+  end
 
-        {:ok, %{state | started: true}}
+  def pull(_ctrl, %{source: source, pid: pid} = state) when is_pid(source) do
+    send(source, {:pull, pid})
+    {:ok, %{state | started: true}, :pause}
+  end
 
-      src when is_pid(src) ->
-        send(src, {:pull, pid})
-        {:ok, %{state | started: true}, :pause}
+  def pull(_ctrl, %{source: {module, function, args}, pid: pid} = state) when is_list(args) do
+    pid
+    |> controller()
+    |> then(&apply(module, function, args ++ [&1]))
 
-      {m, f, a} ->
-        ctrl = %Web.ReadableStreamDefaultController{pid: pid}
-        apply(m, f, a ++ [ctrl])
-        {:ok, %{state | started: true}}
+    {:ok, %{state | started: true}}
+  end
 
-      fun when is_function(fun, 1) ->
-        ctrl = %Web.ReadableStreamDefaultController{pid: pid}
+  def pull(_ctrl, %{source: fun, pid: pid} = state) when is_function(fun, 1) do
+    pid
+    |> controller()
+    |> fun.()
+    |> await_pull_result()
 
-        case fun.(ctrl) do
-          %Promise{task: task} -> Task.await(task, :infinity)
-          _ -> :ok
-        end
+    {:ok, %{state | started: true}}
+  end
 
-        {:ok, %{state | started: true}}
-
-      _ ->
-        # No pull source — pause to avoid a busy-loop
-        {:ok, state, :pause}
-    end
+  def pull(_ctrl, state) do
+    # No pull source — pause to avoid a busy-loop
+    {:ok, state, :pause}
   end
 
   @impl Web.Stream
@@ -101,6 +100,11 @@ defmodule Web.ReadableStream do
   def terminate(reason, %{source: source}) do
     do_terminate(reason, source)
   end
+
+  defp controller(pid), do: %Web.ReadableStreamDefaultController{pid: pid}
+
+  defp await_pull_result(%Promise{task: task}), do: Task.await(task, :infinity)
+  defp await_pull_result(_result), do: :ok
 
   defp do_terminate(reason, source) do
     case source do
@@ -813,25 +817,21 @@ defmodule Web.ReadableStream do
 
   # coveralls-ignore-start
   defp release_reader_lock(reader) do
-    try do
-      case release_lock(reader.controller_pid) do
-        :ok -> :ok
-        _ -> :ok
-      end
-    catch
-      :exit, _ -> :ok
+    case release_lock(reader.controller_pid) do
+      :ok -> :ok
+      _ -> :ok
     end
+  catch
+    :exit, _ -> :ok
   end
 
   defp release_writer_lock(writer) do
-    try do
-      case WritableStream.release_lock(writer.controller_pid, writer.owner_pid) do
-        :ok -> :ok
-        _ -> :ok
-      end
-    catch
-      :exit, _ -> :ok
+    case WritableStream.release_lock(writer.controller_pid, writer.owner_pid) do
+      :ok -> :ok
+      _ -> :ok
     end
+  catch
+    :exit, _ -> :ok
   end
 
   # coveralls-ignore-stop

@@ -242,15 +242,13 @@ defmodule Web.AbortSignalTest do
   defp wait_for_abort({:error, :aborted} = result), do: result
 
   defp wait_for_abort({:ok, subscription}) do
-    try do
-      Enum.reduce_while(1..20, :ok, fn _, _ ->
-        case Web.AbortSignal.receive_abort(subscription, 25) do
-          :ok -> {:cont, :ok}
-          result -> {:halt, result}
-        end
-      end)
-    after
-      Web.AbortSignal.unsubscribe(subscription)
-    end
+    Enum.reduce_while(1..20, :ok, fn _, _ ->
+      case Web.AbortSignal.receive_abort(subscription, 25) do
+        :ok -> {:cont, :ok}
+        result -> {:halt, result}
+      end
+    end)
+  after
+    Web.AbortSignal.unsubscribe(subscription)
   end
 end

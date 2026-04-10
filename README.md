@@ -90,6 +90,59 @@ pair = await Promise.all([
 
 ## 📖 API Usage & Examples
 
+### `Web.Promise` — Async Composition
+`Web.Promise` gives you a browser-style promise API for composing async work
+before you call `await/1`.
+
+```elixir
+# Resolve and reject explicit values
+ok = Promise.resolve("ready")
+value = await(ok)
+# => "ready"
+
+fallback =
+  Promise.reject(:boom)
+  |> Promise.catch(fn reason -> "recovered: #{reason}" end)
+  |> await()
+# => "recovered: boom"
+
+# Wait for every promise to resolve
+results =
+  Promise.all([
+    Promise.resolve(1),
+    Promise.resolve(2)
+  ])
+  |> await()
+# => [1, 2]
+
+# Collect fulfillment and rejection outcomes together
+settled =
+  Promise.all_settled([
+    Promise.resolve("ok"),
+    Promise.reject(:nope)
+  ])
+  |> await()
+# => [%{status: "fulfilled", value: "ok"}, %{status: "rejected", reason: :nope}]
+
+# Return the first fulfilled promise
+winner =
+  Promise.any([
+    Promise.reject(:first_failed),
+    Promise.resolve("winner")
+  ])
+  |> await()
+# => "winner"
+
+# Return the first settled promise
+raced =
+  Promise.race([
+    Promise.resolve("fast"),
+    Promise.resolve("slow")
+  ])
+  |> await()
+# => "fast"
+```
+
 ### `Web.ReadableStream` — The Source
 The source of every streaming pipeline. A `ReadableStream` is a managed process that provides data to consumers, handling **Backpressure** (throttling producers when consumers are slow), **Locking** (ensuring exclusive access), and **Teeing** (splitting streams for multiple consumers) in a zero-copy, process-safe way.
 

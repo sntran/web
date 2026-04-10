@@ -58,6 +58,7 @@ defmodule Web.DecompressionStream do
   def new(format) when format in @valid_formats do
     window_bits = window_bits_for(format)
     {:ok, pid} = start_link(window_bits: window_bits)
+
     %__MODULE__{
       readable: %Web.ReadableStream{controller_pid: pid},
       writable: %Web.WritableStream{controller_pid: pid}
@@ -138,8 +139,9 @@ defmodule Web.DecompressionStream do
           {:ok, :zlib.inflate(z, <<>>)}
         rescue
           # coveralls-ignore-start
-          e in ErlangError -> {:error, e}
-          # coveralls-ignore-stop
+          e in ErlangError ->
+            {:error, e}
+            # coveralls-ignore-stop
         end
       end)
 
@@ -156,6 +158,7 @@ defmodule Web.DecompressionStream do
           ReadableStreamDefaultController.wait_for_capacity(ctrl)
           ReadableStreamDefaultController.enqueue(ctrl, chunk)
         end
+
         # coveralls-ignore-stop
 
         {:ok, state}
@@ -210,5 +213,6 @@ defmodule Web.DecompressionStream do
 
   defp zlib_error_message(%ErlangError{original: reason}),
     do: "Decompression failed: #{inspect(reason)}"
+
   # coveralls-ignore-stop
 end

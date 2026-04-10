@@ -51,13 +51,13 @@ defmodule Web.ResponseTest do
     assert "hello" = await(Response.text(resp))
   end
 
-  test "text/1 and arrayBuffer/1 drain the response body" do
+  test "text/1 and array_buffer/1 drain the response body" do
     resp = Response.new(body: "hello")
 
     assert "hello" = await(Response.text(resp))
 
     resp = Response.new(body: "hello")
-    assert %Web.ArrayBuffer{data: "hello", byte_length: 5} = await(Response.arrayBuffer(resp))
+    assert %Web.ArrayBuffer{data: "hello", byte_length: 5} = await(Response.array_buffer(resp))
 
     assert %TypeError{message: "body already used"} =
              catch_exit(await(Response.text(resp)))

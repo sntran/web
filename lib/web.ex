@@ -33,29 +33,29 @@ defmodule Web do
       import Web, only: [fetch: 1, fetch: 2, await: 1]
       import Web.DSL, only: [new: 2]
 
-      alias Web.URL
-      alias Web.URLSearchParams
-      alias Web.Headers
-      alias Web.Request
-      alias Web.Response
       alias Web.AbortController
       alias Web.AbortSignal
+      alias Web.ArrayBuffer
+      alias Web.Blob
+      alias Web.CompressionStream
+      alias Web.DecompressionStream
+      alias Web.Headers
       alias Web.Promise
       alias Web.ReadableStream
       alias Web.ReadableStreamDefaultController
+      alias Web.Request
+      alias Web.Response
+      alias Web.TextDecoder
+      alias Web.TextDecoderStream
+      alias Web.TextEncoder
+      alias Web.TextEncoderStream
       alias Web.TransformStream
+      alias Web.Uint8Array
+      alias Web.URL
+      alias Web.URLSearchParams
       alias Web.WritableStream
       alias Web.WritableStreamDefaultController
       alias Web.WritableStreamDefaultWriter
-      alias Web.ArrayBuffer
-      alias Web.Uint8Array
-      alias Web.Blob
-      alias Web.TextEncoder
-      alias Web.TextDecoder
-      alias Web.TextEncoderStream
-      alias Web.TextDecoderStream
-      alias Web.CompressionStream
-      alias Web.DecompressionStream
 
       :ok
     end
@@ -126,24 +126,11 @@ defmodule Web do
   def fetch(input, init \\ [])
 
   def fetch(%Web.Request{} = request, _init) do
-    try do
-      Web.AbortSignal.check!(request.signal)
-
-      Web.Promise.new(fn resolve, reject ->
-        try do
-          case do_fetch(request) do
-            {:ok, response} -> resolve.(response)
-            {:error, reason} -> reject.(reason)
-          end
-        catch
-          # coveralls-ignore-next-line
-          :throw, {:abort, reason} -> reject.(reason)
-        end
-      end)
-    catch
-      :throw, {:abort, reason} ->
-        Web.Promise.reject(reason)
-    end
+    Web.AbortSignal.check!(request.signal)
+    fetch_request(request)
+  catch
+    :throw, {:abort, reason} ->
+      Web.Promise.reject(reason)
   end
 
   def fetch(%Web.URL{} = input, init) do
@@ -152,6 +139,20 @@ defmodule Web do
 
   def fetch(input, init) when is_binary(input) do
     fetch(Web.Request.new(input, init))
+  end
+
+  defp fetch_request(request) do
+    Web.Promise.new(fn resolve, reject ->
+      try do
+        case do_fetch(request) do
+          {:ok, response} -> resolve.(response)
+          {:error, reason} -> reject.(reason)
+        end
+      catch
+        # coveralls-ignore-next-line
+        :throw, {:abort, reason} -> reject.(reason)
+      end
+    end)
   end
 
   defp do_fetch(request) do

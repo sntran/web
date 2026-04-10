@@ -40,6 +40,9 @@ defmodule Web.MixProject do
     [
       licenses: ["Apache-2.0"],
       files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md),
+      requirements: %{
+        "erlang" => ">= 28.0.0"
+      },
       links: %{
         "GitHub" => @repo_url,
         "JS Fetch Spec" => "https://fetch.spec.whatwg.org/"

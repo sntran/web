@@ -46,37 +46,48 @@ defmodule Web.TextDecoder do
     stream = Map.get(options, :stream, false)
     chunk = normalize_input(input)
 
-    case Agent.get_and_update(decoder.state_pid, fn %{carry: carry, bom_seen: bom_seen} = state ->
-           data = IO.iodata_to_binary([carry, chunk])
-           {complete, trailing} = if stream, do: split_incomplete_utf8(data), else: {data, ""}
-
-           case decode_complete_bytes(complete, decoder.fatal) do
-             {:ok, decoded} ->
-               {decoded, next_bom_seen} =
-                 maybe_strip_bom(
-                   decoded,
-                   bom_seen,
-                   decoder.ignore_bom,
-                   byte_size(complete),
-                   stream
-                 )
-
-               next_state =
-                 if stream do
-                   %{state | carry: :binary.copy(trailing), bom_seen: next_bom_seen}
-                 else
-                   %{state | carry: "", bom_seen: next_bom_seen}
-                 end
-
-               {{:ok, IO.iodata_to_binary(finish_decode(decoded))}, next_state}
-
-             {:error, error} ->
-               {{:error, error}, state}
-           end
-         end) do
+    case Agent.get_and_update(decoder.state_pid, &decode_chunk(&1, chunk, decoder, stream)) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
+  end
+
+  defp decode_chunk(%{carry: carry, bom_seen: bom_seen} = state, chunk, decoder, stream) do
+    data = IO.iodata_to_binary([carry, chunk])
+    {complete, trailing} = split_stream_data(data, stream)
+
+    case decode_complete_bytes(complete, decoder.fatal) do
+      {:ok, decoded} ->
+        build_decode_result(state, decoded, bom_seen, trailing, decoder, complete, stream)
+
+      {:error, error} ->
+        {{:error, error}, state}
+    end
+  end
+
+  defp split_stream_data(data, true), do: split_incomplete_utf8(data)
+  defp split_stream_data(data, false), do: {data, ""}
+
+  defp build_decode_result(state, decoded, bom_seen, trailing, decoder, complete, stream) do
+    {decoded, next_bom_seen} =
+      maybe_strip_bom(
+        decoded,
+        bom_seen,
+        decoder.ignore_bom,
+        byte_size(complete),
+        stream
+      )
+
+    next_state = next_decoder_state(state, trailing, next_bom_seen, stream)
+    {{:ok, IO.iodata_to_binary(finish_decode(decoded))}, next_state}
+  end
+
+  defp next_decoder_state(state, trailing, bom_seen, true) do
+    %{state | carry: :binary.copy(trailing), bom_seen: bom_seen}
+  end
+
+  defp next_decoder_state(state, _trailing, bom_seen, false) do
+    %{state | carry: "", bom_seen: bom_seen}
   end
 
   defp normalize_label(label) when is_binary(label) do

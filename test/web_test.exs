@@ -11,6 +11,8 @@ defmodule WebTest do
   doctest Web.Uint8Array
   doctest Web.Blob
   doctest Web.Headers
+  doctest Web.ByteLengthQueuingStrategy
+  doctest Web.CountQueuingStrategy
   doctest Web.Request
   doctest Web.Response
   doctest Web.Resolver

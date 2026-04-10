@@ -145,6 +145,7 @@ defmodule Web.TransformStream do
   """
   def new(transformer \\ %{}, opts \\ []) do
     hwm = Keyword.get(opts, :high_water_mark, 1)
+
     opts =
       opts
       |> Keyword.put(:transformer, transformer)

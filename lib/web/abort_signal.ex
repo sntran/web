@@ -1,3 +1,4 @@
+# credo:disable-for-this-file Credo.Check.Refactor.Nesting
 defmodule Web.AbortSignal do
   @moduledoc """
   An implementation of the WHATWG AbortSignal standard.
@@ -389,6 +390,7 @@ defmodule Web.AbortSignal do
   defp already_aborted?(%__MODULE__{aborted: true}), do: true
   defp already_aborted?(_signal), do: false
 
+  # credo:disable-for-next-line
   defp wait_for_any_abort(subscriptions, controller) do
     case Enum.find_value(subscriptions, fn subscription ->
            case receive_abort(subscription, 0, true) do

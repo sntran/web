@@ -80,7 +80,7 @@ defmodule Web.WritableStream do
   end
 
   def error(pid, reason) when is_pid(pid) do
-    :gen_statem.cast(pid, {:error, reason})
+    Web.Stream.control_cast(pid, {:error, reason})
   end
 
   # ---------------------------------------------------------------------------
@@ -94,12 +94,14 @@ defmodule Web.WritableStream do
 
   def new(underlying_sink) when is_map(underlying_sink) do
     hwm = Map.get(underlying_sink, :high_water_mark, 1)
+
     {:ok, pid} =
       start_link(
         underlying_sink: underlying_sink,
         high_water_mark: hwm,
         strategy: Web.CountQueuingStrategy.new(hwm)
       )
+
     %__MODULE__{controller_pid: pid}
   end
 
@@ -150,11 +152,20 @@ defmodule Web.WritableStream do
   end
 
   def ready(pid) when is_pid(pid) do
-    :gen_statem.call(pid, {:ready, self()}, :infinity)
+    ready(pid, self())
   end
 
   def ready(pid, owner_pid) when is_pid(pid) and is_pid(owner_pid) do
-    :gen_statem.call(pid, {:ready, owner_pid}, :infinity)
+    ref = make_ref()
+    Web.Stream.control_cast(pid, {:register_ready_waiter, self(), owner_pid, ref})
+
+    receive do
+      {:ready, ^ref} ->
+        :ok
+
+      {:stream_error, ^ref, reason} ->
+        {:error, reason}
+    end
   end
 
   def close(%__MODULE__{controller_pid: pid}) do
@@ -163,14 +174,16 @@ defmodule Web.WritableStream do
 
   def close(pid) when is_pid(pid) do
     Web.Promise.new(fn resolve, _reject ->
-      Web.Stream.terminate(pid, :close)
-      await_settled_state(pid, :closed)
+      if Process.alive?(pid) do
+        :ok = Web.Stream.control_call(pid, {:terminate, :close, nil})
+      end
+
       resolve.(:ok)
     end)
   end
 
   def close(pid, owner_pid) when is_pid(pid) and is_pid(owner_pid) do
-    :gen_statem.call(pid, {:close, owner_pid}, :infinity)
+    Web.Stream.control_call(pid, {:close, owner_pid})
   end
 
   def abort(%__MODULE__{controller_pid: pid}, reason) do
@@ -179,14 +192,16 @@ defmodule Web.WritableStream do
 
   def abort(pid, reason) when is_pid(pid) do
     Web.Promise.new(fn resolve, _reject ->
-      Web.Stream.terminate(pid, :abort, reason)
-      await_abort_completion(pid)
+      if Process.alive?(pid) do
+        :ok = Web.Stream.control_call(pid, {:terminate, :abort, reason})
+      end
+
       resolve.(:ok)
     end)
   end
 
   def abort(pid, owner_pid, reason) when is_pid(pid) and is_pid(owner_pid) do
-    :gen_statem.call(pid, {:abort, owner_pid, reason}, :infinity)
+    Web.Stream.control_call(pid, {:abort, owner_pid, reason})
   end
 
   def release_lock(pid) when is_pid(pid) do
@@ -228,36 +243,4 @@ defmodule Web.WritableStream do
   end
 
   defp invoke_abort(_sink, _reason), do: :ok
-
-  defp await_settled_state(pid, expected_state) do
-    case safe_get_slots(pid) do
-      %{state: ^expected_state, active_operation: nil} ->
-        :ok
-
-      _ ->
-        # coveralls-ignore-next-line
-        Process.sleep(10)
-        # coveralls-ignore-next-line
-        await_settled_state(pid, expected_state)
-    end
-  end
-
-  defp await_abort_completion(pid) do
-    case safe_get_slots(pid) do
-      %{state: :errored, active_operation: nil} ->
-        :ok
-
-      _ ->
-        # coveralls-ignore-next-line
-        Process.sleep(10)
-        # coveralls-ignore-next-line
-        await_abort_completion(pid)
-    end
-  end
-
-  defp safe_get_slots(pid) do
-    __get_slots__(pid)
-  catch
-    :exit, _reason -> %{state: :errored, active_operation: nil}
-  end
 end

@@ -117,6 +117,32 @@ defmodule Web.Stream do
     :gen_statem.start_link(__MODULE__, {module, opts}, [])
   end
 
+  @doc false
+  def control_cast(pid, message) when is_pid(pid) do
+    priority_send(pid, {:"$gen_cast", message})
+    :ok
+  end
+
+  @doc false
+  def control_call(pid, message, timeout \\ :infinity) when is_pid(pid) do
+    monitor_ref = Process.monitor(pid)
+    ref = make_ref()
+    priority_send(pid, {:"$gen_call", {self(), ref}, message})
+
+    receive do
+      {^ref, reply} ->
+        Process.demonitor(monitor_ref, [:flush])
+        reply
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        exit({reason, {__MODULE__, :control_call, [pid, message, timeout]}})
+    after
+      timeout ->
+        Process.demonitor(monitor_ref, [:flush])
+        exit({:timeout, {__MODULE__, :control_call, [pid, message, timeout]}})
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # :gen_statem callbacks
   # ---------------------------------------------------------------------------
@@ -126,6 +152,7 @@ defmodule Web.Stream do
 
   @impl true
   def init({module, opts}) do
+    Process.flag(:message_queue_data, :off_heap)
     hwm = Keyword.get(opts, :high_water_mark, 1)
     strategy = normalize_strategy(Keyword.get(opts, :strategy, %Web.CountQueuingStrategy{}))
     timeout_ms = Keyword.get(opts, :timeout_ms, 30_000)
@@ -177,7 +204,7 @@ defmodule Web.Stream do
   def terminate(pid, type, reason \\ nil)
 
   def terminate(pid, type, reason) when is_pid(pid) do
-    :gen_statem.cast(pid, {:terminate, type, reason})
+    control_cast(pid, {:terminate, type, reason})
   end
 
   def terminate(_reason, _state, data) do
@@ -425,11 +452,13 @@ defmodule Web.Stream do
         _ ->
           if not :queue.is_empty(data.queue) do
             {{:value, chunk}, new_queue} = :queue.out(data.queue)
+
             new_data = %{
               data
               | queue: new_queue,
                 total_queued_size: data.total_queued_size - queue_chunk_size(data, chunk)
             }
+
             actions = [{:reply, from, {:ok, chunk}}]
 
             {new_data, actions} =
@@ -606,6 +635,17 @@ defmodule Web.Stream do
   end
 
   # Error injection (cast)
+  defp handle_common({:call, from}, {:terminate, type, reason}, state, data)
+       when type in [:cancel, :close, :abort, :error] do
+    case handle_terminate_request(type, reason, state, data) do
+      :keep_state_and_data ->
+        {:keep_state_and_data, [{:reply, from, :ok}]}
+
+      {:next_state, next_state, new_data, actions} ->
+        {:next_state, next_state, new_data, [{:reply, from, :ok} | actions]}
+    end
+  end
+
   defp handle_common(:cast, {:error, reason}, state, data) do
     if state in [:closed, :errored] do
       :keep_state_and_data
@@ -616,22 +656,61 @@ defmodule Web.Stream do
 
   defp handle_common(:cast, {:terminate, type, reason}, state, data)
        when type in [:cancel, :close, :abort, :error] do
-    cond do
-      type == :cancel and state == :closed ->
-        _ = signal_terminate(data, type, reason)
-        :keep_state_and_data
-
-      state in [:closed, :errored] ->
-        :keep_state_and_data
-
-      true ->
-        handle_termination(type, reason, data)
-    end
+    handle_terminate_request(type, reason, state, data)
   end
 
   # Cancel
   defp handle_common(:cast, {:cancel, reason}, _state, data) do
     handle_termination(:cancel, reason, data)
+  end
+
+  defp handle_common(
+         :cast,
+         {:register_ready_waiter, waiter_pid, owner_pid, ref},
+         state,
+         data
+       )
+       when data.type in [:consumer, :producer_consumer] do
+    cond do
+      owner_pid != data.writer_pid ->
+        priority_send(waiter_pid, {:stream_error, ref, :not_locked_by_writer})
+        :keep_state_and_data
+
+      state == :closed ->
+        priority_send(waiter_pid, {:ready, ref})
+        :keep_state_and_data
+
+      internal_desired_size(data) > 0 ->
+        priority_send(waiter_pid, {:ready, ref})
+        :keep_state_and_data
+
+      true ->
+        waiter = {:signal, waiter_pid, ref}
+        {:keep_state, %{data | ready_waiters: :queue.in(waiter, data.ready_waiters)}}
+    end
+  end
+
+  defp handle_common(
+         :cast,
+         {:register_enqueue_waiter, waiter_pid, ref},
+         state,
+         %{
+           type: :producer_consumer
+         } = data
+       ) do
+    cond do
+      state in [:closed, :errored] ->
+        priority_send(waiter_pid, {:ready, ref})
+        :keep_state_and_data
+
+      readable_capacity(data) > 0 ->
+        priority_send(waiter_pid, {:ready, ref})
+        :keep_state_and_data
+
+      true ->
+        waiter = {:signal, waiter_pid, ref}
+        {:keep_state, %{data | enqueue_waiters: :queue.in(waiter, data.enqueue_waiters)}}
+    end
   end
 
   # Task result (info message: {ref, result})
@@ -998,6 +1077,7 @@ defmodule Web.Stream do
   defp extract_new_state_from_result({:ok, new_state}, _old_state) do
     new_state
   end
+
   # coveralls-ignore-stop
 
   defp continue_after_consumer_completion(data, state, actions) do
@@ -1079,7 +1159,7 @@ defmodule Web.Stream do
   end
 
   defp pending_write_error_actions(%{pending_write_request: {from, _pid, _chunk}}, reason) do
-    [{:reply, from, {:error, {:errored, reason}}}]
+    [waiter_error_action(from, reason)]
   end
 
   defp pending_write_error_actions(_data, _reason), do: []
@@ -1087,11 +1167,11 @@ defmodule Web.Stream do
   defp queued_write_error_actions(data, reason) do
     data.queued_write_requests
     |> :queue.to_list()
-    |> Enum.map(fn {from, _pid, _chunk} -> {:reply, from, {:error, {:errored, reason}}} end)
+    |> Enum.map(fn {from, _pid, _chunk} -> waiter_error_action(from, reason) end)
   end
 
   defp close_error_actions(%{pending_close_request: from}, reason) when not is_nil(from) do
-    [{:reply, from, {:error, {:errored, reason}}}]
+    [waiter_error_action(from, reason)]
   end
 
   defp close_error_actions(_data, _reason), do: []
@@ -1099,13 +1179,13 @@ defmodule Web.Stream do
   defp ready_error_actions(data, reason) do
     data.ready_waiters
     |> :queue.to_list()
-    |> Enum.map(fn from -> {:reply, from, {:error, {:errored, reason}}} end)
+    |> Enum.flat_map(&List.wrap(waiter_error_action(&1, reason)))
   end
 
   defp enqueue_error_actions(data, reason) do
     data.enqueue_waiters
     |> :queue.to_list()
-    |> Enum.map(fn from -> {:reply, from, {:error, {:errored, reason}}} end)
+    |> Enum.flat_map(&List.wrap(waiter_error_action(&1, reason)))
   end
 
   # ---------------------------------------------------------------------------
@@ -1184,7 +1264,7 @@ defmodule Web.Stream do
   end
 
   defp pending_write_closed_actions(%{pending_write_request: {from, _pid, _chunk}}) do
-    [{:reply, from, {:error, :closed}}]
+    [waiter_closed_action(from)]
   end
 
   defp pending_write_closed_actions(_data), do: []
@@ -1192,11 +1272,11 @@ defmodule Web.Stream do
   defp queued_write_closed_actions(data) do
     data.queued_write_requests
     |> :queue.to_list()
-    |> Enum.map(fn {from, _pid, _chunk} -> {:reply, from, {:error, :closed}} end)
+    |> Enum.map(fn {from, _pid, _chunk} -> waiter_closed_action(from) end)
   end
 
   defp close_ok_actions(%{pending_close_request: from}) when not is_nil(from) do
-    [{:reply, from, :ok}]
+    [waiter_ok_action(from)]
   end
 
   defp close_ok_actions(_data), do: []
@@ -1204,7 +1284,7 @@ defmodule Web.Stream do
   defp ready_ok_actions(data) do
     data.ready_waiters
     |> :queue.to_list()
-    |> Enum.map(fn from -> {:reply, from, :ok} end)
+    |> Enum.flat_map(&List.wrap(waiter_ok_action(&1)))
   end
 
   defp refresh_backpressure(data) do
@@ -1259,7 +1339,7 @@ defmodule Web.Stream do
       actions =
         data.ready_waiters
         |> :queue.to_list()
-        |> Enum.map(fn from -> {:reply, from, :ok} end)
+        |> Enum.flat_map(&List.wrap(waiter_ok_action(&1)))
 
       {%{data | ready_waiters: :queue.new()}, actions}
     else
@@ -1275,14 +1355,48 @@ defmodule Web.Stream do
       actions =
         data.enqueue_waiters
         |> :queue.to_list()
-        |> Enum.map(fn from -> {:reply, from, :ok} end)
+        |> Enum.flat_map(&List.wrap(waiter_ok_action(&1)))
 
       {%{data | enqueue_waiters: :queue.new()}, actions}
     end
   end
 
+  defp handle_terminate_request(type, reason, state, data) do
+    cond do
+      type == :cancel and state == :closed ->
+        _ = signal_terminate(data, type, reason)
+        :keep_state_and_data
+
+      state in [:closed, :errored] ->
+        :keep_state_and_data
+
+      true ->
+        handle_termination(type, reason, data)
+    end
+  end
+
+  defp waiter_ok_action({:signal, pid, ref}) do
+    priority_send(pid, {:ready, ref})
+    []
+  end
+
+  defp waiter_ok_action(from), do: {:reply, from, :ok}
+
+  defp waiter_closed_action(from), do: {:reply, from, {:error, :closed}}
+
+  defp waiter_error_action({:signal, pid, ref}, reason) do
+    priority_send(pid, {:stream_error, ref, {:errored, reason}})
+    []
+  end
+
+  defp waiter_error_action(from, reason), do: {:reply, from, {:error, {:errored, reason}}}
+
   defp reply_keep_state(data) do
     {:keep_state, data, []}
+  end
+
+  defp priority_send(pid, message) do
+    :erlang.send(pid, message, [:priority])
   end
 
   defp queue_chunk_size(%{strategy: strategy}, chunk) do
@@ -1329,6 +1443,7 @@ defmodule Web.Stream do
       :exit, reason -> {:error, reason}
     end
   end
+
   # coveralls-ignore-stop
 
   defp resolve_if_promise(result, _fallback), do: result

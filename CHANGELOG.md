@@ -18,6 +18,8 @@ All notable changes to this project are documented in this file.
   strategy-aware stream buffering.
 - `Web.CompressionStream` and `Web.DecompressionStream` for
   WHATWG-style gzip, deflate, and deflate-raw stream transforms.
+- `BENCHMARKS.md` draft with selective-receive, abort-latency, GC-isolation,
+  and throughput measurements for the responsive-core changes.
 
 ## Changed
 
@@ -37,6 +39,11 @@ All notable changes to this project are documented in this file.
   size.
 - `Web.Stream` now parks transform writes on readable backpressure instead of
   over-buffering producer-consumer queues.
+- `Web.Stream` now routes internal control signals through ref-tagged receives,
+  uses local priority messaging when available, and sets stream message queues
+  to `:off_heap`.
+- `README.md` now includes benchmark highlights for the responsive-core
+  changes.
 
 ## [0.2.0] - 2026-04-03
 

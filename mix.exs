@@ -1,7 +1,7 @@
 defmodule Web.MixProject do
   use Mix.Project
 
-  @version "0.2.0"
+  @version "0.3.0"
   @repo_url "https://github.com/sntran/web"
   @description "A protocol-agnostic, zero-buffer suite of Web Standard APIs for Elixir."
 
@@ -54,7 +54,8 @@ defmodule Web.MixProject do
         coveralls: :test,
         "coveralls.detail": :test,
         "coveralls.post": :test,
-        "coveralls.html": :test
+        "coveralls.html": :test,
+        "coveralls.github": :test
       ]
     ]
   end
@@ -65,8 +66,10 @@ defmodule Web.MixProject do
       {:finch, "~> 0.16"},
       {:castore, "~> 1.0"},
       {:jason, "~> 1.4"},
+      {:benchee, "~> 1.3", only: [:dev, :test]},
       {:stream_data, "~> 1.0", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.14", only: :dev, runtime: false}
     ]
   end

@@ -54,10 +54,15 @@ defmodule Web.ReadableStreamDefaultController do
   transform task can complete cleanly.
   """
   def wait_for_capacity(%__MODULE__{pid: pid}) do
-    case :gen_statem.call(pid, :enqueue_ready, :infinity) do
-      :ok -> :ok
-      # On error the stream is already broken; let the task proceed and exit.
-      {:error, _} -> :ok
+    ref = make_ref()
+    Web.Stream.control_cast(pid, {:register_enqueue_waiter, self(), ref})
+
+    receive do
+      {:ready, ^ref} ->
+        :ok
+
+      {:stream_error, ^ref, _reason} ->
+        :ok
     end
   end
 

@@ -193,9 +193,7 @@ defmodule Web.CompressionPBTTest do
 
       error =
         catch_exit(
-          await(
-            WritableStreamDefaultWriter.write(writer, <<0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA>>)
-          )
+          await(WritableStreamDefaultWriter.write(writer, <<0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA>>))
         )
 
       assert %Web.TypeError{} = error
@@ -206,11 +204,7 @@ defmodule Web.CompressionPBTTest do
       writer = WritableStream.get_writer(ds.writable)
 
       error =
-        catch_exit(
-          await(
-            WritableStreamDefaultWriter.write(writer, <<0xFF, 0xFE, 0xFD, 0xFC>>)
-          )
-        )
+        catch_exit(await(WritableStreamDefaultWriter.write(writer, <<0xFF, 0xFE, 0xFD, 0xFC>>)))
 
       assert %Web.TypeError{} = error
     end
@@ -233,6 +227,7 @@ defmodule Web.CompressionPBTTest do
         writer = WritableStream.get_writer(ds.writable)
 
         result = catch_exit(await(WritableStreamDefaultWriter.write(writer, garbage)))
+
         assert %Web.TypeError{} = result,
                "Expected TypeError for garbage #{format} input, got: #{inspect(result)}"
       end
@@ -306,6 +301,28 @@ defmodule Web.CompressionPBTTest do
   # ---------------------------------------------------------------------------
 
   describe "wait_for_capacity error branch" do
+    test "returns :ok immediately when readable capacity is already available" do
+      cs = CompressionStream.new("gzip")
+      ctrl = %ReadableStreamDefaultController{pid: cs.readable.controller_pid}
+
+      assert :ok == ReadableStreamDefaultController.wait_for_capacity(ctrl)
+    end
+
+    test "returns :ok when the stream is already closed" do
+      cs = CompressionStream.new("gzip")
+      pid = cs.readable.controller_pid
+      ctrl = %ReadableStreamDefaultController{pid: pid}
+
+      Web.Stream.terminate(pid, :close)
+
+      assert wait_until(2_000, fn ->
+               Web.ReadableStream.__get_slots__(pid).state == :closed
+             end),
+             "stream did not transition to :closed in time"
+
+      assert :ok == ReadableStreamDefaultController.wait_for_capacity(ctrl)
+    end
+
     test "returns :ok when the stream errors while a waiter is parked" do
       # Build an errored-stream scenario:
       #   1. Fill the readable queue to HWM=1.

@@ -436,7 +436,7 @@ defmodule Web.ReadableStream do
   end
 
   def close(pid) do
-    :gen_statem.cast(pid, :close)
+    Web.Stream.control_cast(pid, :close)
   end
 
   @impl Web.Stream
@@ -445,7 +445,7 @@ defmodule Web.ReadableStream do
   end
 
   def error(pid, reason) when is_pid(pid) do
-    :gen_statem.cast(pid, {:error, reason})
+    Web.Stream.control_cast(pid, {:error, reason})
   end
 
   def cancel(target, reason \\ :cancelled)
@@ -457,8 +457,7 @@ defmodule Web.ReadableStream do
   def cancel(pid, reason) do
     Promise.new(fn resolve, _reject ->
       if Process.alive?(pid) do
-        cancel_now(pid, reason)
-        await_stream_state(pid, :closed)
+        :ok = Web.Stream.control_call(pid, {:terminate, :cancel, reason})
       end
 
       resolve.(:ok)
@@ -711,7 +710,7 @@ defmodule Web.ReadableStream do
   end
 
   defp cancel_now(pid, reason) do
-    Web.Stream.terminate(pid, :cancel, reason)
+    Web.Stream.control_cast(pid, {:terminate, :cancel, reason})
   end
 
   defp acquire_reader_for_pipe(%__MODULE__{} = readable), do: get_reader(readable)
@@ -733,26 +732,6 @@ defmodule Web.ReadableStream do
     end
   end
 
-  defp await_stream_state(pid, expected_state) do
-    case safe_get_slots(pid) do
-      %{state: ^expected_state} ->
-        :ok
-
-      _ ->
-        # coveralls-ignore-next-line
-        Process.sleep(10)
-        # coveralls-ignore-next-line
-        await_stream_state(pid, expected_state)
-    end
-  end
-
-  defp safe_get_slots(pid) do
-    __get_slots__(pid)
-  catch
-    # coveralls-ignore-next-line
-    :exit, _reason -> %{state: :closed}
-  end
-
   defp do_tee(%__MODULE__{} = source) do
     strategy = Web.CountQueuingStrategy.new(16)
     ts1 = Web.TransformStream.new(%{}, writable_strategy: strategy)
@@ -769,7 +748,8 @@ defmodule Web.ReadableStream do
             |> Promise.catch(fn _ -> :ok end),
             Web.WritableStreamDefaultWriter.ready(writer2)
             |> Promise.catch(fn _ -> :ok end)
-          ]) |> Promise.then(fn _ ->
+          ])
+          |> Promise.then(fn _ ->
             Promise.all([
               Web.WritableStreamDefaultWriter.write(writer1, chunk)
               |> Promise.catch(fn _ -> :ok end),

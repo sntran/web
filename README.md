@@ -11,6 +11,25 @@ Most Elixir networking libraries buffer data into memory by default. `Web` is bu
 
 By implementing WHATWG standards as **Native Process-backed** entities (`:gen_statem`), `Web` provides a consistent, predictable, and backpressure-aware interface for HTTP, TCP, and custom protocols.
 
+## ⚡ Performance Notes
+The current responsive-core work added ref-tagged control receives, local
+priority signaling, and `:message_queue_data, :off_heap` for stream engines.
+On the benchmark machine below, those changes materially improved the control
+plane under mailbox pressure.
+
+| Benchmark | Before (`fa74d7f`) | After (`9babea0`) | Result |
+| --- | --- | --- | --- |
+| Selective receive at 100k mailbox depth | 1.76 s | 2.78 ms | 99.84% faster |
+| Selective receive at 10k mailbox depth | 123.00 ms | 0.79 ms | 99.36% faster |
+| 100 MiB burst final heap size | 225,340 words | 4,264 words | 98.11% lower |
+| 100 MiB burst peak queue length | 1,415 | 905 | 36.04% lower |
+
+For the compression pipeline, `CompressionStream` averaged `263.68 ms`
+for `32 MiB` of input on this machine, which is about `121.36 MB/s`.
+
+The abort-latency benchmark remains noisy and is documented in
+[`BENCHMARKS.md`](BENCHMARKS.md) as a caveat instead of a headline claim.
+
 ---
 
 ## 🛠 The "Web-First" DSL

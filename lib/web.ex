@@ -28,9 +28,11 @@ defmodule Web do
       :boom
   """
 
+  alias Web.TypeError
+
   defmacro __using__(_opts) do
     quote do
-      import Web, only: [fetch: 1, fetch: 2, await: 1]
+      import Web, only: [fetch: 1, fetch: 2, await: 1, atob: 1, btoa: 1]
       import Web.DSL, only: [new: 2]
 
       alias Web.AbortController
@@ -38,10 +40,14 @@ defmodule Web do
       alias Web.ArrayBuffer
       alias Web.Blob
       alias Web.CompressionStream
+      alias Web.Console
+      alias Web.CustomEvent
       alias Web.DecompressionStream
+      alias Web.EventTarget
       alias Web.File
       alias Web.FormData
       alias Web.Headers
+      alias Web.Performance
       alias Web.Promise
       alias Web.ReadableStream
       alias Web.ReadableStreamDefaultController
@@ -92,6 +98,35 @@ defmodule Web do
           raise "await: unexpected result: #{inspect(other)}"
       end
     end
+  end
+
+  @doc """
+  Decodes a Base64 string using forgiving Base64 semantics.
+  """
+  @spec atob(String.t()) :: String.t()
+  def atob(string) when is_binary(string) do
+    with {:ok, normalized} <- normalize_base64(string),
+         {:ok, decoded} <- Base.decode64(normalized) do
+      decoded
+      |> :binary.bin_to_list()
+      |> List.to_string()
+    else
+      :error ->
+        raise TypeError.exception("Failed to execute atob: malformed base64 input")
+
+      {:error, :invalid} ->
+        raise TypeError.exception("Failed to execute atob: malformed base64 input")
+    end
+  end
+
+  @doc """
+  Encodes a byte string into Base64.
+  """
+  @spec btoa(String.t()) :: String.t()
+  def btoa(string) when is_binary(string) do
+    string
+    |> byte_string_to_binary!()
+    |> Base.encode64()
   end
 
   @doc """
@@ -165,5 +200,52 @@ defmodule Web do
         Web.Resolver.resolve(request.url)
 
     dispatcher.fetch(request)
+  end
+
+  defp byte_string_to_binary!(string) do
+    string
+    |> String.to_charlist()
+    |> Enum.reduce([], fn
+      codepoint, acc when codepoint in 0..255 ->
+        [codepoint | acc]
+
+      _codepoint, _acc ->
+        raise TypeError.exception(
+                "Failed to execute btoa: input contains characters outside the Latin1 range"
+              )
+    end)
+    |> Enum.reverse()
+    |> :erlang.list_to_binary()
+  end
+
+  defp normalize_base64(string) do
+    trimmed = String.replace(string, ~r/[\t\n\f\r ]+/, "")
+
+    cond do
+      trimmed == "" ->
+        {:ok, ""}
+
+      Regex.match?(~r/[^A-Za-z0-9+\/=]/, trimmed) ->
+        {:error, :invalid}
+
+      Regex.match?(~r/=.+[^=]/, trimmed) ->
+        {:error, :invalid}
+
+      true ->
+        stripped = String.trim_trailing(trimmed, "=")
+        padding_size = byte_size(trimmed) - byte_size(stripped)
+
+        cond do
+          padding_size > 2 ->
+            {:error, :invalid}
+
+          rem(byte_size(stripped), 4) == 1 ->
+            {:error, :invalid}
+
+          true ->
+            required_padding = rem(4 - rem(byte_size(stripped), 4), 4)
+            {:ok, stripped <> String.duplicate("=", required_padding)}
+        end
+    end
   end
 end

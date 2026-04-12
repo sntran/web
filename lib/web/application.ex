@@ -5,6 +5,8 @@ defmodule Web.Application do
 
   @impl true
   def start(_type, _args) do
+    Web.Performance.put_time_origin()
+
     children = [
       {Task.Supervisor, name: Web.TaskSupervisor},
       {Finch,

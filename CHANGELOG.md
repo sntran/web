@@ -8,9 +8,19 @@ All notable changes to this project are documented in this file.
 
 - `Web.File`.
 - `Web.FormData` struct and streaming multipart parser.
+- `Web.CustomEvent` for lightweight event payload construction.
+- `Web.EventTarget` with listener registration, `once` handling, callback
+  deduplication, and `AbortSignal`-driven listener cleanup.
+- `Web.Performance` User Timing support with `mark/1`, `measure/1-3`,
+  `getEntries*`, `clearMarks*`, and `clearMeasures*`.
+- `Web.Console` helpers backed by Erlang `:logger`, including `assert`,
+  `count`, `countReset`, `time`, `timeLog`, `timeEnd`, `trace`, grouping,
+  and ASCII `table` rendering.
 - `examples/streaming_upload_proxy.exs` demonstrating a WHATWG-only multipart
 	ingestion flow (`Response.form_data/1` + `FormData.get/2`) that streams a
 	simulated `1 GiB` file to a writable sink while reporting memory checkpoints.
+
+### Changed
 
 ## [0.3.0] - 2026-04-10
 

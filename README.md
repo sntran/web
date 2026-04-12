@@ -152,6 +152,49 @@ raced =
 # => "fast"
 ```
 
+### `Web.Performance` — High Resolution Timing
+Use `Web.Performance` for browser-style monotonic timing and local User Timing
+entries.
+
+```elixir
+Performance.mark("boot:start")
+Process.sleep(5)
+Performance.mark("boot:ready")
+
+measure = Performance.measure("boot", "boot:start", "boot:ready")
+measure.duration
+# => 5.0-ish milliseconds
+
+Performance.getEntriesByType("mark")
+# => [%Web.Performance.Mark{...}, ...]
+
+Performance.clearMeasures()
+Performance.clearMarks()
+```
+
+### `Web.Console` — Logger-backed Diagnostics
+`Web.Console` mirrors familiar browser console helpers while routing output
+through Erlang `:logger`.
+
+```elixir
+Console.group("bootstrap")
+Console.count("workers")
+Console.count("workers")
+
+Console.time("load-config")
+Process.sleep(2)
+Console.timeLog("load-config", "halfway")
+Console.timeEnd("load-config")
+
+Console.table([
+  %{name: "Ada", score: 10},
+  %{name: "Linus", score: 8}
+])
+
+Console.assert(length([1, 2, 3]) == 3, "unexpected worker count")
+Console.groupEnd()
+```
+
 ### `Web.ReadableStream` — The Source
 The source of every streaming pipeline. A `ReadableStream` is a managed process that provides data to consumers, handling **Backpressure** (throttling producers when consumers are slow), **Locking** (ensuring exclusive access), and **Teeing** (splitting streams for multiple consumers) in a zero-copy, process-safe way.
 
@@ -292,6 +335,31 @@ await(Response.text(Response.new(body: round_tripped)))
 # => "hello world"
 ```
 
+### `Web.CustomEvent` and `Web.EventTarget`
+Use `Web.CustomEvent` to describe payloads and `Web.EventTarget` to manage
+event listeners inside your own process state.
+
+```elixir
+parent = self()
+
+target =
+  EventTarget.new(owner: self())
+  |> EventTarget.addEventListener("message", fn event ->
+    send(parent, {:message, event.detail})
+  end, once: true)
+
+event = CustomEvent.new("message", detail: %{id: 1, body: "hello"})
+{target, true} = EventTarget.dispatchEvent(target, event)
+
+receive do
+  {:message, %{body: "hello"}} -> :ok
+end
+
+# The `once: true` listener was removed after dispatch
+target.listeners
+# => %{}
+```
+
 ### `Web.Request` & `Web.Response`
 First-class containers for network data with high-level factories and standard body readers.
 
@@ -356,19 +424,34 @@ IO.inspect(Headers.set(headers, "Authorization", "Bearer secret"))
 ```
 
 ### `Web.AbortController` & `Web.AbortSignal`
-A unified mechanism for cancelling any asynchronous operation.
+A unified mechanism for cancelling asynchronous operations, stream pipelines,
+and `EventTarget` listeners.
 
 ```elixir
 controller = AbortController.new()
-signal = AbortController.signal(controller)
+signal = controller.signal
 
 # Pass the signal to a fetch or any async task
-Task.start(fn -> 
+Task.start(fn ->
   # Logic that listens for AbortSignal.aborted?(signal)
 end)
 
+target =
+  EventTarget.new(owner: self())
+  |> EventTarget.addEventListener(
+    "tick",
+    fn _event -> IO.puts("removed on abort") end,
+    signal: signal
+  )
+
 # Trigger cancellation
 AbortController.abort(controller, "Too slow!")
+
+# If your process stores the target in state, route its messages through:
+#   case EventTarget.handle_info(target, message) do
+#     {:ok, next_target} -> {:noreply, %{state | target: next_target}}
+#     :unknown -> ...
+#   end
 ```
 
 ### `Web.Blob`, `Web.ArrayBuffer`, & `Web.Uint8Array`

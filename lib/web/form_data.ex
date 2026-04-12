@@ -154,7 +154,7 @@ defmodule Web.FormData do
   """
   @spec entries(t()) :: Enumerable.t()
   def entries(%__MODULE__{} = form) do
-    Stream.map(form, & &1)
+    form
   end
 
   @doc """

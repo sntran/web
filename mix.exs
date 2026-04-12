@@ -24,7 +24,8 @@ defmodule Web.MixProject do
         main: "Web",
         extras: ["README.md"]
       ],
-      test_coverage: [tool: ExCoveralls]
+      test_coverage: [tool: ExCoveralls],
+      aliases: aliases()
     ]
   end
 
@@ -58,7 +59,8 @@ defmodule Web.MixProject do
         "coveralls.detail": :test,
         "coveralls.post": :test,
         "coveralls.html": :test,
-        "coveralls.github": :test
+        "coveralls.github": :test,
+        precommit: :test
       ]
     ]
   end
@@ -74,6 +76,18 @@ defmodule Web.MixProject do
       {:excoveralls, "~> 0.18", only: :test},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.14", only: :dev, runtime: false}
+    ]
+  end
+
+  # Aliases are shortcuts or tasks specific to the current project.
+  # For example, to ensure formatting is consistent before committing, you might run:
+  #
+  #     $ mix precommit
+  #
+  # See the documentation for `Mix` for more info on aliases.
+  defp aliases do
+    [
+      precommit: ["format", "credo --strict", "test --cover"]
     ]
   end
 end

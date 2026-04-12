@@ -10,6 +10,8 @@ defmodule WebTest do
   doctest Web.ArrayBuffer
   doctest Web.Uint8Array
   doctest Web.Blob
+  doctest Web.CustomEvent
+  doctest Web.EventTarget
   doctest Web.Headers
   doctest Web.ByteLengthQueuingStrategy
   doctest Web.CountQueuingStrategy
@@ -39,6 +41,11 @@ defmodule WebTest do
 
     def fetch_with_import(input, init \\ []) do
       fetch(input, init)
+    end
+
+    def base64_with_imports(value) do
+      encoded = btoa(value)
+      {encoded, atob(encoded)}
     end
 
     def aliases_work? do
@@ -91,6 +98,10 @@ defmodule WebTest do
 
   test "use Web aliases the public Web modules" do
     assert UsingWeb.aliases_work?()
+  end
+
+  test "use Web imports atob/1 and btoa/1" do
+    assert {"aGVsbG8=", "hello"} = UsingWeb.base64_with_imports("hello")
   end
 
   test "await macro returns value on {:ok, value}" do
@@ -164,5 +175,37 @@ defmodule WebTest do
     # Also via Web.Request
     req = Web.Request.new(url, signal: controller.signal)
     assert :aborted = catch_exit(await(Web.fetch(req)))
+  end
+
+  test "Web.btoa and Web.atob round-trip latin1 byte strings" do
+    assert Web.btoa("hello") == "aGVsbG8="
+    assert Web.atob("aGVsbG8=") == "hello"
+    assert Web.atob(" Y Q==\n") == "a"
+    assert Web.atob("YQ") == "a"
+    assert Web.atob(Web.btoa("ÿ")) == "ÿ"
+  end
+
+  test "Web.btoa rejects codepoints outside the latin1 range" do
+    assert_raise Web.TypeError, ~r/outside the Latin1 range/, fn ->
+      Web.btoa("snowman ☃")
+    end
+  end
+
+  test "Web.atob rejects malformed input" do
+    assert_raise Web.TypeError, ~r/malformed base64 input/, fn ->
+      Web.atob("abcde")
+    end
+
+    assert_raise Web.TypeError, ~r/malformed base64 input/, fn ->
+      Web.atob("ab=c")
+    end
+
+    assert_raise Web.TypeError, ~r/malformed base64 input/, fn ->
+      Web.atob("A===")
+    end
+  end
+
+  test "Web.atob accepts empty input" do
+    assert Web.atob("") == ""
   end
 end

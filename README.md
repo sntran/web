@@ -1,6 +1,8 @@
 # 🌐 Web: WHATWG Extension to BEAM
 > A protocol-agnostic, zero-buffer suite of Web Standard APIs for Elixir.
 
+[![Build Status](https://github.com/sntran/web/workflows/CI/badge.svg)](https://github.com/sntran/web/actions)
+[![Coverage Status](https://coveralls.io/repos/sntran/web/badge.svg?branch=main)](https://coveralls.io/r/sntran/web?branch=main)
 [![Hex.pm](https://img.shields.io/hexpm/v/web.svg)](https://hex.pm/packages/web)
 [![Docs](https://img.shields.io/badge/hexdocs-latest-blue.svg)](https://hexdocs.pm/web)
 

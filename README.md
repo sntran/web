@@ -27,6 +27,13 @@ plane under mailbox pressure.
 For the compression pipeline, `CompressionStream` averaged `263.68 ms`
 for `32 MiB` of input on this machine, which is about `121.36 MB/s`.
 
+For multipart routing workloads, the new
+[`examples/streaming_upload_proxy.exs`](examples/streaming_upload_proxy.exs)
+simulates a `1 GiB` upload and logs `:erlang.memory(:total)` checkpoints while
+streaming from `Response.form_data/1` to a sink via `ReadableStream.pipe_to/3`.
+On the benchmark machine, the memory profile stayed flat within normal BEAM GC
+variance instead of scaling with payload size.
+
 The abort-latency benchmark remains noisy and is documented in
 [`BENCHMARKS.md`](BENCHMARKS.md) as a caveat instead of a headline claim.
 
@@ -298,6 +305,27 @@ end
 
 # Multi-protocol support (HTTP/TCP)
 req = Request.new("tcp://localhost:8080", method: "SEND", body: "ping")
+```
+
+### `Web.FormData` - Live Iteration and O(1) Streaming
+`Web.FormData` is an `Enumerable` that yields `[name, value]` pairs, mirroring
+browser `FormData.entries()` output. Multipart parses are live-backed by a
+coordinator process, so fields are discovered lazily.
+
+When iteration or lookup advances past an unread file part, the parser
+automatically discards skipped file bodies before continuing. This preserves
+`O(1)` memory usage and avoids deadlocks when users skip blocking file streams.
+
+```elixir
+boundary = "example-boundary"
+
+response = Response.new(
+  body: "--#{boundary}--\r\n",
+  headers: %{"content-type" => "multipart/form-data; boundary=#{boundary}"}
+)
+
+form = await(Response.form_data(response))
+Enum.to_list(form)
 ```
 
 ### `Web.URL` & `Web.URLSearchParams`

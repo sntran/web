@@ -9,6 +9,20 @@ defmodule Web.StreamTest do
     def start(_pid, _opts), do: {:producer, %{}}
   end
 
+  defmodule HibernateSourceStream do
+    use Web.Stream
+
+    @impl Web.Stream
+    def start(_pid, _opts), do: {:producer, %{sent?: false}}
+
+    @impl Web.Stream
+    def pull(ctrl, %{sent?: false} = state) do
+      Web.ReadableStreamDefaultController.enqueue(ctrl, "x")
+      Web.ReadableStreamDefaultController.close(ctrl)
+      {:ok, %{state | sent?: true}, :hibernate}
+    end
+  end
+
   alias Web.ReadableStream
   alias Web.TransformStream
   alias Web.TypeError
@@ -80,6 +94,15 @@ defmodule Web.StreamTest do
         })
 
       assert "x" == Enum.join(stream, "")
+    end
+
+    test "pull callbacks can request hibernation" do
+      {:ok, pid} = HibernateSourceStream.start_link([])
+      stream = %ReadableStream{controller_pid: pid}
+      _reader = ReadableStream.get_reader(stream)
+
+      assert {:ok, "x"} = ReadableStream.read(pid)
+      assert :done = ReadableStream.read(pid)
     end
   end
 

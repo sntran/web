@@ -215,6 +215,15 @@ defmodule Web.BodyTest do
     assert Web.Headers.get(binary_headers, "content-type") == "text/plain;charset=UTF-8"
   end
 
+  test "Web.Body.put_inferred_content_type infers multipart FormData bodies" do
+    form_data = Web.FormData.new(boundary: "body-form-boundary")
+
+    headers = Web.Body.put_inferred_content_type(Web.Headers.new(), form_data)
+
+    assert Web.Headers.get(headers, "content-type") ==
+             "multipart/form-data; boundary=body-form-boundary"
+  end
+
   test "Web.Body.put_inferred_content_type only uses non-empty Blob types and leaves unknown bodies alone" do
     empty_blob_headers =
       Web.Body.put_inferred_content_type(Web.Headers.new(), Web.Blob.new(["x"], type: ""))
@@ -245,5 +254,137 @@ defmodule Web.BodyTest do
     assert {original, clone} = BodyHarness.clone(%BodyHarness{body: ReadableStream.from("hello")})
     assert "hello" == await(BodyHarness.text(original))
     assert "hello" == await(BodyHarness.text(clone))
+  end
+
+  test "Response.form_data/1 parses multipart text and file values" do
+    boundary = "----body-test-boundary"
+
+    payload =
+      "--#{boundary}\r\n" <>
+        ~s(Content-Disposition: form-data; name="field"\r\n\r\n) <>
+        "ok\r\n" <>
+        "--#{boundary}\r\n" <>
+        ~s(Content-Disposition: form-data; name="upload"; filename="a.txt"\r\n) <>
+        "Content-Type: text/plain\r\n\r\n" <>
+        "hello\r\n" <>
+        "--#{boundary}--\r\n"
+
+    response =
+      Response.new(
+        body:
+          Web.ReadableStream.from([
+            binary_part(payload, 0, 9),
+            binary_part(payload, 9, byte_size(payload) - 9)
+          ]),
+        headers: %{"content-type" => "multipart/form-data; boundary=#{boundary}"}
+      )
+
+    form_data = await(Response.form_data(response))
+
+    assert Web.FormData.get(form_data, "field") == "ok"
+
+    assert %Web.File{name: "upload", filename: "a.txt", type: "text/plain"} =
+             file = Web.FormData.get(form_data, "upload")
+
+    assert Enum.join(Web.File.stream(file), "") == "hello"
+  end
+
+  test "Response.form_data/1 parses application/x-www-form-urlencoded payload" do
+    response =
+      Response.new(
+        body: "a=1&b=two",
+        headers: %{"content-type" => "application/x-www-form-urlencoded;charset=UTF-8"}
+      )
+
+    form_data = await(Response.form_data(response))
+
+    assert Web.FormData.get(form_data, "a") == "1"
+    assert Web.FormData.get(form_data, "b") == "two"
+  end
+
+  test "Response.form_data/1 rejects multipart payload when boundary is missing" do
+    response =
+      Response.new(
+        body: "--x\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--x--\r\n",
+        headers: %{"content-type" => "multipart/form-data"}
+      )
+
+    assert %Web.TypeError{message: "multipart/form-data boundary is missing"} =
+             catch_exit(await(Response.form_data(response)))
+  end
+
+  test "Response.form_data/1 rejects empty quoted multipart boundaries" do
+    response =
+      Response.new(
+        body: "",
+        headers: %{"content-type" => "multipart/form-data; boundary=\"\""}
+      )
+
+    assert %Web.TypeError{message: "multipart/form-data boundary is missing"} =
+             catch_exit(await(Response.form_data(response)))
+  end
+
+  test "Response.form_data/1 rejects whitespace-only multipart boundaries" do
+    response =
+      Response.new(
+        body: "",
+        headers: %{"content-type" => "multipart/form-data; boundary=   "}
+      )
+
+    assert %Web.TypeError{message: "multipart/form-data boundary is missing"} =
+             catch_exit(await(Response.form_data(response)))
+  end
+
+  test "Response.form_data/1 accepts quoted multipart boundary parameters" do
+    boundary = "quoted-boundary"
+
+    response =
+      Response.new(
+        body:
+          "--#{boundary}\r\n" <>
+            "Content-Disposition: form-data; name=\"field\"\r\n\r\n" <>
+            "value\r\n" <>
+            "--#{boundary}--\r\n",
+        headers: %{"content-type" => "multipart/form-data; boundary=\"#{boundary}\""}
+      )
+
+    form_data = await(Response.form_data(response))
+    assert Web.FormData.get(form_data, "field") == "value"
+  end
+
+  test "Response.form_data/1 rescues malformed multipart parser errors" do
+    response =
+      Response.new(
+        body: "not-a-multipart-body",
+        headers: %{"content-type" => "multipart/form-data; boundary=broken"}
+      )
+
+    assert %Web.TypeError{message: "Malformed multipart body: missing opening boundary"} =
+             catch_exit(await(Response.form_data(response)))
+  end
+
+  test "Response.form_data/1 rejects unsupported content types" do
+    response =
+      Response.new(
+        body: "plain text",
+        headers: %{"content-type" => "text/plain"}
+      )
+
+    assert %Web.TypeError{message: "Cannot parse form data from content-type \"text/plain\""} =
+             catch_exit(await(Response.form_data(response)))
+  end
+
+  test "Request.form_data/1 rejects immediately when the request signal is already aborted" do
+    controller = Web.AbortController.new()
+    :ok = Web.AbortController.abort(controller, :user_cancelled)
+
+    request =
+      Request.new("https://example.com",
+        body: "a=1",
+        headers: %{"content-type" => "application/x-www-form-urlencoded"},
+        signal: controller.signal
+      )
+
+    assert :user_cancelled = catch_exit(await(Request.form_data(request)))
   end
 end

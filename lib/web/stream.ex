@@ -40,7 +40,9 @@ defmodule Web.Stream do
 
   @doc "Called by the engine to pull data from a producer source."
   @callback pull(ctrl :: term(), state :: term()) ::
-              {:ok, new_state :: term()} | {:ok, new_state :: term(), :pause}
+              {:ok, new_state :: term()}
+              | {:ok, new_state :: term(), :pause}
+              | {:ok, new_state :: term(), :hibernate}
 
   @doc "Called by the engine to process an incoming write chunk."
   @callback write(chunk :: term(), ctrl :: term(), state :: term()) ::
@@ -1026,6 +1028,20 @@ defmodule Web.Stream do
       |> Map.put(:pulling, false)
 
     {:keep_state, new_data}
+  end
+
+  defp handle_task_result(
+         {:ok, new_impl_state, :hibernate},
+         _state,
+         %{active_operation: :pull} = data
+       ) do
+    new_data =
+      data
+      |> Map.put(:impl_state, new_impl_state)
+      |> clear_active_operation()
+      |> Map.put(:pulling, false)
+
+    {:keep_state, new_data, [:hibernate]}
   end
 
   defp handle_task_result({:ok, new_impl_state}, _state, %{active_operation: :pull} = data) do

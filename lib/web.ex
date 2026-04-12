@@ -39,6 +39,8 @@ defmodule Web do
       alias Web.Blob
       alias Web.CompressionStream
       alias Web.DecompressionStream
+      alias Web.File
+      alias Web.FormData
       alias Web.Headers
       alias Web.Promise
       alias Web.ReadableStream

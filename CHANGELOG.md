@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.File`.
+- `Web.FormData` struct and streaming multipart parser.
+- `examples/streaming_upload_proxy.exs` demonstrating a WHATWG-only multipart
+	ingestion flow (`Response.form_data/1` + `FormData.get/2`) that streams a
+	simulated `1 GiB` file to a writable sink while reporting memory checkpoints.
+
+## [0.3.0] - 2026-04-10
+
+### Added
+
 - `Web.Stream` behaviour that abstracts streaming state machine.
 - `use Web.Stream` macro.
 - `Web.TransformStream` that uses `use Web.Stream`

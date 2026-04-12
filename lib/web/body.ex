@@ -49,6 +49,7 @@ defmodule Web.Body do
 
   @callback text(struct()) :: Web.Promise.t()
   @callback json(struct()) :: Web.Promise.t()
+  @callback form_data(struct()) :: Web.Promise.t()
   @callback array_buffer(struct()) :: Web.Promise.t()
   @callback bytes(struct()) :: Web.Promise.t()
   @callback blob(struct()) :: Web.Promise.t()
@@ -72,6 +73,14 @@ defmodule Web.Body do
       @impl Web.Body
       def json(%{body: _} = struct) do
         Web.Body.json(struct)
+      end
+
+      @doc """
+      Reads the body and resolves with `%Web.FormData{}`.
+      """
+      @impl Web.Body
+      def form_data(%{body: _} = struct) do
+        Web.Body.form_data(struct)
       end
 
       @doc """
@@ -130,6 +139,25 @@ defmodule Web.Body do
   @doc false
   def json(%{body: body}) do
     consume_body(body, &Jason.decode/1)
+  end
+
+  @doc false
+  def form_data(%{body: body} = struct) do
+    owner = self()
+
+    Web.Promise.new(fn resolve, reject ->
+      try do
+        ensure_usable!(body)
+        Web.AbortSignal.check!(Map.get(struct, :signal))
+
+        case parse_form_data(body, content_type(struct), Map.get(struct, :signal), owner) do
+          {:ok, form_data} -> resolve.(form_data)
+          {:error, reason} -> reject.(reason)
+        end
+      catch
+        :throw, {:abort, reason} -> reject.(reason)
+      end
+    end)
   end
 
   @doc false
@@ -290,9 +318,60 @@ defmodule Web.Body do
   defp infer_content_type(%Web.URLSearchParams{}),
     do: "application/x-www-form-urlencoded;charset=UTF-8"
 
+  defp infer_content_type(%Web.FormData{} = form_data), do: Web.FormData.content_type(form_data)
+
   defp infer_content_type(%Web.Blob{type: type}) when type != "", do: type
   defp infer_content_type(body) when is_binary(body), do: "text/plain;charset=UTF-8"
   defp infer_content_type(_body), do: nil
+
+  defp parse_form_data(body, content_type, signal, owner) do
+    cond do
+      String.starts_with?(String.downcase(content_type), "multipart/form-data") ->
+        with {:ok, boundary} <- multipart_boundary(content_type) do
+          {:ok, Web.FormData.parse(body, boundary, signal: signal, owner: owner)}
+        end
+
+      String.starts_with?(String.downcase(content_type), "application/x-www-form-urlencoded") ->
+        with {:ok, binary} <- read_body_to_binary(body) do
+          {:ok, parse_urlencoded_form_data(binary)}
+        end
+
+      true ->
+        {:error,
+         Web.TypeError.exception(
+           "Cannot parse form data from content-type #{inspect(content_type)}"
+         )}
+    end
+  rescue
+    e in Web.TypeError -> {:error, e}
+  end
+
+  defp parse_urlencoded_form_data(binary) do
+    params = Web.URLSearchParams.new(binary)
+
+    Enum.reduce(Web.URLSearchParams.to_list(params), Web.FormData.new(), fn {name, value}, form ->
+      Web.FormData.append(form, name, value)
+    end)
+  end
+
+  defp multipart_boundary(content_type) do
+    pattern = ~S/(?:^|;\s*)boundary=(?:"([^"]+)"|([^;]+))/
+
+    case :re.run(content_type, pattern, [{:capture, :all_but_first, :binary}]) do
+      {:match, captures} ->
+        captures
+        |> Enum.find("", &(is_binary(&1) and &1 != ""))
+        |> String.trim()
+        |> case do
+          "" -> {:error, Web.TypeError.exception("multipart/form-data boundary is missing")}
+          "\"\"" -> {:error, Web.TypeError.exception("multipart/form-data boundary is missing")}
+          boundary -> {:ok, boundary}
+        end
+
+      _ ->
+        {:error, Web.TypeError.exception("multipart/form-data boundary is missing")}
+    end
+  end
 
   defp content_type(%{headers: %Web.Headers{} = headers}) do
     Web.Headers.get(headers, "content-type", "")

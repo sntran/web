@@ -103,6 +103,17 @@ defmodule Web.TextEncodingTest do
              <<0xEF, 0xBF, 0xBD, 0x28>>
   end
 
+  test "TextDecoder treats 0xED prefixes as partial only for valid surrogate-range second bytes" do
+    decoder = TextDecoder.new()
+    assert TextDecoder.decode(decoder, <<0xED, 0x9F>>, %{stream: true}) == ""
+    assert %{carry: <<0xED, 0x9F>>} = :sys.get_state(decoder.state_pid)
+
+    decoder = TextDecoder.new()
+
+    assert TextDecoder.decode(decoder, <<0xED, 0xA0>>, %{stream: true}) ==
+             <<0xEF, 0xBF, 0xBD, 0xEF, 0xBF, 0xBD>>
+  end
+
   test "TextDecoder only holds three-byte partial suffixes for valid four-byte prefixes" do
     decoder = TextDecoder.new()
     assert TextDecoder.decode(decoder, <<0xF0, 0x9F, 0x8C>>, %{stream: true}) == ""

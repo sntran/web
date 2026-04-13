@@ -144,13 +144,17 @@ defmodule Web.Body do
   @doc false
   def form_data(%{body: body} = struct) do
     owner = self()
+    explicit_signal = Map.get(struct, :signal)
+    struct_snapshot = Map.get(struct, :snapshot)
+    # Derive the signal: explicit field takes priority, then creation-time ambient.
+    signal = explicit_signal || (struct_snapshot && struct_snapshot.ambient_signal)
 
     Web.Promise.new(fn resolve, reject ->
       try do
         ensure_usable!(body)
-        Web.AbortSignal.check!(Map.get(struct, :signal))
+        Web.AbortSignal.check!(signal)
 
-        case parse_form_data(body, content_type(struct), Map.get(struct, :signal), owner) do
+        case parse_form_data(body, content_type(struct), signal, struct_snapshot, owner) do
           {:ok, form_data} -> resolve.(form_data)
           {:error, reason} -> reject.(reason)
         end
@@ -324,11 +328,16 @@ defmodule Web.Body do
   defp infer_content_type(body) when is_binary(body), do: "text/plain;charset=UTF-8"
   defp infer_content_type(_body), do: nil
 
-  defp parse_form_data(body, content_type, signal, owner) do
+  defp parse_form_data(body, content_type, signal, struct_snapshot, owner) do
     cond do
       String.starts_with?(String.downcase(content_type), "multipart/form-data") ->
         with {:ok, boundary} <- multipart_boundary(content_type) do
-          {:ok, Web.FormData.parse(body, boundary, signal: signal, owner: owner)}
+          {:ok,
+           Web.FormData.parse(body, boundary,
+             signal: signal,
+             struct_snapshot: struct_snapshot,
+             owner: owner
+           )}
         end
 
       String.starts_with?(String.downcase(content_type), "application/x-www-form-urlencoded") ->

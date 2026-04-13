@@ -7,6 +7,8 @@ defmodule Web.Response do
   """
   use Web.Body
 
+  alias Web.AsyncContext
+
   defstruct [
     :body,
     :status,
@@ -14,6 +16,7 @@ defmodule Web.Response do
     :status_text,
     :url,
     :type,
+    :snapshot,
     headers: Web.Headers.new()
   ]
 
@@ -24,7 +27,8 @@ defmodule Web.Response do
           ok: boolean(),
           status_text: String.t(),
           url: String.t(),
-          type: String.t()
+          type: String.t(),
+          snapshot: AsyncContext.Snapshot.t() | nil
         }
 
   @redirect_statuses [301, 302, 303, 307, 308]
@@ -68,7 +72,8 @@ defmodule Web.Response do
       ok: ok,
       status_text: status_text,
       url: Keyword.get(opts, :url),
-      type: Keyword.get(opts, :type, "default")
+      type: Keyword.get(opts, :type, "default"),
+      snapshot: AsyncContext.Snapshot.take()
     }
   end
 

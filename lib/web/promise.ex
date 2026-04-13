@@ -13,7 +13,22 @@ defmodule Web.Promise do
 
   Promises are one-shot and follow standard Elixir `Task` semantics: once awaited,
   their result message is consumed.
+
+  ## Synchronous Chaining Model
+
+  Unlike JavaScript Promises, `.then/2` and `.catch/2` execute their callbacks
+  **synchronously in the caller's process**. The caller blocks on
+  `Task.await/2` until the upstream promise settles, then invokes the callback
+  inline — no new process is spawned.
+
+  This means that any `Web.AsyncContext.Variable` values set via
+  `Variable.run/3` in the calling scope are naturally visible inside `.then`
+  and `.catch` callbacks because they share the same process dictionary. No
+  snapshot capture or restore is needed for chaining — only `Promise.new/1`
+  (which spawns a Task) requires snapshot propagation.
   """
+
+  alias Web.AsyncContext.Snapshot
 
   defstruct [:task]
 
@@ -21,10 +36,14 @@ defmodule Web.Promise do
 
   @spec new(((... -> no_return()), (... -> no_return()) -> any())) :: t()
   def new(executor) when is_function(executor, 2) do
+    snapshot = Snapshot.take()
+
     %__MODULE__{
       task:
         Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
-          run_executor(executor)
+          Snapshot.run(snapshot, fn ->
+            run_executor(executor)
+          end)
         end)
     }
   end

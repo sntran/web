@@ -2,12 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased] - 2026-04-09
+## [Unreleased] - 2026-04-12
 
 ### Added
 
 - `Web.File`.
 - `Web.FormData` struct and streaming multipart parser.
+- `Web.AsyncContext` for BEAM-native async context propagation.
+- `Web.AsyncContext.Variable` for scoped context values that participate in
+  snapshot capture and restoration.
+- `Web.AsyncContext.Snapshot` for capturing registered variables, logger
+  metadata, `$callers`, and ambient abort signals.
 - `Web.CustomEvent` for lightweight event payload construction.
 - `Web.EventTarget` with listener registration, `once` handling, callback
   deduplication, and `AbortSignal`-driven listener cleanup.
@@ -19,8 +24,35 @@ All notable changes to this project are documented in this file.
 - `examples/streaming_upload_proxy.exs` demonstrating a WHATWG-only multipart
 	ingestion flow (`Response.form_data/1` + `FormData.get/2`) that streams a
 	simulated `1 GiB` file to a writable sink while reporting memory checkpoints.
+- `examples/async_runtime_power.exs`, a runtime-focused demo showing ambient
+  aborts, logger metadata, console grouping, multipart file parsing, and
+  `CompressionStream` working together across process boundaries.
 
 ### Changed
+
+- `use Web` now aliases `Web.AsyncContext`.
+- `Web.Promise.new/1` and `Web.Stream` task callbacks now capture and restore
+  `Web.AsyncContext` snapshots, preserving logger metadata, scoped variables,
+  `$callers`, and ambient abort signals across spawned tasks.
+- Streams created inside `Web.AsyncContext.with_signal/2` now auto-bind to the
+  ambient signal and cancel themselves when it aborts.
+- `Web.ReadableStreamDefaultReader.read/1` now returns WHATWG-style
+  `%{value: term(), done: boolean()}` results inside `%Web.Promise{}` values
+  and rejects with the stored stream error reason when reads fail.
+- `Web.ReadableStreamDefaultReader.cancel/2` now returns the underlying
+  cancellation promise so callers can await stream shutdown.
+- `Web.ReadableStream.pipe_to/3` now consumes WHATWG-shaped read results from
+  default readers.
+- `Web.TransformStream.new/2` now accepts `:readable_strategy` as the primary
+  readable-side queue option and keeps `:writable_strategy` as a legacy alias.
+- `Web.FormData.Parser` now captures and restores `Web.AsyncContext`
+  snapshots, auto-binds to ambient abort signals, and propagates that context
+  into live file streams it creates on demand.
+- `Web.Console.group/1` now keeps `group_depth` in logger metadata so grouped
+  output survives async-context snapshot restore across task boundaries.
+- `Web.CompressionStream` and `Web.DecompressionStream` now emit context-aware
+  zlib observability logs from restored task contexts, including ambient
+  metadata such as `request_id`, `user`, and console grouping depth.
 
 ## [0.3.0] - 2026-04-10
 

@@ -610,7 +610,7 @@ defmodule Web.ReadableStream do
            read_result <-
              await_pipe_step(fn -> read_for_pipe(reader.controller_pid, owner_pid) end, options) do
         case read_result do
-          {:ok, chunk} ->
+          %{value: chunk, done: false} ->
             case WritableStream.write(writer.controller_pid, writer.owner_pid, chunk) do
               :ok ->
                 pump(reader, writer, options)
@@ -619,7 +619,7 @@ defmodule Web.ReadableStream do
                 {:sink_error, reason}
             end
 
-          :done ->
+          %{done: true} ->
             :done
 
           {:error, reason} ->
@@ -678,7 +678,11 @@ defmodule Web.ReadableStream do
   end
 
   defp read_for_pipe(pid, owner_pid) do
-    :gen_statem.call(pid, {:read, owner_pid})
+    case :gen_statem.call(pid, {:read, owner_pid}) do
+      {:ok, chunk} -> %{value: chunk, done: false}
+      :done -> %{value: nil, done: true}
+      {:error, _} = error -> error
+    end
   end
 
   # coveralls-ignore-start
@@ -861,8 +865,28 @@ defimpl Enumerable, for: Web.ReadableStream do
   end
 
   defp do_reduce(reader, {:cont, acc}, fun) do
-    case ReadableStreamDefaultReader.read(reader) do
-      :done ->
+    %Web.Promise{task: task} = ReadableStreamDefaultReader.read(reader)
+
+    result =
+      try do
+        Task.await(task, :infinity)
+      catch
+        :exit, reason ->
+          {:__rejected__, normalize_reader_exit_reason(reason)}
+      end
+
+    case result do
+      {:__rejected__, _reason} ->
+        try do
+          ReadableStreamDefaultReader.release_lock(reader)
+        rescue
+          # coveralls-ignore-next-line
+          _ -> :ok
+        end
+
+        raise Web.TypeError, "The stream is errored."
+
+      %{done: true} ->
         try do
           ReadableStreamDefaultReader.release_lock(reader)
         rescue
@@ -872,7 +896,7 @@ defimpl Enumerable, for: Web.ReadableStream do
 
         {:done, acc}
 
-      chunk ->
+      %{value: chunk, done: false} ->
         try do
           do_reduce(reader, fun.(chunk, acc), fun)
         rescue
@@ -892,4 +916,10 @@ defimpl Enumerable, for: Web.ReadableStream do
   def count(_stream), do: {:error, __MODULE__}
   def member?(_stream, _element), do: {:error, __MODULE__}
   def slice(_stream), do: {:error, __MODULE__}
+
+  defp normalize_reader_exit_reason({{:shutdown, reason}, {Task, :await, _}}), do: reason
+  # coveralls-ignore-next-line
+  defp normalize_reader_exit_reason({:shutdown, reason}), do: reason
+  # coveralls-ignore-next-line
+  defp normalize_reader_exit_reason(reason), do: reason
 end

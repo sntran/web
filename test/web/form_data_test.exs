@@ -4,6 +4,8 @@ defmodule Web.FormDataTest do
 
   import Web, only: [await: 1]
 
+  alias Web.AbortController
+  alias Web.AsyncContext
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultReader
 
@@ -814,6 +816,98 @@ defmodule Web.FormDataTest do
     assert_eventually(fn -> source_cancel_reason(tracker) == :signal_abort end)
     assert_eventually(fn -> not Process.alive?(form.coordinator) end)
     assert_eventually(fn -> not Process.alive?(stream.controller_pid) end)
+  end
+
+  test "ambient abort signals cancel the coordinator, child stream, and upstream" do
+    boundary = "ambient-signal-boundary"
+    controller = AbortController.new()
+    file_body = String.duplicate("p", 128)
+    key = AsyncContext.ambient_signal_key()
+    previous = Process.get(key)
+
+    {stream, tracker} =
+      boundary
+      |> multipart_payload([
+        %{name: "upload", filename: "x.txt", content_type: "text/plain", value: file_body}
+      ])
+      |> byte_chunks()
+      |> tracked_source()
+
+    form =
+      try do
+        Process.put(key, controller.signal)
+        Web.FormData.parse(stream, boundary)
+      after
+        restore_ambient_signal(key, previous)
+      end
+
+    file_stream = form |> Web.FormData.get("upload") |> Web.File.stream()
+
+    assert :ok = AbortController.abort(controller, :ambient_abort)
+    assert_eventually(fn -> source_cancel_reason(tracker) == :ambient_abort end)
+    assert_eventually(fn -> not Process.alive?(form.coordinator) end)
+    assert_eventually(fn -> not Process.alive?(file_stream.controller_pid) end)
+  end
+
+  test "multiple signal subscriptions ignore unrelated messages and honor explicit abort" do
+    boundary = "multi-signal-ignore-boundary"
+    explicit = AbortController.new()
+    ambient = AbortController.new()
+    file_body = String.duplicate("p", 128)
+    key = AsyncContext.ambient_signal_key()
+    previous = Process.get(key)
+
+    {stream, tracker} =
+      boundary
+      |> multipart_payload([
+        %{name: "upload", filename: "x.txt", content_type: "text/plain", value: file_body}
+      ])
+      |> byte_chunks()
+      |> tracked_source()
+
+    form =
+      try do
+        Process.put(key, ambient.signal)
+        Web.FormData.parse(stream, boundary, signal: explicit.signal)
+      after
+        restore_ambient_signal(key, previous)
+      end
+
+    file_stream = form |> Web.FormData.get("upload") |> Web.File.stream()
+
+    send(form.coordinator, {:unrelated, :message})
+    Process.sleep(50)
+    assert Process.alive?(form.coordinator)
+
+    assert :ok = AbortController.abort(explicit, :explicit_abort)
+    assert_eventually(fn -> source_cancel_reason(tracker) == :explicit_abort end)
+    assert_eventually(fn -> not Process.alive?(form.coordinator) end)
+    assert_eventually(fn -> not Process.alive?(file_stream.controller_pid) end)
+    _ = AbortController.abort(ambient, :cleanup)
+  end
+
+  test "already-aborted explicit signal short-circuits when multiple signals are bound" do
+    boundary = "multi-signal-aborted-boundary"
+    ambient = AbortController.new()
+    explicit = Web.AbortSignal.abort(:already_aborted)
+    key = AsyncContext.ambient_signal_key()
+    previous = Process.get(key)
+
+    payload =
+      multipart_payload(boundary, [
+        %{name: "meta", value: "value"}
+      ])
+
+    try do
+      Process.put(key, ambient.signal)
+
+      assert catch_exit(Web.FormData.parse(payload, boundary, signal: explicit)) ==
+               :already_aborted
+    after
+      restore_ambient_signal(key, previous)
+    end
+
+    _ = AbortController.abort(ambient, :cleanup)
   end
 
   test "token signals without an explicit reason default to aborted" do
@@ -1881,6 +1975,9 @@ defmodule Web.FormDataTest do
   defp source_cancel_reason(tracker) do
     Agent.get(tracker, & &1.cancel_reason)
   end
+
+  defp restore_ambient_signal(key, nil), do: Process.delete(key)
+  defp restore_ambient_signal(key, previous), do: Process.put(key, previous)
 
   defp assert_eventually(fun, attempts \\ 20)
 

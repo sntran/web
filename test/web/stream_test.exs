@@ -67,6 +67,44 @@ defmodule Web.StreamTest do
       slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
       assert slots.state == :writable
     end
+
+    test "init tolerates unexpected async context snapshots" do
+      assert {:ok, :readable, %Web.Stream{}, _actions} =
+               Web.Stream.init({UsingMacroStream, [], :not_a_snapshot})
+
+      assert {:ok, :readable, %Web.Stream{}, _actions} =
+               Web.Stream.init({UsingMacroStream, [], %{ambient_signal: :not_a_signal}})
+    end
+
+    test "init forwards ambient aborts for signals that abort during subscription" do
+      pid = spawn(fn -> :ok end)
+      ref = Process.monitor(pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, reason}
+      assert reason in [:normal, :noproc]
+
+      signal = %Web.AbortSignal{pid: pid, ref: make_ref()}
+
+      assert {:ok, :readable, %Web.Stream{}, _actions} =
+               Web.Stream.init({UsingMacroStream, [], %{ambient_signal: signal}})
+
+      assert_receive {:ambient_signal_abort, :aborted}
+    end
+
+    test "start_task falls back to plain execution when async_context is not a snapshot" do
+      parent = self()
+
+      data = %Web.Stream{async_context: :not_a_snapshot, timeout_ms: 50}
+
+      assert {:keep_state, next_data} =
+               Web.Stream.readable(
+                 :internal,
+                 {:start_task, fn -> send(parent, :started) end},
+                 data
+               )
+
+      assert_receive :started, 1_000
+      assert {:ok, :init_done} = Task.await(next_data.active_task, 1_000)
+    end
   end
 
   describe "Web.Stream backpressure (producer)" do
@@ -228,7 +266,7 @@ defmodule Web.StreamTest do
 
       reader = ReadableStream.get_reader(stream)
       assert ReadableStream.locked?(stream.controller_pid) == true
-      assert Web.ReadableStreamDefaultReader.read(reader) == "hello"
+      assert await(Web.ReadableStreamDefaultReader.read(reader)) == %{value: "hello", done: false}
       assert ReadableStream.disturbed?(stream.controller_pid) == true
       assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
 
@@ -550,7 +588,7 @@ defmodule Web.StreamTest do
       assert Task.yield(ready_task, 100) == nil
 
       reader = ReadableStream.get_reader(ts.readable)
-      assert Web.ReadableStreamDefaultReader.read(reader) == "a"
+      assert await(Web.ReadableStreamDefaultReader.read(reader)) == %{value: "a", done: false}
       assert {:ok, :ok} = Task.yield(ready_task, 1_000)
       assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
       assert :ok = WritableStreamDefaultWriter.release_lock(writer)
@@ -579,13 +617,9 @@ defmodule Web.StreamTest do
       left_reader = ReadableStream.get_reader(left)
       right_reader = ReadableStream.get_reader(right)
 
-      assert_raise TypeError, "The stream is errored.", fn ->
-        Web.ReadableStreamDefaultReader.read(left_reader)
-      end
+      assert catch_exit(await(Web.ReadableStreamDefaultReader.read(left_reader)))
 
-      assert_raise TypeError, "The stream is errored.", fn ->
-        Web.ReadableStreamDefaultReader.read(right_reader)
-      end
+      assert catch_exit(await(Web.ReadableStreamDefaultReader.read(right_reader)))
     end
 
     test "timeout check transitions to errored with task timeout reason" do
@@ -999,7 +1033,7 @@ defmodule Web.StreamTest do
       end)
 
       reader = Web.ReadableStream.get_reader(ts.readable)
-      assert "full" == Web.ReadableStreamDefaultReader.read(reader)
+      assert %{value: "full", done: false} == await(Web.ReadableStreamDefaultReader.read(reader))
       assert :ok = Task.await(waiter, 1_000)
     end
 

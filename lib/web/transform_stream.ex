@@ -135,6 +135,10 @@ defmodule Web.TransformStream do
   ## Options
 
   - `:high_water_mark` — the writable-side high water mark (default: 1)
+  - `:readable_strategy` — a queuing strategy (e.g. `Web.CountQueuingStrategy.new(n)`)
+    for the readable side, allowing users to tune the high-water mark of the
+    transformed output queue. Defaults to `Web.CountQueuingStrategy.new(1)`.
+  - `:writable_strategy` — legacy alias for `:readable_strategy` (deprecated)
 
   ## Transformer keys
 
@@ -146,13 +150,17 @@ defmodule Web.TransformStream do
   def new(transformer \\ %{}, opts \\ []) do
     hwm = Keyword.get(opts, :high_water_mark, 1)
 
+    readable_strategy =
+      Keyword.get(
+        opts,
+        :readable_strategy,
+        Keyword.get(opts, :writable_strategy, Web.CountQueuingStrategy.new(hwm))
+      )
+
     opts =
       opts
       |> Keyword.put(:transformer, transformer)
-      |> Keyword.put_new(
-        :strategy,
-        Keyword.get(opts, :writable_strategy, Web.CountQueuingStrategy.new(hwm))
-      )
+      |> Keyword.put_new(:strategy, readable_strategy)
 
     {:ok, pid} = start_link(opts)
 

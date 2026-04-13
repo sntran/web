@@ -243,6 +243,8 @@ defmodule Web.FormData do
     @moduledoc false
     @behaviour :gen_statem
 
+    alias Web.AbortSignal
+    alias Web.AsyncContext.Snapshot
     alias Web.File
     alias Web.ReadableStream
     alias Web.ReadableStreamDefaultController
@@ -254,10 +256,11 @@ defmodule Web.FormData do
       caller = self()
       owner = Keyword.get(opts, :owner, self())
       reply_ref = make_ref()
+      snapshot = Snapshot.take()
 
       {_owner_pid, owner_ref} =
         spawn_monitor(fn ->
-          start_link_owner(caller, owner, reply_ref, source, boundary, opts)
+          start_link_owner(caller, owner, reply_ref, source, boundary, opts, snapshot)
         end)
 
       receive do
@@ -328,11 +331,12 @@ defmodule Web.FormData do
       |> then(&unwrap!(:next_entry, &1))
     end
 
-    defp start_link_owner(caller, owner, reply_ref, source, boundary, opts) do
+    defp start_link_owner(caller, owner, reply_ref, source, boundary, opts, snapshot) do
       Process.flag(:trap_exit, true)
       owner_ref = Process.monitor(owner)
+      Snapshot.restore(snapshot)
 
-      case :gen_statem.start_link(__MODULE__, {source, boundary, opts}, []) do
+      case :gen_statem.start_link(__MODULE__, {source, boundary, opts, snapshot}, []) do
         {:ok, pid} = result ->
           send(caller, {reply_ref, result})
           owner_loop(pid, owner, owner_ref)
@@ -365,40 +369,47 @@ defmodule Web.FormData do
     def callback_mode, do: :handle_event_function
 
     @impl true
-    def init({%ReadableStream{controller_pid: source_pid}, boundary, opts}) do
+    def init({%ReadableStream{controller_pid: source_pid}, boundary, opts, snapshot}) do
       Process.flag(:message_queue_data, :off_heap)
+      Snapshot.restore(snapshot)
 
-      subscription = subscribe_signal(Keyword.get(opts, :signal))
+      struct_snapshot = Keyword.get(opts, :struct_snapshot)
 
-      if match?(%{aborted: true}, subscription) do
-        {:stop, {:shutdown, subscription.reason}}
-      else
-        data = %{
-          source_pid: source_pid,
-          source_lock_released?: false,
-          signal_subscription: subscription,
-          boundary: boundary,
-          opening_boundary: "--" <> boundary,
-          delimiter_prefix: "\r\n--" <> boundary,
-          retain_bytes: byte_size("\r\n--" <> boundary) + 1,
-          buffer: "",
-          phase: :opening,
-          ready?: false,
-          entries: [],
-          current_field: nil,
-          current_file: nil,
-          next_part_id: 1,
-          pending: [],
-          materializing?: false
-        }
+      subscription =
+        maybe_bind_ambient_signal(Keyword.get(opts, :signal), snapshot, struct_snapshot)
 
-        case ReadableStream.get_reader(source_pid) do
-          :ok ->
-            {:ok, :running, data}
+      case aborted_reason(subscription) do
+        nil ->
+          data = %{
+            source_pid: source_pid,
+            source_lock_released?: false,
+            signal_subscription: subscription,
+            async_context: snapshot,
+            boundary: boundary,
+            opening_boundary: "--" <> boundary,
+            delimiter_prefix: "\r\n--" <> boundary,
+            retain_bytes: byte_size("\r\n--" <> boundary) + 1,
+            buffer: "",
+            phase: :opening,
+            ready?: false,
+            entries: [],
+            current_field: nil,
+            current_file: nil,
+            next_part_id: 1,
+            pending: [],
+            materializing?: false
+          }
 
-          {:error, :already_locked} ->
-            {:stop, TypeError.exception("ReadableStream is already locked")}
-        end
+          case ReadableStream.get_reader(source_pid) do
+            :ok ->
+              {:ok, :running, data}
+
+            {:error, :already_locked} ->
+              {:stop, TypeError.exception("ReadableStream is already locked")}
+          end
+
+        reason ->
+          {:stop, {:shutdown, reason}}
       end
     end
 
@@ -1045,10 +1056,8 @@ defmodule Web.FormData do
       %{file | parts: []}
     end
 
-    defp subscribe_signal(nil), do: nil
-
     defp subscribe_signal(signal) do
-      case Web.AbortSignal.subscribe(signal) do
+      case AbortSignal.subscribe(signal) do
         {:ok, subscription} ->
           subscription
 
@@ -1057,15 +1066,57 @@ defmodule Web.FormData do
             type: :token,
             token: make_ref(),
             aborted: true,
-            reason: Web.AbortSignal.reason(signal) || :aborted
+            reason: AbortSignal.reason(signal) || :aborted
           }
       end
     end
 
+    defp maybe_bind_ambient_signal(explicit, site_snapshot, struct_snapshot) do
+      struct_ambient = struct_snapshot && struct_snapshot.ambient_signal
+
+      # Collect all distinct non-nil signals so either can trigger abort.
+      signals =
+        [explicit, struct_ambient, site_snapshot.ambient_signal]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+
+      case signals do
+        [] -> nil
+        [single] -> subscribe_signal(single)
+        multiple -> Enum.map(multiple, &subscribe_signal/1)
+      end
+    end
+
+    defp aborted_reason(nil), do: nil
+
+    defp aborted_reason(subscriptions) when is_list(subscriptions) do
+      Enum.find_value(subscriptions, fn
+        %{aborted: true, reason: reason} -> reason
+        _ -> nil
+      end)
+    end
+
+    defp aborted_reason(%{aborted: true, reason: reason}), do: reason
+    defp aborted_reason(_), do: nil
+
     defp unsubscribe_signal(nil), do: :ok
-    defp unsubscribe_signal(subscription), do: Web.AbortSignal.unsubscribe(subscription)
+
+    defp unsubscribe_signal(subscriptions) when is_list(subscriptions) do
+      Enum.each(subscriptions, &unsubscribe_signal/1)
+    end
+
+    defp unsubscribe_signal(subscription), do: AbortSignal.unsubscribe(subscription)
 
     defp abort_reason_from_message(_message, nil), do: :ignore
+
+    defp abort_reason_from_message(_message, []), do: :ignore
+
+    defp abort_reason_from_message(message, [sub | rest]) do
+      case abort_reason_from_message(message, sub) do
+        :ignore -> abort_reason_from_message(message, rest)
+        result -> result
+      end
+    end
 
     defp abort_reason_from_message({:abort, ref, reason}, %{type: :abort_signal, ref: ref}),
       do: {:ok, reason}
@@ -1250,8 +1301,11 @@ defmodule Web.FormData do
            entry_index
          ) do
       case data.materializing? do
-        true -> build_materialized_file_entry(name, filename, type, part_id, entry_index)
-        false -> build_live_file_entry(name, filename, type, part_id, entry_index)
+        true ->
+          build_materialized_file_entry(name, filename, type, part_id, entry_index)
+
+        false ->
+          build_live_file_entry(name, filename, type, part_id, entry_index, data.async_context)
       end
     end
 
@@ -1270,14 +1324,16 @@ defmodule Web.FormData do
       {file, current_file}
     end
 
-    defp build_live_file_entry(name, filename, type, part_id, entry_index) do
+    defp build_live_file_entry(name, filename, type, part_id, entry_index, %Snapshot{} = snapshot) do
       coordinator_pid = self()
 
       stream =
-        ReadableStream.new(%{
-          pull: fn controller -> child_pull(coordinator_pid, part_id, controller) end,
-          cancel: fn reason -> child_cancel(coordinator_pid, part_id, reason) end
-        })
+        Snapshot.run(snapshot, fn ->
+          ReadableStream.new(%{
+            pull: fn controller -> child_pull(coordinator_pid, part_id, controller) end,
+            cancel: fn reason -> child_cancel(coordinator_pid, part_id, reason) end
+          })
+        end)
 
       file = File.new([], name: name, filename: filename, type: type, size: nil, stream: stream)
 

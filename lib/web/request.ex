@@ -7,6 +7,8 @@ defmodule Web.Request do
   """
   use Web.Body
 
+  alias Web.AsyncContext
+
   defstruct [
     :url,
     :method,
@@ -14,6 +16,7 @@ defmodule Web.Request do
     :dispatcher,
     :redirect,
     :signal,
+    :snapshot,
     :options,
     headers: Web.Headers.new()
   ]
@@ -26,6 +29,7 @@ defmodule Web.Request do
           dispatcher: module() | nil,
           redirect: String.t(),
           signal: Web.AbortSignal.t() | pid() | reference() | nil,
+          snapshot: AsyncContext.Snapshot.t() | nil,
           options: keyword()
         }
 
@@ -84,7 +88,9 @@ defmodule Web.Request do
     body = Web.ReadableStream.from(raw_body)
     dispatcher = Keyword.get(init, :dispatcher)
     redirect = Keyword.get(init, :redirect, "follow") |> to_string()
-    signal = Keyword.get(init, :signal)
+
+    snapshot = AsyncContext.Snapshot.take()
+    signal = Keyword.get(init, :signal) || snapshot.ambient_signal
 
     options =
       init
@@ -100,6 +106,7 @@ defmodule Web.Request do
       dispatcher: dispatcher,
       redirect: redirect,
       signal: signal,
+      snapshot: snapshot,
       options: options
     }
   end

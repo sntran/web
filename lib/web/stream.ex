@@ -29,6 +29,9 @@ defmodule Web.Stream do
 
   @behaviour :gen_statem
 
+  alias Web.AbortSignal
+  alias Web.AsyncContext.Snapshot
+
   # ---------------------------------------------------------------------------
   # Behavior definition
   # ---------------------------------------------------------------------------
@@ -85,6 +88,7 @@ defmodule Web.Stream do
     :task_ref,
     :task_timeout_ref,
     :active_operation,
+    :async_context,
     # Producer (readable) side
     queue: :queue.new(),
     hwm: 1,
@@ -116,7 +120,8 @@ defmodule Web.Stream do
 
   @doc "Starts a stream engine process for the given implementing module."
   def start_link(module, opts) when is_atom(module) do
-    :gen_statem.start_link(__MODULE__, {module, opts}, [])
+    snapshot = Snapshot.take()
+    :gen_statem.start_link(__MODULE__, {module, opts, snapshot}, [])
   end
 
   @doc false
@@ -153,7 +158,7 @@ defmodule Web.Stream do
   def callback_mode, do: :state_functions
 
   @impl true
-  def init({module, opts}) do
+  def init({module, opts, snapshot}) do
     Process.flag(:message_queue_data, :off_heap)
     hwm = Keyword.get(opts, :high_water_mark, 1)
     strategy = normalize_strategy(Keyword.get(opts, :strategy, %Web.CountQueuingStrategy{}))
@@ -172,7 +177,8 @@ defmodule Web.Stream do
       hwm: hwm,
       total_queued_size: 0,
       strategy: strategy,
-      timeout_ms: timeout_ms
+      timeout_ms: timeout_ms,
+      async_context: snapshot
     }
 
     {initial_state, default_actions} =
@@ -197,6 +203,10 @@ defmodule Web.Stream do
       else
         data
       end
+
+    # Bind ambient AbortSignal — if one was captured in the snapshot, subscribe
+    # so the stream auto-cancels when the signal fires.
+    maybe_bind_ambient_signal(snapshot)
 
     {:ok, initial_state, data, all_actions}
   end
@@ -230,16 +240,19 @@ defmodule Web.Stream do
 
           {:internal, {:start_task, fun}} ->
             task =
-              start_task(fn ->
-                try do
-                  fun.()
-                  {:ok, :init_done}
-                rescue
-                  e -> {:error, e}
-                catch
-                  kind, r -> {:error, {kind, r}}
-                end
-              end)
+              start_task(
+                fn ->
+                  try do
+                    fun.()
+                    {:ok, :init_done}
+                  rescue
+                    e -> {:error, e}
+                  catch
+                    kind, r -> {:error, {kind, r}}
+                  end
+                end,
+                data.async_context
+              )
 
             {:keep_state, set_active_task(data, task, :init, pulling: true)}
 
@@ -277,16 +290,19 @@ defmodule Web.Stream do
 
         {:internal, {:start_task, fun}} ->
           task =
-            start_task(fn ->
-              try do
-                fun.()
-                {:ok, :start_done}
-              rescue
-                e -> {:error, e}
-              catch
-                kind, r -> {:error, {kind, r}}
-              end
-            end)
+            start_task(
+              fn ->
+                try do
+                  fun.()
+                  {:ok, :start_done}
+                rescue
+                  e -> {:error, e}
+                catch
+                  kind, r -> {:error, {kind, r}}
+                end
+              end,
+              data.async_context
+            )
 
           {:keep_state, set_active_task(data, task, :start)}
 
@@ -678,6 +694,15 @@ defmodule Web.Stream do
     end
   end
 
+  # Ambient AbortSignal fired
+  defp handle_common(:info, {:ambient_signal_abort, reason}, state, data) do
+    if state in [:closed, :errored] do
+      :keep_state_and_data
+    else
+      handle_termination(:cancel, reason, data)
+    end
+  end
+
   defp handle_common(_type, _content, _state, _data), do: :not_handled
 
   defp handle_closed_event(:cast, {:enqueue, _chunk}, _data), do: :keep_state_and_data
@@ -862,15 +887,18 @@ defmodule Web.Stream do
       ctrl = %Web.ReadableStreamDefaultController{pid: self()}
 
       task =
-        start_task(fn ->
-          try do
-            module.pull(ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
-          rescue
-            e -> {:error, e}
-          catch
-            kind, reason -> {:error, {kind, reason}}
-          end
-        end)
+        start_task(
+          fn ->
+            try do
+              module.pull(ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
+            rescue
+              e -> {:error, e}
+            catch
+              kind, reason -> {:error, {kind, reason}}
+            end
+          end,
+          data.async_context
+        )
 
       {:keep_state, set_active_task(data, task, :pull, pulling: true)}
     else
@@ -946,15 +974,18 @@ defmodule Web.Stream do
     ctrl = %Web.ReadableStreamDefaultController{pid: self()}
 
     task =
-      start_task(fn ->
-        try do
-          module.write(chunk, ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
-        rescue
-          e -> {:error, e}
-        catch
-          kind, reason -> {:error, {kind, reason}}
-        end
-      end)
+      start_task(
+        fn ->
+          try do
+            module.write(chunk, ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
+          rescue
+            e -> {:error, e}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          end
+        end,
+        data.async_context
+      )
 
     data
     |> Map.put(:pending_write_request, request)
@@ -968,19 +999,22 @@ defmodule Web.Stream do
     ctrl = %Web.ReadableStreamDefaultController{pid: self()}
 
     task =
-      start_task(fn ->
-        try do
-          if function_exported?(module, :flush, 2) do
-            module.flush(ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
-          else
-            {:ok, impl_state}
+      start_task(
+        fn ->
+          try do
+            if function_exported?(module, :flush, 2) do
+              module.flush(ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
+            else
+              {:ok, impl_state}
+            end
+          rescue
+            e -> {:error, e}
+          catch
+            kind, reason -> {:error, {kind, reason}}
           end
-        rescue
-          e -> {:error, e}
-        catch
-          kind, reason -> {:error, {kind, reason}}
-        end
-      end)
+        end,
+        data.async_context
+      )
 
     {:next_state, :closing, set_active_task(data, task, {:flush, data.pending_close_request})}
   end
@@ -990,19 +1024,22 @@ defmodule Web.Stream do
     impl_state = data.impl_state
 
     task =
-      start_task(fn ->
-        try do
-          if function_exported?(module, :terminate, 2) do
-            module.terminate(reason, impl_state)
-          else
-            :ok
+      start_task(
+        fn ->
+          try do
+            if function_exported?(module, :terminate, 2) do
+              module.terminate(reason, impl_state)
+            else
+              :ok
+            end
+          rescue
+            _ -> :ok
+          catch
+            _, _ -> :ok
           end
-        rescue
-          _ -> :ok
-        catch
-          _, _ -> :ok
-        end
-      end)
+        end,
+        data.async_context
+      )
 
     set_active_task(data, task, :abort)
   end
@@ -1436,8 +1473,13 @@ defmodule Web.Stream do
     end
   end
 
-  defp start_task(fun) do
-    Task.Supervisor.async_nolink(Web.TaskSupervisor, fun)
+  defp start_task(fun, snapshot) do
+    Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
+      case snapshot do
+        %Snapshot{} -> Snapshot.run(snapshot, fun)
+        _ -> fun.()
+      end
+    end)
   end
 
   # Resolve a callback result that may be a %Web.Promise{}, awaiting it and
@@ -1474,5 +1516,47 @@ defmodule Web.Stream do
       |> Map.put(:active_operation, operation)
 
     Enum.reduce(updates, data, fn {key, value}, acc -> Map.put(acc, key, value) end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Ambient AbortSignal binding
+  # ---------------------------------------------------------------------------
+
+  defp maybe_bind_ambient_signal(%{ambient_signal: signal}), do: bind_ambient_signal(signal)
+  defp maybe_bind_ambient_signal(_), do: :ok
+
+  defp bind_ambient_signal(nil), do: :ok
+
+  defp bind_ambient_signal(%AbortSignal{aborted: true, reason: reason}) do
+    send(self(), {:ambient_signal_abort, reason})
+    :ok
+  end
+
+  defp bind_ambient_signal(%AbortSignal{} = signal) do
+    stream_pid = self()
+
+    spawn_link(fn -> forward_ambient_signal_abort(signal, stream_pid) end)
+
+    :ok
+  end
+
+  defp bind_ambient_signal(_), do: :ok
+
+  defp forward_ambient_signal_abort(signal, stream_pid) do
+    case AbortSignal.subscribe(signal) do
+      {:ok, subscription} ->
+        await_ambient_signal_abort(subscription, stream_pid)
+
+      {:error, :aborted} ->
+        send(stream_pid, {:ambient_signal_abort, signal.reason || :aborted})
+    end
+  end
+
+  defp await_ambient_signal_abort(subscription, stream_pid) do
+    with {:error, :aborted, reason} <- AbortSignal.receive_abort(subscription, :infinity, true) do
+      send(stream_pid, {:ambient_signal_abort, reason})
+    end
+
+    :ok
   end
 end

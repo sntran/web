@@ -35,6 +35,8 @@ defmodule Web.CompressionStream do
 
   use Web.Stream
 
+  require Logger
+
   alias Web.ReadableStreamDefaultController
   alias Web.TypeError
   alias Web.Uint8Array
@@ -97,18 +99,8 @@ defmodule Web.CompressionStream do
   @impl Web.Stream
   def write(chunk, ctrl, %{zlib_agent: agent} = state) do
     bin = to_binary!(chunk, "CompressionStream")
-
-    result =
-      Agent.get(agent, fn z ->
-        try do
-          {:ok, :zlib.deflate(z, bin)}
-        rescue
-          # coveralls-ignore-start
-          e in ErlangError ->
-            {:error, e}
-            # coveralls-ignore-stop
-        end
-      end)
+    maybe_log_runtime_event("write", byte_size(bin))
+    result = run_zlib(agent, fn z -> :zlib.deflate(z, bin) end, "CompressionStream")
 
     case result do
       {:ok, compressed_chunks} ->
@@ -129,17 +121,8 @@ defmodule Web.CompressionStream do
 
   @impl Web.Stream
   def flush(ctrl, %{zlib_agent: agent} = state) do
-    result =
-      Agent.get(agent, fn z ->
-        try do
-          {:ok, :zlib.deflate(z, <<>>, :finish)}
-        rescue
-          # coveralls-ignore-start
-          e in ErlangError ->
-            {:error, e}
-            # coveralls-ignore-stop
-        end
-      end)
+    maybe_log_runtime_event("flush", 0)
+    result = run_zlib(agent, fn z -> :zlib.deflate(z, <<>>, :finish) end, "CompressionStream")
 
     # Always stop the agent — whether flush succeeds or fails.
     stop_agent(agent)
@@ -183,6 +166,72 @@ defmodule Web.CompressionStream do
   # Stop the Agent idempotently.
   defp stop_agent(agent) do
     if Process.alive?(agent), do: Agent.stop(agent, :normal)
+  end
+
+  defp run_zlib(agent, operation, context) do
+    metadata = runtime_metadata()
+
+    case Agent.get(agent, fn z ->
+           try do
+             {:ok, operation.(z)}
+           rescue
+             # coveralls-ignore-next-line
+             e in ErlangError -> {:error, e}
+           end
+         end) do
+      {:ok, _result} = ok ->
+        ok
+
+      {:error, e} ->
+        # coveralls-ignore-next-line
+        maybe_log_zlib_failure(metadata, context, e)
+
+        {:error, e}
+    end
+  end
+
+  defp maybe_log_runtime_event(stage, bytes) do
+    metadata = runtime_metadata()
+
+    if Map.get(metadata, :web_runtime_observe, false) do
+      user = Map.get(metadata, :user, "unknown")
+
+      Logger.info(
+        runtime_log_prefix(metadata) <>
+          "CompressionStream #{stage} #{bytes}B user=#{user}#{runtime_context_suffix(metadata)}"
+      )
+    end
+  end
+
+  defp runtime_log_prefix(metadata) do
+    String.duplicate("  ", Map.get(metadata, :group_depth, 0))
+  end
+
+  defp runtime_metadata do
+    case :logger.get_process_metadata() do
+      current when is_map(current) -> current
+      _ -> %{}
+    end
+  end
+
+  defp runtime_context_suffix(metadata) do
+    context = Map.take(metadata, [:group_depth, :request_id, :user])
+    if context == %{}, do: "", else: " metadata=" <> inspect(context)
+  end
+
+  defp maybe_log_zlib_failure(metadata, context, error) do
+    # coveralls-ignore-start
+    # CompressionStream's zlib failure logging is defensive only.
+    # On current OTP runtimes the public stream API transitions to an errored
+    # stream before :zlib.deflate/2 surfaces a recoverable ErlangError here.
+    if Map.get(metadata, :web_runtime_observe, false) do
+      Logger.error(
+        runtime_log_prefix(metadata) <>
+          "#{context} zlib failure: #{Exception.message(error)}#{runtime_context_suffix(metadata)}"
+      )
+    end
+
+    # coveralls-ignore-stop
   end
 
   # coveralls-ignore-start

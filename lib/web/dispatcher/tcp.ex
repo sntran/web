@@ -105,7 +105,11 @@ defmodule Web.Dispatcher.TCP do
       :ok ->
         case :gen_tcp.recv(socket, 0, 50) do
           {:ok, data} ->
-            {:ok, data}
+            case Web.AbortSignal.receive_abort(signal_subscription, 0) do
+              # coveralls-ignore-next-line
+              {:error, :aborted} -> {:error, :aborted}
+              :ok -> {:ok, data}
+            end
 
           {:error, :timeout} ->
             case Web.AbortSignal.receive_abort(signal_subscription, 0) do

@@ -25,7 +25,9 @@ defmodule Web.Console do
   @spec group(term() | nil) :: :ok
   def group(label \\ nil) do
     if !is_nil(label), do: log(label)
-    Process.put(@group_depth_key, group_depth() + 1)
+    depth = group_depth() + 1
+    Process.put(@group_depth_key, depth)
+    sync_group_depth_metadata(depth)
     :ok
   end
 
@@ -36,7 +38,9 @@ defmodule Web.Console do
 
   @spec group_end() :: :ok
   def group_end do
-    Process.put(@group_depth_key, max(group_depth() - 1, 0))
+    depth = max(group_depth() - 1, 0)
+    Process.put(@group_depth_key, depth)
+    sync_group_depth_metadata(depth)
     :ok
   end
 
@@ -172,11 +176,24 @@ defmodule Web.Console do
     info("#{normalize_label(label)}: #{elapsed_ms} ms#{suffix}")
   end
 
-  defp group_depth, do: Process.get(@group_depth_key, 0)
+  defp group_depth do
+    case Process.get(@group_depth_key) do
+      nil -> logger_group_depth()
+      depth -> depth
+    end
+  end
+
   defp indent, do: String.duplicate("  ", group_depth())
   defp monotonic_us, do: :erlang.monotonic_time(:microsecond)
   defp normalize_label(label) when is_atom(label), do: Atom.to_string(label)
   defp normalize_label(label), do: to_string(label)
+
+  defp logger_group_depth do
+    case :logger.get_process_metadata() do
+      metadata when is_map(metadata) -> Map.get(metadata, :group_depth, 0)
+      _ -> 0
+    end
+  end
 
   defp format_data(data) when is_binary(data), do: data
 
@@ -283,4 +300,14 @@ defmodule Web.Console do
 
   defp restore_process_metadata(:undefined), do: :logger.unset_process_metadata()
   defp restore_process_metadata(metadata), do: :logger.set_process_metadata(metadata)
+
+  defp sync_group_depth_metadata(depth) do
+    metadata =
+      case :logger.get_process_metadata() do
+        current when is_map(current) -> current
+        _ -> %{}
+      end
+
+    :logger.set_process_metadata(Map.put(metadata, :group_depth, depth))
+  end
 end

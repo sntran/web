@@ -2,10 +2,13 @@ defmodule Web.CompressionPBTTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
+  import ExUnit.CaptureLog
   import Web, only: [await: 1]
 
   alias Web.ArrayBuffer
+  alias Web.AsyncContext
   alias Web.CompressionStream
+  alias Web.Console
   alias Web.DecompressionStream
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController
@@ -243,6 +246,57 @@ defmodule Web.CompressionPBTTest do
   # ---------------------------------------------------------------------------
 
   describe "Uint8Array and invalid chunk inputs" do
+    test "runtime observation logs inherit async context metadata and console depth" do
+      user = AsyncContext.Variable.new("user")
+
+      log =
+        capture_log(fn ->
+          AsyncContext.Variable.run(user, "alice", fn ->
+            :logger.update_process_metadata(%{
+              request_id: "req-compress",
+              user: AsyncContext.Variable.get(user),
+              web_runtime_observe: true
+            })
+
+            Console.group("secure proxy")
+
+            try do
+              ReadableStream.from(["hello"])
+              |> ReadableStream.pipe_through(CompressionStream.new("gzip"))
+              |> Enum.to_list()
+            after
+              Console.group_end()
+              :logger.set_process_metadata(%{})
+            end
+          end)
+        end)
+
+      assert log =~ "secure proxy"
+      assert log =~ "  CompressionStream write 5B user=alice"
+      assert log =~ "request_id: \"req-compress\""
+      assert log =~ "group_depth: 1"
+    end
+
+    test "CompressionStream logs runtime observation events with default user and no context suffix" do
+      log =
+        capture_log(fn ->
+          :logger.update_process_metadata(%{web_runtime_observe: true})
+
+          try do
+            ReadableStream.from(["hello world"])
+            |> ReadableStream.pipe_through(CompressionStream.new("gzip"))
+            |> ReadableStream.pipe_through(DecompressionStream.new("gzip"))
+            |> Enum.to_list()
+          after
+            :logger.set_process_metadata(%{})
+          end
+        end)
+
+      assert log =~ "CompressionStream write"
+      assert log =~ "user=unknown"
+      refute log =~ "metadata="
+    end
+
     test "CompressionStream accepts Uint8Array chunk" do
       # Use pipe_through so the consumer drives the pipeline concurrently;
       # a sequential write→close→read deadlocks because the flush task parks
@@ -277,6 +331,51 @@ defmodule Web.CompressionPBTTest do
       writer = WritableStream.get_writer(ds.writable)
       error = catch_exit(await(WritableStreamDefaultWriter.write(writer, :not_a_binary)))
       assert %Web.TypeError{} = error
+    end
+
+    test "DecompressionStream logs runtime observation events with default user and no context suffix" do
+      log =
+        capture_log(fn ->
+          :logger.update_process_metadata(%{web_runtime_observe: true})
+
+          try do
+            compressed = :zlib.gzip("hello world")
+            source = ReadableStream.from([compressed])
+            decompressed = ReadableStream.pipe_through(source, DecompressionStream.new("gzip"))
+            assert Enum.join(decompressed, "") == "hello world"
+          after
+            :logger.set_process_metadata(%{})
+          end
+        end)
+
+      assert log =~ "DecompressionStream write"
+      assert log =~ "user=unknown"
+      refute log =~ "metadata="
+    end
+
+    test "DecompressionStream logs zlib failures when runtime observation is enabled" do
+      log =
+        capture_log(fn ->
+          :logger.update_process_metadata(%{
+            group_depth: 1,
+            request_id: "req-decompress-error",
+            user: "alice",
+            web_runtime_observe: true
+          })
+
+          try do
+            ds = DecompressionStream.new("gzip")
+            writer = WritableStream.get_writer(ds.writable)
+            error = catch_exit(await(WritableStreamDefaultWriter.write(writer, "not gzip")))
+            assert %Web.TypeError{} = error
+          after
+            :logger.set_process_metadata(%{})
+          end
+        end)
+
+      assert log =~ "DecompressionStream zlib failure"
+      assert log =~ "request_id: \"req-decompress-error\""
+      assert log =~ "group_depth: 1"
     end
   end
 

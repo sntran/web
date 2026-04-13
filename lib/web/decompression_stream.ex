@@ -35,6 +35,8 @@ defmodule Web.DecompressionStream do
 
   use Web.Stream
 
+  require Logger
+
   alias Web.ReadableStreamDefaultController
   alias Web.TypeError
   alias Web.Uint8Array
@@ -97,15 +99,8 @@ defmodule Web.DecompressionStream do
   @impl Web.Stream
   def write(chunk, ctrl, %{zlib_agent: agent} = state) do
     bin = to_binary!(chunk, "DecompressionStream")
-
-    result =
-      Agent.get(agent, fn z ->
-        try do
-          {:ok, :zlib.inflate(z, bin)}
-        rescue
-          e in ErlangError -> {:error, e}
-        end
-      end)
+    maybe_log_runtime_event("write", byte_size(bin))
+    result = run_zlib(agent, fn z -> :zlib.inflate(z, bin) end, "DecompressionStream")
 
     case result do
       {:ok, decompressed_chunks} ->
@@ -133,17 +128,8 @@ defmodule Web.DecompressionStream do
     # NOTE: In OTP 27+ inflate/2 returns {:ok, []} instead of raising
     # :buf_error with empty input, so the rescue and error branches below
     # are unreachable in current runtimes but kept for older OTP.
-    result =
-      Agent.get(agent, fn z ->
-        try do
-          {:ok, :zlib.inflate(z, <<>>)}
-        rescue
-          # coveralls-ignore-start
-          e in ErlangError ->
-            {:error, e}
-            # coveralls-ignore-stop
-        end
-      end)
+    maybe_log_runtime_event("flush", 0)
+    result = run_zlib(agent, fn z -> :zlib.inflate(z, <<>>) end, "DecompressionStream")
 
     # Always stop the agent — whether flush succeeds or fails.
     stop_agent(agent)
@@ -193,6 +179,64 @@ defmodule Web.DecompressionStream do
   # Stop the Agent idempotently.
   defp stop_agent(agent) do
     if Process.alive?(agent), do: Agent.stop(agent, :normal)
+  end
+
+  defp run_zlib(agent, operation, context) do
+    metadata = runtime_metadata()
+
+    case Agent.get(agent, fn z ->
+           try do
+             {:ok, operation.(z)}
+           rescue
+             e in ErlangError -> {:error, e}
+           end
+         end) do
+      {:ok, _result} = ok ->
+        ok
+
+      {:error, e} ->
+        maybe_log_zlib_failure(metadata, context, e)
+
+        {:error, e}
+    end
+  end
+
+  defp maybe_log_runtime_event(stage, bytes) do
+    metadata = runtime_metadata()
+
+    if Map.get(metadata, :web_runtime_observe, false) do
+      user = Map.get(metadata, :user, "unknown")
+
+      Logger.info(
+        runtime_log_prefix(metadata) <>
+          "DecompressionStream #{stage} #{bytes}B user=#{user}#{runtime_context_suffix(metadata)}"
+      )
+    end
+  end
+
+  defp runtime_log_prefix(metadata) do
+    String.duplicate("  ", Map.get(metadata, :group_depth, 0))
+  end
+
+  defp runtime_metadata do
+    case :logger.get_process_metadata() do
+      current when is_map(current) -> current
+      _ -> %{}
+    end
+  end
+
+  defp runtime_context_suffix(metadata) do
+    context = Map.take(metadata, [:group_depth, :request_id, :user])
+    if context == %{}, do: "", else: " metadata=" <> inspect(context)
+  end
+
+  defp maybe_log_zlib_failure(metadata, context, error) do
+    if Map.get(metadata, :web_runtime_observe, false) do
+      Logger.error(
+        runtime_log_prefix(metadata) <>
+          "#{context} zlib failure: #{Exception.message(error)}#{runtime_context_suffix(metadata)}"
+      )
+    end
   end
 
   defp zlib_error_message(%ErlangError{original: :data_error}),

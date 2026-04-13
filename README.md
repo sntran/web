@@ -80,7 +80,9 @@ response.body
 
 ### `Web.Promise` and `await/1`
 Async APIs now return `%Web.Promise{}` values so you can compose fetches, body
-reads, and stream writes before awaiting the final result.
+reads, and stream writes before awaiting the final result. Promise executors now
+capture the current `Web.AsyncContext`, so logger metadata, scoped variables,
+and ambient abort signals flow into spawned tasks automatically.
 
 ```elixir
 use Web
@@ -95,13 +97,42 @@ pair = await Promise.all([
   ])
 ```
 
+### `Web.AsyncContext` — Ambient Context Propagation
+`Web.AsyncContext` carries scoped values and logger metadata across promise and
+stream task boundaries. Use explicit `signal:` options (WHATWG-style) for
+cancellation, and `AsyncContext.Variable` for request-scoped values.
+
+```elixir
+use Web
+
+request_id = AsyncContext.Variable.new("request_id")
+
+AsyncContext.Variable.run(request_id, "req-42", fn ->
+  :logger.update_process_metadata(%{request_id: "req-42"})
+
+  stream =
+    ReadableStream.new(%{
+      pull: fn controller ->
+        chunk = AsyncContext.Variable.get(request_id)
+        ReadableStreamDefaultController.enqueue(controller, chunk)
+        ReadableStreamDefaultController.close(controller)
+      end
+    })
+
+  await(Promise.resolve(Enum.to_list(stream)))
+end)
+# => ["req-42"]
+```
+
 ---
 
 ## 📖 API Usage & Examples
 
 ### `Web.Promise` — Async Composition
 `Web.Promise` gives you a browser-style promise API for composing async work
-before you call `await/1`.
+before you call `await/1`. Chained callbacks execute synchronously in the caller
+process, so active `Web.AsyncContext` values remain visible across `.then/2`
+and `.catch/2`.
 
 ```elixir
 # Resolve and reject explicit values
@@ -385,6 +416,9 @@ coordinator process, so fields are discovered lazily.
 When iteration or lookup advances past an unread file part, the parser
 automatically discards skipped file bodies before continuing. This preserves
 `O(1)` memory usage and avoids deadlocks when users skip blocking file streams.
+When parsing receives an explicit `signal:` option, live `FormData` iteration
+is abort-aware: aborting that signal tears down the coordinator, open file
+streams, and upstream source automatically.
 
 ```elixir
 boundary = "example-boundary"
@@ -397,6 +431,10 @@ response = Response.new(
 form = await(Response.form_data(response))
 Enum.to_list(form)
 ```
+
+See [`examples/async_runtime_power.exs`](examples/async_runtime_power.exs) for a
+full-stack example that combines explicit abort signals, logger metadata,
+console grouping, multipart file parsing, and `CompressionStream`.
 
 ### `Web.URL` & `Web.URLSearchParams`
 Pure, immutable URL parsing and ordered query parameter management.

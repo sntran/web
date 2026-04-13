@@ -38,6 +38,7 @@ defmodule Web do
       alias Web.AbortController
       alias Web.AbortSignal
       alias Web.ArrayBuffer
+      alias Web.AsyncContext
       alias Web.Blob
       alias Web.CompressionStream
       alias Web.Console

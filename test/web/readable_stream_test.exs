@@ -2,6 +2,8 @@ defmodule Web.ReadableStreamTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
+  import Web, only: [await: 1]
+
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController
   alias Web.ReadableStreamDefaultReader
@@ -181,7 +183,7 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStream.locked?(stream) == false
       reader = ReadableStream.get_reader(stream)
       assert ReadableStream.locked?(stream) == true
-      assert Web.ReadableStreamDefaultReader.read(reader) == "he"
+      assert await(Web.ReadableStreamDefaultReader.read(reader)) == %{value: "he", done: false}
       assert ReadableStream.disturbed?(stream) == true
       assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
 
@@ -226,17 +228,20 @@ defmodule Web.ReadableStreamTest do
       reader = ReadableStream.get_reader(stream)
 
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert ReadableStreamDefaultReader.read(reader) == "1"
-      assert ReadableStreamDefaultReader.read(reader) == "2"
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "1", done: false}
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "2", done: false}
 
       remaining =
         3..1_000
         |> Enum.map(fn expected ->
-          assert ReadableStreamDefaultReader.read(reader) == Integer.to_string(expected)
+          assert await(ReadableStreamDefaultReader.read(reader)) == %{
+                   value: Integer.to_string(expected),
+                   done: false
+                 }
         end)
 
       assert length(remaining) == 998
-      assert ReadableStreamDefaultReader.read(reader) == :done
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: nil, done: true}
       assert :ok = ReadableStreamDefaultReader.release_lock(reader)
     end
 
@@ -258,12 +263,12 @@ defmodule Web.ReadableStreamTest do
       reader = ReadableStream.get_reader(stream)
 
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert ReadableStreamDefaultReader.read(reader) == chunk_a
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: chunk_a, done: false}
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert ReadableStreamDefaultReader.read(reader) == chunk_b
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: chunk_b, done: false}
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert ReadableStreamDefaultReader.read(reader) == chunk_c
-      assert ReadableStreamDefaultReader.read(reader) == :done
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: chunk_c, done: false}
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: nil, done: true}
       assert :ok = ReadableStreamDefaultReader.release_lock(reader)
     end
 
@@ -507,35 +512,31 @@ defmodule Web.ReadableStreamTest do
     test "errors", %{stream: stream, controller_pid: pid} do
       reader = ReadableStream.get_reader(stream)
 
-      # Errored with reason
+      # Errored with reason — promise rejects with the stored error
       ReadableStream.error(pid, :fail)
-      # Sync to ensure reason is set
       ReadableStream.__get_slots__(pid)
 
-      assert_raise TypeError, "The stream is errored.", fn ->
-        ReadableStreamDefaultReader.read(reader)
-      end
+      assert :fail = catch_exit(await(ReadableStreamDefaultReader.read(reader)))
 
-      # Errored WITHOUT reason (forced)
+      # Errored WITHOUT reason (forced) — promise rejects with TypeError
       {:ok, p2} = ReadableStream.start_link()
       s2 = %ReadableStream{controller_pid: p2}
       r2 = ReadableStream.get_reader(s2)
       ReadableStream.error(p2, :force_error_no_reason)
       ReadableStream.__get_slots__(p2)
 
-      assert_raise TypeError, "The stream is errored.", fn ->
-        ReadableStreamDefaultReader.read(r2)
-      end
+      assert %TypeError{message: "The stream is errored."} =
+               catch_exit(await(ReadableStreamDefaultReader.read(r2)))
 
-      # Unexpected read
+      # Unexpected read — promise rejects with the error
       {:ok, p3} = ReadableStream.start_link()
       s3 = %ReadableStream{controller_pid: p3}
       r3 = ReadableStream.get_reader(s3)
       ReadableStream.error(p3, :force_unexpected_read)
       ReadableStream.__get_slots__(p3)
-      assert_raise TypeError, ~r/Unknown error/, fn -> ReadableStreamDefaultReader.read(r3) end
+      assert :unexpected = catch_exit(await(ReadableStreamDefaultReader.read(r3)))
 
-      # Unexpected release
+      # Unexpected release — release_lock still raises directly
       {:ok, p4} = ReadableStream.start_link()
       s4 = %ReadableStream{controller_pid: p4}
       r4 = ReadableStream.get_reader(s4)
@@ -549,7 +550,9 @@ defmodule Web.ReadableStreamTest do
 
     test "PID mismatch", %{controller_pid: pid} do
       r = %ReadableStreamDefaultReader{controller_pid: pid}
-      assert_raise TypeError, ~r/longer locked/, fn -> ReadableStreamDefaultReader.read(r) end
+
+      assert %TypeError{message: "This reader is no longer locked."} =
+               catch_exit(await(ReadableStreamDefaultReader.read(r)))
 
       assert_raise TypeError, ~r/longer locked/, fn ->
         ReadableStreamDefaultReader.release_lock(r)
@@ -558,7 +561,7 @@ defmodule Web.ReadableStreamTest do
 
     test "cancel", %{stream: stream} do
       reader = ReadableStream.get_reader(stream)
-      assert :ok == ReadableStreamDefaultReader.cancel(reader)
+      assert :ok = await(ReadableStreamDefaultReader.cancel(reader))
     end
 
     test "The Finite Counter" do
@@ -644,7 +647,7 @@ defmodule Web.ReadableStreamTest do
       reader_b = ReadableStream.get_reader(branch_b)
       # Wait a bit for async start/pull to complete if needed
       Process.sleep(50)
-      assert ReadableStreamDefaultReader.read(reader_b) == "data"
+      assert await(ReadableStreamDefaultReader.read(reader_b)) == %{value: "data", done: false}
       assert_receive :pull_called
 
       # Cancel branch B
@@ -678,14 +681,14 @@ defmodule Web.ReadableStreamTest do
       left_reader = ReadableStream.get_reader(left)
       right_reader = ReadableStream.get_reader(right)
 
-      assert ReadableStreamDefaultReader.read(left_reader) == 0
-      assert ReadableStreamDefaultReader.read(right_reader) == 0
+      assert await(ReadableStreamDefaultReader.read(left_reader)) == %{value: 0, done: false}
+      assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 0, done: false}
 
-      assert :ok = ReadableStreamDefaultReader.cancel(left_reader)
+      assert :ok = await(ReadableStreamDefaultReader.cancel(left_reader))
 
-      assert ReadableStreamDefaultReader.read(right_reader) == 1
-      assert ReadableStreamDefaultReader.read(right_reader) == 2
-      assert ReadableStreamDefaultReader.read(right_reader) == 3
+      assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 1, done: false}
+      assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 2, done: false}
+      assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 3, done: false}
 
       assert_receive {:source_pull, _}, 1_000
       assert_receive {:source_pull, _}, 1_000
@@ -751,7 +754,7 @@ defmodule Web.ReadableStreamTest do
 
       # B should still work
       reader_b = ReadableStream.get_reader(branch_b)
-      assert ReadableStreamDefaultReader.read(reader_b) == "data"
+      assert await(ReadableStreamDefaultReader.read(reader_b)) == %{value: "data", done: false}
     end
 
     test "tee/1 allows 16 chunks to queue on the fast branch" do

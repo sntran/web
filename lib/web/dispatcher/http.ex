@@ -500,7 +500,14 @@ defmodule Web.Dispatcher.HTTP do
   defp await_body_chunk(state) do
     receive do
       {:bridge_chunk, ref, chunk} when ref == state.bridge_ref ->
-        {[chunk], state}
+        case Web.AbortSignal.receive_abort(state.signal_subscription, 0) do
+          {:error, :aborted} ->
+            # coveralls-ignore-next-line
+            abort_and_halt(state)
+
+          :ok ->
+            {[chunk], state}
+        end
 
       {:bridge_done, ref} when ref == state.bridge_ref ->
         {:halt, state}

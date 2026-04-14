@@ -8,6 +8,11 @@ All notable changes to this project are documented in this file.
 
 - `Web.File`.
 - `Web.FormData` struct and streaming multipart parser.
+- `Web.URLPattern` with WHATWG-style pattern parsing, compilation, matching,
+  generation, component comparison, and ambient route param injection via
+  `match_context/3`.
+- `Web.URLPattern.Cache`, `Web.URLPattern.Parser`, and
+  `Web.URLPattern.Compiler`.
 - `Web.AsyncContext` for BEAM-native async context propagation.
 - `Web.AsyncContext.Variable` for scoped context values that participate in
   snapshot capture and restoration.
@@ -48,6 +53,9 @@ All notable changes to this project are documented in this file.
 - `Web.FormData.Parser` now captures and restores `Web.AsyncContext`
   snapshots, auto-binds to ambient abort signals, and propagates that context
   into live file streams it creates on demand.
+- `Web.Application` now eagerly initializes the singleton
+  `Web.URLPattern.params/0` variable during boot so route-param context stays
+  stable across processes in async workloads and tests.
 - `Web.Console.group/1` now keeps `group_depth` in logger metadata so grouped
   output survives async-context snapshot restore across task boundaries.
 - `Web.CompressionStream` and `Web.DecompressionStream` now emit context-aware

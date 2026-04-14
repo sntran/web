@@ -124,6 +124,35 @@ end)
 # => ["req-42"]
 ```
 
+### `Web.URLPattern` — Spec-Compliant Routing and URL Matching
+`Web.URLPattern` implements the WHATWG URLPattern API for matching URL strings,
+`Web.URL` structs, requests, or component maps. It also bridges naturally into
+`Web.AsyncContext`, so successful matches can expose captured params to
+downstream work with `match_context/3`.
+
+```elixir
+use Web
+
+pattern =
+  URLPattern.new(%{
+    protocol: "https",
+    hostname: "example.com",
+    pathname: "/users/:id"
+  })
+
+URLPattern.test(pattern, "https://example.com/users/42")
+# => true
+
+result = URLPattern.exec(pattern, "https://example.com/users/42")
+result[:pathname][:groups]
+# => %{"id" => "42"}
+
+URLPattern.match_context(pattern, "https://example.com/users/42", fn ->
+  AsyncContext.Variable.get(URLPattern.params())
+end)
+# => %{"id" => "42"}
+```
+
 ---
 
 ## 📖 API Usage & Examples

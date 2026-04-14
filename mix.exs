@@ -11,6 +11,7 @@ defmodule Web.MixProject do
       version: @version,
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
+      elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
 
       # Hex Metadata
@@ -85,6 +86,9 @@ defmodule Web.MixProject do
   #     $ mix precommit
   #
   # See the documentation for `Mix` for more info on aliases.
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+
   defp aliases do
     [
       precommit: ["format", "credo --strict", "test --cover"]

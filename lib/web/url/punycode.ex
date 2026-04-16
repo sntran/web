@@ -63,7 +63,7 @@ defmodule Web.URL.Punycode do
   end
 
   defp convert_host_with_node(trimmed, normalized) do
-    with :ok <- validate_host_structure(trimmed),
+    with :ok <- validate_host_structure_with_node(trimmed),
          {:ok, ascii} <- Idna.domain_to_ascii(normalized),
          :ok <- validate_ascii_host(ascii) do
       {:ok, ascii}
@@ -236,6 +236,12 @@ defmodule Web.URL.Punycode do
       numeric_label?(List.last(labels)) -> :error
       true -> :ok
     end
+  end
+
+  defp validate_host_structure_with_node(hostname) do
+    labels = String.split(hostname, ".", trim: false)
+
+    if numeric_label?(List.last(labels)), do: :error, else: :ok
   end
 
   defp validate_ascii_host(hostname) do

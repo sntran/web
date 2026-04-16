@@ -1,5 +1,5 @@
 defmodule Web.URL.EncodingTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   use Web.Platform.Test,
     urls: [

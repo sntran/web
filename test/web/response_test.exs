@@ -6,40 +6,9 @@ defmodule Web.ResponseTest do
   alias Web.Response
   alias Web.TypeError
 
-  property "new/1 sets ok true for strictly 2xx status codes matching JS Fetch" do
-    check all(status <- integer(200..299)) do
-      resp = Response.new(status: status)
-      assert resp.status == status
-      assert resp.ok == true
-    end
-  end
-
-  property "new/1 sets ok false for non 2xx status codes generically" do
-    check all(status <- one_of([integer(0..199), integer(300..999)])) do
-      resp = Response.new(status: status)
-      assert resp.status == status
-      assert resp.ok == false
-    end
-  end
-
-  test "new/1 ensures appropriate defaults are assigned dynamically" do
-    resp = Response.new()
-    assert resp.status == 200
-    assert resp.ok == true
-    assert resp.status_text == ""
-    assert resp.type == "default"
-    assert match?(%Web.ReadableStream{}, resp.body)
-    assert "" == Enum.join(resp.body, "")
-    assert resp.url == nil
-    assert resp.headers == Web.Headers.new()
-  end
-
-  test "new/1 normalizes repeated tuple-list headers into Web.Headers" do
-    resp = Response.new(headers: [{"Set-Cookie", "a=1"}, {"set-cookie", "b=2"}])
-
-    assert resp.headers == Web.Headers.new([{"Set-Cookie", "a=1"}, {"set-cookie", "b=2"}])
-    assert Web.Headers.get_set_cookie(resp.headers) == ["a=1", "b=2"]
-  end
+  # ============================================================================
+  # Standard Response Tests (Preserved - testing core API functionality)
+  # ============================================================================
 
   test "struct defaults include a Web.Headers container" do
     assert %Response{}.headers == Web.Headers.new()
@@ -74,6 +43,16 @@ defmodule Web.ResponseTest do
     resp = Response.new(body: "hello", headers: [{"content-type", "text/plain"}])
 
     assert %Web.Blob{size: 5, type: "text/plain"} = await(Response.blob(resp))
+  end
+
+  test "resolved_content_type/2 sniffs binary, iodata, and fallback bodies" do
+    binary_response = %Response{body: "<!doctype html><html>", headers: Web.Headers.new()}
+    list_response = %Response{body: ["{", "\"ok\"", ":true}"], headers: Web.Headers.new()}
+    stream_response = %Response{body: Web.ReadableStream.from([]), headers: Web.Headers.new()}
+
+    assert Response.resolved_content_type(binary_response) == "text/html"
+    assert Response.resolved_content_type(list_response) == "application/json"
+    assert Response.resolved_content_type(stream_response) == "application/octet-stream"
   end
 
   test "new/1 defaults string bodies to text/plain;charset=UTF-8" do

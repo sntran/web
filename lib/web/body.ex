@@ -181,7 +181,14 @@ defmodule Web.Body do
   @doc false
   def blob(%{body: body} = struct) do
     consume_body(body, fn binary ->
-      Web.Blob.new([binary], type: content_type(struct))
+      type =
+        if Map.get(struct, :__struct__) == Web.Response do
+          Web.Response.resolved_content_type(struct, binary)
+        else
+          content_type(struct)
+        end
+
+      Web.Blob.new([binary], type: type)
     end)
   end
 
@@ -382,8 +389,15 @@ defmodule Web.Body do
     end
   end
 
-  defp content_type(%{headers: %Web.Headers{} = headers}) do
-    Web.Headers.get(headers, "content-type", "")
+  defp content_type(%{headers: %Web.Headers{} = headers} = struct) do
+    if Map.get(struct, :__struct__) == Web.Response do
+      Web.Response.resolved_content_type(struct)
+    else
+      headers
+      |> Web.Headers.get("content-type", "")
+      |> Web.MIME.parse()
+      |> Kernel.||("")
+    end
   end
 
   defp content_type(_), do: ""

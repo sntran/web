@@ -352,6 +352,28 @@ defmodule Web.BodyTest do
     assert Web.FormData.get(form_data, "field") == "value"
   end
 
+  test "Response.form_data/1 rejects multipart bodies with an empty boundary" do
+    response =
+      Response.new(
+        body: "",
+        headers: [{"content-type", "multipart/form-data; boundary="}]
+      )
+
+    assert %Web.TypeError{message: "multipart/form-data boundary is missing"} =
+             catch_exit(await(Response.form_data(response)))
+  end
+
+  test "Response.form_data/1 rejects multipart bodies with a whitespace-only boundary" do
+    response =
+      Response.new(
+        body: "",
+        headers: [{"content-type", ~s(multipart/form-data; boundary="   ")}]
+      )
+
+    assert %Web.TypeError{message: "multipart/form-data boundary is missing"} =
+             catch_exit(await(Response.form_data(response)))
+  end
+
   test "Response.form_data/1 rescues malformed multipart parser errors" do
     response =
       Response.new(

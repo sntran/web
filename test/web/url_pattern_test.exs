@@ -1121,6 +1121,12 @@ defmodule Web.URLPatternTest do
       assert result[:pathname][:input] == "/1://example.com"
     end
 
+    test "malformed scheme-like inputs preserve a leading slash in the raw pathname" do
+      result = URLPattern.exec(URLPattern.new(%{}), "/1://example.com")
+
+      assert result[:pathname][:input] == "/1://example.com"
+    end
+
     test "compare_tokens exhaustive" do
       p1 = URLPattern.new(%{pathname: "/a"})
       p2 = URLPattern.new(%{pathname: "/:id"})

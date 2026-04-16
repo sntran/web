@@ -72,6 +72,7 @@ defmodule Web.URLPattern do
 
   alias Web.AsyncContext.Variable
   alias Web.URL
+  alias Web.URL.Punycode
   alias Web.URLPattern.{Cache, Compiler, Parser}
 
   # All URL components that URLPattern tracks
@@ -1933,15 +1934,26 @@ defmodule Web.URLPattern do
   defp parse_url_string(input) do
     parse_input = normalize_special_scheme_authority_input(input)
 
-    # We use URL.new but validate it actually parsed a scheme
-    url = URL.new(parse_input)
+    try do
+      url = URL.new(parse_input)
 
-    if url.protocol == "" and not String.contains?(parse_input, "/") do
-      :error
-    else
-      {:ok, url, parse_input}
+      if url.protocol == "" and not String.contains?(parse_input, "/") do
+        :error
+      else
+        {:ok, url, parse_input}
+      end
+    rescue
+      ArgumentError ->
+        if String.contains?(parse_input, "://") do
+          {:ok, %URL{pathname: ensure_leading_slash_for_input(parse_input)}, parse_input}
+        else
+          :error
+        end
     end
   end
+
+  defp ensure_leading_slash_for_input("/" <> _ = input), do: input
+  defp ensure_leading_slash_for_input(input), do: "/" <> input
 
   # Inputs like "https:user:pass@example.com" (special schemes without "//")
   # should be interpreted with authority semantics.
@@ -2291,103 +2303,7 @@ defmodule Web.URLPattern do
   end
 
   defp host_to_ascii(hostname) do
-    hostname
-    |> String.downcase()
-    |> String.split(".", trim: false)
-    |> Enum.map_join(".", &label_to_ascii/1)
-  end
-
-  defp label_to_ascii(""), do: ""
-
-  defp label_to_ascii(label) do
-    if String.match?(label, ~r/^[\x00-\x7F]+$/) do
-      label
-    else
-      "xn--" <> punycode_encode(label)
-    end
-  end
-
-  defp punycode_encode(label) do
-    codepoints = String.to_charlist(label)
-    basic = Enum.filter(codepoints, &(&1 < 0x80))
-    basic_part = basic |> List.to_string() |> String.downcase()
-    basic_count = length(basic)
-    needs_delimiter = basic_count > 0 and basic_count < length(codepoints)
-
-    encoded_tail =
-      punycode_encode_loop(
-        codepoints,
-        128,
-        0,
-        72,
-        basic_count,
-        basic_count,
-        length(codepoints),
-        []
-      )
-      |> List.to_string()
-
-    if needs_delimiter do
-      basic_part <> "-" <> encoded_tail
-    else
-      encoded_tail
-    end
-  end
-
-  defp punycode_encode_loop(_codepoints, _n, _delta, _bias, _basic_count, h, total, acc)
-       when h >= total,
-       do: acc
-
-  defp punycode_encode_loop(codepoints, n, delta, bias, basic_count, h, total, acc) do
-    m =
-      codepoints
-      |> Enum.filter(&(&1 >= n))
-      |> Enum.min()
-
-    delta = delta + (m - n) * (h + 1)
-
-    {delta, bias, h, acc} =
-      Enum.reduce(codepoints, {delta, bias, h, acc}, fn cp,
-                                                        {delta_acc, bias_acc, h_acc, out_acc} ->
-        cond do
-          cp < m ->
-            {delta_acc + 1, bias_acc, h_acc, out_acc}
-
-          cp == m ->
-            {encoded, next_bias} =
-              punycode_encode_delta(delta_acc, bias_acc, h_acc + 1, h_acc == basic_count)
-
-            {0, next_bias, h_acc + 1, out_acc ++ encoded}
-
-          true ->
-            {delta_acc, bias_acc, h_acc, out_acc}
-        end
-      end)
-
-    punycode_encode_loop(codepoints, m + 1, delta + 1, bias, basic_count, h, total, acc)
-  end
-
-  defp punycode_encode_delta(delta, bias, points, first_time?) do
-    punycode_encode_delta(delta, bias, points, first_time?, 36, [])
-  end
-
-  defp punycode_encode_delta(delta, bias, points, first_time?, k, acc) do
-    threshold = punycode_threshold(k, bias)
-
-    if delta < threshold do
-      {acc ++ [encode_digit(delta)], adapt_bias(delta, points, first_time?)}
-    else
-      value = threshold + rem(delta - threshold, 36 - threshold)
-
-      punycode_encode_delta(
-        div(delta - threshold, 36 - threshold),
-        bias,
-        points,
-        first_time?,
-        k + 36,
-        acc ++ [encode_digit(value)]
-      )
-    end
+    Punycode.host_to_ascii(hostname)
   end
 
   defp maybe_inherit_base_search(components, normalized, base_url_str) do
@@ -2482,30 +2398,6 @@ defmodule Web.URLPattern do
   defp split_top_level_marker(<<c::utf8, rest::binary>>, marker, acc, pd, bd, brackets) do
     split_top_level_marker(rest, marker, acc <> <<c::utf8>>, pd, bd, brackets)
   end
-
-  defp punycode_threshold(k, bias), do: min(max(k - bias, 1), 26)
-
-  defp adapt_bias(delta, points, first_time?) do
-    delta = if first_time?, do: div(delta, 700), else: div(delta, 2)
-    delta = delta + div(delta, points)
-    adapt_bias_loop(delta, 0)
-  end
-
-  defp adapt_bias_loop(delta, k) do
-    {delta, k} =
-      Enum.reduce_while(Stream.cycle([:step]), {delta, k}, fn _, {delta_acc, k_acc} ->
-        if delta_acc > div(35 * 26, 2) do
-          {:cont, {div(delta_acc, 35), k_acc + 36}}
-        else
-          {:halt, {delta_acc, k_acc}}
-        end
-      end)
-
-    k + div(36 * delta, delta + 38)
-  end
-
-  defp encode_digit(value) when value < 26, do: ?a + value
-  defp encode_digit(value), do: ?0 + value - 26
 
   # ---------------------------------------------------------------------------
   # Component matching

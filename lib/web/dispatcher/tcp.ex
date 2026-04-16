@@ -138,7 +138,7 @@ defmodule Web.Dispatcher.TCP do
   end
 
   defp connection_target(url) do
-    if Web.URL.rclone?(url) do
+    if Web.URL.rclone?(url) or remote_like_url?(url) do
       authority =
         url
         |> Web.URL.pathname()
@@ -167,5 +167,10 @@ defmodule Web.Dispatcher.TCP do
 
       {host, port}
     end
+  end
+
+  defp remote_like_url?(url) do
+    Web.URL.hostname(url) == "" and Web.URL.protocol(url) != "" and
+      not String.starts_with?(Web.URL.pathname(url), "/")
   end
 end

@@ -8,6 +8,8 @@ All notable changes to this project are documented in this file.
 
 - `Web.File`.
 - `Web.FormData` struct and streaming multipart parser.
+- `Web.MIME` for MIME parsing, normalization, and signature-based sniffing
+  used by response body helpers.
 - `Web.URLPattern` with WHATWG-style pattern parsing, compilation, matching,
   generation, component comparison, and ambient route param injection via
   `match_context/3`.
@@ -36,6 +38,19 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - `use Web` now aliases `Web.AsyncContext`.
+- `Web.URL` now aligns its internal state and serialization around WHATWG
+  `search` and `hash` semantics, with improved special/non-special setter
+  behavior, `file:` path normalization, IDNA handling, and rclone URL
+  serialization.
+- `Web.URLPattern` now reuses `Web.URL.Punycode` for host ASCII
+  normalization and preserves the leading slash for malformed
+  scheme-looking pathname inputs.
+- `Web.Request.new/2`, `Web.Resolver.resolve/1`, and
+  `Web.Dispatcher.TCP` now handle malformed, path-only, and remote-like
+  targets more defensively.
+- `Web.Response.blob/1` and response content-type resolution now parse
+  explicit MIME types and sniff bodies when headers are absent or fall back
+  to generic binary types.
 - `Web.Promise.new/1` and `Web.Stream` task callbacks now capture and restore
   `Web.AsyncContext` snapshots, preserving logger metadata, scoped variables,
   `$callers`, and ambient abort signals across spawned tasks.
@@ -61,6 +76,9 @@ All notable changes to this project are documented in this file.
 - `Web.CompressionStream` and `Web.DecompressionStream` now emit context-aware
   zlib observability logs from restored task contexts, including ambient
   metadata such as `request_id`, `user`, and console grouping depth.
+- URL and MIME compliance coverage is now split into focused WPT-backed test
+  suites, and `mix precommit` now uses exported coverage data so the full
+  gate reports stable `100.0%` coverage summaries.
 
 ## [0.3.0] - 2026-04-10
 

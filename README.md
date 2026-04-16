@@ -433,6 +433,16 @@ if res.ok do
   data = await(Response.json(res))
 end
 
+# MIME-aware blobs parse explicit types and sniff generic binaries
+html =
+  Response.new(
+    body: "<!doctype html><html><body>ok</body></html>",
+    headers: [{"content-type", "application/octet-stream"}]
+  )
+
+await(Response.blob(html)).type
+# => "text/html"
+
 # Multi-protocol support (HTTP/TCP)
 req = Request.new("tcp://localhost:8080", method: "SEND", body: "ping")
 ```
@@ -466,16 +476,29 @@ full-stack example that combines explicit abort signals, logger metadata,
 console grouping, multipart file parsing, and `CompressionStream`.
 
 ### `Web.URL` & `Web.URLSearchParams`
-Pure, immutable URL parsing and ordered query parameter management.
+Pure, immutable WHATWG URL parsing with ordered search parameter
+management, IDNA host handling, and support for special,
+non-special, `file:`, and rclone-style URLs.
 
 ```elixir
-# URL parsing
+# WHATWG-style URL parsing
 url = URL.new("https://user:pass@example.com:8080/p/a/t/h?query=string#hash")
-url.port # => 8080
+URL.port(url)   # => "8080"
+URL.search(url) # => "?query=string"
 
-# Params management
-params = URLSearchParams.new("foo=bar&foo=baz")
-URLSearchParams.get_all(params, "foo") # => ["bar", "baz"]
+# Ordered search params management
+params =
+  URL.search_params(url)
+  |> URLSearchParams.set("query", "updated")
+  |> URLSearchParams.append("page", "1")
+
+url = %{url | search_params: params}
+URL.href(url)
+# => "https://user:pass@example.com:8080/p/a/t/h?query=updated&page=1#hash"
+
+# Non-standard but common remote targets are preserved
+URL.href(URL.new("my_s3:bucket/file.txt"))
+# => "my_s3:bucket/file.txt"
 ```
 
 ### `Web.Headers` — Security-First
@@ -547,10 +570,12 @@ view = Uint8Array.new(buffer, 10, 100) # Offset 10, Length 100
 ---
 
 ## 🧪 Industrial-Grade Testing
-Reliability is a core requirement. `Web` features exhaustive coverage for stream transitions, body consumption, and redirect handling.
+Reliability is a core requirement. `Web` combines focused JSON Test data from 
+Web Platform Tests with property tests and strict lint and coverage gates.
 
 ```bash
 mix test --cover
+mix precommit
 ```
 
 ---

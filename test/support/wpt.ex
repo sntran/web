@@ -4,6 +4,7 @@ defmodule Web.Platform.Test do
   use Web
 
   alias Web.AsyncContext.Variable
+  alias Web.Platform.Test, as: PlatformTest
 
   @cache_dir Path.expand("tmp/wpt_cache", Elixir.File.cwd!())
   # The infrastructure uses an AsyncContext.Variable (referenced via
@@ -15,7 +16,7 @@ defmodule Web.Platform.Test do
   # URL being passed through every single function.
   @context_key {__MODULE__, :current_url}
 
-  @callback web_platform_test(map()) :: any()
+  @callback web_platform_test(any()) :: any()
 
   defmacro __using__(opts) do
     opts = normalize_use_options!(opts)
@@ -29,13 +30,13 @@ defmodule Web.Platform.Test do
           Enum.with_index(test_cases, 1)
           |> Enum.map(fn {test_case, index} ->
             quote do
-              test unquote(wpt_case_name(test_case, index)) do
+              test unquote(PlatformTest.wpt_case_name(test_case, index)) do
                 __MODULE__.web_platform_test(unquote(Macro.escape(test_case)))
               end
             end
           end)
 
-        describe_term = "#{prefix} (#{suite_name(url)})"
+        describe_term = "#{prefix} (#{PlatformTest.suite_name(url)})"
 
         quote do
           describe unquote(describe_term) do
@@ -53,7 +54,7 @@ defmodule Web.Platform.Test do
 
   def load_many!(urls) when is_list(urls) do
     Enum.map(urls, fn url ->
-      %{url: url, cases: load_json!(url)}
+      %{url: url, cases: normalize_cases(url, load_json!(url))}
     end)
   end
 
@@ -61,8 +62,9 @@ defmodule Web.Platform.Test do
 
   def wpt_case_name(test_case, index) do
     cond do
-      is_binary(test_case["//"]) -> "#{index}: #{test_case["//"]}"
-      is_binary(test_case["comment"]) -> "#{index}: #{test_case["comment"]}"
+      is_binary(test_case) -> "#{index}: #{String.slice(test_case, 0, 96)}"
+      is_map(test_case) and is_binary(test_case["//"]) -> "#{index}: #{test_case["//"]}"
+      is_map(test_case) and is_binary(test_case["comment"]) -> "#{index}: #{test_case["comment"]}"
       true -> "case #{index}"
     end
   end
@@ -81,44 +83,42 @@ defmodule Web.Platform.Test do
   defp fetch_with_cache(url, cache_path, meta_path, meta) do
     headers = conditional_headers(meta)
 
-    try do
-      response = Web.await(Web.fetch(url, headers: headers))
+    response = Web.await(Web.fetch(url, headers: headers))
 
-      case response.status do
-        200 ->
-          persist_fresh_response(response, cache_path, meta_path)
+    case response.status do
+      200 ->
+        persist_fresh_response(response, cache_path, meta_path)
 
-        304 ->
-          read_cached_json!(cache_path, url)
+      304 ->
+        read_cached_json!(cache_path, url)
 
-        status when status in 400..599 ->
-          fallback_to_cache_or_raise(cache_path, url, "HTTP #{status} fetching WPT data")
+      status when status in 400..599 ->
+        fallback_to_cache_or_raise(cache_path, url, "HTTP #{status} fetching WPT data")
 
-        status ->
-          fallback_to_cache_or_raise(
-            cache_path,
-            url,
-            "Unexpected HTTP #{status} fetching WPT data"
-          )
-      end
-    rescue
-      error ->
-        fallback_to_cache_or_raise(cache_path, url, Exception.message(error))
-    catch
-      :exit, reason ->
+      status ->
         fallback_to_cache_or_raise(
           cache_path,
           url,
-          "Network error fetching WPT data: #{inspect(reason)}"
-        )
-
-      kind, reason ->
-        fallback_to_cache_or_raise(
-          cache_path,
-          url,
-          "Fetch failure (#{kind}) fetching WPT data: #{inspect(reason)}"
+          "Unexpected HTTP #{status} fetching WPT data"
         )
     end
+  rescue
+    error ->
+      fallback_to_cache_or_raise(cache_path, url, Exception.message(error))
+  catch
+    :exit, reason ->
+      fallback_to_cache_or_raise(
+        cache_path,
+        url,
+        "Network error fetching WPT data: #{inspect(reason)}"
+      )
+
+    kind, reason ->
+      fallback_to_cache_or_raise(
+        cache_path,
+        url,
+        "Fetch failure (#{kind}) fetching WPT data: #{inspect(reason)}"
+      )
   end
 
   defp persist_fresh_response(response, cache_path, meta_path) do
@@ -141,14 +141,16 @@ defmodule Web.Platform.Test do
     Web.await(Web.Response.json(json_response))
   rescue
     _ ->
-      raw
-      |> repair_surrogates()
-      |> Jason.decode!()
+      decode_fallback_payload(raw)
   catch
     :exit, _reason ->
-      raw
-      |> repair_surrogates()
-      |> Jason.decode!()
+      decode_fallback_payload(raw)
+  end
+
+  defp decode_fallback_payload(raw) do
+    raw
+    |> repair_surrogates()
+    |> Jason.decode!()
   end
 
   defp fallback_to_cache_or_raise(cache_path, url, reason) do
@@ -237,6 +239,10 @@ defmodule Web.Platform.Test do
   end
 
   defp normalize_url!(url) when is_binary(url), do: url
+
+  defp normalize_cases(url, payload) when is_binary(url) and is_list(payload), do: payload
+
+  defp normalize_cases(url, payload) when is_binary(url) and is_map(payload), do: [payload]
 
   defp repair_surrogates(text) do
     Regex.replace(

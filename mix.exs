@@ -71,6 +71,7 @@ defmodule Web.MixProject do
     [
       {:finch, "~> 0.16"},
       {:castore, "~> 1.0"},
+      {:idna, "~> 7.1"},
       {:jason, "~> 1.4"},
       {:benchee, "~> 1.3", only: [:dev, :test]},
       {:stream_data, "~> 1.0", only: :test},

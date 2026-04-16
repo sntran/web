@@ -8,6 +8,7 @@ defmodule Web.Response do
   use Web.Body
 
   alias Web.AsyncContext
+  alias Web.MIME
 
   defstruct [
     :body,
@@ -139,5 +140,29 @@ defmodule Web.Response do
       status_text: status_text,
       headers: %{"location" => to_string(url)}
     )
+  end
+
+  @doc false
+  @spec resolved_content_type(t(), binary() | nil) :: String.t()
+  def resolved_content_type(%__MODULE__{} = response, body_binary \\ nil) do
+    header_value = Web.Headers.get(response.headers, "content-type")
+    parsed_header = MIME.parse(header_value)
+
+    cond do
+      parsed_header != nil and not MIME.generic_binary?(parsed_header) ->
+        parsed_header
+
+      is_binary(body_binary) ->
+        MIME.sniff(body_binary)
+
+      is_binary(response.body) ->
+        MIME.sniff(response.body)
+
+      is_list(response.body) ->
+        response.body |> IO.iodata_to_binary() |> MIME.sniff()
+
+      true ->
+        parsed_header || "application/octet-stream"
+    end
   end
 end

@@ -3,6 +3,7 @@ defmodule Web.ResolverTest do
   use ExUnitProperties
 
   alias Web.Resolver
+  alias Web.URL
 
   property "resolves HTTP specific scheme prefixes naturally" do
     check all(path <- string(:alphanumeric)) do
@@ -25,5 +26,10 @@ defmodule Web.ResolverTest do
 
   test "resolves default or fallback to HTTP cleanly" do
     assert Resolver.resolve("unknown_uri_scheme_no_colon") == Web.Dispatcher.HTTP
+  end
+
+  test "resolves URL structs for rclone and unknown protocols" do
+    assert Resolver.resolve(URL.new("my_s3:path/to/file")) == Web.Dispatcher.TCP
+    assert Resolver.resolve(URL.new("foo://example.com")) == Web.Dispatcher.HTTP
   end
 end

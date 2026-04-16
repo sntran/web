@@ -178,6 +178,21 @@ defmodule Web.Dispatcher.HTTPTest do
     assert {:error, _} = HTTP.fetch(req)
   end
 
+  test "fetch/1 unsubscribes and returns an error when request building fails" do
+    req = %Request{
+      url: nil,
+      method: "GET",
+      headers: Web.Headers.new(),
+      body: nil,
+      dispatcher: nil,
+      redirect: "follow",
+      signal: nil,
+      options: [redirect: "follow", signal: nil]
+    }
+
+    assert {:error, %FunctionClauseError{}} = HTTP.fetch(req)
+  end
+
   test "fetch/1 handles unified packets cleanly routing data remainder payload" do
     port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"])
 

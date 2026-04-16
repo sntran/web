@@ -3,23 +3,16 @@ defmodule Web.URLSearchParamsTest do
 
   alias Web.URLSearchParams
 
-  test "preserves order, duplicate keys, and serializes using web encoding rules" do
-    params = URLSearchParams.new("q=hello+world&tag=one&tag=two")
+  # Note: URLSearchParams tests in WPT are scattered across multiple .any.js files
+  # rather than being in a single JSON data file like URL tests. For now, we rely
+  # on the custom tests below to validate the implementation. Future work could
+  # pull individual .any.js test files and adapt them.
 
-    assert URLSearchParams.get(params, "q") == "hello world"
-    assert URLSearchParams.get_all(params, "tag") == ["one", "two"]
-    assert URLSearchParams.has?(params, "tag")
+  # ============================================================================
+  # Custom protocol implementations (Enumerable, Access) - NOT covered by WPT
+  # ============================================================================
 
-    assert URLSearchParams.to_list(params) == [
-             {"q", "hello world"},
-             {"tag", "one"},
-             {"tag", "two"}
-           ]
-
-    assert URLSearchParams.to_string(params) == "q=hello+world&tag=one&tag=two"
-  end
-
-  test "append, set, delete, sort, Enumerable, and Access all work together" do
+  test "append, set, delete, sort, Enumerable, and Access protocols work together" do
     params =
       URLSearchParams.new([{"b", "2"}, {"a", "3"}, {"a", "1"}])
       |> URLSearchParams.append("c", "4")
@@ -37,12 +30,9 @@ defmodule Web.URLSearchParamsTest do
     assert URLSearchParams.to_string(params) == "a=9&c=4"
   end
 
-  test "supports map construction, default construction, aliases, Access helpers, and string conversion" do
+  test "supports Access protocol: get_and_update, pop, and bracket notation" do
     params = URLSearchParams.new(%{foo: "bar"})
-    empty = URLSearchParams.new(nil)
-    also_empty = URLSearchParams.new()
 
-    assert URLSearchParams.has(params, "foo")
     assert Access.fetch(params, "foo") == {:ok, "bar"}
     assert Access.fetch(params, "missing") == :error
 
@@ -56,7 +46,6 @@ defmodule Web.URLSearchParamsTest do
              {"baz", %URLSearchParams{pairs: []}}
 
     params = URLSearchParams.delete(params, "foo")
-
     params = URLSearchParams.set(params, "foo", "again")
 
     assert Access.get_and_update(params, "foo", fn _current -> :pop end) ==
@@ -64,10 +53,36 @@ defmodule Web.URLSearchParamsTest do
 
     params = URLSearchParams.delete(params, "foo")
     assert Access.pop(params, "foo") == {nil, params}
-    assert Enum.empty?(params)
-    refute Enum.member?(params, {"foo", "baz"})
-    assert Enumerable.impl_for(params).slice(params) == {:error, Enumerable.Web.URLSearchParams}
+  end
+
+  test "supports map construction, default construction, and string conversion" do
+    params = URLSearchParams.new(%{foo: "bar"})
+    empty = URLSearchParams.new(nil)
+    also_empty = URLSearchParams.new()
+
+    assert URLSearchParams.has(params, "foo")
+    assert Enum.empty?(empty)
+    assert Enum.empty?(also_empty)
     assert Kernel.to_string(empty) == ""
     assert Kernel.to_string(also_empty) == ""
+
+    refute Enum.member?(params, {"foo", "missing"})
+    assert Enumerable.impl_for(params).slice(params) == {:error, Enumerable.Web.URLSearchParams}
+  end
+
+  test "preserves order, duplicate keys, and serializes using web encoding rules" do
+    params = URLSearchParams.new("q=hello+world&tag=one&tag=two")
+
+    assert URLSearchParams.get(params, "q") == "hello world"
+    assert URLSearchParams.get_all(params, "tag") == ["one", "two"]
+    assert URLSearchParams.has?(params, "tag")
+
+    assert URLSearchParams.to_list(params) == [
+             {"q", "hello world"},
+             {"tag", "one"},
+             {"tag", "two"}
+           ]
+
+    assert URLSearchParams.to_string(params) == "q=hello+world&tag=one&tag=two"
   end
 end

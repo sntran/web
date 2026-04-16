@@ -42,8 +42,22 @@ defmodule Web.Resolver do
   end
 
   def resolve(input) when is_binary(input) do
+    if remote_syntax?(input) do
+      Web.Dispatcher.TCP
+    else
+      resolve_string_input(input)
+    end
+  end
+
+  defp resolve_string_input(input) do
     input
     |> Web.URL.new()
     |> resolve()
+  rescue
+    ArgumentError -> Web.Dispatcher.HTTP
+  end
+
+  defp remote_syntax?(input) do
+    String.match?(input, ~r/^[A-Za-z0-9][A-Za-z0-9+.-]*:(?!\/\/).*$/)
   end
 end

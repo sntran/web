@@ -58,7 +58,7 @@ defmodule Web.Request do
 
   def new(input, init) when is_binary(input) and is_list(init) do
     input
-    |> Web.URL.new()
+    |> build_request_url()
     |> build_request(init)
   end
 
@@ -74,6 +74,31 @@ defmodule Web.Request do
   """
   def new(input) do
     new(input, [])
+  end
+
+  defp build_request_url(input) do
+    Web.URL.new(input)
+  rescue
+    ArgumentError ->
+      input
+      |> fallback_request_target()
+      |> Web.URL.new()
+  end
+
+  defp fallback_request_target(input) do
+    candidate =
+      if String.starts_with?(input, ["/", "?", "#"]) do
+        "http://localhost" <> input
+      else
+        "http://" <> input
+      end
+
+    try do
+      Web.URL.new(candidate)
+      candidate
+    rescue
+      ArgumentError -> "http://localhost/"
+    end
   end
 
   defp build_request(url, init) do

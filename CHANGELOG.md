@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.Governor`, `Web.AbortableGovernor`, `Web.Governor.Token`, and
+  `Web.CountingGovernor` for TC39 concurrency-control proposal-aligned
+  concurrency limiting, including FIFO acquisition, abortable acquisition,
+  token release helpers, and `Governor.with/2` / `Governor.wrap/2`
+  ergonomics.
+- `examples/fetch_pool.exs`, demonstrating pooled `Web.fetch` usage with
+  `CountingGovernor`.
 - `Web.File`.
 - `Web.FormData` struct and streaming multipart parser.
 - `Web.MIME` for MIME parsing, normalization, and signature-based sniffing
@@ -37,6 +44,13 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- `README.md` now documents governor-based concurrency limiting and notes
+  that `web` keeps `Web.fetch/2` unchanged instead of adding a custom
+  `fetch(..., governor: ...)` option, matching the Stage 1 TC39
+  concurrency-control proposal (`tc39/proposal-concurrency-control`,
+  advanced to Stage 1 in July 2024).
+- `use Web` now aliases `Web.Governor`, `Web.AbortableGovernor`, and
+  `Web.CountingGovernor`.
 - `use Web` now aliases `Web.AsyncContext`.
 - `Web.URL` now aligns its internal state and serialization around WHATWG
   `search` and `hash` semantics, with improved special/non-special setter

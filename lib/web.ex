@@ -35,6 +35,7 @@ defmodule Web do
       import Web, only: [fetch: 1, fetch: 2, await: 1, atob: 1, btoa: 1]
       import Web.DSL, only: [new: 2]
 
+      alias Web.AbortableGovernor
       alias Web.AbortController
       alias Web.AbortSignal
       alias Web.ArrayBuffer
@@ -42,11 +43,13 @@ defmodule Web do
       alias Web.Blob
       alias Web.CompressionStream
       alias Web.Console
+      alias Web.CountingGovernor
       alias Web.CustomEvent
       alias Web.DecompressionStream
       alias Web.EventTarget
       alias Web.File
       alias Web.FormData
+      alias Web.Governor
       alias Web.Headers
       alias Web.Performance
       alias Web.Promise
@@ -182,7 +185,7 @@ defmodule Web do
   defp fetch_request(request) do
     Web.Promise.new(fn resolve, reject ->
       try do
-        case do_fetch(request) do
+        case do_fetch_with_signal(request) do
           {:ok, response} -> resolve.(response)
           {:error, reason} -> reject.(reason)
         end
@@ -191,6 +194,16 @@ defmodule Web do
         :throw, {:abort, reason} -> reject.(reason)
       end
     end)
+  end
+
+  defp do_fetch_with_signal(%Web.Request{signal: %Web.AbortSignal{} = signal} = request) do
+    Web.AsyncContext.with_signal(signal, fn ->
+      do_fetch(request)
+    end)
+  end
+
+  defp do_fetch_with_signal(%Web.Request{} = request) do
+    do_fetch(request)
   end
 
   defp do_fetch(request) do

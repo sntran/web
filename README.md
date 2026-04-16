@@ -212,6 +212,35 @@ raced =
 # => "fast"
 ```
 
+### `Web.Governor` and `Web.CountingGovernor`
+`Web.fetch` stays unchanged. When you want to limit concurrency, apply the
+proposal-defined governor API around the work you are already doing.
+
+```elixir
+use Web
+
+governor = CountingGovernor.new(2)
+
+requests =
+  for url <- [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c"
+      ] do
+    Governor.with(governor, fn ->
+      fetch(url)
+    end)
+  end
+
+responses = await(Promise.all(requests))
+Enum.map(responses, & &1.status)
+```
+
+`Governor.with/2` and `Governor.wrap/2` are part of the TC39 concurrency
+control proposal surface. `web` intentionally does not add a custom
+`fetch(..., governor: ...)` option, so concurrency limiting remains explicit and
+proposal-aligned.
+
 ### `Web.Performance` — High Resolution Timing
 Use `Web.Performance` for browser-style monotonic timing and local User Timing
 entries.

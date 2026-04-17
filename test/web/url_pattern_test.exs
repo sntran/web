@@ -4,8 +4,8 @@ defmodule Web.URLPatternTest do
   use Web.Platform.Test,
     urls: [
       "https://raw.githubusercontent.com/web-platform-tests/wpt/master/urlpattern/resources/urlpatterntestdata.json",
-      "https://github.com/web-platform-tests/wpt/raw/refs/heads/master/urlpattern/resources/urlpattern-generate-test-data.json",
-      "https://github.com/web-platform-tests/wpt/raw/refs/heads/master/urlpattern/resources/urlpattern-compare-test-data.json"
+      "https://raw.githubusercontent.com/web-platform-tests/wpt/master/urlpattern/resources/urlpattern-generate-test-data.json",
+      "https://raw.githubusercontent.com/web-platform-tests/wpt/master/urlpattern/resources/urlpattern-compare-test-data.json"
     ],
     prefix: "URLPattern WPT compliance"
 

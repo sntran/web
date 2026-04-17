@@ -267,6 +267,9 @@ defmodule Web.FormData do
         {^reply_ref, result} ->
           Process.demonitor(owner_ref, [:flush])
           result
+
+        {:DOWN, ^owner_ref, :process, _pid, reason} ->
+          {:error, normalize_call_exit(reason)}
       end
     end
 
@@ -400,12 +403,15 @@ defmodule Web.FormData do
             materializing?: false
           }
 
-          case ReadableStream.get_reader(source_pid) do
+          case safe_get_reader(source_pid) do
             :ok ->
               {:ok, :running, data}
 
             {:error, :already_locked} ->
               {:stop, TypeError.exception("ReadableStream is already locked")}
+
+            {:error, reason} ->
+              {:stop, reason}
           end
 
         reason ->
@@ -1227,6 +1233,16 @@ defmodule Web.FormData do
 
     defp call(pid, request) do
       :gen_statem.call(pid, request, :infinity)
+    catch
+      :exit, reason ->
+        {:error, normalize_call_exit(reason)}
+    end
+
+    defp safe_get_reader(pid) do
+      case ReadableStream.get_reader(pid) do
+        :ok -> :ok
+        {:error, :already_locked} -> {:error, :already_locked}
+      end
     catch
       :exit, reason ->
         {:error, normalize_call_exit(reason)}

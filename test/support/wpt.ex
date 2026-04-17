@@ -2,6 +2,7 @@ defmodule Web.Platform.Test do
   @moduledoc false
 
   use Web
+  @on_load :ensure_fetch_governor
 
   alias Web.AsyncContext.Variable
   alias Web.Platform.Test, as: PlatformTest
@@ -15,8 +16,22 @@ defmodule Web.Platform.Test do
   # file (e.g., urlpatterntestdata.json) caused the error without that
   # URL being passed through every single function.
   @context_key {__MODULE__, :current_url}
+  @governor_key {__MODULE__, :fetch_governor}
+  @governor_lock_key {__MODULE__, :fetch_governor_lock}
+  @default_governor_capacity 5
+  @default_max_fetch_attempts 6
+  @default_fetch_timeout_ms 30_000
+  @default_max_total_fetch_ms 60_000
+  @default_base_backoff_ms 500
+  @default_max_backoff_ms 10_000
+  @default_max_retry_after_ms 30_000
 
   @callback web_platform_test(any()) :: any()
+
+  def ensure_fetch_governor do
+    _ = fetch_governor()
+    :ok
+  end
 
   defmacro __using__(opts) do
     opts = normalize_use_options!(opts)
@@ -74,34 +89,23 @@ defmodule Web.Platform.Test do
 
     {cache_path, meta_path} = cache_paths(url)
     meta = read_meta(meta_path)
+    fetch_url = normalize_fetch_url(url)
+    started_at = System.monotonic_time(:millisecond)
 
     Variable.run(fetch_context_variable(), url, fn ->
-      fetch_with_cache(url, cache_path, meta_path, meta)
+      fetch_governor()
+      |> Governor.with(fn ->
+        fetch_with_cache(fetch_url, cache_path, meta_path, meta, started_at)
+      end)
+      |> Web.await()
     end)
   end
 
-  defp fetch_with_cache(url, cache_path, meta_path, meta) do
-    headers = conditional_headers(meta)
-
-    response = Web.await(Web.fetch(url, headers: headers))
-
-    case response.status do
-      200 ->
-        persist_fresh_response(response, cache_path, meta_path)
-
-      304 ->
-        read_cached_json!(cache_path, url)
-
-      status when status in 400..599 ->
-        fallback_to_cache_or_raise(cache_path, url, "HTTP #{status} fetching WPT data")
-
-      status ->
-        fallback_to_cache_or_raise(
-          cache_path,
-          url,
-          "Unexpected HTTP #{status} fetching WPT data"
-        )
-    end
+  defp fetch_with_cache(url, cache_path, meta_path, meta, started_at) do
+    meta
+    |> conditional_headers()
+    |> fetch_with_retry(url, started_at)
+    |> handle_fetch_response(url, cache_path, meta_path)
   rescue
     error ->
       fallback_to_cache_or_raise(cache_path, url, Exception.message(error))
@@ -119,6 +123,205 @@ defmodule Web.Platform.Test do
         url,
         "Fetch failure (#{kind}) fetching WPT data: #{inspect(reason)}"
       )
+  end
+
+  defp fetch_with_retry(headers, url, started_at, attempt \\ 1)
+
+  defp fetch_with_retry(headers, url, started_at, attempt) do
+    signal = fetch_timeout_signal(started_at)
+    response = Web.await(Web.fetch(url, headers: headers, signal: signal))
+
+    remaining = remaining_budget_ms(started_at)
+
+    if retryable_fetch_status?(response.status) and attempt < max_fetch_attempts() and
+         remaining > 0 do
+      discard_response_body(response)
+
+      remaining
+      |> min(retry_delay_ms(response, attempt))
+      |> sleep_if_needed()
+
+      fetch_with_retry(headers, url, started_at, attempt + 1)
+    else
+      response
+    end
+  catch
+    :exit, reason ->
+      if retryable_fetch_error?(reason) and attempt < max_fetch_attempts() and
+           remaining_budget_ms(started_at) > 0 do
+        started_at
+        |> remaining_budget_ms()
+        |> min(backoff_delay_ms(attempt))
+        |> sleep_if_needed()
+
+        fetch_with_retry(headers, url, started_at, attempt + 1)
+      else
+        exit(reason)
+      end
+  end
+
+  defp handle_fetch_response(response, url, cache_path, meta_path) do
+    case response.status do
+      200 ->
+        persist_fresh_response(response, cache_path, meta_path)
+
+      304 ->
+        read_cached_json!(cache_path, url)
+
+      status when status in 400..599 ->
+        discard_response_body(response)
+
+        reason =
+          if retryable_fetch_status?(status) do
+            "HTTP #{status} fetching WPT data after #{max_fetch_attempts()} attempts"
+          else
+            "HTTP #{status} fetching WPT data"
+          end
+
+        fallback_to_cache_or_raise(cache_path, url, reason)
+
+      status ->
+        discard_response_body(response)
+
+        fallback_to_cache_or_raise(
+          cache_path,
+          url,
+          "Unexpected HTTP #{status} fetching WPT data"
+        )
+    end
+  end
+
+  defp retry_delay_ms(response, attempt) do
+    header_delay =
+      [retry_after_delay_ms(response), rate_limit_reset_delay_ms(response)]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.max(fn -> 0 end)
+
+    max(header_delay, backoff_delay_ms(attempt))
+  end
+
+  defp retry_after_delay_ms(response) do
+    case Web.Headers.get(response.headers, "retry-after") do
+      nil ->
+        nil
+
+      value ->
+        retry_after = value |> to_string() |> String.trim()
+
+        case Integer.parse(retry_after) do
+          {seconds, ""} when seconds >= 0 -> min(seconds * 1000, max_retry_after_ms())
+          _ -> retry_after_http_date_delay_ms(retry_after)
+        end
+    end
+  end
+
+  defp retry_after_http_date_delay_ms(retry_after) do
+    case :httpd_util.convert_request_date(String.to_charlist(retry_after)) do
+      {{year, month, day}, {hour, minute, second}} ->
+        retry_at =
+          DateTime.new!(Date.new!(year, month, day), Time.new!(hour, minute, second), "Etc/UTC")
+
+        max(DateTime.diff(retry_at, DateTime.utc_now(), :millisecond), 0)
+        |> min(max_retry_after_ms())
+
+      _ ->
+        nil
+    end
+  rescue
+    _ ->
+      nil
+  end
+
+  defp rate_limit_reset_delay_ms(response) do
+    remaining = Web.Headers.get(response.headers, "x-ratelimit-remaining")
+    reset = Web.Headers.get(response.headers, "x-ratelimit-reset")
+
+    case {remaining, reset} do
+      {"0", reset_value} when not is_nil(reset_value) ->
+        case Integer.parse(to_string(reset_value)) do
+          {reset_epoch, ""} ->
+            now = System.system_time(:second)
+            wait_seconds = max(reset_epoch - now, 0)
+            min(wait_seconds * 1000, max_retry_after_ms())
+
+          _ ->
+            nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp sleep_if_needed(delay_ms) when delay_ms > 0 do
+    Process.sleep(delay_ms)
+  end
+
+  defp sleep_if_needed(_delay_ms), do: :ok
+
+  defp backoff_delay_ms(attempt) do
+    pow = max(attempt - 1, 0)
+    delay = trunc(base_backoff_ms() * :math.pow(2, pow))
+    min(delay, max_backoff_ms())
+  end
+
+  defp fetch_timeout_signal(started_at) do
+    case remaining_budget_ms(started_at) do
+      remaining when remaining > 0 ->
+        Web.AbortSignal.any([
+          Web.AbortSignal.timeout(fetch_timeout_ms()),
+          Web.AbortSignal.timeout(remaining)
+        ])
+
+      _ ->
+        Web.AbortSignal.abort(:timeout)
+    end
+  end
+
+  defp retryable_fetch_status?(status) do
+    status in [403, 408, 425, 429] or status >= 500
+  end
+
+  defp retryable_fetch_error?(%Mint.TransportError{reason: reason}) do
+    transient_network_error?(reason)
+  end
+
+  defp retryable_fetch_error?({:aborted, _reason}), do: true
+  defp retryable_fetch_error?({:shutdown, reason}), do: retryable_fetch_error?(reason)
+  defp retryable_fetch_error?(reason), do: transient_network_error?(reason)
+
+  defp transient_network_error?(reason)
+
+  defp transient_network_error?(reason)
+       when reason in [:aborted, :timeout, :closed, :econnaborted, :econnrefused, :econnreset] do
+    true
+  end
+
+  defp transient_network_error?(reason)
+       when reason in [:enetdown, :enetunreach, :ehostdown, :ehostunreach, :etimedout, :nxdomain] do
+    true
+  end
+
+  defp transient_network_error?({:failed_connect, _details}), do: true
+  defp transient_network_error?(_reason), do: false
+
+  defp remaining_budget_ms(started_at) do
+    max(max_total_fetch_ms() - elapsed_ms(started_at), 0)
+  end
+
+  defp elapsed_ms(started_at) do
+    System.monotonic_time(:millisecond) - started_at
+  end
+
+  defp discard_response_body(%Web.Response{body: body}) do
+    _ = Enum.reduce_while(body, :ok, fn _, acc -> {:halt, acc} end)
+    :ok
+  rescue
+    _ ->
+      :ok
+  catch
+    :exit, _reason ->
+      :ok
   end
 
   defp persist_fresh_response(response, cache_path, meta_path) do
@@ -206,6 +409,74 @@ defmodule Web.Platform.Test do
       variable ->
         variable
     end
+  end
+
+  defp fetch_governor do
+    governor = :persistent_term.get(@governor_key, nil)
+
+    if live_fetch_governor?(governor) do
+      governor
+    else
+      init_fetch_governor()
+    end
+  end
+
+  defp init_fetch_governor do
+    :global.trans(@governor_lock_key, fn ->
+      governor = :persistent_term.get(@governor_key, nil)
+
+      if live_fetch_governor?(governor) do
+        governor
+      else
+        new_fetch_governor()
+      end
+    end)
+  end
+
+  defp new_fetch_governor do
+    governor = CountingGovernor.new(governor_capacity())
+    :persistent_term.put(@governor_key, governor)
+    governor
+  end
+
+  defp live_fetch_governor?(%CountingGovernor{pid: pid}) when is_pid(pid) do
+    Process.alive?(pid) and pid_governor_capacity(pid) == governor_capacity()
+  end
+
+  defp live_fetch_governor?(_), do: false
+
+  defp pid_governor_capacity(pid) do
+    :sys.get_state(pid).capacity
+  rescue
+    _ -> nil
+  end
+
+  defp governor_capacity, do: runtime_option(:governor_capacity, @default_governor_capacity)
+  defp max_fetch_attempts, do: runtime_option(:max_fetch_attempts, @default_max_fetch_attempts)
+  defp fetch_timeout_ms, do: runtime_option(:fetch_timeout_ms, @default_fetch_timeout_ms)
+  defp max_total_fetch_ms, do: runtime_option(:max_total_fetch_ms, @default_max_total_fetch_ms)
+  defp base_backoff_ms, do: runtime_option(:base_backoff_ms, @default_base_backoff_ms)
+  defp max_backoff_ms, do: runtime_option(:max_backoff_ms, @default_max_backoff_ms)
+  defp max_retry_after_ms, do: runtime_option(:max_retry_after_ms, @default_max_retry_after_ms)
+
+  defp normalize_fetch_url(url) do
+    case URI.parse(url) do
+      %URI{
+        scheme: "https",
+        host: "github.com",
+        path: "/web-platform-tests/wpt/raw/refs/heads/" <> rest
+      } ->
+        "https://raw.githubusercontent.com/web-platform-tests/wpt/" <> rest
+
+      _ ->
+        url
+    end
+  end
+
+  defp runtime_option(key, default) do
+    :web
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(key, default)
   end
 
   defp normalize_use_options!(opts) when is_list(opts) do

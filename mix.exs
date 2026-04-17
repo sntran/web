@@ -1,7 +1,7 @@
 defmodule Web.MixProject do
   use Mix.Project
 
-  @version "0.3.0"
+  @version "0.4.0"
   @repo_url "https://github.com/sntran/web"
   @description "A protocol-agnostic, zero-buffer suite of Web Standard APIs for Elixir."
 
@@ -69,15 +69,15 @@ defmodule Web.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:finch, "~> 0.16"},
+      {:finch, "~> 0.21"},
       {:castore, "~> 1.0"},
       {:idna, "~> 7.1"},
       {:jason, "~> 1.4"},
-      {:benchee, "~> 1.3", only: [:dev, :test]},
-      {:stream_data, "~> 1.0", only: :test},
+      {:benchee, "~> 1.5", only: [:dev, :test]},
+      {:stream_data, "~> 1.3", only: :test},
       {:excoveralls, "~> 0.18", only: :test},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:ex_doc, "~> 0.14", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false}
     ]
   end
 

@@ -1371,6 +1371,18 @@ defmodule Web.FormDataTest do
     assert {:reader_crash, _} = catch_exit(Web.FormData.parse(stream, "reader-crash-boundary"))
   end
 
+  test "parser start_link returns an error when startup crashes before replying" do
+    assert {:error, :function_clause} =
+             Web.FormData.Parser.start_link(:invalid_source, "bad-boundary")
+  end
+
+  test "parser start_link returns an error when the owner helper crashes before replying" do
+    stream = ReadableStream.from("")
+
+    assert {:error, _reason} =
+             Web.FormData.Parser.start_link(stream, "owner-crash-boundary", owner: 123)
+  end
+
   test "parser terminate normalizes normal and custom stop reasons" do
     data = %{
       signal_subscription: nil,

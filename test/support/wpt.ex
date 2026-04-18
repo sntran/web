@@ -6,6 +6,7 @@ defmodule Web.Platform.Test do
 
   alias Web.AsyncContext.Variable
   alias Web.Platform.Test, as: PlatformTest
+  alias Web.Platform.Test.JSHarvester
 
   @cache_dir Path.expand("tmp/wpt_cache", Elixir.File.cwd!())
   # The infrastructure uses an AsyncContext.Variable (referenced via
@@ -69,7 +70,7 @@ defmodule Web.Platform.Test do
 
   def load_many!(urls) when is_list(urls) do
     Enum.map(urls, fn url ->
-      %{url: url, cases: normalize_cases(url, load_json!(url))}
+      %{url: url, cases: load_cases!(url)}
     end)
   end
 
@@ -77,10 +78,20 @@ defmodule Web.Platform.Test do
 
   def wpt_case_name(test_case, index) do
     cond do
-      is_binary(test_case) -> "#{index}: #{String.slice(test_case, 0, 96)}"
-      is_map(test_case) and is_binary(test_case["//"]) -> "#{index}: #{test_case["//"]}"
-      is_map(test_case) and is_binary(test_case["comment"]) -> "#{index}: #{test_case["comment"]}"
-      true -> "case #{index}"
+      is_binary(test_case) ->
+        "#{index}: #{String.slice(test_case, 0, 96)}"
+
+      is_map(test_case) and is_binary(test_case["//"]) ->
+        "#{index}: #{test_case["//"]}"
+
+      is_map(test_case) and is_binary(test_case["comment"]) ->
+        "#{index}: #{test_case["comment"]}"
+
+      is_map(test_case) and is_binary(test_case["description"]) ->
+        "#{index}: #{test_case["description"]}"
+
+      true ->
+        "case #{index}"
     end
   end
 
@@ -95,30 +106,78 @@ defmodule Web.Platform.Test do
     Variable.run(fetch_context_variable(), url, fn ->
       fetch_governor()
       |> Governor.with(fn ->
-        fetch_with_cache(fetch_url, cache_path, meta_path, meta, started_at)
+        fetch_json_with_cache(fetch_url, cache_path, meta_path, meta, started_at)
       end)
       |> Web.await()
     end)
   end
 
-  defp fetch_with_cache(url, cache_path, meta_path, meta, started_at) do
+  defp load_cases!(url) when is_binary(url) do
+    case resource_format(url) do
+      :js -> normalize_cases(url, JSHarvester.load!(url, load_source!(url)))
+      :json -> normalize_cases(url, load_json!(url))
+    end
+  end
+
+  defp load_source!(url) when is_binary(url) do
+    Elixir.File.mkdir_p!(@cache_dir)
+
+    {cache_path, meta_path} = cache_paths(url)
+    meta = read_meta(meta_path)
+    fetch_url = normalize_fetch_url(url)
+    started_at = System.monotonic_time(:millisecond)
+
+    Variable.run(fetch_context_variable(), url, fn ->
+      fetch_governor()
+      |> Governor.with(fn ->
+        fetch_source_with_cache(fetch_url, cache_path, meta_path, meta, started_at)
+      end)
+      |> Web.await()
+    end)
+  end
+
+  defp fetch_source_with_cache(url, cache_path, meta_path, meta, started_at) do
     meta
     |> conditional_headers()
     |> fetch_with_retry(url, started_at)
-    |> handle_fetch_response(url, cache_path, meta_path)
+    |> handle_fetch_source_response(url, cache_path, meta_path)
   rescue
     error ->
-      fallback_to_cache_or_raise(cache_path, url, Exception.message(error))
+      fallback_to_cache_source_or_raise(cache_path, url, Exception.message(error))
   catch
     :exit, reason ->
-      fallback_to_cache_or_raise(
+      fallback_to_cache_source_or_raise(
         cache_path,
         url,
         "Network error fetching WPT data: #{inspect(reason)}"
       )
 
     kind, reason ->
-      fallback_to_cache_or_raise(
+      fallback_to_cache_source_or_raise(
+        cache_path,
+        url,
+        "Fetch failure (#{kind}) fetching WPT data: #{inspect(reason)}"
+      )
+  end
+
+  defp fetch_json_with_cache(url, cache_path, meta_path, meta, started_at) do
+    meta
+    |> conditional_headers()
+    |> fetch_with_retry(url, started_at)
+    |> handle_fetch_json_response(url, cache_path, meta_path)
+  rescue
+    error ->
+      fallback_to_cache_json_or_raise(cache_path, url, Exception.message(error))
+  catch
+    :exit, reason ->
+      fallback_to_cache_json_or_raise(
+        cache_path,
+        url,
+        "Network error fetching WPT data: #{inspect(reason)}"
+      )
+
+    kind, reason ->
+      fallback_to_cache_json_or_raise(
         cache_path,
         url,
         "Fetch failure (#{kind}) fetching WPT data: #{inspect(reason)}"
@@ -160,10 +219,41 @@ defmodule Web.Platform.Test do
       end
   end
 
-  defp handle_fetch_response(response, url, cache_path, meta_path) do
+  defp handle_fetch_source_response(response, url, cache_path, meta_path) do
     case response.status do
       200 ->
-        persist_fresh_response(response, cache_path, meta_path)
+        persist_fresh_source(response, cache_path, meta_path)
+
+      304 ->
+        read_cached_source!(cache_path, url)
+
+      status when status in 400..599 ->
+        discard_response_body(response)
+
+        reason =
+          if retryable_fetch_status?(status) do
+            "HTTP #{status} fetching WPT data after #{max_fetch_attempts()} attempts"
+          else
+            "HTTP #{status} fetching WPT data"
+          end
+
+        fallback_to_cache_source_or_raise(cache_path, url, reason)
+
+      status ->
+        discard_response_body(response)
+
+        fallback_to_cache_source_or_raise(
+          cache_path,
+          url,
+          "Unexpected HTTP #{status} fetching WPT data"
+        )
+    end
+  end
+
+  defp handle_fetch_json_response(response, url, cache_path, meta_path) do
+    case response.status do
+      200 ->
+        persist_fresh_json(response, cache_path, meta_path)
 
       304 ->
         read_cached_json!(cache_path, url)
@@ -178,12 +268,12 @@ defmodule Web.Platform.Test do
             "HTTP #{status} fetching WPT data"
           end
 
-        fallback_to_cache_or_raise(cache_path, url, reason)
+        fallback_to_cache_json_or_raise(cache_path, url, reason)
 
       status ->
         discard_response_body(response)
 
-        fallback_to_cache_or_raise(
+        fallback_to_cache_json_or_raise(
           cache_path,
           url,
           "Unexpected HTTP #{status} fetching WPT data"
@@ -324,7 +414,21 @@ defmodule Web.Platform.Test do
       :ok
   end
 
-  defp persist_fresh_response(response, cache_path, meta_path) do
+  defp persist_fresh_source(response, cache_path, meta_path) do
+    raw = Web.await(Web.Response.text(response))
+
+    Elixir.File.write!(cache_path, raw)
+
+    meta = %{
+      etag: Web.Headers.get(response.headers, "etag"),
+      last_modified: Web.Headers.get(response.headers, "last-modified")
+    }
+
+    Elixir.File.write!(meta_path, Jason.encode!(meta))
+    raw
+  end
+
+  defp persist_fresh_json(response, cache_path, meta_path) do
     {json_response, text_response} = Web.Response.clone(response)
     raw = Web.await(Web.Response.text(text_response))
     decoded = decode_payload(json_response, raw)
@@ -356,7 +460,16 @@ defmodule Web.Platform.Test do
     |> Jason.decode!()
   end
 
-  defp fallback_to_cache_or_raise(cache_path, url, reason) do
+  defp fallback_to_cache_source_or_raise(cache_path, url, reason) do
+    if Elixir.File.exists?(cache_path) do
+      read_cached_source!(cache_path, url)
+    else
+      raise ArgumentError,
+            "#{reason}. Connect to the internet and rerun the tests once to populate #{cache_path} for #{url}."
+    end
+  end
+
+  defp fallback_to_cache_json_or_raise(cache_path, url, reason) do
     if Elixir.File.exists?(cache_path) do
       read_cached_json!(cache_path, url)
     else
@@ -364,6 +477,8 @@ defmodule Web.Platform.Test do
             "#{reason}. Connect to the internet and rerun the tests once to populate #{cache_path} for #{url}."
     end
   end
+
+  defp read_cached_source!(cache_path, _url), do: Elixir.File.read!(cache_path)
 
   defp read_cached_json!(cache_path, _url) do
     cache_path
@@ -510,6 +625,13 @@ defmodule Web.Platform.Test do
   end
 
   defp normalize_url!(url) when is_binary(url), do: url
+
+  defp resource_format(url) do
+    case url |> URI.parse() |> Map.get(:path, "") |> Path.extname() do
+      ".js" -> :js
+      _ -> :json
+    end
+  end
 
   defp normalize_cases(url, payload) when is_binary(url) and is_list(payload), do: payload
 

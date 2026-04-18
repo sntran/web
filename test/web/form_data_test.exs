@@ -2,6 +2,7 @@ defmodule Web.FormDataTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
+  import ExUnit.CaptureLog
   import Web, only: [await: 1]
 
   alias Web.AbortController
@@ -1372,15 +1373,19 @@ defmodule Web.FormDataTest do
   end
 
   test "parser start_link returns an error when startup crashes before replying" do
-    assert {:error, :function_clause} =
-             Web.FormData.Parser.start_link(:invalid_source, "bad-boundary")
+    capture_log(fn ->
+      assert {:error, :function_clause} =
+               Web.FormData.Parser.start_link(:invalid_source, "bad-boundary")
+    end)
   end
 
   test "parser start_link returns an error when the owner helper crashes before replying" do
     stream = ReadableStream.from("")
 
-    assert {:error, _reason} =
-             Web.FormData.Parser.start_link(stream, "owner-crash-boundary", owner: 123)
+    capture_log(fn ->
+      assert {:error, _reason} =
+               Web.FormData.Parser.start_link(stream, "owner-crash-boundary", owner: 123)
+    end)
   end
 
   test "parser terminate normalizes normal and custom stop reasons" do

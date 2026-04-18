@@ -15,6 +15,7 @@
 * **Predictability**: 100% WPT compliance for core primitives like `URL` and `MIME`.
 * **Flow Control**: TC39-aligned concurrency management via `Web.Governor`.
 * **Context Propagation**: Ambient `AsyncContext` for metadata that survives process boundaries.
+* **Structured Data**: WHATWG-style `structured_clone/2` with transferable `ArrayBuffer`s.
 * **Zero-Buffer Performance**: Native streaming with backpressure-aware engines.
 
 ---
@@ -150,6 +151,28 @@ await(Response.text(Response.new(body: encoded)))
 
 ### 🌍 Data & Metadata
 
+Structured cloning is available directly from `Web` and preserves supported
+Web container types, shared references, and transferable `ArrayBuffer`
+semantics.
+
+```elixir
+use Web
+
+buffer = ArrayBuffer.new("hello")
+
+clone =
+  structured_clone(%{"payload" => buffer}, transfer: [buffer])
+
+ArrayBuffer.data(clone["payload"])
+# => "hello"
+
+ArrayBuffer.byte_length(buffer)
+# => 0
+```
+
+Unsupported values and non-transferable entries raise `Web.DOMException`
+with the standard `DataCloneError` name.
+
 Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rclone-style URL support.
 
 ```elixir
@@ -186,10 +209,14 @@ Enum.to_list(form)
 🧪 Testing & Compliance
 -----------------------
 
-`Web` combines focused JSON data from **Web Platform Tests (WPT)** with property tests and strict coverage gates.
+`Web` combines cached JSON fixtures and harvested JS batteries from
+**Web Platform Tests (WPT)** with property tests and strict coverage gates.
 
 ```shell
-# Run the full compliance suite
+# Run the full lint + test + coverage gate
+mix precommit
+
+# Run the compliance suite directly
 mix test --cover
 ```
 

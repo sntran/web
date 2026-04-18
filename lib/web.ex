@@ -28,11 +28,22 @@ defmodule Web do
       :boom
   """
 
+  alias Web.Internal.StructuredData
   alias Web.TypeError
 
   defmacro __using__(_opts) do
     quote do
-      import Web, only: [fetch: 1, fetch: 2, await: 1, atob: 1, btoa: 1]
+      import Web,
+        only: [
+          fetch: 1,
+          fetch: 2,
+          await: 1,
+          atob: 1,
+          btoa: 1,
+          structured_clone: 1,
+          structured_clone: 2
+        ]
+
       import Web.DSL, only: [new: 2]
 
       alias Web.AbortableGovernor
@@ -131,6 +142,20 @@ defmodule Web do
     string
     |> byte_string_to_binary!()
     |> Base.encode64()
+  end
+
+  @doc """
+  Returns a structured clone of `value`.
+
+  ## Examples
+
+      iex> clone = Web.structured_clone(%{"items" => [1, 2, 3]})
+      iex> clone
+      %{"items" => [1, 2, 3]}
+  """
+  @spec structured_clone(term(), keyword()) :: term()
+  def structured_clone(value, options \\ []) do
+    StructuredData.clone(value, options)
   end
 
   @doc """

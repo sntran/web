@@ -2,6 +2,49 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased] - 2026-04-17
+
+### Added
+
+- `Web.structured_clone/1` and `Web.structured_clone/2`, backed by
+  `Web.Internal.StructuredData`, with support for structured cloning of
+  primitives, collections, `DateTime`, `Regex`, `Headers`,
+  `URLSearchParams`, `Blob`, `File`, `ArrayBuffer`, and `Uint8Array`
+  values.
+- `Web.DOMException` with `DataCloneError` support for structured-clone
+  validation failures.
+- `Web.Platform.Test.JSHarvester` and JS-source loading in
+  `Web.Platform.Test`, enabling structured-clone WPT subset coverage from
+  upstream `structured-clone-battery-of-tests*.js` fixtures.
+- Structured-clone regression/property suites and dedicated
+  `Web.ArrayBuffer` coverage tests for transfer detachment,
+  shared-reference preservation, and concurrent table startup races.
+
+### Changed
+
+- `use Web` now imports `structured_clone/1` and `structured_clone/2`.
+- `Web.ArrayBuffer` now uses detachable backing storage with stable
+  identities and a persistent named ETS owner process so transferred
+  buffers detach safely and concurrent buffer creation cannot lose the
+  shared table.
+- `Web.Blob`, `Web.File`, and `Web.Uint8Array` now carry stable identities
+  so structured cloning preserves shared references across repeated
+  appearances in a serialized graph.
+- `Web.Platform.Test` now loads either JSON or JS WPT resources, caches raw
+  JS sources, and derives case names from richer fixture metadata such as
+  `description`.
+
+### Fixed
+
+- `Web.Stream` now replies to writable-stream abort callers before draining
+  queued failures, restoring low-latency priority signaling under mailbox
+  pressure.
+- Expected negative-path tests for governors, multipart parser startup, and
+  IDNA node restarts now capture their logs locally so the full suite stays
+  quiet without muting real failures.
+- Added targeted `TextDecoder` and `ArrayBuffer` coverage cases, bringing
+  the full `mix precommit` gate back to stable `100.0%` coverage.
+
 ## [0.4.0] - 2026-04-17
 
 ### Added

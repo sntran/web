@@ -956,10 +956,12 @@ defmodule Web.Stream do
         Task.shutdown(data.active_task, :brutal_kill)
       end
 
+      :gen_statem.reply(from, :ok)
+
       data
       |> clear_active_operation()
       |> start_abort_task(reason)
-      |> then(&fail_stream(reason, &1, [{:reply, from, :ok}]))
+      |> then(&fail_stream(reason, &1))
     end
   end
 

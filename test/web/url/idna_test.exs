@@ -1,6 +1,8 @@
 defmodule Web.URL.IdnaTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   use Web.Platform.Test,
     urls: [
       "https://raw.githubusercontent.com/web-platform-tests/wpt/master/url/resources/IdnaTestV2.json"
@@ -128,55 +130,57 @@ defmodule Web.URL.IdnaTest do
 
         File.chmod!(fake_node_path, 0o755)
 
-        trap_exits_while(fn ->
-          stop_idna_node()
+        capture_log(fn ->
+          trap_exits_while(fn ->
+            stop_idna_node()
 
-          original_path = System.get_env("PATH")
-          System.put_env("PATH", fake_bin_dir <> ":" <> (original_path || ""))
+            original_path = System.get_env("PATH")
+            System.put_env("PATH", fake_bin_dir <> ":" <> (original_path || ""))
 
-          try do
-            owner =
+            try do
+              owner =
+                spawn(fn ->
+                  Process.flag(:trap_exit, true)
+                  {:ok, _pid} = GenServer.start_link(Idna, fake_node_path, name: Idna)
+
+                  receive do
+                    :stop -> :ok
+                  end
+                end)
+
+              wait_until(fn -> Process.whereis(Idna) != nil end)
+
+              parent = self()
+
               spawn(fn ->
-                Process.flag(:trap_exit, true)
-                {:ok, _pid} = GenServer.start_link(Idna, fake_node_path, name: Idna)
+                wait_until(fn ->
+                  case Process.whereis(Idna) do
+                    nil ->
+                      false
 
-                receive do
-                  :stop -> :ok
-                end
+                    pid ->
+                      case :sys.get_state(pid).pending do
+                        pending when map_size(pending) > 0 -> true
+                        _ -> false
+                      end
+                  end
+                end)
+
+                pid = Process.whereis(Idna)
+                state = :sys.get_state(pid)
+                File.write!(marker_path, "ready")
+                send(pid, {state.port, {:exit_status, 1}})
+                send(parent, :restart_injected)
               end)
 
-            wait_until(fn -> Process.whereis(Idna) != nil end)
-
-            parent = self()
-
-            spawn(fn ->
-              wait_until(fn ->
-                case Process.whereis(Idna) do
-                  nil ->
-                    false
-
-                  pid ->
-                    case :sys.get_state(pid).pending do
-                      pending when map_size(pending) > 0 -> true
-                      _ -> false
-                    end
-                end
-              end)
-
-              pid = Process.whereis(Idna)
-              state = :sys.get_state(pid)
-              File.write!(marker_path, "ready")
-              send(pid, {state.port, {:exit_status, 1}})
-              send(parent, :restart_injected)
-            end)
-
-            assert Idna.domain_to_ascii("☃.com") == {:ok, "xn--n3h.com"}
-            assert_receive :restart_injected, 5_000
-            assert Process.alive?(Process.whereis(Idna))
-            send(owner, :stop)
-          after
-            restore_env("PATH", original_path)
-          end
+              assert Idna.domain_to_ascii("☃.com") == {:ok, "xn--n3h.com"}
+              assert_receive :restart_injected, 5_000
+              assert Process.alive?(Process.whereis(Idna))
+              send(owner, :stop)
+            after
+              restore_env("PATH", original_path)
+            end
+          end)
         end)
       end)
     end

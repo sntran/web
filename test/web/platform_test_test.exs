@@ -311,6 +311,85 @@ defmodule Web.Platform.TestTest do
     end
   end
 
+  test "load_many!/1 parses supported structured clone JS datasets" do
+    basename = "structured-clone-battery-of-tests.js"
+    path = "/#{basename}"
+
+    js = """
+    check('primitive true', true, compare_primitive);
+    check('primitive string, NUL', '\\u0000', compare_primitive);
+    check('Date 0', new Date(0), compare_Date);
+    check('RegExp empty', new RegExp(''), compare_RegExp('(?:)'));
+    function func_Blob_basic() { return new Blob(['foo'], {type:'text/x-bar'}); }
+    function func_Blob_empty() { return new Blob(['']); }
+    function func_Blob_NUL() { return new Blob(['\\u0000']); }
+    check('Blob basic', func_Blob_basic, compare_Blob);
+    check('Blob empty', func_Blob_empty, compare_Blob);
+    check('Blob NUL', func_Blob_NUL, compare_Blob);
+    check('Array with identical property values', function() { const obj = {}; return [obj, obj]; }, compare_Array(check_identical_property_values('0', '1')));
+    structuredCloneBatteryOfTests.push({ description: 'Serializing a non-serializable platform object fails', async f(runner, t) {} });
+    """
+
+    server =
+      ScriptedHTTPServer.start_link([
+        {:response, 200, [{"content-type", "text/javascript"}], js}
+      ])
+
+    url = "http://127.0.0.1:#{server.port}#{path}"
+
+    try do
+      clear_cache(url)
+
+      assert [%{url: ^url, cases: cases}] = PlatformTest.load_many!([url])
+      assert Enum.any?(cases, &(&1["kind"] == "primitive" and &1["value"] == true))
+      assert Enum.any?(cases, &(&1["kind"] == "blob" and &1["type"] == "text/x-bar"))
+      assert Enum.any?(cases, &(&1["kind"] == "shared_reference_array"))
+      assert Enum.any?(cases, &(&1["kind"] == "data_clone_error"))
+    after
+      clear_cache(url)
+    end
+  end
+
+  test "load_many!/1 parses supported structured clone transfer JS datasets" do
+    basename = "structured-clone-battery-of-tests-with-transferables.js"
+    path = "/#{basename}"
+
+    js = """
+    structuredCloneBatteryOfTests.push({
+      description: 'ArrayBuffer',
+      async f(runner) {
+        const buffer = new Uint8Array([1, 2]).buffer;
+        const copy = await runner.structuredClone(buffer, [buffer]);
+      }
+    });
+
+    structuredCloneBatteryOfTests.push({
+      description: 'Transferring a non-transferable platform object fails',
+      async f(runner, t) {
+        const blob = new Blob();
+      }
+    });
+    """
+
+    server =
+      ScriptedHTTPServer.start_link([
+        {:response, 200, [{"content-type", "text/javascript"}], js}
+      ])
+
+    url = "http://127.0.0.1:#{server.port}#{path}"
+
+    try do
+      clear_cache(url)
+
+      assert [%{url: ^url, cases: cases}] = PlatformTest.load_many!([url])
+
+      assert Enum.any?(cases, &(&1["kind"] == "transfer_array_buffer" and &1["bytes"] == [1, 2]))
+      assert Enum.any?(cases, &(&1["kind"] == "transfer_blob_error"))
+    after
+      clear_cache(url)
+    end
+  end
+
   defp unique_basename(prefix) do
     "#{prefix}-#{System.unique_integer([:positive])}.json"
   end

@@ -9,11 +9,12 @@ defmodule Web.Blob do
       {11, "text/plain"}
   """
 
-  @enforce_keys [:parts, :size, :type]
-  defstruct [:parts, :size, :type]
+  @enforce_keys [:id, :parts, :size, :type]
+  defstruct [:id, :parts, :size, :type]
 
   @type blob_part :: binary() | t()
   @type t :: %__MODULE__{
+          id: reference() | nil,
           parts: [blob_part()],
           size: non_neg_integer(),
           type: String.t()
@@ -31,8 +32,12 @@ defmodule Web.Blob do
         acc + part_size(part)
       end)
 
-    %__MODULE__{parts: parts_list, size: size, type: type}
+    %__MODULE__{id: make_ref(), parts: parts_list, size: size, type: type}
   end
+
+  @doc false
+  @spec identity(t()) :: reference() | nil
+  def identity(%__MODULE__{} = blob), do: blob.id
 
   @doc """
   Returns a new Blob representing the selected range.

@@ -1,6 +1,7 @@
 defmodule Web.GovernorTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Web, only: [await: 1]
 
   alias Web.AbortableGovernor
@@ -274,33 +275,35 @@ defmodule Web.GovernorTest do
   test "Governor.with/2 propagates task exits returned as promise tasks" do
     governor = CountingGovernor.new(1)
 
-    assert :task_shutdown ==
-             catch_exit(
-               await(
-                 Governor.with(governor, fn ->
-                   %Promise{
-                     task:
-                       Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
-                         exit({:shutdown, :task_shutdown})
-                       end)
-                   }
-                 end)
+    capture_log(fn ->
+      assert :task_shutdown ==
+               catch_exit(
+                 await(
+                   Governor.with(governor, fn ->
+                     %Promise{
+                       task:
+                         Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
+                           exit({:shutdown, :task_shutdown})
+                         end)
+                     }
+                   end)
+                 )
                )
-             )
 
-    assert {:task_exit, {Task, :await, _}} =
-             catch_exit(
-               await(
-                 Governor.with(governor, fn ->
-                   %Promise{
-                     task:
-                       Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
-                         exit(:task_exit)
-                       end)
-                   }
-                 end)
+      assert {:task_exit, {Task, :await, _}} =
+               catch_exit(
+                 await(
+                   Governor.with(governor, fn ->
+                     %Promise{
+                       task:
+                         Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
+                           exit(:task_exit)
+                         end)
+                     }
+                   end)
+                 )
                )
-             )
+    end)
   end
 
   test "acquire_abortable/1 is best-effort after grant" do

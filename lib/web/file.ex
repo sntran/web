@@ -6,10 +6,11 @@ defmodule Web.File do
   `filename` stores the uploaded filename from Content-Disposition.
   """
 
-  @enforce_keys [:parts, :size, :type, :name, :filename]
-  defstruct [:parts, :size, :type, :name, :filename, :stream]
+  @enforce_keys [:id, :parts, :size, :type, :name, :filename]
+  defstruct [:id, :parts, :size, :type, :name, :filename, :stream]
 
   @type t :: %__MODULE__{
+          id: reference() | nil,
           parts: [binary() | Web.Blob.t()],
           size: non_neg_integer() | nil,
           type: String.t(),
@@ -27,6 +28,7 @@ defmodule Web.File do
     size = Keyword.get(opts, :size, blob.size)
 
     %__MODULE__{
+      id: make_ref(),
       parts: parts,
       size: size,
       type: blob.type,
@@ -35,6 +37,10 @@ defmodule Web.File do
       stream: Keyword.get(opts, :stream)
     }
   end
+
+  @doc false
+  @spec identity(t()) :: reference() | nil
+  def identity(%__MODULE__{} = file), do: file.id
 
   @doc """
   Returns a readable stream view over file contents.

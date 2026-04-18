@@ -2,10 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased] - 2026-04-17
+## [Unreleased] - 2026-04-18
 
 ### Added
 
+- `Web.BroadcastChannel` for WHATWG-style same-name message fan-out across
+  the BEAM, backed by `Web.BroadcastChannel.ChannelServer`,
+  `Web.BroadcastChannel.Dispatcher`, `Web.BroadcastChannel.Adapter`, and the
+  default distributed `Web.BroadcastChannel.Adapter.PG`.
+- `Web.MessageEvent` for message payload delivery with standard event fields,
+  including `data`, `origin`, `source`, and `target`.
+- `examples/cluster_auth_sync.exs`, demonstrating cross-node
+  `BroadcastChannel` delivery, structured-clone isolation, and
+  `AsyncContext` propagation.
 - `Web.structured_clone/1` and `Web.structured_clone/2`, backed by
   `Web.Internal.StructuredData`, with support for structured cloning of
   primitives, collections, `DateTime`, `Regex`, `Headers`,

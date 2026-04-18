@@ -16,6 +16,7 @@
 * **Flow Control**: TC39-aligned concurrency management via `Web.Governor`.
 * **Context Propagation**: Ambient `AsyncContext` for metadata that survives process boundaries.
 * **Structured Data**: WHATWG-style `structured_clone/2` with transferable `ArrayBuffer`s.
+* **Cluster Coordination**: `BroadcastChannel` fan-out across BEAM nodes with sender-origin metadata.
 * **Zero-Buffer Performance**: Native streaming with backpressure-aware engines.
 
 ---
@@ -172,6 +173,42 @@ ArrayBuffer.byte_length(buffer)
 
 Unsupported values and non-transferable entries raise `Web.DOMException`
 with the standard `DataCloneError` name.
+
+`Web.BroadcastChannel` turns those structured-clone guarantees into an
+idiomatic, distributed coordination primitive. Every broadcast clones its
+payload before fan-out, preserves sender `origin` metadata across nodes, and
+restores `AsyncContext` values while listeners run.
+
+```elixir
+use Web
+
+request_id = AsyncContext.Variable.new("request_id")
+
+sender = BroadcastChannel.new("auth-sync")
+
+receiver =
+  BroadcastChannel.new("auth-sync")
+  |> BroadcastChannel.onmessage(fn event ->
+    {
+      event.origin,
+      event.data["token"],
+      AsyncContext.Variable.get(request_id)
+    }
+  end)
+
+AsyncContext.Variable.run(request_id, "req-42", fn ->
+  BroadcastChannel.post_message(sender, %{"token" => "token-A"})
+end)
+
+BroadcastChannel.close(sender)
+BroadcastChannel.close(receiver)
+```
+
+For a full cross-node example, run:
+
+```shell
+mix run examples/cluster_auth_sync.exs
+```
 
 Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rclone-style URL support.
 

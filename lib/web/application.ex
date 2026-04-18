@@ -13,6 +13,9 @@ defmodule Web.Application do
     Web.URLPattern.params()
 
     children = [
+      %{id: :pg, start: {:pg, :start_link, []}},
+      {Registry, keys: :unique, name: Web.BroadcastChannel.Registry},
+      Web.BroadcastChannel.DispatcherSupervisor,
       {Task.Supervisor, name: Web.TaskSupervisor},
       Web.URLPattern.Cache,
       {Finch,

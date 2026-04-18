@@ -52,6 +52,7 @@ defmodule Web do
       alias Web.ArrayBuffer
       alias Web.AsyncContext
       alias Web.Blob
+      alias Web.BroadcastChannel
       alias Web.CompressionStream
       alias Web.Console
       alias Web.CountingGovernor
@@ -62,6 +63,7 @@ defmodule Web do
       alias Web.FormData
       alias Web.Governor
       alias Web.Headers
+      alias Web.MessageEvent
       alias Web.Performance
       alias Web.Promise
       alias Web.ReadableStream

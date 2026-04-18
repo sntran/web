@@ -7,13 +7,12 @@ defmodule Web.EventTarget do
   """
 
   alias Web.AbortSignal
-  alias Web.CustomEvent
-
   @abort_message_prefix {__MODULE__, :abort_signal}
 
   defstruct owner: nil, listeners: %{}, next_id: 0
 
-  @type callback :: (CustomEvent.t() -> any()) | (-> any())
+  @type event :: %{required(:type) => String.t() | atom()}
+  @type callback :: (event() -> any()) | (-> any())
   @type listener :: %{
           id: non_neg_integer(),
           callback: callback(),
@@ -97,9 +96,10 @@ defmodule Web.EventTarget do
     remove_event_listener(target, type, callback)
   end
 
-  @spec dispatch_event(t(), CustomEvent.t()) :: {t(), boolean()}
-  def dispatch_event(%__MODULE__{} = target, %CustomEvent{} = event) do
-    type = normalize_type(event.type)
+  @spec dispatch_event(t(), event()) :: {t(), boolean()}
+  def dispatch_event(%__MODULE__{} = target, %{type: type} = event)
+      when is_binary(type) or is_atom(type) do
+    type = normalize_type(type)
     listeners = Map.get(target.listeners, type, [])
 
     updated_target =

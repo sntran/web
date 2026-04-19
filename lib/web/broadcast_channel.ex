@@ -7,21 +7,35 @@ defmodule Web.BroadcastChannel do
   """
 
   alias Web.AsyncContext.Snapshot
-  alias Web.BroadcastChannel.Adapter.PG
   alias Web.BroadcastChannel.ChannelServer
   alias Web.BroadcastChannel.Dispatcher
   alias Web.DOMException
+  alias Web.EventTarget
   alias Web.Internal.StructuredData
 
-  defstruct [:pid, :name, onmessage: nil]
+  defstruct [:ref, :name, onmessage: nil]
 
   @type callback :: (Web.MessageEvent.t() -> any()) | (-> any())
 
   @type t :: %__MODULE__{
-          pid: pid(),
+          ref: reference(),
           name: String.t(),
           onmessage: callback() | nil
         }
+
+  defimpl Web.EventTarget.Protocol do
+    def add_event_listener(target, type, callback, options) do
+      Web.EventTarget.__add_event_listener__(target, type, callback, options)
+    end
+
+    def remove_event_listener(target, type, callback) do
+      Web.EventTarget.__remove_event_listener__(target, type, callback)
+    end
+
+    def dispatch_event(target, event) do
+      Web.EventTarget.__dispatch_event__(target, event)
+    end
+  end
 
   @doc """
   Creates a new broadcast channel for the given name.
@@ -40,21 +54,32 @@ defmodule Web.BroadcastChannel do
   @spec new(term()) :: t()
   def new(name) do
     normalized_name = normalize_name(name)
-    {:ok, pid} = ChannelServer.start(normalized_name, self())
-    %__MODULE__{pid: pid, name: normalized_name, onmessage: nil}
+    ref = make_ref()
+    {:ok, _pid} = ChannelServer.start(normalized_name, self(), ref)
+    %__MODULE__{ref: ref, name: normalized_name, onmessage: nil}
   end
 
   @doc false
   @spec onmessage(t()) :: callback() | nil
-  def onmessage(%__MODULE__{pid: pid}) do
-    GenServer.call(pid, :get_onmessage, :infinity)
+  def onmessage(%__MODULE__{} = channel) do
+    case lookup_server_pid(channel) do
+      nil -> nil
+      pid -> GenServer.call(pid, :get_onmessage, :infinity)
+    end
   end
 
   @doc false
   @spec onmessage(t(), callback() | nil) :: t()
   def onmessage(%__MODULE__{} = channel, callback)
       when is_nil(callback) or is_function(callback, 0) or is_function(callback, 1) do
-    :ok = maybe_call_or_cast(channel.pid, {:set_onmessage, callback})
+    {event_target_pid, pid} = resolve_runtime_pids!(channel)
+
+    if local_control_process?(event_target_pid, pid) do
+      GenServer.cast(pid, {:set_onmessage, callback})
+    else
+      :ok = GenServer.call(pid, {:set_onmessage, callback}, :infinity)
+    end
+
     %{channel | onmessage: callback}
   end
 
@@ -84,8 +109,7 @@ defmodule Web.BroadcastChannel do
   @spec add_event_listener(t(), String.t() | atom(), callback(), keyword() | map()) :: t()
   def add_event_listener(%__MODULE__{} = channel, type, callback, options \\ %{})
       when is_function(callback, 0) or is_function(callback, 1) do
-    :ok = maybe_call_or_cast(channel.pid, {:add_listener, type, callback, options})
-    channel
+    EventTarget.add_event_listener(channel, type, callback, options)
   end
 
   @doc """
@@ -105,8 +129,7 @@ defmodule Web.BroadcastChannel do
   @spec remove_event_listener(t(), String.t() | atom(), callback()) :: t()
   def remove_event_listener(%__MODULE__{} = channel, type, callback)
       when is_function(callback, 0) or is_function(callback, 1) do
-    :ok = maybe_call_or_cast(channel.pid, {:remove_listener, type, callback})
-    channel
+    EventTarget.remove_event_listener(channel, type, callback)
   end
 
   @doc """
@@ -138,13 +161,13 @@ defmodule Web.BroadcastChannel do
       :ok
   """
   @spec post_message(t(), term()) :: :ok
-  def post_message(%__MODULE__{pid: pid}, data) do
-    dispatcher = lookup_open_dispatcher!(pid)
+  def post_message(%__MODULE__{} = channel, data) do
+    {dispatcher, server_pid} = lookup_open_dispatcher!(channel)
     cloned = Web.structured_clone(data)
     serialized = StructuredData.serialize(cloned)
     snapshot = Snapshot.take()
 
-    Dispatcher.post(dispatcher, pid, %{
+    Dispatcher.post(dispatcher, server_pid, %{
       origin: origin(),
       serialized: serialized,
       snapshot: snapshot
@@ -179,9 +202,8 @@ defmodule Web.BroadcastChannel do
       :ok
   """
   @spec dispatch_event(t(), map()) :: {t(), boolean()}
-  def dispatch_event(%__MODULE__{pid: pid} = channel, event) when is_map(event) do
-    dispatched? = GenServer.call(pid, {:dispatch_event, event}, :infinity)
-    {channel, dispatched?}
+  def dispatch_event(%__MODULE__{} = channel, event) when is_map(event) do
+    EventTarget.dispatch_event(channel, event)
   end
 
   @doc """
@@ -194,62 +216,83 @@ defmodule Web.BroadcastChannel do
       :ok
   """
   @spec close(t()) :: :ok
-  def close(%__MODULE__{pid: pid}) do
-    if self() == pid do
-      :ok = ChannelServer.mark_closed(pid)
-      GenServer.cast(pid, :close)
-    else
-      :ok = GenServer.call(pid, :close, :infinity)
+  def close(%__MODULE__{} = channel) do
+    case lookup_runtime_pids(channel) do
+      nil ->
+        :ok
+
+      {event_target_pid, pid} ->
+        if local_control_process?(event_target_pid, pid) do
+          :ok = ChannelServer.mark_closed(channel.ref)
+          GenServer.cast(pid, :close)
+        else
+          :ok = GenServer.call(pid, :close, :infinity)
+        end
     end
 
     :ok
   end
 
-  @doc false
-  @spec adapter() :: module()
-  def adapter do
-    Application.get_env(:web, :broadcast_adapter, PG)
-  end
+  defp resolve_runtime_pids!(%__MODULE__{} = channel) do
+    case Registry.lookup(Web.Registry, channel.ref) do
+      [{event_target_pid, %{server_pid: server_pid}}]
+      when is_pid(event_target_pid) and is_pid(server_pid) ->
+        {event_target_pid, server_pid}
 
-  @doc false
-  @spec governor() :: struct() | nil
-  def governor do
-    Application.get_env(:web, :broadcast_governor)
-  end
+      [{_event_target_pid, _value}] ->
+        raise ArgumentError, "BroadcastChannel #{inspect(channel.ref)} is missing a server pid"
 
-  @doc false
-  @spec origin() :: String.t()
-  def origin do
-    "node://" <> Atom.to_string(node())
-  end
-
-  defp maybe_call_or_cast(pid, message) do
-    if self() == pid do
-      GenServer.cast(pid, message)
-      :ok
-    else
-      GenServer.call(pid, message, :infinity)
+      [] ->
+        raise ArgumentError, "Unknown BroadcastChannel ref: #{inspect(channel.ref)}"
     end
   end
 
-  defp lookup_open_dispatcher!(pid) do
-    case ChannelServer.runtime_info(pid) do
-      %{dispatcher: dispatcher, closed: false} when is_pid(dispatcher) ->
-        if Process.alive?(pid) do
-          dispatcher
+  defp lookup_runtime_pids(%__MODULE__{} = channel) do
+    case Registry.lookup(Web.Registry, channel.ref) do
+      [{event_target_pid, %{server_pid: server_pid}}]
+      when is_pid(event_target_pid) and is_pid(server_pid) ->
+        {event_target_pid, server_pid}
+
+      _other ->
+        nil
+    end
+  end
+
+  defp lookup_server_pid(%__MODULE__{} = channel) do
+    case lookup_runtime_pids(channel) do
+      {_event_target_pid, server_pid} -> server_pid
+      nil -> nil
+    end
+  end
+
+  defp local_control_process?(event_target_pid, server_pid) do
+    self() == server_pid or self() == event_target_pid
+  end
+
+  defp lookup_open_dispatcher!(%__MODULE__{} = channel) do
+    case {ChannelServer.runtime_info(channel.ref), lookup_server_pid(channel)} do
+      {%{dispatcher: dispatcher, closed: false}, server_pid}
+      when is_pid(dispatcher) and is_pid(server_pid) ->
+        if Process.alive?(server_pid) do
+          {dispatcher, server_pid}
         else
-          raise DOMException.exception(
-                  name: "InvalidStateError",
-                  message: "BroadcastChannel is closed"
-                )
+          raise_closed!()
         end
 
       _other ->
-        raise DOMException.exception(
-                name: "InvalidStateError",
-                message: "BroadcastChannel is closed"
-              )
+        raise_closed!()
     end
+  end
+
+  defp raise_closed! do
+    raise DOMException.exception(
+            name: "InvalidStateError",
+            message: "BroadcastChannel is closed"
+          )
+  end
+
+  defp origin do
+    "node://" <> Atom.to_string(node())
   end
 
   defp normalize_name(nil), do: "null"

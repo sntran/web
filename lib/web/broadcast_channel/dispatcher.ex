@@ -3,11 +3,11 @@ defmodule Web.BroadcastChannel.Dispatcher do
 
   use GenServer
 
-  alias Web.BroadcastChannel
+  alias Web.BroadcastChannel.Adapter.PG
   alias Web.BroadcastChannel.DispatcherSupervisor
   alias Web.Governor
 
-  @registry Web.BroadcastChannel.Registry
+  @registry Web.Registry
 
   @type subscriber :: %{
           creation_index: non_neg_integer(),
@@ -74,7 +74,7 @@ defmodule Web.BroadcastChannel.Dispatcher do
 
   @impl true
   def init(name) do
-    adapter = BroadcastChannel.adapter()
+    adapter = adapter()
     :ok = adapter.join(name, self())
 
     {:ok,
@@ -213,11 +213,19 @@ defmodule Web.BroadcastChannel.Dispatcher do
     ensure_supervisor_started()
   end
 
+  defp adapter do
+    Application.get_env(:web, :broadcast_adapter, PG)
+  end
+
   defp ensure_registry_started do
     case Process.whereis(@registry) do
       nil ->
         # coveralls-ignore-start
-        case Registry.start_link(keys: :unique, name: @registry) do
+        case Registry.start_link(
+               keys: :unique,
+               name: @registry,
+               partitions: System.schedulers_online()
+             ) do
           {:ok, _pid} -> :ok
           {:error, {:already_started, _pid}} -> :ok
         end
@@ -269,6 +277,10 @@ defmodule Web.BroadcastChannel.Dispatcher do
 
   defp dispatcher_key(name), do: {:dispatcher, name}
 
+  defp governor do
+    Application.get_env(:web, :broadcast_governor)
+  end
+
   defp remove_subscriber(state, pid) do
     case Map.pop(state.subscribers, pid) do
       {nil, subscribers} ->
@@ -294,7 +306,7 @@ defmodule Web.BroadcastChannel.Dispatcher do
   end
 
   defp run_with_governor(fun) when is_function(fun, 0) do
-    case BroadcastChannel.governor() do
+    case governor() do
       nil ->
         fun.()
 

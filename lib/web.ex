@@ -38,6 +38,7 @@ defmodule Web do
           fetch: 1,
           fetch: 2,
           await: 1,
+          using: 2,
           atob: 1,
           btoa: 1,
           structured_clone: 1,
@@ -70,6 +71,7 @@ defmodule Web do
       alias Web.ReadableStreamDefaultController
       alias Web.Request
       alias Web.Response
+      alias Web.Symbol
       alias Web.TextDecoder
       alias Web.TextDecoderStream
       alias Web.TextEncoder
@@ -115,6 +117,16 @@ defmodule Web do
           raise "await: unexpected result: #{inspect(other)}"
       end
     end
+  end
+
+  @doc """
+  Runs a block with a disposable resource and guarantees `:dispose` runs after.
+
+  Supports `using resource <- expression do ... end`,
+  `using resource = expression do ... end`, and `using expression do ... end`.
+  """
+  defmacro using(binding, do: block) do
+    build_using(binding, block, __CALLER__)
   end
 
   @doc """
@@ -241,6 +253,36 @@ defmodule Web do
         Web.Resolver.resolve(request.url)
 
     dispatcher.fetch(request)
+  end
+
+  defp build_using({operator, _meta, [pattern, resource]}, block, caller)
+       when operator in [:<-, :=] do
+    resource_var = Macro.unique_var(:using_resource, caller.module || __MODULE__)
+
+    quote do
+      unquote(resource_var) = unquote(resource)
+      unquote(pattern) = unquote(resource_var)
+
+      try do
+        unquote(block)
+      after
+        Web.Symbol.Protocol.symbol(unquote(resource_var), Web.Symbol.dispose(), [])
+      end
+    end
+  end
+
+  defp build_using(resource, block, caller) do
+    resource_var = Macro.unique_var(:using_resource, caller.module || __MODULE__)
+
+    quote do
+      unquote(resource_var) = unquote(resource)
+
+      try do
+        unquote(block)
+      after
+        Web.Symbol.Protocol.symbol(unquote(resource_var), Web.Symbol.dispose(), [])
+      end
+    end
   end
 
   defp byte_string_to_binary!(string) do

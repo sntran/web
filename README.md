@@ -17,6 +17,7 @@
 * **Context Propagation**: Ambient `AsyncContext` for metadata that survives process boundaries.
 * **Structured Data**: WHATWG-style `structured_clone/2` with transferable `ArrayBuffer`s.
 * **Cluster Coordination**: `BroadcastChannel` fan-out across BEAM nodes with sender-origin metadata.
+* **Resource Disposal**: TC39-inspired `Symbol.dispose` support with a `using` macro for deterministic cleanup.
 * **Zero-Buffer Performance**: Native streaming with backpressure-aware engines.
 
 ---
@@ -56,6 +57,18 @@ defmodule GitHub do
 end
 
 Web.await(GitHub.repositories())
+```
+
+Disposable resources also fit the same runtime-first DSL. `use Web` now
+aliases `Web.Symbol` and imports a `using` macro that guarantees
+`Symbol.dispose` runs in an `after` block.
+
+```elixir
+use Web
+
+using channel <- BroadcastChannel.new("audit-log") do
+  BroadcastChannel.post_message(channel, %{status: "started"})
+end
 ```
 
 📖 API Usage & Examples
@@ -176,8 +189,9 @@ with the standard `DataCloneError` name.
 
 `Web.BroadcastChannel` turns those structured-clone guarantees into an
 idiomatic, distributed coordination primitive. Every broadcast clones its
-payload before fan-out, preserves sender `origin` metadata across nodes, and
-restores `AsyncContext` values while listeners run.
+payload before fan-out, preserves sender `origin` metadata across nodes,
+restores `AsyncContext` values while listeners run, and exposes
+WHATWG-style `EventTarget` listener APIs on top of a process-backed runtime.
 
 ```elixir
 use Web
@@ -200,8 +214,9 @@ AsyncContext.Variable.run(request_id, "req-42", fn ->
   BroadcastChannel.post_message(sender, %{"token" => "token-A"})
 end)
 
-BroadcastChannel.close(sender)
-BroadcastChannel.close(receiver)
+using receiver do
+  BroadcastChannel.close(sender)
+end
 ```
 
 For a full cross-node example, run:

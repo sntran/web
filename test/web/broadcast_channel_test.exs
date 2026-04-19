@@ -96,6 +96,55 @@ defmodule Web.BroadcastChannelTest do
     assert channel.name == "null"
   end
 
+  test "unregistered channel refs return nil onmessage and close as a no-op" do
+    channel = %BroadcastChannel{ref: make_ref(), name: "orphan"}
+
+    assert channel_pid(channel) == nil
+    assert BroadcastChannel.onmessage(channel) == nil
+    assert :ok = BroadcastChannel.close(channel)
+  end
+
+  test "broadcast channel control paths raise for unknown or malformed refs" do
+    unknown = %BroadcastChannel{ref: make_ref(), name: "unknown"}
+    partial = %BroadcastChannel{ref: make_ref(), name: "partial"}
+
+    assert_raise ArgumentError, ~r/Unknown BroadcastChannel ref/, fn ->
+      BroadcastChannel.onmessage(unknown, fn _event -> :ok end)
+    end
+
+    {:ok, _owner} = Registry.register(Web.Registry, partial.ref, %{})
+
+    assert_raise ArgumentError, ~r/missing a server pid/, fn ->
+      BroadcastChannel.onmessage(partial, fn _event -> :ok end)
+    end
+  end
+
+  test "broadcast channel public surface only exports standard-facing methods" do
+    exported = BroadcastChannel.__info__(:functions)
+
+    refute {:server_pid, 1} in exported
+    refute {:__server_pid__, 1} in exported
+    refute {:adapter, 0} in exported
+    refute {:governor, 0} in exported
+    refute {:origin, 0} in exported
+    refute {:handle_add_listener, 4} in exported
+    refute {:handle_dispatch, 2} in exported
+
+    assert Enum.sort(exported) == [
+             {:__struct__, 0},
+             {:__struct__, 1},
+             {:add_event_listener, 3},
+             {:add_event_listener, 4},
+             {:close, 1},
+             {:dispatch_event, 2},
+             {:new, 1},
+             {:onmessage, 1},
+             {:onmessage, 2},
+             {:post_message, 2},
+             {:remove_event_listener, 3}
+           ]
+  end
+
   test "adapter behavior exposes the expected callback contract" do
     assert Enum.sort(BroadcastChannel.Adapter.behaviour_info(:callbacks)) ==
              [broadcast: 3, join: 2, leave: 2]
@@ -184,7 +233,7 @@ defmodule Web.BroadcastChannelTest do
         send(parent, {:payload_origin, event.origin, event.data})
       end)
 
-    dispatcher = :sys.get_state(receiver.pid).dispatcher
+    dispatcher = :sys.get_state(channel_pid(receiver)).dispatcher
 
     send(dispatcher, {
       :broadcast_channel_remote,
@@ -461,29 +510,73 @@ defmodule Web.BroadcastChannelTest do
     receiver = BroadcastChannel.new(channel_name)
     listener = fn event -> send(parent, {:cast_listener, event.data}) end
 
-    GenServer.cast(receiver.pid, {
+    GenServer.cast(channel_pid(receiver), {
       :set_onmessage,
       fn event -> send(parent, {:cast_onmessage, event.data}) end
     })
 
-    GenServer.cast(receiver.pid, {:add_listener, "message", listener, %{}})
+    GenServer.cast(channel_pid(receiver), {:add_listener, "message", listener, %{}})
     Process.sleep(20)
 
-    send(receiver.pid, :unrelated_message)
+    send(channel_pid(receiver), :unrelated_message)
     Process.sleep(20)
-    assert Process.alive?(receiver.pid)
+    assert Process.alive?(channel_pid(receiver))
 
     assert :ok = BroadcastChannel.post_message(sender, "casted")
     assert_receive {:cast_onmessage, "casted"}
     assert_receive {:cast_listener, "casted"}
 
-    GenServer.cast(receiver.pid, {:remove_listener, "message", listener})
+    GenServer.cast(channel_pid(receiver), {:remove_listener, "message", listener})
     Process.sleep(20)
 
     assert :ok = BroadcastChannel.post_message(sender, "after-remove")
     assert_receive {:cast_onmessage, "after-remove"}
     refute_receive {:cast_listener, "after-remove"}
     assert is_function(BroadcastChannel.onmessage(receiver), 1)
+  end
+
+  test "channel server call paths update listeners and dispatch directly" do
+    parent = self()
+    channel_name = unique_name("channel-server-calls")
+    receiver = BroadcastChannel.new(channel_name)
+    listener = fn event -> send(parent, {:call_listener, event.data}) end
+    callback = fn event -> send(parent, {:call_onmessage, event.data}) end
+
+    assert :ok = GenServer.call(channel_pid(receiver), {:set_onmessage, callback}, :infinity)
+
+    assert :ok =
+             GenServer.call(
+               channel_pid(receiver),
+               {:add_listener, "custom", listener, %{}},
+               :infinity
+             )
+
+    assert is_function(BroadcastChannel.onmessage(receiver), 1)
+
+    assert true =
+             GenServer.call(
+               channel_pid(receiver),
+               {:dispatch_event, %{type: "custom", data: "payload", target: receiver}},
+               :infinity
+             )
+
+    assert_receive {:call_listener, "payload"}
+
+    assert :ok =
+             GenServer.call(
+               channel_pid(receiver),
+               {:remove_listener, "custom", listener},
+               :infinity
+             )
+
+    assert true =
+             GenServer.call(
+               channel_pid(receiver),
+               {:dispatch_event, %{type: "custom", data: "gone", target: receiver}},
+               :infinity
+             )
+
+    refute_receive {:call_listener, "gone"}
   end
 
   test "closing inside a listener makes self-post validation fail immediately" do
@@ -510,34 +603,44 @@ defmodule Web.BroadcastChannelTest do
     assert_receive {:self_close_post, "InvalidStateError"}
   end
 
-  test "stale open runtime metadata still raises InvalidStateError for dead pids" do
+  test "stale open runtime metadata still raises InvalidStateError for dead refs" do
     channel_name = unique_name("stale-runtime")
     channel = BroadcastChannel.new(channel_name)
     assert :ok = BroadcastChannel.close(channel)
 
+    dead_ref = make_ref()
     dead_pid = spawn(fn -> :ok end)
     Process.sleep(20)
 
-    assert ChannelServer.runtime_info(dead_pid) == nil
-    assert :ok = ChannelServer.mark_closed(dead_pid)
+    assert ChannelServer.runtime_info(dead_ref) == nil
+    assert :ok = ChannelServer.mark_closed(dead_ref)
+
+    {:ok, _owner} = Registry.register(Web.Registry, dead_ref, %{server_pid: dead_pid})
 
     true =
       :ets.insert(Web.BroadcastChannel.ChannelServer.Runtime, {
-        dead_pid,
+        dead_ref,
         %{dispatcher: self(), closed: false}
       })
 
     on_exit(fn ->
       case :ets.whereis(Web.BroadcastChannel.ChannelServer.Runtime) do
-        :undefined -> :ok
-        _table -> :ets.delete(Web.BroadcastChannel.ChannelServer.Runtime, dead_pid)
+        :undefined ->
+          :ok
+
+        _table ->
+          try do
+            :ets.delete(Web.BroadcastChannel.ChannelServer.Runtime, dead_ref)
+          catch
+            :error, :badarg -> :ok
+          end
       end
     end)
 
     exception =
       assert_raise DOMException, fn ->
         BroadcastChannel.post_message(
-          %BroadcastChannel{pid: dead_pid, name: channel_name},
+          %BroadcastChannel{ref: dead_ref, name: channel_name},
           "stale"
         )
       end
@@ -548,10 +651,36 @@ defmodule Web.BroadcastChannelTest do
   test "channel server handles event-target cleanup messages" do
     channel = BroadcastChannel.new(unique_name("channel-server-event-target"))
 
-    send(channel.pid, {{Web.EventTarget, :abort_signal}, 0})
+    send(event_target_pid(channel), {{Web.EventTarget, :abort_signal}, 0})
 
     Process.sleep(20)
-    assert Process.alive?(channel.pid)
+    assert Process.alive?(event_target_pid(channel))
+  end
+
+  test "closed channel servers acknowledge queued deliveries without invoking handlers" do
+    parent = self()
+
+    channel =
+      BroadcastChannel.new(unique_name("closed-delivery"))
+      |> BroadcastChannel.onmessage(fn event ->
+        send(parent, {:closed_delivery, event.data})
+      end)
+
+    assert :ok = BroadcastChannel.close(channel)
+
+    send(channel_pid(channel), {
+      :broadcast_channel_deliver,
+      self(),
+      :closed_ref,
+      %{
+        origin: origin(),
+        serialized: StructuredData.serialize("ignored"),
+        snapshot: Snapshot.take()
+      }
+    })
+
+    assert_receive {:broadcast_channel_delivery_complete, :closed_ref, _pid}
+    refute_receive {:closed_delivery, _}
   end
 
   test "closing in onmessage prevents already queued tasks from firing" do
@@ -595,7 +724,7 @@ defmodule Web.BroadcastChannelTest do
         raise "boom"
       end)
 
-    monitor_ref = Process.monitor(crashing.pid)
+    monitor_ref = Process.monitor(channel_pid(crashing))
 
     _receiver =
       BroadcastChannel.new(channel_name)
@@ -635,12 +764,12 @@ defmodule Web.BroadcastChannelTest do
   test "dispatcher edge paths stay stable for duplicate register, unknown unregister, and empty remote fan-out" do
     channel_name = unique_name("dispatcher-edges")
     channel = BroadcastChannel.new(channel_name)
-    channel_state = :sys.get_state(channel.pid)
+    channel_state = :sys.get_state(channel_pid(channel))
     dispatcher = channel_state.dispatcher
     creation_index = channel_state.creation_index
 
     assert %{dispatcher: ^dispatcher, creation_index: ^creation_index} =
-             Dispatcher.register(channel_name, channel.pid)
+             Dispatcher.register(channel_name, channel_pid(channel))
 
     dead_pid = spawn(fn -> :ok end)
     Process.sleep(20)
@@ -661,7 +790,7 @@ defmodule Web.BroadcastChannelTest do
     send(empty_dispatcher, {
       :broadcast_channel_remote,
       %{
-        origin: BroadcastChannel.origin(),
+        origin: origin(),
         serialized: StructuredData.serialize("noop"),
         snapshot: Snapshot.take()
       }
@@ -712,7 +841,7 @@ defmodule Web.BroadcastChannelTest do
             current_pid: current_pid,
             remaining: [],
             message: %{
-              origin: BroadcastChannel.origin(),
+              origin: origin(),
               serialized: serialized,
               snapshot: snapshot
             }
@@ -735,7 +864,7 @@ defmodule Web.BroadcastChannelTest do
               %{
                 recipients: [spawn(fn -> :ok end)],
                 message: %{
-                  origin: BroadcastChannel.origin(),
+                  origin: origin(),
                   serialized: serialized,
                   snapshot: snapshot
                 }
@@ -760,7 +889,7 @@ defmodule Web.BroadcastChannelTest do
               %{
                 recipients: [],
                 message: %{
-                  origin: BroadcastChannel.origin(),
+                  origin: origin(),
                   serialized: serialized,
                   snapshot: snapshot
                 }
@@ -783,7 +912,7 @@ defmodule Web.BroadcastChannelTest do
               %{
                 recipients: [],
                 message: %{
-                  origin: BroadcastChannel.origin(),
+                  origin: origin(),
                   serialized: serialized,
                   snapshot: snapshot
                 }
@@ -795,7 +924,7 @@ defmodule Web.BroadcastChannelTest do
 
     send(stop_noreply_dispatcher, {
       :broadcast_channel_remote,
-      %{origin: BroadcastChannel.origin(), serialized: serialized, snapshot: snapshot}
+      %{origin: origin(), serialized: serialized, snapshot: snapshot}
     })
 
     Process.sleep(20)
@@ -828,6 +957,24 @@ defmodule Web.BroadcastChannelTest do
 
   defp unique_name(prefix) do
     "#{prefix}-#{System.unique_integer([:positive, :monotonic])}"
+  end
+
+  defp origin do
+    "node://" <> Atom.to_string(node())
+  end
+
+  defp channel_pid(channel) do
+    case Registry.lookup(Web.Registry, channel.ref) do
+      [{_event_target_pid, %{server_pid: server_pid}}] when is_pid(server_pid) -> server_pid
+      _other -> nil
+    end
+  end
+
+  defp event_target_pid(target) do
+    case Registry.lookup(Web.Registry, target.ref) do
+      [{event_target_pid, _value}] when is_pid(event_target_pid) -> event_target_pid
+      [] -> raise ArgumentError, "Unknown EventTarget ref: #{inspect(target.ref)}"
+    end
   end
 
   defp restore_env(key, nil) do

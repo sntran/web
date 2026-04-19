@@ -1,278 +1,152 @@
 defmodule Web.EventTarget do
   @moduledoc """
-  Foundational event listener storage and dispatch helpers.
+  Public event-target interface for process-backed Web objects.
 
-  Store this struct in process state for evented modules, then route lifecycle
-  events through `handle_info/2` to support abort-signal based listener cleanup.
+  Evented structs expose an opaque `ref` and use `Web.Registry` as the single
+  lookup point for their internal listener server.
   """
 
-  alias Web.AbortSignal
-  @abort_message_prefix {__MODULE__, :abort_signal}
-
-  defstruct owner: nil, listeners: %{}, next_id: 0
+  alias Web.AsyncContext.Snapshot
+  alias Web.Internal.EventTarget.Server
 
   @type event :: %{required(:type) => String.t() | atom()}
   @type callback :: (event() -> any()) | (-> any())
-  @type listener :: %{
-          id: non_neg_integer(),
-          callback: callback(),
-          once: boolean(),
-          watcher: pid() | nil
-        }
-  @type t :: %__MODULE__{
-          owner: pid() | nil,
-          listeners: %{optional(String.t()) => [listener()]},
-          next_id: non_neg_integer()
-        }
 
-  @spec new(keyword()) :: t()
-  def new(opts \\ []) do
-    %__MODULE__{owner: Keyword.get(opts, :owner, self())}
-  end
+  @callback handle_add_listener(struct(), String.t() | atom(), callback(), map()) ::
+              :ok | {:ok, struct()}
+  @callback handle_dispatch(struct(), event()) :: :ok | {:ok, struct()}
+  @optional_callbacks handle_add_listener: 4, handle_dispatch: 2
 
-  @spec add_event_listener(t(), String.t() | atom(), callback(), keyword() | map()) :: t()
-  # coveralls-ignore-start
-  def add_event_listener(%__MODULE__{} = target, type, callback)
-      when is_function(callback, 0) or is_function(callback, 1),
-      do: add_event_listener(target, type, callback, %{})
+  defmacro __using__(_opts) do
+    quote do
+      @behaviour Web.EventTarget
 
-  # coveralls-ignore-stop
+      @impl Web.EventTarget
+      def handle_add_listener(target, _type, _callback, _options), do: {:ok, target}
 
-  def add_event_listener(%__MODULE__{} = target, type, callback, options)
-      when is_function(callback, 0) or is_function(callback, 1) do
-    type = normalize_type(type)
+      @impl Web.EventTarget
+      def handle_dispatch(target, _event), do: {:ok, target}
 
-    if listener_registered?(target, type, callback) do
-      target
-    else
-      opts = normalize_options(options)
-      signal = Map.get(opts, :signal)
+      defoverridable handle_add_listener: 4, handle_dispatch: 2
 
-      if signal && AbortSignal.aborted?(signal) do
-        target
-      else
-        id = target.next_id
-        watcher = maybe_start_signal_watcher(target.owner, signal, id)
+      defimpl Web.EventTarget.Protocol, for: __MODULE__ do
+        def add_event_listener(target, type, callback, options) do
+          Web.EventTarget.__add_event_listener__(target, type, callback, options)
+        end
 
-        listener = %{
-          id: id,
-          callback: callback,
-          once: Map.get(opts, :once, false),
-          watcher: watcher
-        }
+        def remove_event_listener(target, type, callback) do
+          Web.EventTarget.__remove_event_listener__(target, type, callback)
+        end
 
-        listeners = Map.update(target.listeners, type, [listener], &(&1 ++ [listener]))
-        %{target | listeners: listeners, next_id: id + 1}
+        def dispatch_event(target, event) do
+          Web.EventTarget.__dispatch_event__(target, event)
+        end
       end
     end
+  end
+
+  @spec add_event_listener(target, String.t() | atom(), callback(), keyword() | map()) :: target
+        when target: var
+  def add_event_listener(target, type, callback, options \\ %{})
+      when is_function(callback, 0) or is_function(callback, 1) do
+    Web.EventTarget.Protocol.add_event_listener(target, type, callback, options)
   end
 
   def unquote(:addEventListener)(target, type, callback, options \\ %{}) do
     add_event_listener(target, type, callback, options)
   end
 
-  @spec remove_event_listener(t(), String.t() | atom(), callback()) :: t()
-  def remove_event_listener(%__MODULE__{} = target, type, callback)
+  @spec remove_event_listener(target, String.t() | atom(), callback()) :: target when target: var
+  def remove_event_listener(target, type, callback)
       when is_function(callback, 0) or is_function(callback, 1) do
-    type = normalize_type(type)
-
-    {removed, kept} =
-      target.listeners
-      |> Map.get(type, [])
-      |> Enum.split_with(&same_callback?(&1.callback, callback))
-
-    Enum.each(removed, &stop_watcher(&1.watcher))
-
-    listeners =
-      case kept do
-        [] -> Map.delete(target.listeners, type)
-        _ -> Map.put(target.listeners, type, kept)
-      end
-
-    %{target | listeners: listeners}
+    Web.EventTarget.Protocol.remove_event_listener(target, type, callback)
   end
 
   def unquote(:removeEventListener)(target, type, callback) do
     remove_event_listener(target, type, callback)
   end
 
-  @spec dispatch_event(t(), event()) :: {t(), boolean()}
-  def dispatch_event(%__MODULE__{} = target, %{type: type} = event)
-      when is_binary(type) or is_atom(type) do
-    type = normalize_type(type)
-    listeners = Map.get(target.listeners, type, [])
-
-    updated_target =
-      Enum.reduce(listeners, target, fn listener, acc ->
-        invoke_callback(listener.callback, event)
-
-        if listener.once do
-          remove_listener_by_id(acc, type, listener.id)
-        else
-          acc
-        end
-      end)
-
-    {updated_target, true}
+  @spec dispatch_event(target, event()) :: {target, boolean()} when target: var
+  def dispatch_event(target, %{type: type} = event) when is_binary(type) or is_atom(type) do
+    Web.EventTarget.Protocol.dispatch_event(target, event)
   end
 
   def unquote(:dispatchEvent)(target, event) do
     dispatch_event(target, event)
   end
 
-  @spec handle_info(t(), term()) :: {:ok, t()} | :unknown
-  def handle_info(%__MODULE__{} = target, {@abort_message_prefix, listener_id}) do
-    {:ok, remove_listener_by_id(target, listener_id)}
+  @spec event_target_pid!(%{ref: reference()}) :: pid()
+  defp event_target_pid!(%{ref: ref}) when is_reference(ref) do
+    {event_target_pid, _value} = lookup_registration!(ref)
+    event_target_pid
   end
 
-  def handle_info(%__MODULE__{}, _message), do: :unknown
+  @doc false
+  def __add_event_listener__(%{ref: ref} = target, type, callback, options)
+      when is_reference(ref) and (is_function(callback, 0) or is_function(callback, 1)) do
+    event_target_pid = event_target_pid!(target)
 
-  defp normalize_type(type) when is_atom(type), do: Atom.to_string(type)
-  defp normalize_type(type), do: to_string(type)
-
-  defp normalize_options(options) when is_list(options), do: Map.new(options)
-  defp normalize_options(%{} = options), do: options
-
-  defp listener_registered?(%__MODULE__{} = target, type, callback) do
-    target.listeners
-    |> Map.get(type, [])
-    |> Enum.any?(&same_callback?(&1.callback, callback))
-  end
-
-  defp same_callback?(left, right) do
-    module_matches? = :erlang.fun_info(left, :module) == :erlang.fun_info(right, :module)
-    index_matches? = :erlang.fun_info(left, :new_index) == :erlang.fun_info(right, :new_index)
-    uniq_matches? = :erlang.fun_info(left, :uniq) == :erlang.fun_info(right, :uniq)
-
-    module_matches? and index_matches? and uniq_matches?
-  end
-
-  defp maybe_start_signal_watcher(_owner, nil, _listener_id), do: nil
-  defp maybe_start_signal_watcher(nil, _signal, _listener_id), do: nil
-
-  defp maybe_start_signal_watcher(owner, signal, listener_id) do
-    spawn(fn -> watch_signal(owner, signal, listener_id) end)
-  end
-
-  defp watch_signal(owner, signal, listener_id) do
-    owner_ref = Process.monitor(owner)
-
-    case AbortSignal.subscribe(signal) do
-      {:ok, subscription} ->
-        try do
-          await_signal_or_owner(subscription, owner, owner_ref, listener_id)
-        after
-          AbortSignal.unsubscribe(subscription)
-          Process.demonitor(owner_ref, [:flush])
-        end
-
-      {:error, :aborted} ->
-        send(owner, {@abort_message_prefix, listener_id})
-        Process.demonitor(owner_ref, [:flush])
+    if self() == event_target_pid do
+      GenServer.cast(event_target_pid, {:add_event_listener, type, callback, options})
+    else
+      :ok = Server.add_event_listener(event_target_pid, type, callback, options)
     end
+
+    target
   end
 
-  defp await_signal_or_owner(
-         %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: signal_ref},
-         owner,
-         owner_ref,
-         listener_id
-       ) do
-    receive do
-      {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
-        :ok
+  @doc false
+  def __remove_event_listener__(%{ref: ref} = target, type, callback)
+      when is_reference(ref) and (is_function(callback, 0) or is_function(callback, 1)) do
+    event_target_pid = event_target_pid!(target)
 
-      {:abort, ^ref, _reason} ->
-        send(owner, {@abort_message_prefix, listener_id})
-
-      {:DOWN, ^signal_ref, :process, ^pid, _reason} ->
-        send(owner, {@abort_message_prefix, listener_id})
-
-      _other ->
-        await_signal_or_owner(
-          %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: signal_ref},
-          owner,
-          owner_ref,
-          listener_id
-        )
+    if self() == event_target_pid do
+      GenServer.cast(event_target_pid, {:remove_event_listener, type, callback})
+    else
+      :ok = Server.remove_event_listener(event_target_pid, type, callback)
     end
+
+    target
   end
 
-  defp await_signal_or_owner(
-         %{type: :pid, pid: pid, monitor_ref: signal_ref},
-         owner,
-         owner_ref,
-         listener_id
-       ) do
-    receive do
-      {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
-        :ok
+  @doc false
+  def __dispatch_event__(%{ref: ref} = target, %{type: type} = event)
+      when is_reference(ref) and (is_binary(type) or is_atom(type)) do
+    event_target_pid = event_target_pid!(target)
+    snapshot = Snapshot.take()
 
-      {:abort, ^pid, _reason} ->
-        send(owner, {@abort_message_prefix, listener_id})
-
-      {:DOWN, ^signal_ref, :process, ^pid, _reason} ->
-        send(owner, {@abort_message_prefix, listener_id})
-
-      _other ->
-        await_signal_or_owner(
-          %{type: :pid, pid: pid, monitor_ref: signal_ref},
-          owner,
-          owner_ref,
-          listener_id
-        )
-    end
-  end
-
-  defp await_signal_or_owner(%{type: :token, token: token}, owner, owner_ref, listener_id) do
-    receive do
-      {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
-        :ok
-
-      {:abort, ^token} ->
-        send(owner, {@abort_message_prefix, listener_id})
-
-      {:abort, ^token, _reason} ->
-        send(owner, {@abort_message_prefix, listener_id})
-
-      _other ->
-        await_signal_or_owner(%{type: :token, token: token}, owner, owner_ref, listener_id)
-    end
-  end
-
-  defp invoke_callback(callback, event) when is_function(callback, 1), do: callback.(event)
-  defp invoke_callback(callback, _event) when is_function(callback, 0), do: callback.()
-
-  defp remove_listener_by_id(%__MODULE__{} = target, listener_id) do
-    Enum.reduce(Map.keys(target.listeners), target, fn type, acc ->
-      remove_listener_by_id(acc, type, listener_id)
-    end)
-  end
-
-  defp remove_listener_by_id(%__MODULE__{} = target, type, listener_id) do
-    {removed, kept} =
-      target.listeners
-      |> Map.get(type, [])
-      |> Enum.split_with(&(&1.id == listener_id))
-
-    Enum.each(removed, &stop_watcher(&1.watcher))
-
-    listeners =
-      case kept do
-        [] -> Map.delete(target.listeners, type)
-        _ -> Map.put(target.listeners, type, kept)
+    dispatched? =
+      if self() == event_target_pid do
+        GenServer.cast(event_target_pid, {:dispatch_event, event, snapshot})
+        true
+      else
+        Server.dispatch_event(event_target_pid, event, snapshot)
       end
 
-    %{target | listeners: listeners}
+    {target, dispatched?}
   end
 
-  defp stop_watcher(nil), do: :ok
-
-  defp stop_watcher(pid) when is_pid(pid) do
-    if Process.alive?(pid) do
-      Process.exit(pid, :normal)
+  defp lookup_registration!(ref) do
+    case Registry.lookup(Web.Registry, ref) do
+      [{pid, value}] when is_pid(pid) -> {pid, value}
+      [] -> raise ArgumentError, "Unknown EventTarget ref: #{inspect(ref)}"
     end
-
-    :ok
   end
+end
+
+defprotocol Web.EventTarget.Protocol do
+  @spec add_event_listener(
+          term(),
+          String.t() | atom(),
+          Web.EventTarget.callback(),
+          keyword() | map()
+        ) ::
+          term()
+  def add_event_listener(target, type, callback, options)
+
+  @spec remove_event_listener(term(), String.t() | atom(), Web.EventTarget.callback()) :: term()
+  def remove_event_listener(target, type, callback)
+
+  @spec dispatch_event(term(), Web.EventTarget.event()) :: {term(), boolean()}
+  def dispatch_event(target, event)
 end

@@ -6,12 +6,19 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.Symbol` and `Web.Symbol.Protocol` for TC39-style well-known
+  symbols, including disposable-resource support for `BroadcastChannel`
+  and `Port`.
+- `using ... do` in `Web`, with support for `<-`, `=`, and implicit
+  bindings that guarantee `Symbol.dispose` runs in an `after` block.
 - `Web.BroadcastChannel` for WHATWG-style same-name message fan-out across
   the BEAM, backed by `Web.BroadcastChannel.ChannelServer`,
   `Web.BroadcastChannel.Dispatcher`, `Web.BroadcastChannel.Adapter`, and the
   default distributed `Web.BroadcastChannel.Adapter.PG`.
 - `Web.MessageEvent` for message payload delivery with standard event fields,
   including `data`, `origin`, `source`, and `target`.
+- `Web.Internal.EventTarget.Server` plus fixture coverage for registry-backed,
+  process-local listener storage and abort-driven watcher cleanup.
 - `examples/cluster_auth_sync.exs`, demonstrating cross-node
   `BroadcastChannel` delivery, structured-clone isolation, and
   `AsyncContext` propagation.
@@ -31,7 +38,21 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
-- `use Web` now imports `structured_clone/1` and `structured_clone/2`.
+- `use Web` now imports `structured_clone/1`, `structured_clone/2`, and
+  `using/2`, and now aliases `Web.Symbol`.
+- `Web.EventTarget` now exposes a public, opaque-ref interface for
+  process-backed evented structs, with listener state delegated to
+  `Web.Internal.EventTarget.Server` through `Web.Registry`.
+- `Web.BroadcastChannel` now stores opaque refs instead of public pids,
+  implements `Web.EventTarget.Protocol`, routes listener operations through
+  the shared event-target server, and resolves runtime metadata through
+  `Web.Registry`.
+- `Web.BroadcastChannel.ChannelServer` now tracks runtime info by channel
+  ref, starts dedicated event-target servers, marks mailboxes `:off_heap`,
+  and relies on an eagerly created runtime ETS table during application boot.
+- `Web.BroadcastChannel.Dispatcher` now uses the shared `Web.Registry`,
+  keeps adapter and governor lookups local, and starts partitioned registries
+  when it has to bootstrap itself.
 - `Web.ArrayBuffer` now uses detachable backing storage with stable
   identities and a persistent named ETS owner process so transferred
   buffers detach safely and concurrent buffer creation cannot lose the
@@ -45,6 +66,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.BroadcastChannel` close and `onmessage` control paths now treat missing
+  runtime registrations defensively, raising clear argument errors for unknown
+  refs and returning safe no-op behavior where appropriate.
+- `Web.EventTarget` listener cleanup now remains stable across nested
+  dispatches, self-cast add/remove flows, pre-aborted signals, token signals,
+  pid signals, and abrupt watcher-owner shutdown.
 - `Web.Stream` now replies to writable-stream abort callers before draining
   queued failures, restoring low-latency priority signaling under mailbox
   pressure.

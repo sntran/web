@@ -59,12 +59,15 @@ defmodule Web do
       alias Web.CountingGovernor
       alias Web.CustomEvent
       alias Web.DecompressionStream
+      alias Web.DOMException
       alias Web.EventTarget
       alias Web.File
       alias Web.FormData
       alias Web.Governor
       alias Web.Headers
+      alias Web.MessageChannel
       alias Web.MessageEvent
+      alias Web.MessagePort
       alias Web.Performance
       alias Web.Promise
       alias Web.ReadableStream
@@ -77,6 +80,7 @@ defmodule Web do
       alias Web.TextEncoder
       alias Web.TextEncoderStream
       alias Web.TransformStream
+      alias Web.TypeError
       alias Web.Uint8Array
       alias Web.URL
       alias Web.URLSearchParams

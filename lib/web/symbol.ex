@@ -47,3 +47,12 @@ defimpl Web.Symbol.Protocol, for: Web.BroadcastChannel do
   def symbol(channel, :async_dispose, args), do: symbol(channel, :dispose, args)
   def symbol(_channel, :iterator, _args), do: :unsupported
 end
+
+defimpl Web.Symbol.Protocol, for: Web.MessagePort do
+  def symbol(port, :dispose, _args) do
+    Web.MessagePort.close(port)
+  end
+
+  def symbol(port, :async_dispose, args), do: symbol(port, :dispose, args)
+  def symbol(_port, :iterator, _args), do: :unsupported
+end

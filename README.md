@@ -16,6 +16,7 @@
 * **Flow Control**: TC39-aligned concurrency management via `Web.Governor`.
 * **Context Propagation**: Ambient `AsyncContext` for metadata that survives process boundaries.
 * **Structured Data**: WHATWG-style `structured_clone/2` with transferable `ArrayBuffer`s.
+* **Capability Messaging**: `MessageChannel` and `MessagePort` for unforgeable, transferable process-backed handles.
 * **Cluster Coordination**: `BroadcastChannel` fan-out across BEAM nodes with sender-origin metadata.
 * **Resource Disposal**: TC39-inspired `Symbol.dispose` support with a `using` macro for deterministic cleanup.
 * **Zero-Buffer Performance**: Native streaming with backpressure-aware engines.
@@ -187,6 +188,33 @@ ArrayBuffer.byte_length(buffer)
 Unsupported values and non-transferable entries raise `Web.DOMException`
 with the standard `DataCloneError` name.
 
+`Web.MessageChannel` and `Web.MessagePort` expose the WHATWG capability
+messaging model directly on the BEAM. Ports are transferable handles,
+delivery restores `AsyncContext`, and the receiving process only gains the
+capabilities you explicitly transfer.
+
+```elixir
+use Web
+
+{controller, worker} = MessageChannel.new()
+
+spawn(fn ->
+  worker =
+    MessagePort.onmessage(worker, fn event ->
+      received = event.data["port"]
+      MessagePort.post_message(received, %{"status" => "ok"})
+    end)
+
+  receive do
+    :stop -> MessagePort.close(worker)
+  end
+end)
+
+{client, service} = MessageChannel.new()
+
+MessagePort.post_message(controller, %{"port" => service}, [service])
+```
+
 `Web.BroadcastChannel` turns those structured-clone guarantees into an
 idiomatic, distributed coordination primitive. Every broadcast clones its
 payload before fan-out, preserves sender `origin` metadata across nodes,
@@ -223,6 +251,13 @@ For a full cross-node example, run:
 
 ```shell
 mix run examples/cluster_auth_sync.exs
+```
+
+For a capability-handover example that keeps secrets isolated behind a
+transferred port, run:
+
+```shell
+mix run examples/secure_worker.exs
 ```
 
 Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rclone-style URL support.

@@ -235,19 +235,29 @@ defmodule Web.EventTargetTest do
     refute {:server_pid!, 1} in exported
   end
 
-  test "registry registration resolves the event target server" do
+  test "direct event_target_pid resolves the event target server" do
     target = FixtureTarget.new()
-    {pid, value} = lookup_registration!(target)
+    pid = event_target_pid(target)
 
-    assert pid == value.server_pid
     assert Process.alive?(pid)
   end
 
-  test "event target operations raise for unknown refs" do
-    target = %FixtureTarget{ref: make_ref(), parent: self()}
+  test "event target operations raise for unknown handles" do
+    target = %FixtureTarget{event_target_pid: nil, parent: self()}
 
-    assert_raise ArgumentError, ~r/Unknown EventTarget ref/, fn ->
+    assert_raise ArgumentError, ~r/Unknown EventTarget handle/, fn ->
       Web.EventTarget.add_event_listener(target, "missing", fn _event -> :ok end)
+    end
+  end
+
+  test "event target operations raise for dead pids" do
+    target = FixtureTarget.new()
+    pid = event_target_pid(target)
+
+    assert :ok = GenServer.stop(pid)
+
+    assert_raise ArgumentError, ~r/Unknown EventTarget pid/, fn ->
+      Web.EventTarget.dispatch_event(target, %{type: "dead", target: target})
     end
   end
 
@@ -343,18 +353,8 @@ defmodule Web.EventTargetTest do
     |> Map.fetch!(:listeners)
   end
 
-  defp event_target_pid(target) do
-    target
-    |> lookup_registration!()
-    |> elem(0)
-  end
-
-  defp lookup_registration!(%{ref: ref}) when is_reference(ref) do
-    case Registry.lookup(Web.Registry, ref) do
-      [{pid, value}] when is_pid(pid) -> {pid, value}
-      [] -> raise ArgumentError, "Unknown EventTarget ref: #{inspect(ref)}"
-    end
-  end
+  defp event_target_pid(%{event_target_pid: event_target_pid}) when is_pid(event_target_pid),
+    do: event_target_pid
 
   defp await_no_listeners(target, attempts \\ 20)
 

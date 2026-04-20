@@ -16,6 +16,8 @@ defmodule Web.StructuredCloneTest do
   alias Web.Headers
   alias Web.Internal.Reference
   alias Web.Internal.StructuredData
+  alias Web.MessageChannel
+  alias Web.MessagePort
   alias Web.TypeError
   alias Web.Uint8Array
   alias Web.URLSearchParams
@@ -270,6 +272,27 @@ defmodule Web.StructuredCloneTest do
 
     assert_raise ArgumentError, fn ->
       Web.structured_clone(%{}, "invalid")
+    end
+
+    assert_raise ArgumentError, fn ->
+      StructuredData.serialize(%{}, message_port_recipient: :invalid)
+    end
+  end
+
+  test "MessagePort transfers require an explicit recipient pid during serialization" do
+    {port1, port2} = MessageChannel.new()
+
+    exception =
+      assert_raise DOMException, fn ->
+        StructuredData.serialize(%{"port" => port1}, transfer: [port1])
+      end
+
+    assert exception.name == "DataCloneError"
+
+    assert :ok = MessagePort.close(port1)
+
+    assert_raise DOMException, fn ->
+      MessagePort.post_message(port2, "closed")
     end
   end
 

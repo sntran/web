@@ -6,7 +6,9 @@ defmodule Web.Internal.StructuredData do
   alias Web.DOMException
   alias Web.File
   alias Web.Headers
+  alias Web.Internal.MessagePort, as: MessagePortRuntime
   alias Web.Internal.Reference
+  alias Web.MessagePort
   alias Web.TypeError
   alias Web.Uint8Array
   alias Web.URLSearchParams
@@ -23,7 +25,7 @@ defmodule Web.Internal.StructuredData do
 
   @spec serialize(term(), keyword()) :: serialized()
   def serialize(value, opts \\ []) do
-    transfer = normalize_transfer!(opts)
+    {transfer, message_port_recipient} = normalize_transfer!(opts)
     transfer_keys = validate_transfer_list!(transfer)
 
     {root, ctx} =
@@ -32,12 +34,13 @@ defmodule Web.Internal.StructuredData do
         memo: %{},
         nodes: %{},
         transfer: transfer,
-        transfer_keys: transfer_keys
+        transfer_keys: transfer_keys,
+        message_port_recipient: message_port_recipient
       })
 
-    detach_transferables(transfer)
+    nodes = detach_transferables(transfer, ctx.nodes, message_port_recipient)
 
-    %{root: root, nodes: ctx.nodes}
+    %{root: root, nodes: nodes}
   end
 
   @spec deserialize(serialized()) :: term()
@@ -48,18 +51,7 @@ defmodule Web.Internal.StructuredData do
 
   defp normalize_transfer!(opts) when is_list(opts) do
     if Keyword.keyword?(opts) do
-      case Keyword.keys(opts) -- [:transfer] do
-        [] -> :ok
-        unknown -> raise ArgumentError, "unknown structured_clone options: #{inspect(unknown)}"
-      end
-
-      transfer = Keyword.get(opts, :transfer, [])
-
-      if is_list(transfer) do
-        transfer
-      else
-        raise ArgumentError, "structured_clone transfer option must be a list"
-      end
+      normalize_keyword_transfer!(opts)
     else
       raise ArgumentError, "structured_clone options must be a keyword list"
     end
@@ -67,6 +59,33 @@ defmodule Web.Internal.StructuredData do
 
   defp normalize_transfer!(other) do
     raise ArgumentError, "structured_clone options must be a keyword list, got: #{inspect(other)}"
+  end
+
+  defp normalize_keyword_transfer!(opts) do
+    case Keyword.keys(opts) -- [:transfer, :message_port_recipient] do
+      [] -> :ok
+      unknown -> raise ArgumentError, "unknown structured_clone options: #{inspect(unknown)}"
+    end
+
+    transfer = Keyword.get(opts, :transfer, [])
+
+    message_port_recipient =
+      validate_message_port_recipient!(Keyword.get(opts, :message_port_recipient))
+
+    if is_list(transfer) do
+      {transfer, message_port_recipient}
+    else
+      raise ArgumentError, "structured_clone transfer option must be a list"
+    end
+  end
+
+  defp validate_message_port_recipient!(nil), do: nil
+
+  defp validate_message_port_recipient!(message_port_recipient)
+       when is_pid(message_port_recipient), do: message_port_recipient
+
+  defp validate_message_port_recipient!(_other) do
+    raise ArgumentError, "structured_clone message_port_recipient must be a pid or nil"
   end
 
   defp validate_transfer_list!(transfer) do
@@ -88,6 +107,10 @@ defmodule Web.Internal.StructuredData do
     end
 
     :ok
+  end
+
+  defp validate_transferable!(%MessagePort{} = port) do
+    MessagePortRuntime.ensure_transferable(port)
   end
 
   defp validate_transferable!(other) do
@@ -166,6 +189,16 @@ defmodule Web.Internal.StructuredData do
     }
 
     {id, put_node(ctx, id, node)}
+  end
+
+  defp serialize_reserved(%MessagePort{} = value, id, ctx) do
+    id = ensure_node_id!(id)
+
+    if MapSet.member?(ctx.transfer_keys, transfer_key!(value)) do
+      {id, put_node(ctx, id, %{type: :message_port, address: value.address, token: value.token})}
+    else
+      data_clone_error!("MessagePort values must be transferred")
+    end
   end
 
   defp serialize_reserved(%Uint8Array{} = value, id, ctx) do
@@ -291,6 +324,10 @@ defmodule Web.Internal.StructuredData do
     {ArrayBuffer.new(data), memo}
   end
 
+  defp build_node(%{type: :message_port, address: address, token: token}, _nodes, memo) do
+    {MessagePortRuntime.deserialize(%{address: address, token: token}), memo}
+  end
+
   defp build_node(
          %{type: :uint8_array, buffer: buffer_id, byte_offset: offset, byte_length: length},
          nodes,
@@ -380,9 +417,46 @@ defmodule Web.Internal.StructuredData do
     %{ctx | nodes: Map.put(ctx.nodes, id, node)}
   end
 
-  defp detach_transferables(transfer) do
-    Enum.each(transfer, &ArrayBuffer.detach/1)
+  defp detach_transferables(transfer, nodes, message_port_recipient) do
+    Enum.reduce(transfer, nodes, fn
+      %ArrayBuffer{} = buffer, current_nodes ->
+        ArrayBuffer.detach(buffer)
+        current_nodes
+
+      %MessagePort{} = port, current_nodes ->
+        detached_fields = detach_message_port(port, message_port_recipient)
+        rewrite_transferred_message_port(current_nodes, port, detached_fields)
+    end)
   end
+
+  defp detach_message_port(%MessagePort{} = port, message_port_recipient)
+       when is_pid(message_port_recipient) do
+    MessagePortRuntime.detach_transferable(port, message_port_recipient)
+  end
+
+  defp detach_message_port(%MessagePort{}, nil) do
+    data_clone_error!("MessagePort transfers require a recipient process")
+  end
+
+  defp rewrite_transferred_message_port(
+         nodes,
+         %MessagePort{address: address, token: token},
+         detached_fields
+       ) do
+    Map.new(nodes, fn {id, node} ->
+      {id, rewrite_transferred_message_port_node(node, {address, token}, detached_fields)}
+    end)
+  end
+
+  defp rewrite_transferred_message_port_node(
+         %{type: :message_port, address: address, token: token} = node,
+         {address, token},
+         %{address: next_address, token: next_token}
+       ) do
+    %{node | address: next_address, token: next_token}
+  end
+
+  defp rewrite_transferred_message_port_node(node, _current_handle, _detached_fields), do: node
 
   defp transfer_key!(%ArrayBuffer{} = buffer) do
     case ArrayBuffer.identity(buffer) do
@@ -391,8 +465,18 @@ defmodule Web.Internal.StructuredData do
     end
   end
 
+  defp transfer_key!(%MessagePort{address: address, token: token})
+       when is_reference(address) and is_reference(token) do
+    {:transferable, MessagePort, address, token}
+  end
+
   defp memo_key(%ArrayBuffer{} = value) do
     reference_memo_key(ArrayBuffer, ArrayBuffer.identity(value), value)
+  end
+
+  defp memo_key(%MessagePort{address: address, token: token})
+       when is_reference(address) and is_reference(token) do
+    {:ok, {:reference, MessagePort, address, token}}
   end
 
   defp memo_key(%Uint8Array{} = value) do

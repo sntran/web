@@ -5,20 +5,18 @@ defmodule Web.TestSupport.EventTargetFixture do
 
   use Web.EventTarget
 
-  defstruct [:ref, :parent]
+  defstruct [:event_target_pid, :parent]
 
   def new(parent \\ self()) do
-    ref = make_ref()
-    target = %__MODULE__{ref: ref, parent: parent}
+    target = %__MODULE__{event_target_pid: nil, parent: parent}
 
-    {:ok, _pid} =
+    {:ok, event_target_pid} =
       Server.start_link(
         target: target,
-        registry_key: ref,
         callback_module: __MODULE__
       )
 
-    target
+    %{target | event_target_pid: event_target_pid}
   end
 
   @impl Web.EventTarget

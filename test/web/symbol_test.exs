@@ -15,7 +15,7 @@ defmodule Web.SymbolTest do
     channel = BroadcastChannel.new(unique_name("symbol-dispose"))
 
     assert :ok = Web.Symbol.Protocol.symbol(channel, :dispose, [])
-    assert_invalid_state(channel)
+    assert_data_clone_error(channel)
   end
 
   test "symbol protocol closes ports and falls back to unsupported for unknown resources" do
@@ -58,7 +58,7 @@ defmodule Web.SymbolTest do
     channel = BroadcastChannel.new(unique_name("symbol-async-dispose"))
 
     assert :ok = Web.Symbol.Protocol.symbol(channel, :async_dispose, [])
-    assert_invalid_state(channel)
+    assert_data_clone_error(channel)
     assert :unsupported = Web.Symbol.Protocol.symbol(channel, :iterator, [])
   end
 
@@ -69,7 +69,7 @@ defmodule Web.SymbolTest do
         resource
       end
 
-    assert_invalid_state(channel)
+    assert_data_clone_error(channel)
   end
 
   test "using with = binding disposes channels when the block raises" do
@@ -82,7 +82,7 @@ defmodule Web.SymbolTest do
       end
     end
 
-    assert_invalid_state(channel)
+    assert_data_clone_error(channel)
   end
 
   test "using without an explicit binding still evaluates the block" do
@@ -90,13 +90,13 @@ defmodule Web.SymbolTest do
              Web.using(BroadcastChannel.new(unique_name("using-implicit")), do: :ok)
   end
 
-  defp assert_invalid_state(channel) do
+  defp assert_data_clone_error(channel) do
     exception =
       assert_raise DOMException, fn ->
         BroadcastChannel.post_message(channel, "boom")
       end
 
-    assert exception.name == "InvalidStateError"
+    assert exception.name == "DataCloneError"
   end
 
   defp unique_name(prefix) do

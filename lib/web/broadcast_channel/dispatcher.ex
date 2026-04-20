@@ -6,12 +6,12 @@ defmodule Web.BroadcastChannel.Dispatcher do
   alias Web.BroadcastChannel.Adapter.PG
   alias Web.BroadcastChannel.DispatcherSupervisor
   alias Web.Governor
-
-  @registry Web.Registry
+  alias Web.Internal.Envelope
 
   @type subscriber :: %{
           creation_index: non_neg_integer(),
-          monitor_ref: reference()
+          monitor_ref: reference(),
+          token: reference()
         }
 
   @type state :: %{
@@ -29,18 +29,26 @@ defmodule Web.BroadcastChannel.Dispatcher do
 
   @spec ensure_started(String.t()) :: pid()
   def ensure_started(name) when is_binary(name) do
-    ensure_runtime_started()
+    :global.trans({__MODULE__, name}, fn ->
+      case lookup(name) do
+        {:ok, pid} ->
+          pid
 
-    case lookup(name) do
-      {:ok, pid} -> pid
-      :error -> start_or_lookup_dispatcher(name)
-    end
+        :error ->
+          {:ok, pid} = DynamicSupervisor.start_child(DispatcherSupervisor, {__MODULE__, name})
+          pid
+      end
+    end)
   end
 
-  @spec register(String.t(), pid()) :: %{dispatcher: pid(), creation_index: non_neg_integer()}
-  def register(name, pid) when is_binary(name) and is_pid(pid) do
+  @spec register(String.t(), pid(), reference()) :: %{
+          dispatcher: pid(),
+          creation_index: non_neg_integer()
+        }
+  def register(name, pid, token)
+      when is_binary(name) and is_pid(pid) and is_reference(token) do
     dispatcher = ensure_started(name)
-    GenServer.call(dispatcher, {:register, pid}, :infinity)
+    GenServer.call(dispatcher, {:register, pid, token}, :infinity)
   end
 
   @spec unregister(pid(), pid()) :: :ok
@@ -69,7 +77,7 @@ defmodule Web.BroadcastChannel.Dispatcher do
   end
 
   def start_link(name) when is_binary(name) do
-    GenServer.start_link(__MODULE__, name, name: via(name))
+    GenServer.start_link(__MODULE__, name, name: {:global, global_name(name)})
   end
 
   @impl true
@@ -96,10 +104,11 @@ defmodule Web.BroadcastChannel.Dispatcher do
   end
 
   @impl true
-  def handle_call({:register, pid}, _from, state) do
+  def handle_call({:register, pid, token}, _from, state) do
     case Map.get(state.subscribers, pid) do
-      %{creation_index: creation_index} ->
-        {:reply, %{dispatcher: self(), creation_index: creation_index}, state}
+      %{creation_index: creation_index} = subscriber ->
+        next_state = put_in(state, [:subscribers, pid], %{subscriber | token: token})
+        {:reply, %{dispatcher: self(), creation_index: creation_index}, next_state}
 
       nil ->
         monitor_ref = Process.monitor(pid)
@@ -109,7 +118,8 @@ defmodule Web.BroadcastChannel.Dispatcher do
           state
           |> put_in([:subscribers, pid], %{
             creation_index: creation_index,
-            monitor_ref: monitor_ref
+            monitor_ref: monitor_ref,
+            token: token
           })
           |> put_in([:subscriber_monitors, monitor_ref], pid)
           |> Map.put(:next_creation_index, creation_index + 1)
@@ -195,87 +205,17 @@ defmodule Web.BroadcastChannel.Dispatcher do
   def handle_info(_message, state), do: {:noreply, state}
 
   defp lookup(name) do
-    case Process.whereis(@registry) do
-      # coveralls-ignore-next-line
-      nil ->
-        :error
-
-      _pid ->
-        case Registry.lookup(@registry, dispatcher_key(name)) do
-          [{pid, _value}] -> {:ok, pid}
-          [] -> :error
-        end
+    case :global.whereis_name(global_name(name)) do
+      pid when is_pid(pid) -> {:ok, pid}
+      :undefined -> :error
     end
-  end
-
-  defp ensure_runtime_started do
-    ensure_registry_started()
-    ensure_supervisor_started()
   end
 
   defp adapter do
     Application.get_env(:web, :broadcast_adapter, PG)
   end
 
-  defp ensure_registry_started do
-    case Process.whereis(@registry) do
-      nil ->
-        # coveralls-ignore-start
-        case Registry.start_link(
-               keys: :unique,
-               name: @registry,
-               partitions: System.schedulers_online()
-             ) do
-          {:ok, _pid} -> :ok
-          {:error, {:already_started, _pid}} -> :ok
-        end
-
-      # coveralls-ignore-stop
-
-      _pid ->
-        :ok
-    end
-  end
-
-  defp ensure_supervisor_started do
-    case Process.whereis(DispatcherSupervisor) do
-      nil ->
-        # coveralls-ignore-start
-        case DispatcherSupervisor.start_link([]) do
-          {:ok, _pid} -> :ok
-          {:error, {:already_started, _pid}} -> :ok
-        end
-
-      # coveralls-ignore-stop
-
-      _pid ->
-        :ok
-    end
-  end
-
-  defp start_or_lookup_dispatcher(name) do
-    case DynamicSupervisor.start_child(DispatcherSupervisor, {__MODULE__, name}) do
-      {:ok, pid} -> pid
-      # coveralls-ignore-next-line
-      {:error, {:already_started, pid}} -> pid
-      # coveralls-ignore-next-line
-      {:error, _reason} -> lookup_dispatcher!(name)
-    end
-  end
-
-  # coveralls-ignore-start
-  defp lookup_dispatcher!(name) do
-    case lookup(name) do
-      {:ok, pid} -> pid
-      :error -> raise "BroadcastChannel dispatcher failed to start for #{inspect(name)}"
-    end
-  end
-
-  # coveralls-ignore-stop
-
-  defp via(name), do: {:via, Registry, {@registry, dispatcher_key(name)}}
-
-  defp dispatcher_key(name), do: {:dispatcher, name}
+  defp global_name(name), do: {__MODULE__, name}
 
   defp governor do
     Application.get_env(:web, :broadcast_governor)
@@ -325,7 +265,7 @@ defmodule Web.BroadcastChannel.Dispatcher do
     state.subscribers
     |> Enum.reject(fn {pid, _subscriber} -> pid == exclude_pid end)
     |> Enum.sort_by(fn {_pid, subscriber} -> subscriber.creation_index end)
-    |> Enum.map(fn {pid, _subscriber} -> pid end)
+    |> Enum.map(fn {pid, subscriber} -> %{pid: pid, token: subscriber.token} end)
   end
 
   defp enqueue_event(state, [], _message), do: state
@@ -344,16 +284,16 @@ defmodule Web.BroadcastChannel.Dispatcher do
         state = %{state | queue: queue}
 
         case next_recipient(event.recipients, state.subscribers) do
-          {:recipient, pid, remaining} ->
+          {:recipient, recipient, remaining} ->
             dispatch_ref = make_ref()
 
-            :ok = dispatch_to_recipient(pid, dispatch_ref, event.message)
+            :ok = dispatch_to_recipient(recipient, dispatch_ref, event.message)
 
             %{
               state
               | current: %{
                   ref: dispatch_ref,
-                  current_pid: pid,
+                  current_pid: recipient.pid,
                   remaining: remaining,
                   message: event.message
                 }
@@ -385,16 +325,16 @@ defmodule Web.BroadcastChannel.Dispatcher do
 
   defp advance_current_after_current_drop(state, current) do
     case next_recipient(current.remaining, state.subscribers) do
-      {:recipient, pid, remaining} ->
+      {:recipient, recipient, remaining} ->
         dispatch_ref = make_ref()
 
-        :ok = dispatch_to_recipient(pid, dispatch_ref, current.message)
+        :ok = dispatch_to_recipient(recipient, dispatch_ref, current.message)
 
         %{
           state
           | current: %{
               ref: dispatch_ref,
-              current_pid: pid,
+              current_pid: recipient.pid,
               remaining: remaining,
               message: current.message
             }
@@ -407,9 +347,9 @@ defmodule Web.BroadcastChannel.Dispatcher do
 
   defp next_recipient([], _subscribers), do: :none
 
-  defp next_recipient([pid | remaining], subscribers) do
-    if Map.has_key?(subscribers, pid) do
-      {:recipient, pid, remaining}
+  defp next_recipient([recipient | remaining], subscribers) do
+    if Map.has_key?(subscribers, recipient.pid) do
+      {:recipient, recipient, remaining}
     else
       next_recipient(remaining, subscribers)
     end
@@ -435,9 +375,19 @@ defmodule Web.BroadcastChannel.Dispatcher do
   defp maybe_stop_idle(state, :ok), do: {:reply, :ok, state}
   defp maybe_stop_idle(state, :noreply), do: {:noreply, state}
 
-  defp dispatch_to_recipient(pid, dispatch_ref, message) do
+  defp dispatch_to_recipient(recipient, dispatch_ref, message) do
     run_with_governor(fn ->
-      send(pid, {:broadcast_channel_deliver, self(), dispatch_ref, message})
+      send(
+        recipient.pid,
+        {:"$gen_cast",
+         Envelope.new(
+           recipient.token,
+           {:deliver, self(), dispatch_ref,
+            %{origin: message.origin, serialized: message.serialized}},
+           message.snapshot
+         )}
+      )
+
       :ok
     end)
   end

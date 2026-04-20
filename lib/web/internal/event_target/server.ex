@@ -54,14 +54,9 @@ defmodule Web.Internal.EventTarget.Server do
   def init(opts) do
     Process.flag(:message_queue_data, :off_heap)
 
-    target = Keyword.fetch!(opts, :target)
-    callback_module = Keyword.get(opts, :callback_module, target.__struct__)
-    registry_key = Keyword.get(opts, :registry_key, Map.get(target, :ref))
     server_pid = Keyword.get(opts, :server_pid, self())
-
-    if registry_key do
-      {:ok, _owner} = Registry.register(Web.Registry, registry_key, %{server_pid: server_pid})
-    end
+    target = opts |> Keyword.fetch!(:target) |> attach_event_target_pid(server_pid)
+    callback_module = Keyword.get(opts, :callback_module, target.__struct__)
 
     {:ok,
      %{
@@ -214,6 +209,14 @@ defmodule Web.Internal.EventTarget.Server do
 
   defp normalize_options(options) when is_list(options), do: Map.new(options)
   defp normalize_options(%{} = options), do: options
+
+  defp attach_event_target_pid(target, event_target_pid) do
+    if is_map(target) and Map.has_key?(target, :event_target_pid) do
+      %{target | event_target_pid: event_target_pid}
+    else
+      target
+    end
+  end
 
   defp listener_registered?(state, type, callback) do
     state.listeners

@@ -2,8 +2,8 @@ defmodule Web.EventTarget do
   @moduledoc """
   Public event-target interface for process-backed Web objects.
 
-  Evented structs expose an opaque `ref` and use `Web.Registry` as the single
-  lookup point for their internal listener server.
+  Evented structs may expose a direct `event_target_pid` so listener routing can
+  stay capability-local without any central registry lookup.
   """
 
   alias Web.AsyncContext.Snapshot
@@ -75,15 +75,22 @@ defmodule Web.EventTarget do
     dispatch_event(target, event)
   end
 
-  @spec event_target_pid!(%{ref: reference()}) :: pid()
-  defp event_target_pid!(%{ref: ref}) when is_reference(ref) do
-    {event_target_pid, _value} = lookup_registration!(ref)
-    event_target_pid
+  @spec event_target_pid!(map()) :: pid()
+  defp event_target_pid!(%{event_target_pid: event_target_pid}) when is_pid(event_target_pid) do
+    if Process.alive?(event_target_pid) do
+      event_target_pid
+    else
+      raise ArgumentError, "Unknown EventTarget pid: #{inspect(event_target_pid)}"
+    end
+  end
+
+  defp event_target_pid!(target) do
+    raise ArgumentError, "Unknown EventTarget handle: #{inspect(target)}"
   end
 
   @doc false
-  def __add_event_listener__(%{ref: ref} = target, type, callback, options)
-      when is_reference(ref) and (is_function(callback, 0) or is_function(callback, 1)) do
+  def __add_event_listener__(%{} = target, type, callback, options)
+      when is_function(callback, 0) or is_function(callback, 1) do
     event_target_pid = event_target_pid!(target)
 
     if self() == event_target_pid do
@@ -96,8 +103,8 @@ defmodule Web.EventTarget do
   end
 
   @doc false
-  def __remove_event_listener__(%{ref: ref} = target, type, callback)
-      when is_reference(ref) and (is_function(callback, 0) or is_function(callback, 1)) do
+  def __remove_event_listener__(%{} = target, type, callback)
+      when is_function(callback, 0) or is_function(callback, 1) do
     event_target_pid = event_target_pid!(target)
 
     if self() == event_target_pid do
@@ -110,8 +117,8 @@ defmodule Web.EventTarget do
   end
 
   @doc false
-  def __dispatch_event__(%{ref: ref} = target, %{type: type} = event)
-      when is_reference(ref) and (is_binary(type) or is_atom(type)) do
+  def __dispatch_event__(%{} = target, %{type: type} = event)
+      when is_binary(type) or is_atom(type) do
     event_target_pid = event_target_pid!(target)
     snapshot = Snapshot.take()
 
@@ -124,13 +131,6 @@ defmodule Web.EventTarget do
       end
 
     {target, dispatched?}
-  end
-
-  defp lookup_registration!(ref) do
-    case Registry.lookup(Web.Registry, ref) do
-      [{pid, value}] when is_pid(pid) -> {pid, value}
-      [] -> raise ArgumentError, "Unknown EventTarget ref: #{inspect(ref)}"
-    end
   end
 end
 

@@ -12,9 +12,11 @@ All notable changes to this project are documented in this file.
 - `using ... do` in `Web`, with support for `<-`, `=`, and implicit
   bindings that guarantee `Symbol.dispose` runs in an `after` block.
 - `Web.BroadcastChannel` for WHATWG-style same-name message fan-out across
-  the BEAM, backed by `Web.BroadcastChannel.ChannelServer`,
-  `Web.BroadcastChannel.Dispatcher`, `Web.BroadcastChannel.Adapter`, and the
-  default distributed `Web.BroadcastChannel.Adapter.PG`.
+  the BEAM, backed by `Web.BroadcastChannel.Dispatcher`,
+  `Web.BroadcastChannel.Adapter`, and the default distributed
+  `Web.BroadcastChannel.Adapter.PG`.
+- `Web.MessagePort` and `Web.MessageChannel` for WHATWG-style capability
+  messaging with transferable, process-backed port handles.
 - `Web.MessageEvent` for message payload delivery with standard event fields,
   including `data`, `origin`, `source`, and `target`.
 - `Web.Internal.EventTarget.Server` plus fixture coverage for registry-backed,
@@ -22,6 +24,8 @@ All notable changes to this project are documented in this file.
 - `examples/cluster_auth_sync.exs`, demonstrating cross-node
   `BroadcastChannel` delivery, structured-clone isolation, and
   `AsyncContext` propagation.
+- `examples/secure_worker.exs`, demonstrating capability handover with a
+  private `MessagePort` and a secret-holding worker.
 - `Web.structured_clone/1` and `Web.structured_clone/2`, backed by
   `Web.Internal.StructuredData`, with support for structured cloning of
   primitives, collections, `DateTime`, `Regex`, `Headers`,
@@ -47,12 +51,14 @@ All notable changes to this project are documented in this file.
   implements `Web.EventTarget.Protocol`, routes listener operations through
   the shared event-target server, and resolves runtime metadata through
   `Web.Registry`.
-- `Web.BroadcastChannel.ChannelServer` now tracks runtime info by channel
-  ref, starts dedicated event-target servers, marks mailboxes `:off_heap`,
-  and relies on an eagerly created runtime ETS table during application boot.
+- `Web.BroadcastChannel` and `Web.MessagePort` now authenticate internal
+  calls through `%Web.Internal.Envelope{}` values that carry the bearer token
+  and `AsyncContext` snapshot together.
 - `Web.BroadcastChannel.Dispatcher` now uses the shared `Web.Registry`,
   keeps adapter and governor lookups local, and starts partitioned registries
   when it has to bootstrap itself.
+- `Web.BroadcastChannel.t/0` and `Web.MessagePort.t/0` now carry explicit
+  typedoc-backed public type exports for docs and LSP autocomplete.
 - `Web.ArrayBuffer` now uses detachable backing storage with stable
   identities and a persistent named ETS owner process so transferred
   buffers detach safely and concurrent buffer creation cannot lose the

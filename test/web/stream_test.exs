@@ -23,6 +23,22 @@ defmodule Web.StreamTest do
     end
   end
 
+  defmodule PromiseResultReadableStream do
+    use Web.Stream
+
+    @impl Web.Stream
+    def start(_pid, opts), do: {:producer, Map.new(opts)}
+
+    @impl Web.Stream
+    def pull(ctrl, %{promise_factory: promise_factory}) when is_function(promise_factory, 1) do
+      promise_factory.(ctrl)
+    end
+
+    def pull(_ctrl, %{promise_factory: promise_factory}) when is_function(promise_factory, 0) do
+      promise_factory.()
+    end
+  end
+
   defmodule InvalidReadableHwmStrategy do
     defstruct high_water_mark: :invalid
 
@@ -30,8 +46,10 @@ defmodule Web.StreamTest do
   end
 
   alias Web.ReadableStream
+  alias Web.ReadableStreamBYOBReader
   alias Web.TransformStream
   alias Web.TypeError
+  alias Web.Uint8Array
   alias Web.WritableStream
   alias Web.WritableStreamDefaultWriter
 
@@ -147,6 +165,58 @@ defmodule Web.StreamTest do
 
       assert {:ok, "x"} = ReadableStream.read(pid)
       assert :done = ReadableStream.read(pid)
+    end
+
+    test "byte stream BYOB reads preserve queued remainders in engine state" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+
+      ReadableStream.enqueue(stream.controller_pid, "hello")
+
+      view = Uint8Array.new(Web.ArrayBuffer.new(2))
+
+      assert %{value: first_chunk, done: false} =
+               await(ReadableStreamBYOBReader.read(reader, view))
+
+      assert Uint8Array.to_binary(first_chunk) == "he"
+
+      slots = ReadableStream.__get_slots__(stream.controller_pid)
+      assert slots.total_queued_size == 3
+      assert :queue.to_list(slots.queue) == ["llo"]
+    end
+
+    test "byte streams clear pending BYOB requests when they close" do
+      parent = self()
+
+      stream = ReadableStream.new(%{type: "bytes"})
+
+      spawn(fn ->
+        reader = ReadableStream.get_reader(stream, mode: "byob")
+
+        send(
+          parent,
+          {:read_result,
+           await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(Web.ArrayBuffer.new(4))))}
+        )
+      end)
+
+      request =
+        Enum.reduce_while(1..50, nil, fn _, _acc ->
+          case Web.Stream.control_call(stream.controller_pid, :get_byob_request) do
+            %Web.ReadableStreamBYOBRequest{} = request ->
+              {:halt, request}
+
+            _ ->
+              Process.sleep(10)
+              {:cont, nil}
+          end
+        end)
+
+      assert %Web.ReadableStreamBYOBRequest{} = request
+
+      ReadableStream.close(stream.controller_pid)
+      assert_receive {:read_result, %{done: true}}, 1_000
+      assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request == nil
     end
   end
 
@@ -443,6 +513,13 @@ defmodule Web.StreamTest do
       slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
       assert slots.readable_hwm == 3
       assert slots.desired_size == 3
+    end
+
+    test "ReadableStream falls back to a count strategy for invalid readable strategies" do
+      {:ok, pid} = ReadableStream.start_link(high_water_mark: 2, strategy: :invalid)
+
+      ReadableStream.enqueue(pid, "ab")
+      assert ReadableStream.get_desired_size(pid) == 1
     end
 
     test "readable side can be locked independently" do
@@ -1004,6 +1081,21 @@ defmodule Web.StreamTest do
       assert :ok = await(WritableStreamDefaultWriter.close(writer))
     end
 
+    test "owner calls on closed writable streams use closed replies" do
+      stream = WritableStream.new()
+      writer = WritableStream.get_writer(stream)
+
+      :sys.replace_state(stream.controller_pid, fn {_state, data} ->
+        {:closed, data}
+      end)
+
+      assert {:error, :closed} =
+               :gen_statem.call(stream.controller_pid, {:write, writer.owner_pid, "x"})
+
+      assert :ok = :gen_statem.call(stream.controller_pid, {:close, writer.owner_pid})
+      assert :ok = :gen_statem.call(stream.controller_pid, {:abort, writer.owner_pid, :boom})
+    end
+
     # --- writable_stream.ex line 192 (release_lock/2 with explicit owner_pid) ---
 
     test "WritableStream.release_lock/2 accepts explicit owner_pid" do
@@ -1194,6 +1286,99 @@ defmodule Web.StreamTest do
 
       assert_receive :start_promise_executed, 500
       assert WritableStream.__get_slots__(stream.controller_pid).state == :writable
+    end
+
+    test "resolve_if_promise handles promised pull results and exits" do
+      {:ok, ok_pid} =
+        PromiseResultReadableStream.start_link(
+          promise_factory: fn ctrl ->
+            Web.Promise.new(fn resolve, _reject ->
+              Web.ReadableStreamDefaultController.close(ctrl)
+              resolve.({:ok, %{promise_factory: fn _ -> :ok end}})
+            end)
+          end
+        )
+
+      send(ok_pid, {:internal, :maybe_pull})
+
+      assert_wait(fn ->
+        :gen_statem.call(ok_pid, :get_slots).active_task == nil
+      end)
+
+      {:ok, pause_pid} =
+        PromiseResultReadableStream.start_link(
+          promise_factory: fn ctrl ->
+            Web.Promise.new(fn resolve, _reject ->
+              Web.ReadableStreamDefaultController.close(ctrl)
+              resolve.({:ok, %{promise_factory: fn _ -> :ok end}, :pause})
+            end)
+          end
+        )
+
+      send(pause_pid, {:internal, :maybe_pull})
+
+      assert_wait(fn ->
+        :gen_statem.call(pause_pid, :get_slots).active_task == nil
+      end)
+
+      {:ok, error_pid} =
+        PromiseResultReadableStream.start_link(
+          promise_factory: fn -> Web.Promise.resolve({:error, :promise_error}) end
+        )
+
+      send(error_pid, {:internal, :maybe_pull})
+      assert_wait(fn -> :gen_statem.call(error_pid, :get_slots).state == :errored end)
+
+      {:ok, unexpected_pid} =
+        PromiseResultReadableStream.start_link(
+          promise_factory: fn ctrl ->
+            Web.Promise.new(fn resolve, _reject ->
+              Web.ReadableStreamDefaultController.close(ctrl)
+              resolve.(:unexpected)
+            end)
+          end
+        )
+
+      send(unexpected_pid, {:internal, :maybe_pull})
+
+      assert_wait(fn ->
+        :gen_statem.call(unexpected_pid, :get_slots).active_task == nil
+      end)
+
+      {:ok, shutdown_pid} =
+        PromiseResultReadableStream.start_link(
+          promise_factory: fn ->
+            %Web.Promise{task: Task.async(fn -> exit({:shutdown, :promise_shutdown}) end)}
+          end
+        )
+
+      send(shutdown_pid, {:internal, :maybe_pull})
+      assert_wait(fn -> :gen_statem.call(shutdown_pid, :get_slots).state == :errored end)
+
+      {:ok, nested_shutdown_pid} =
+        PromiseResultReadableStream.start_link(
+          promise_factory: fn ->
+            Web.Promise.new(fn _resolve, _reject ->
+              exit({{:shutdown, :nested_shutdown}, :context})
+            end)
+          end
+        )
+
+      send(nested_shutdown_pid, {:internal, :maybe_pull})
+
+      assert_wait(fn ->
+        :gen_statem.call(nested_shutdown_pid, :get_slots).state == :errored
+      end)
+
+      {:ok, generic_exit_pid} =
+        PromiseResultReadableStream.start_link(
+          promise_factory: fn ->
+            %Web.Promise{task: Task.async(fn -> exit(:promise_boom) end)}
+          end
+        )
+
+      send(generic_exit_pid, {:internal, :maybe_pull})
+      assert_wait(fn -> :gen_statem.call(generic_exit_pid, :get_slots).state == :errored end)
     end
   end
 

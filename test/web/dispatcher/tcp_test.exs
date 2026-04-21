@@ -219,10 +219,13 @@ defmodule Web.Dispatcher.TCPTest do
     {:ok, resp} = TCP.fetch(req)
     socket = dispatcher_socket(resp.body)
 
-    assert_eventually(fn ->
-      info = socket_debug(socket)
-      info.active == false and info.desired_size <= 0 and info.queued_size >= 65_536
-    end, 120)
+    assert_eventually(
+      fn ->
+        info = socket_debug(socket)
+        info.active == false and info.desired_size <= 0 and info.queued_size >= 65_536
+      end,
+      120
+    )
 
     assert :ok = Task.await(ReadableStream.cancel(resp.body, :backpressure_proven).task, 1_000)
     assert_receive :tcp_client_closed, 1_000
@@ -505,6 +508,26 @@ defmodule Web.Dispatcher.TCPTest do
     assert resp.status_text == "Connected"
   end
 
+  test "__debug_start_socket_bridge__/3 supports its default body and signal arguments" do
+    port = TCPServer.start_link("data", false, false, self())
+
+    assert {:ok, bridge_pid, socket} =
+             TCP.__debug_start_socket_bridge__(%{hostname: "localhost", port: port})
+
+    assert is_pid(bridge_pid)
+    _ = Socket.close(socket)
+    assert_receive :tcp_client_closed, 1_000
+
+    port = TCPServer.start_link("data", false, false, self())
+
+    assert {:ok, bridge_pid, socket} =
+             TCP.__debug_start_socket_bridge__(%{hostname: "localhost", port: port}, nil)
+
+    assert is_pid(bridge_pid)
+    _ = Socket.close(socket)
+    assert_receive :tcp_client_closed, 1_000
+  end
+
   defp raw_request(url, method, body) do
     %Request{
       url: Web.URL.new(url),
@@ -575,5 +598,4 @@ defmodule Web.Dispatcher.TCPTest do
       timeout -> flunk("socket request timed out")
     end
   end
-
 end

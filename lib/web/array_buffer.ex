@@ -124,6 +124,37 @@ defmodule Web.ArrayBuffer do
   end
 
   @doc false
+  @spec write_at(t(), non_neg_integer(), binary()) :: :ok
+  def write_at(%__MODULE__{id: id}, offset, data)
+      when is_reference(id) and is_integer(offset) and offset >= 0 and is_binary(data) do
+    case :ets.lookup(table(), id) do
+      [{^id, %{detached?: true}}] ->
+        raise TypeError.exception("Cannot write to a detached ArrayBuffer")
+
+      [{^id, %{data: current} = state}] ->
+        if offset > byte_size(current) do
+          raise ArgumentError, "invalid byte offset"
+        end
+
+        prefix = binary_part(current, 0, offset)
+        suffix_start = offset + byte_size(data)
+
+        suffix =
+          if suffix_start < byte_size(current) do
+            binary_part(current, suffix_start, byte_size(current) - suffix_start)
+          else
+            <<>>
+          end
+
+        new_data = prefix <> data <> suffix
+        write_state(id, %{state | data: new_data, byte_length: byte_size(new_data)})
+
+      [] ->
+        raise TypeError.exception("ArrayBuffer not found")
+    end
+  end
+
+  @doc false
   @spec identity(t()) :: reference() | nil
   def identity(%__MODULE__{} = buffer), do: buffer.id
 

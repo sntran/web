@@ -72,7 +72,10 @@ defmodule Web do
       alias Web.MessagePort
       alias Web.Performance
       alias Web.Promise
+      alias Web.ReadableByteStreamController
       alias Web.ReadableStream
+      alias Web.ReadableStreamBYOBReader
+      alias Web.ReadableStreamBYOBRequest
       alias Web.ReadableStreamDefaultController
       alias Web.Request
       alias Web.Response

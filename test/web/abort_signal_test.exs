@@ -133,9 +133,22 @@ defmodule Web.AbortSignalTest do
 
     assert :ok = Web.AbortController.abort(second, :middle_first)
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
+    assert Web.AbortSignal.reason(signal) == :middle_first
 
     assert :ok = Web.AbortController.abort(first, :later)
     assert :ok = Web.AbortController.abort(third, :later)
+    assert Web.AbortSignal.reason(signal) == :middle_first
+  end
+
+  test "any/1 aborts immediately when a source is already aborted" do
+    controller = Web.AbortController.new()
+    assert :ok = Web.AbortController.abort(controller, :pre_aborted)
+
+    signal = Web.AbortSignal.any([controller.signal, self()])
+
+    assert Web.AbortSignal.aborted?(signal)
+    assert Web.AbortSignal.reason(signal) == :pre_aborted
+    assert {:error, :aborted} = Web.AbortSignal.subscribe(signal)
   end
 
   test "any/1 ignores sources that are already dead while waiting on the rest" do
@@ -189,6 +202,169 @@ defmodule Web.AbortSignalTest do
     assert :ok = Web.AbortSignal.receive_abort(%{type: :token, token: :token}, 0, true)
   end
 
+  test "throw_if_aborted/1 allows nil and active signals" do
+    controller = Web.AbortController.new()
+
+    assert :ok = Web.AbortSignal.throw_if_aborted(nil)
+    assert :ok = Web.AbortSignal.throw_if_aborted(controller.signal)
+  end
+
+  test "throw_if_aborted/1 raises AbortError for pre-aborted signals" do
+    exception =
+      assert_raise Web.DOMException, fn ->
+        Web.AbortSignal.throw_if_aborted(Web.AbortSignal.abort(:manual))
+      end
+
+    assert exception.name == "AbortError"
+    assert exception.message == ":manual"
+  end
+
+  test "throw_if_aborted/1 raises AbortError for live aborted signals" do
+    controller = Web.AbortController.new()
+    assert :ok = Web.AbortController.abort(controller, :boom)
+
+    exception =
+      assert_raise Web.DOMException, fn ->
+        Web.AbortSignal.throw_if_aborted(controller.signal)
+      end
+
+    assert exception.name == "AbortError"
+    assert exception.message == ":boom"
+  end
+
+  test "throw_if_aborted/1 can consume queued abort messages from a live signal" do
+    controller = Web.AbortController.new()
+    send(self(), {:abort, controller.signal.ref, :queued_abort})
+
+    exception =
+      assert_raise Web.DOMException, fn ->
+        Web.AbortSignal.throw_if_aborted(controller.signal)
+      end
+
+    assert exception.name == "AbortError"
+    assert exception.message == ":queued_abort"
+  end
+
+  test "any/1 ignores nil sources while waiting on live sources" do
+    controller = Web.AbortController.new()
+    signal = Web.AbortSignal.any([nil, controller.signal])
+
+    assert :ok = Web.AbortController.abort(controller, :survivor)
+    assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
+    assert Web.AbortSignal.reason(signal) == :survivor
+  end
+
+  test "any/1 token waiters abort on bare token messages" do
+    {signal, _coordinator, waiter} = start_any_with_waiter(:token)
+    send(waiter, {:abort, :token})
+
+    assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
+    assert Web.AbortSignal.reason(signal) == :aborted
+  end
+
+  test "any/1 token waiters abort on reasoned token messages" do
+    {signal, _coordinator, waiter} = start_any_with_waiter(:token)
+    send(waiter, {:abort, :token, :token_reason})
+
+    assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
+    assert Web.AbortSignal.reason(signal) == :token_reason
+  end
+
+  test "any/1 token waiters stop quietly when their coordinator exits" do
+    {signal, coordinator, _waiter} = start_any_with_waiter(:token)
+    Process.unlink(coordinator)
+    monitor_ref = Process.monitor(coordinator)
+    Process.exit(coordinator, :kill)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^coordinator, :killed}
+    Process.sleep(25)
+
+    refute Web.AbortSignal.aborted?(signal)
+  end
+
+  test "any/1 pid waiters abort on direct abort messages" do
+    pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    {signal, _coordinator, waiter} = start_any_with_waiter(pid)
+    send(waiter, {:abort, pid, :pid_reason})
+
+    assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
+    assert Web.AbortSignal.reason(signal) == :pid_reason
+
+    send(pid, :stop)
+  end
+
+  test "any/1 pid waiters abort when the monitored pid exits" do
+    pid =
+      spawn(fn ->
+        receive do
+        end
+      end)
+
+    {signal, _coordinator, _waiter} = start_any_with_waiter(pid)
+    Process.sleep(25)
+    Process.exit(pid, :pid_shutdown)
+
+    assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
+    assert Web.AbortSignal.reason(signal) == :pid_shutdown
+  end
+
+  test "any/1 pid waiters stop quietly when their coordinator exits" do
+    pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    {signal, coordinator, _waiter} = start_any_with_waiter(pid)
+    Process.unlink(coordinator)
+    monitor_ref = Process.monitor(coordinator)
+    Process.exit(coordinator, :kill)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^coordinator, :killed}
+    send(pid, :stop)
+    Process.sleep(25)
+
+    refute Web.AbortSignal.aborted?(signal)
+  end
+
+  test "any/1 abort-signal waiters surface shutdown aborted reasons" do
+    source = start_fake_abort_signal()
+    {signal, _coordinator, _waiter} = start_any_with_waiter(source)
+    Process.sleep(25)
+    send(source.pid, {:stop, {:shutdown, {:aborted, :signal_reason}}})
+
+    assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
+    assert Web.AbortSignal.reason(signal) == :signal_reason
+  end
+
+  test "any/1 abort-signal waiters surface generic exit reasons" do
+    source = start_fake_abort_signal()
+    {signal, _coordinator, _waiter} = start_any_with_waiter(source)
+    Process.sleep(25)
+    send(source.pid, {:stop, :signal_down})
+
+    assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
+    assert Web.AbortSignal.reason(signal) == :signal_down
+  end
+
+  test "any/1 abort-signal waiters stop quietly when their coordinator exits" do
+    source = start_fake_abort_signal()
+    {signal, coordinator, _waiter} = start_any_with_waiter(source)
+    Process.unlink(coordinator)
+    monitor_ref = Process.monitor(coordinator)
+    Process.exit(coordinator, :kill)
+    assert_receive {:DOWN, ^monitor_ref, :process, ^coordinator, :killed}
+    send(source.pid, {:stop, {:shutdown, {:aborted, :ignored}}})
+    Process.sleep(25)
+
+    refute Web.AbortSignal.aborted?(signal)
+  end
+
   test "receive_abort/3 can observe process down reasons directly" do
     signal_pid =
       spawn(fn ->
@@ -237,6 +413,52 @@ defmodule Web.AbortSignalTest do
     controller = %Web.AbortController{signal: %Web.AbortSignal{pid: pid}}
 
     assert :ok = Web.AbortController.abort(controller, :boom)
+  end
+
+  defp start_any_with_waiter(source) do
+    :erlang.trace(self(), true, [:procs, :set_on_spawn])
+
+    try do
+      signal = Web.AbortSignal.any([source])
+      {coordinator, waiter} = await_any_waiter_trace()
+      {signal, coordinator, waiter}
+    after
+      :erlang.trace(self(), false, [:all])
+    end
+  end
+
+  defp await_any_waiter_trace(attempts \\ 40)
+
+  defp await_any_waiter_trace(attempts) when attempts > 0 do
+    receive do
+      {:trace, coordinator, :spawn, waiter, {:erlang, :apply, [fun, []]}} ->
+        if String.contains?(inspect(fun), "start_any_abort_waiter") do
+          {coordinator, waiter}
+        else
+          await_any_waiter_trace(attempts - 1)
+        end
+    after
+      50 -> await_any_waiter_trace(attempts - 1)
+    end
+  end
+
+  defp await_any_waiter_trace(0), do: flunk("expected AbortSignal.any/1 to spawn a waiter")
+
+  defp start_fake_abort_signal do
+    ref = make_ref()
+    pid = spawn(fn -> fake_abort_signal_loop() end)
+    %Web.AbortSignal{pid: pid, ref: ref}
+  end
+
+  defp fake_abort_signal_loop do
+    receive do
+      {:"$gen_call", {from, ref}, {:subscribe, _subscriber}} ->
+        send(from, {ref, :ok})
+        fake_abort_signal_loop()
+
+      {:stop, reason} ->
+        exit(reason)
+    end
   end
 
   defp wait_for_abort({:error, :aborted} = result), do: result

@@ -6,9 +6,19 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.Promise.with_resolvers/0` for externally settled promises with explicit
+  `resolve` and `reject` functions, including creator-lifecycle cleanup when
+  the owning process exits before settlement.
+- `Web.ReadableByteStreamController`, `Web.ReadableStreamBYOBReader`, and
+  `Web.ReadableStreamBYOBRequest` for WHATWG byte streams with BYOB reader
+  support, capability-scoped pull fulfillment, and consumer-owned buffer
+  reuse.
 - `Web.Socket` plus `Web.connect/1-2` for capability-gated TCP/TLS sockets
   with WHATWG stream endpoints, lifecycle promises, and `STARTTLS` upgrade
   support.
+- `examples/secure_byob_stream.exs`, demonstrating BYOB `ReadableStream`
+  pulls, capability-scoped request fulfillment, and stable consumer buffer
+  reuse across reads.
 - `examples/smtp_client.exs`, demonstrating an SMTP `STARTTLS` login flow
   built on `Web.connect/2` and `Socket.start_tls/2`.
 - `Web.Symbol` and `Web.Symbol.Protocol` for TC39-style well-known
@@ -47,6 +57,12 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- `Web.ReadableStream.new/2` now recognizes `%{type: "bytes"}` sources,
+  provisions byte-length queueing defaults, supports `get_reader(..., mode:
+  "byob")`, and surfaces pending BYOB requests through
+  `ReadableByteStreamController.byob_request/1`.
+- `Web.Socket` lifecycle promises now use `Web.Promise.with_resolvers/0`
+  instead of ad hoc mailbox wiring for external settlement.
 - `Web.ReadableStream.new/2` now accepts explicit queueing options and
   inherits high-water-mark and strategy metadata from the underlying source
   when present.
@@ -92,6 +108,8 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.Promise` inspect coverage no longer relies on a sleep-driven race for
+  the in-progress pending-state assertion in `test/web/promise_test.exs`.
 - `Web.Dispatcher.TCP` now seals end-to-end TCP backpressure by reading from
   the socket only inside the proxy stream's `pull` callback, allowing the
   socket transport to enter passive mode once its internal readable high-water

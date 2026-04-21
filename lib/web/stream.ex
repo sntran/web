@@ -80,6 +80,7 @@ defmodule Web.Stream do
   # Engine data
   # ---------------------------------------------------------------------------
 
+  # credo:disable-for-next-line Credo.Check.Warning.StructFieldAmount
   defstruct [
     :module,
     :type,
@@ -96,9 +97,13 @@ defmodule Web.Stream do
     writable_hwm: 1,
     total_queued_size: 0,
     strategy: %Web.CountQueuingStrategy{},
+    stream_type: :default,
+    auto_allocate_chunk_size: nil,
     pulling: false,
     reader_pid: nil,
     reader_ref: nil,
+    reader_mode: nil,
+    pending_byob_request: nil,
     read_requests: :queue.new(),
     disturbed: false,
     # Consumer (writable) side
@@ -185,6 +190,8 @@ defmodule Web.Stream do
       writable_hwm: writable_hwm,
       total_queued_size: 0,
       strategy: strategy,
+      stream_type: Keyword.get(opts, :stream_type, :default),
+      auto_allocate_chunk_size: Keyword.get(opts, :auto_allocate_chunk_size),
       timeout_ms: timeout_ms,
       async_context: snapshot
     }
@@ -390,18 +397,33 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   # Reader lock acquisition
+  defp handle_common({:call, from}, {:get_reader, pid}, state, data)
+       when data.type in [:producer, :producer_consumer] do
+    handle_common({:call, from}, {:get_reader, pid, :default}, state, data)
+  end
+
   defp handle_common(
          {:call, from},
-         {:get_reader, pid},
+         {:get_reader, pid, mode},
          _state,
          %{reader_pid: nil} = data
        )
        when data.type in [:producer, :producer_consumer] do
-    ref = Process.monitor(pid)
-    {:keep_state, %{data | reader_pid: pid, reader_ref: ref}, [{:reply, from, {:ok, ref}}]}
+    case mode do
+      :byob when data.stream_type != :bytes ->
+        {:keep_state_and_data, [{:reply, from, {:error, :not_byte_stream}}]}
+
+      reader_mode when reader_mode in [:default, :byob] ->
+        ref = Process.monitor(pid)
+
+        {:keep_state, %{data | reader_pid: pid, reader_ref: ref, reader_mode: reader_mode},
+         [
+           {:reply, from, {:ok, ref}}
+         ]}
+    end
   end
 
-  defp handle_common({:call, from}, {:get_reader, _pid}, _state, data)
+  defp handle_common({:call, from}, {:get_reader, _pid, _mode}, _state, data)
        when data.type in [:producer, :producer_consumer] do
     {:keep_state_and_data, [{:reply, from, {:error, :already_locked}}]}
   end
@@ -431,6 +453,15 @@ defmodule Web.Stream do
     handle_read_request(from, pid, state, data)
   end
 
+  defp handle_common({:call, from}, {:byob_read, pid, %Web.Uint8Array{} = view}, state, data)
+       when data.type in [:producer, :producer_consumer] do
+    handle_byob_read_request(from, pid, view, state, data)
+  end
+
+  defp handle_common({:call, from}, {:byob_read, _pid, _view}, _state, _data) do
+    {:keep_state_and_data, [{:reply, from, {:error, :invalid_byob_view}}]}
+  end
+
   # Release force-error for release_lock
   defp handle_common(
          {:call, from},
@@ -445,8 +476,16 @@ defmodule Web.Stream do
   defp handle_common({:call, from}, {:release_lock, pid}, _state, data)
        when data.type in [:producer, :producer_consumer] and is_pid(data.reader_pid) do
     if pid == data.reader_pid do
-      if data.reader_ref, do: Process.demonitor(data.reader_ref, [:flush])
-      {:keep_state, %{data | reader_pid: nil, reader_ref: nil}, [{:reply, from, :ok}]}
+      if(data.reader_ref, do: Process.demonitor(data.reader_ref, [:flush]))
+
+      new_data =
+        data
+        |> drop_pending_byob_request()
+        |> Map.put(:reader_pid, nil)
+        |> Map.put(:reader_ref, nil)
+        |> Map.put(:reader_mode, nil)
+
+      {:keep_state, new_data, [{:reply, from, :ok}]}
     else
       {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
     end
@@ -564,6 +603,21 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, desired}]}
   end
 
+  defp handle_common({:call, from}, :get_byob_request, _state, data)
+       when data.type in [:producer, :producer_consumer] do
+    {:keep_state_and_data, [{:reply, from, byob_request_for(data.pending_byob_request)}]}
+  end
+
+  defp handle_common({:call, from}, {:byob_respond, _bytes_written}, _state, data)
+       when data.type in [:producer, :producer_consumer] do
+    {:keep_state_and_data, [{:reply, from, {:error, :byob_capability_required}}]}
+  end
+
+  defp handle_common({:call, from}, {:byob_respond_with_new_view, _view}, _state, data)
+       when data.type in [:producer, :producer_consumer] do
+    {:keep_state_and_data, [{:reply, from, {:error, :byob_capability_required}}]}
+  end
+
   defp handle_common({:call, from}, :get_slots, state, data) do
     readable_desired_size =
       if(state in [:closed, :errored], do: nil, else: readable_desired_size(data))
@@ -646,23 +700,57 @@ defmodule Web.Stream do
          :cast,
          {:register_enqueue_waiter, waiter_pid, ref},
          state,
-         %{
-           type: :producer_consumer
-         } = data
+         %{type: type} = data
        ) do
-    cond do
-      state in [:closed, :errored] ->
-        priority_send(waiter_pid, {:ready, ref})
-        :keep_state_and_data
+    if type in [:producer, :producer_consumer] do
+      cond do
+        state in [:closed, :errored] ->
+          priority_send(waiter_pid, {:ready, ref})
+          :keep_state_and_data
 
-      readable_capacity(data) > 0 ->
-        priority_send(waiter_pid, {:ready, ref})
-        :keep_state_and_data
+        readable_capacity(data) > 0 ->
+          priority_send(waiter_pid, {:ready, ref})
+          :keep_state_and_data
 
-      true ->
-        waiter = {:signal, waiter_pid, ref}
-        {:keep_state, %{data | enqueue_waiters: :queue.in(waiter, data.enqueue_waiters)}}
+        true ->
+          waiter = {:signal, waiter_pid, ref}
+          {:keep_state, %{data | enqueue_waiters: :queue.in(waiter, data.enqueue_waiters)}}
+      end
+    else
+      :keep_state_and_data
     end
+  end
+
+  defp handle_common(
+         :info,
+         {:web_stream_byob_response, address, {:chunk, chunk}},
+         _state,
+         %{pending_byob_request: %{address: address}} = data
+       )
+       when is_binary(chunk) do
+    fulfill_pending_byob_enqueue(chunk, data)
+  end
+
+  defp handle_common(
+         :info,
+         {:web_stream_byob_response, address, {:view, view}},
+         _state,
+         %{pending_byob_request: %{address: address}} = data
+       ) do
+    fulfill_pending_byob_view(view, data)
+  end
+
+  defp handle_common(
+         :info,
+         {:web_stream_byob_response, address, _payload},
+         _state,
+         %{pending_byob_request: %{address: address}} = data
+       ) do
+    fail_invalid_byob_response(data)
+  end
+
+  defp handle_common(:info, {:web_stream_byob_response, _address, _payload}, _state, _data) do
+    :keep_state_and_data
   end
 
   # Task result (info message: {ref, result})
@@ -756,6 +844,11 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
   end
 
+  defp handle_read_request(from, pid, _state, %{reader_mode: :byob} = data)
+       when pid == data.reader_pid do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
+  end
+
   defp handle_read_request(from, _pid, :errored, data) do
     disturbed_data = %{data | disturbed: true}
     {:keep_state, disturbed_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
@@ -795,6 +888,101 @@ defmodule Web.Stream do
     {:keep_state, new_data, maybe_request_pull(new_data, actions)}
   end
 
+  defp handle_byob_read_request(from, pid, _view, _state, data)
+       when pid != data.reader_pid or data.reader_mode != :byob do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
+  end
+
+  defp handle_byob_read_request(from, _pid, _view, _state, %{stream_type: stream_type})
+       when stream_type != :bytes do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_byte_stream}}]}
+  end
+
+  defp handle_byob_read_request(from, _pid, _view, :errored, data) do
+    disturbed_data = %{data | disturbed: true}
+    {:keep_state, disturbed_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
+  end
+
+  defp handle_byob_read_request(from, _pid, %Web.Uint8Array{} = view, state, data) do
+    data = %{data | disturbed: true}
+
+    cond do
+      not :queue.is_empty(data.queue) ->
+        pop_queued_bytes(from, view, data)
+
+      state == :closed ->
+        {:keep_state, data, [{:reply, from, :done}]}
+
+      true ->
+        pending_byob_request = new_pending_byob_request(from, view)
+
+        {:keep_state, %{data | pending_byob_request: pending_byob_request},
+         [{:next_event, :internal, :maybe_pull}]}
+    end
+  end
+
+  defp pop_queued_bytes(from, %Web.Uint8Array{} = view, data) do
+    {chunk, new_queue, new_total_queued_size} =
+      take_bytes_from_queue(data.queue, data.total_queued_size, data.strategy, view.byte_length)
+
+    :ok = Web.ArrayBuffer.write_at(view.buffer, view.byte_offset, chunk)
+    chunk_view = Web.Uint8Array.new(view.buffer, view.byte_offset, byte_size(chunk))
+
+    new_data = %{
+      data
+      | queue: new_queue,
+        total_queued_size: new_total_queued_size
+    }
+
+    actions = [{:reply, from, {:ok, chunk_view}}]
+    {new_data, actions} = maybe_refresh_read_actions(new_data, actions)
+    {:keep_state, new_data, maybe_request_pull(new_data, actions)}
+  end
+
+  defp take_bytes_from_queue(queue, total_queued_size, strategy, byte_length) do
+    {iodata, remaining_chunks, remaining_total_queued_size} =
+      do_take_bytes_from_queue(
+        :queue.to_list(queue),
+        total_queued_size,
+        strategy,
+        byte_length,
+        []
+      )
+
+    {IO.iodata_to_binary(Enum.reverse(iodata)), :queue.from_list(remaining_chunks),
+     remaining_total_queued_size}
+  end
+
+  defp do_take_bytes_from_queue(chunks, total_queued_size, _strategy, byte_length, acc)
+       when byte_length <= 0 do
+    {acc, chunks, total_queued_size}
+  end
+
+  defp do_take_bytes_from_queue([], total_queued_size, _strategy, _byte_length, acc) do
+    {acc, [], total_queued_size}
+  end
+
+  defp do_take_bytes_from_queue([chunk | rest], total_queued_size, strategy, byte_length, acc)
+       when is_binary(chunk) do
+    chunk_size = strategy_size(strategy, chunk)
+
+    if byte_size(chunk) <= byte_length do
+      do_take_bytes_from_queue(
+        rest,
+        total_queued_size - chunk_size,
+        strategy,
+        byte_length - byte_size(chunk),
+        [chunk | acc]
+      )
+    else
+      head = binary_part(chunk, 0, byte_length)
+      tail = binary_part(chunk, byte_length, byte_size(chunk) - byte_length)
+
+      {[head | acc], [tail | rest],
+       total_queued_size - chunk_size + strategy_size(strategy, tail)}
+    end
+  end
+
   defp maybe_refresh_read_actions(%{type: :producer_consumer} = data, actions) do
     data = refresh_backpressure(data)
     {data, ready_actions} = maybe_resolve_ready_waiters(data)
@@ -802,7 +990,10 @@ defmodule Web.Stream do
     {data, actions ++ ready_actions ++ enqueue_actions}
   end
 
-  defp maybe_refresh_read_actions(data, actions), do: {data, actions}
+  defp maybe_refresh_read_actions(data, actions) do
+    {data, enqueue_actions} = maybe_resolve_enqueue_waiters(data)
+    {data, actions ++ enqueue_actions}
+  end
 
   defp maybe_request_pull(data, actions) do
     if readable_desired_size(data) > 0 do
@@ -831,6 +1022,11 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
   # Producer enqueue logic (used from readable/3 and producer_consumer states)
   # ---------------------------------------------------------------------------
+
+  defp handle_producer_enqueue(chunk, _state, %{pending_byob_request: %{}} = data)
+       when is_binary(chunk) do
+    fulfill_pending_byob_enqueue(chunk, data)
+  end
 
   defp handle_producer_enqueue(chunk, _state, data) do
     chunk_size = queue_chunk_size(data, chunk)
@@ -864,8 +1060,41 @@ defmodule Web.Stream do
     end
   end
 
+  defp fulfill_pending_byob_enqueue(chunk, %{pending_byob_request: %{}} = data) do
+    {%{from: from, view: view}, new_data} = take_pending_byob_request(data)
+    written_size = min(byte_size(chunk), view.byte_length)
+    written = binary_part(chunk, 0, written_size)
+
+    :ok = Web.ArrayBuffer.write_at(view.buffer, view.byte_offset, written)
+    chunk_view = Web.Uint8Array.new(view.buffer, view.byte_offset, written_size)
+
+    new_data =
+      if written_size < byte_size(chunk) do
+        remainder = binary_part(chunk, written_size, byte_size(chunk) - written_size)
+
+        %{
+          new_data
+          | queue: :queue.in(remainder, new_data.queue),
+            total_queued_size: new_data.total_queued_size + queue_chunk_size(new_data, remainder)
+        }
+      else
+        new_data
+      end
+
+    new_data = refresh_backpressure(new_data)
+    actions = [{:reply, from, {:ok, chunk_view}}]
+    {new_data, actions} = maybe_refresh_read_actions(new_data, actions)
+    {:keep_state, new_data, maybe_request_pull(new_data, actions)}
+  end
+
   defp handle_producer_close(data) do
-    {:next_state, :closed, %{data | pulling: false}, [{:next_event, :internal, :flush_requests}]}
+    {new_data, pending_byob_actions} =
+      data
+      |> Map.put(:pulling, false)
+      |> settle_pending_byob_request(:done)
+
+    {:next_state, :closed, new_data,
+     pending_byob_actions ++ [{:next_event, :internal, :flush_requests}]}
   end
 
   defp flush_read_requests(data) do
@@ -874,7 +1103,9 @@ defmodule Web.Stream do
       |> :queue.to_list()
       |> Enum.each(&:gen_statem.reply(&1, :done))
 
-      {:keep_state, %{data | read_requests: :queue.new()}}
+      {new_data, pending_byob_actions} = settle_pending_byob_request(data, :done)
+
+      {:keep_state, %{new_data | read_requests: :queue.new()}, pending_byob_actions}
     else
       :keep_state_and_data
     end
@@ -885,7 +1116,10 @@ defmodule Web.Stream do
     |> :queue.to_list()
     |> Enum.each(&:gen_statem.reply(&1, {:error, {:errored, data.error_reason}}))
 
-    {:keep_state, %{data | read_requests: :queue.new()}}
+    {new_data, pending_byob_actions} =
+      settle_pending_byob_request(data, {:error, {:errored, data.error_reason}})
+
+    {:keep_state, %{new_data | read_requests: :queue.new()}, pending_byob_actions}
   end
 
   # ---------------------------------------------------------------------------
@@ -904,7 +1138,7 @@ defmodule Web.Stream do
 
   defp do_trigger_pull(%{module: module, impl_state: impl_state} = data) do
     if function_exported?(module, :pull, 2) do
-      ctrl = %Web.ReadableStreamDefaultController{pid: self()}
+      ctrl = readable_controller(data)
 
       task =
         start_task(
@@ -924,6 +1158,14 @@ defmodule Web.Stream do
     else
       :keep_state_and_data
     end
+  end
+
+  defp readable_controller(%{stream_type: :bytes}) do
+    %Web.ReadableByteStreamController{pid: self()}
+  end
+
+  defp readable_controller(_data) do
+    %Web.ReadableStreamDefaultController{pid: self()}
   end
 
   # ---------------------------------------------------------------------------
@@ -1206,12 +1448,15 @@ defmodule Web.Stream do
         Task.shutdown(data.active_task, :brutal_kill)
     end
 
+    {data, pending_byob_actions} = settle_pending_byob_request(data, {:error, {:errored, reason}})
+
     error_actions =
       pending_write_error_actions(data, reason) ++
         queued_write_error_actions(data, reason) ++
         close_error_actions(data, reason) ++
         ready_error_actions(data, reason) ++
-        enqueue_error_actions(data, reason)
+        enqueue_error_actions(data, reason) ++
+        pending_byob_actions
 
     new_data =
       data
@@ -1277,11 +1522,14 @@ defmodule Web.Stream do
   end
 
   defp finalize_termination(data, type, _reason) when type in [:cancel, :close] do
+    {data, pending_byob_actions} = settle_pending_byob_request(data, :done)
+
     actions =
       pending_write_closed_actions(data) ++
         queued_write_closed_actions(data) ++
         close_ok_actions(data) ++
-        ready_ok_actions(data)
+        ready_ok_actions(data) ++
+        pending_byob_actions
 
     new_data = %{
       data
@@ -1300,11 +1548,14 @@ defmodule Web.Stream do
   end
 
   defp finalize_termination(data, _type, reason) do
+    {data, pending_byob_actions} = settle_pending_byob_request(data, {:error, {:errored, reason}})
+
     error_actions =
       pending_write_error_actions(data, reason) ++
         queued_write_error_actions(data, reason) ++
         close_error_actions(data, reason) ++
-        ready_error_actions(data, reason)
+        ready_error_actions(data, reason) ++
+        pending_byob_actions
 
     new_data = %{
       data
@@ -1331,7 +1582,15 @@ defmodule Web.Stream do
   defp clear_owner(%{reader_ref: reader_ref, writer_ref: writer_ref} = data) do
     if reader_ref, do: Process.demonitor(reader_ref, [:flush])
     if writer_ref, do: Process.demonitor(writer_ref, [:flush])
-    %{data | reader_pid: nil, reader_ref: nil, writer_pid: nil, writer_ref: nil}
+
+    %{
+      data
+      | reader_pid: nil,
+        reader_ref: nil,
+        reader_mode: nil,
+        writer_pid: nil,
+        writer_ref: nil
+    }
   end
 
   defp clear_task(data) do
@@ -1453,7 +1712,14 @@ defmodule Web.Stream do
   end
 
   defp maybe_cancel_on_reader_exit(_reason, _state, data) do
-    {:keep_state, %{data | reader_pid: nil, reader_ref: nil}}
+    new_data =
+      data
+      |> drop_pending_byob_request()
+      |> Map.put(:reader_pid, nil)
+      |> Map.put(:reader_ref, nil)
+      |> Map.put(:reader_mode, nil)
+
+    {:keep_state, new_data}
   end
 
   defp handle_terminate_request(type, reason, state, data) do
@@ -1485,6 +1751,72 @@ defmodule Web.Stream do
   end
 
   defp waiter_error_action(from, reason), do: {:reply, from, {:error, {:errored, reason}}}
+
+  defp byob_request_for(nil), do: nil
+
+  defp byob_request_for(%{address: address, view: %Web.Uint8Array{} = view}) do
+    %Web.ReadableStreamBYOBRequest{
+      address: address,
+      view_byte_offset: view.byte_offset,
+      view_byte_length: view.byte_length
+    }
+  end
+
+  defp new_pending_byob_request(from, %Web.Uint8Array{} = view) do
+    %{
+      from: from,
+      view: view,
+      address: Process.alias([:reply])
+    }
+  end
+
+  defp take_pending_byob_request(%{pending_byob_request: nil} = data) do
+    {nil, data}
+  end
+
+  defp take_pending_byob_request(%{pending_byob_request: %{address: address} = request} = data) do
+    Process.unalias(address)
+    {request, %{data | pending_byob_request: nil}}
+  end
+
+  defp drop_pending_byob_request(data) do
+    {_request, new_data} = take_pending_byob_request(data)
+    new_data
+  end
+
+  defp settle_pending_byob_request(data, reply) do
+    case take_pending_byob_request(data) do
+      {nil, new_data} ->
+        {new_data, []}
+
+      {%{from: from}, new_data} ->
+        {new_data, [{:reply, from, reply}]}
+    end
+  end
+
+  defp fulfill_pending_byob_view(view, %{pending_byob_request: %{}} = data) do
+    case normalize_byob_response_view(view) do
+      {:ok, %Web.Uint8Array{} = response_view} ->
+        {%{from: from}, new_data} = take_pending_byob_request(data)
+        actions = [{:reply, from, {:ok, response_view}}]
+        {:keep_state, new_data, maybe_request_pull(new_data, actions)}
+
+      :error ->
+        fail_stream(:invalid_byob_response, data)
+    end
+  end
+
+  defp fail_invalid_byob_response(%{pending_byob_request: %{}} = data) do
+    fail_stream(:invalid_byob_response, data)
+  end
+
+  defp normalize_byob_response_view(%Web.Uint8Array{} = view), do: {:ok, view}
+
+  defp normalize_byob_response_view(view) when is_binary(view) do
+    {:ok, view |> Web.ArrayBuffer.new() |> Web.Uint8Array.new()}
+  end
+
+  defp normalize_byob_response_view(_view), do: :error
 
   defp slot_desired_size(_data, state) when state in [:closed, :errored], do: nil
 

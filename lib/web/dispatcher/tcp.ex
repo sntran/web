@@ -172,7 +172,6 @@ defmodule Web.Dispatcher.TCP do
         shutdown_bridge(state, reason)
 
       {:abort, reason} ->
-        cancel_controller(state.controller, reason)
         shutdown_bridge(state, reason)
 
       {:register_controller, controller} ->
@@ -378,13 +377,6 @@ defmodule Web.Dispatcher.TCP do
   defp shutdown_bridge(state, reason) do
     stop_abort_watcher(state.abort_watcher)
     close_socket(state.socket, reason)
-    :ok
-  end
-
-  defp cancel_controller(nil, _reason), do: :ok
-
-  defp cancel_controller(%ReadableStreamDefaultController{pid: pid}, reason) do
-    _ = ReadableStream.cancel(pid, reason)
     :ok
   end
 

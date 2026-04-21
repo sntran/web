@@ -45,6 +45,48 @@ defmodule Web.ArrayBufferTest do
     assert detached_legacy.byte_length == 0
   end
 
+  test "write_at/3 writes into managed buffers at the requested offset" do
+    buffer = ArrayBuffer.new(5)
+
+    assert :ok = ArrayBuffer.write_at(buffer, 1, "hey")
+    assert ArrayBuffer.data(buffer) == <<0, ?h, ?e, ?y, 0>>
+    assert ArrayBuffer.byte_length(buffer) == 5
+  end
+
+  test "write_at/3 can replace and extend existing managed buffer contents" do
+    buffer = ArrayBuffer.new("abc")
+
+    assert :ok = ArrayBuffer.write_at(buffer, 2, "def")
+    assert ArrayBuffer.data(buffer) == "abdef"
+    assert ArrayBuffer.byte_length(buffer) == 5
+  end
+
+  test "write_at/3 rejects offsets beyond the current managed buffer length" do
+    buffer = ArrayBuffer.new("abc")
+
+    assert_raise ArgumentError, "invalid byte offset", fn ->
+      ArrayBuffer.write_at(buffer, 4, "z")
+    end
+  end
+
+  test "write_at/3 rejects detached managed buffers" do
+    buffer = ArrayBuffer.new("hello")
+    _detached = ArrayBuffer.detach(buffer)
+
+    assert_raise Web.TypeError, "Cannot write to a detached ArrayBuffer", fn ->
+      ArrayBuffer.write_at(buffer, 0, "x")
+    end
+  end
+
+  test "write_at/3 rejects missing managed buffers" do
+    buffer = ArrayBuffer.new("hello")
+    true = :ets.delete(:ets.whereis(Web.ArrayBuffer), ArrayBuffer.identity(buffer))
+
+    assert_raise Web.TypeError, "ArrayBuffer not found", fn ->
+      ArrayBuffer.write_at(buffer, 0, "x")
+    end
+  end
+
   test "new/1 tolerates concurrent ETS table creation races" do
     parent = self()
 

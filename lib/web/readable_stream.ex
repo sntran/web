@@ -31,6 +31,8 @@ defmodule Web.ReadableStream do
   alias Web.ArrayBuffer
   alias Web.Blob
   alias Web.Promise
+  alias Web.ReadableByteStreamController
+  alias Web.ReadableStreamBYOBReader
   alias Web.TypeError
   alias Web.Uint8Array
   alias Web.URLSearchParams
@@ -43,10 +45,11 @@ defmodule Web.ReadableStream do
   @impl Web.Stream
   def start(pid, opts) do
     source = Keyword.get(opts, :source)
-    state = %{source: source, pid: pid, started: false}
+    stream_type = Keyword.get(opts, :stream_type, :default)
+    state = %{source: source, pid: pid, started: false, stream_type: stream_type}
 
     if is_map(source) and is_function(source[:start], 1) do
-      ctrl = %Web.ReadableStreamDefaultController{pid: pid}
+      ctrl = controller_for(stream_type, pid)
       fun = source.start
 
       {:producer, state, [{:next_event, :internal, {:start_task, fn -> fun.(ctrl) end}}]}
@@ -56,9 +59,8 @@ defmodule Web.ReadableStream do
   end
 
   @impl Web.Stream
-  def pull(_ctrl, %{source: %{pull: pull}, pid: pid} = state) when is_function(pull, 1) do
-    pid
-    |> controller()
+  def pull(ctrl, %{source: %{pull: pull}} = state) when is_function(pull, 1) do
+    ctrl
     |> pull.()
     |> await_pull_result()
 
@@ -70,17 +72,15 @@ defmodule Web.ReadableStream do
     {:ok, %{state | started: true}, :pause}
   end
 
-  def pull(_ctrl, %{source: {module, function, args}, pid: pid} = state) when is_list(args) do
-    pid
-    |> controller()
+  def pull(ctrl, %{source: {module, function, args}} = state) when is_list(args) do
+    ctrl
     |> then(&apply(module, function, args ++ [&1]))
 
     {:ok, %{state | started: true}}
   end
 
-  def pull(_ctrl, %{source: fun, pid: pid} = state) when is_function(fun, 1) do
-    pid
-    |> controller()
+  def pull(ctrl, %{source: fun} = state) when is_function(fun, 1) do
+    ctrl
     |> fun.()
     |> await_pull_result()
 
@@ -101,7 +101,8 @@ defmodule Web.ReadableStream do
     do_terminate(reason, source)
   end
 
-  defp controller(pid), do: %Web.ReadableStreamDefaultController{pid: pid}
+  defp controller_for(:bytes, pid), do: %ReadableByteStreamController{pid: pid}
+  defp controller_for(:default, pid), do: %Web.ReadableStreamDefaultController{pid: pid}
 
   defp await_pull_result(%Promise{task: task}), do: Task.await(task, :infinity)
   defp await_pull_result(_result), do: :ok
@@ -145,6 +146,7 @@ defmodule Web.ReadableStream do
       ["hello"]
   """
   def new(underlying_source \\ %{}, opts \\ []) when is_list(opts) do
+    stream_type = source_stream_type(underlying_source)
     {high_water_mark, strategy} = normalize_stream_options(underlying_source, opts)
 
     stream_opts =
@@ -152,6 +154,11 @@ defmodule Web.ReadableStream do
       |> Keyword.put(:source, underlying_source)
       |> Keyword.put(:high_water_mark, high_water_mark)
       |> Keyword.put(:strategy, strategy)
+      |> Keyword.put(:stream_type, stream_type)
+      |> Keyword.put(
+        :auto_allocate_chunk_size,
+        source_auto_allocate_chunk_size(underlying_source)
+      )
 
     {:ok, pid} =
       start_link(stream_opts)
@@ -258,6 +265,8 @@ defmodule Web.ReadableStream do
   end
 
   defp normalize_stream_options(underlying_source, opts) do
+    stream_type = source_stream_type(underlying_source)
+
     default_hwm =
       case underlying_source do
         %{} = source -> Map.get(source, :high_water_mark, 1)
@@ -272,13 +281,37 @@ defmodule Web.ReadableStream do
 
     strategy =
       Keyword.get_lazy(opts, :strategy, fn ->
-        strategy_from_source || Web.CountQueuingStrategy.new(default_hwm)
+        strategy_from_source || default_strategy_for(stream_type, default_hwm)
       end)
 
     high_water_mark =
       Keyword.get(opts, :high_water_mark, Map.get(strategy, :high_water_mark, default_hwm))
 
     {high_water_mark, strategy}
+  end
+
+  defp source_stream_type(%{} = source) do
+    if Map.get(source, :type) == "bytes", do: :bytes, else: :default
+  end
+
+  defp source_stream_type(_underlying_source), do: :default
+
+  defp source_auto_allocate_chunk_size(%{} = source) do
+    Map.get(source, :auto_allocate_chunk_size)
+  end
+
+  defp source_auto_allocate_chunk_size(_underlying_source), do: nil
+
+  defp default_strategy_for(:bytes, high_water_mark) do
+    Web.ByteLengthQueuingStrategy.new(high_water_mark)
+  end
+
+  defp default_strategy_for(:default, high_water_mark) do
+    Web.CountQueuingStrategy.new(high_water_mark)
+  end
+
+  defp reader_mode_from_options(opts) do
+    if Keyword.get(opts, :mode) == "byob", do: :byob, else: :default
   end
 
   defp start_blob_parts_queue(parts) do
@@ -454,15 +487,43 @@ defmodule Web.ReadableStream do
       iex> is_struct(reader, Web.ReadableStreamDefaultReader)
       true
   """
-  def get_reader(pid) when is_pid(pid) do
-    case :gen_statem.call(pid, {:get_reader, self()}) do
-      {:ok, _ref} -> :ok
-      {:error, :already_locked} -> {:error, :already_locked}
+  def get_reader(%__MODULE__{controller_pid: pid}, opts) when is_list(opts) do
+    case reader_mode_from_options(opts) do
+      :byob ->
+        case get_reader(pid, opts) do
+          :ok ->
+            %ReadableStreamBYOBReader{controller_pid: pid}
+
+          {:error, :already_locked} ->
+            raise TypeError, "ReadableStream is already locked"
+
+          {:error, :not_byte_stream} ->
+            raise TypeError, "ReadableStream is not a byte stream"
+        end
+
+      :default ->
+        get_reader(%__MODULE__{controller_pid: pid})
     end
   end
 
+  def get_reader(pid, opts) when is_pid(pid) and is_list(opts) do
+    request =
+      case reader_mode_from_options(opts) do
+        :default -> {:get_reader, self()}
+        :byob -> {:get_reader, self(), :byob}
+      end
+
+    case :gen_statem.call(pid, request) do
+      {:ok, _ref} -> :ok
+      {:error, :already_locked} -> {:error, :already_locked}
+      {:error, :not_byte_stream} -> {:error, :not_byte_stream}
+    end
+  end
+
+  def get_reader(pid) when is_pid(pid), do: get_reader(pid, [])
+
   def get_reader(%__MODULE__{controller_pid: pid}) do
-    case get_reader(pid) do
+    case get_reader(pid, []) do
       :ok ->
         %Web.ReadableStreamDefaultReader{controller_pid: pid}
 
@@ -473,6 +534,11 @@ defmodule Web.ReadableStream do
 
   def read(pid) do
     :gen_statem.call(pid, {:read, self()})
+  end
+
+  @doc false
+  def byob_read(pid, view) when is_pid(pid) do
+    :gen_statem.call(pid, {:byob_read, self(), view})
   end
 
   def force_unknown_error(pid) do
@@ -651,14 +717,14 @@ defmodule Web.ReadableStream do
     owner_pid = self()
 
     try do
-      AbortSignal.check!(options[:signal])
+      ensure_pipe_signal_active!(options[:signal])
 
       with :ok <-
              await_pipe_step(
                fn -> WritableStream.ready(writer.controller_pid, writer.owner_pid) end,
                options
              ),
-           :ok <- AbortSignal.check!(options[:signal]),
+           :ok <- ensure_pipe_signal_active!(options[:signal]),
            read_result <-
              await_pipe_step(fn -> read_for_pipe(reader.controller_pid, owner_pid) end, options) do
         case read_result do
@@ -736,6 +802,17 @@ defmodule Web.ReadableStream do
       {:error, _} = error -> error
     end
   end
+
+  defp ensure_pipe_signal_active!(nil), do: :ok
+
+  defp ensure_pipe_signal_active!(%AbortSignal{} = signal) do
+    AbortSignal.throw_if_aborted(signal)
+  rescue
+    _error in Web.DOMException ->
+      throw({:abort, normalize_abort_reason(signal, :aborted)})
+  end
+
+  defp ensure_pipe_signal_active!(signal), do: AbortSignal.check!(signal)
 
   # coveralls-ignore-start
   defp normalize_abort_reason(signal, :aborted), do: AbortSignal.reason(signal) || :aborted

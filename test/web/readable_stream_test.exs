@@ -4,7 +4,9 @@ defmodule Web.ReadableStreamTest do
 
   import Web, only: [await: 1]
 
+  alias Web.ReadableByteStreamController
   alias Web.ReadableStream
+  alias Web.ReadableStreamBYOBReader
   alias Web.ReadableStreamDefaultController
   alias Web.ReadableStreamDefaultReader
   alias Web.TypeError
@@ -169,6 +171,59 @@ defmodule Web.ReadableStreamTest do
 
       assert ReadableStream.get_desired_size(source_stream.controller_pid) == 7
       assert Enum.join(source_stream, "") == "abc"
+    end
+
+    test "new/2 defaults byte streams to byte-length accounting and supports BYOB readers" do
+      stream = ReadableStream.new(%{type: "bytes"})
+
+      ReadableStream.enqueue(stream.controller_pid, "ab")
+
+      assert ReadableStream.__get_slots__(stream.controller_pid).stream_type == :bytes
+      assert ReadableStream.get_desired_size(stream.controller_pid) == -1
+
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      assert %ReadableStreamBYOBReader{} = reader
+      assert :ok = ReadableStreamBYOBReader.release_lock(reader)
+    end
+
+    test "byte sources receive a ReadableByteStreamController" do
+      parent = self()
+
+      stream =
+        ReadableStream.new(%{
+          type: "bytes",
+          pull: fn controller ->
+            send(parent, controller)
+            ReadableByteStreamController.close(controller)
+          end
+        })
+
+      assert Enum.to_list(stream) == []
+      assert_receive %ReadableByteStreamController{pid: pid}, 1_000
+      assert pid == stream.controller_pid
+    end
+
+    test "get_reader/2 rejects BYOB mode for default streams" do
+      stream = ReadableStream.new()
+
+      assert_raise TypeError, ~r/not a byte stream/, fn ->
+        ReadableStream.get_reader(stream, mode: "byob")
+      end
+    end
+
+    test "get_reader/2 accepts an explicit default mode" do
+      stream = ReadableStream.new()
+
+      assert %ReadableStreamDefaultReader{} = ReadableStream.get_reader(stream, mode: "default")
+    end
+
+    test "get_reader/2 raises already locked for BYOB mode when a byte stream is locked" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      _reader = ReadableStream.get_reader(stream)
+
+      assert_raise TypeError, ~r/already locked/, fn ->
+        ReadableStream.get_reader(stream, mode: "byob")
+      end
     end
 
     test "DOWN monitoring" do

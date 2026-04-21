@@ -48,6 +48,61 @@ defmodule Web.Promise do
     }
   end
 
+  @doc """
+  Returns a promise together with its external settlement functions.
+
+  Provides a snake_case Elixir API for external promise settlement.
+
+  ## Examples
+
+      iex> {promise, resolve, _reject} = Web.Promise.with_resolvers()
+      iex> resolve.(:hello)
+      iex> Web.await(promise)
+      :hello
+  """
+  @spec with_resolvers() :: {t(), (term() -> :ok), (term() -> :ok)}
+  def with_resolvers do
+    creator_pid = self()
+    ref = make_ref()
+    snapshot = Snapshot.take()
+
+    task =
+      Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
+        Snapshot.run(snapshot, fn ->
+          creator_monitor = Process.monitor(creator_pid)
+
+          try do
+            receive do
+              {:promise_with_resolvers, ^ref, {:resolve, value}} ->
+                value
+
+              {:promise_with_resolvers, ^ref, {:reject, reason}} ->
+                exit({:shutdown, reason})
+
+              {:DOWN, ^creator_monitor, :process, ^creator_pid, _reason} ->
+                exit(:normal)
+            end
+          after
+            Process.demonitor(creator_monitor, [:flush])
+          end
+        end)
+      end)
+
+    promise = %__MODULE__{task: task}
+
+    resolve = fn value ->
+      send(promise.task.pid, {:promise_with_resolvers, ref, {:resolve, value}})
+      :ok
+    end
+
+    reject = fn reason ->
+      send(promise.task.pid, {:promise_with_resolvers, ref, {:reject, reason}})
+      :ok
+    end
+
+    {promise, resolve, reject}
+  end
+
   @spec resolve(t() | Task.t() | any()) :: t()
   def resolve(%__MODULE__{} = promise), do: promise
   def resolve(%Task{} = task), do: %__MODULE__{task: task}

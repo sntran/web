@@ -113,6 +113,23 @@ pair = await Promise.all([
 
 ```
 
+For externally controlled promise settlement, use
+`Promise.with_resolvers/0` to get a promise plus explicit `resolve` and
+`reject` functions.
+
+```elixir
+use Web
+
+{promise, resolve, _reject} = Promise.with_resolvers()
+
+Task.start(fn ->
+  resolve.(%{status: :ready})
+end)
+
+await(promise)
+# => %{status: :ready}
+```
+
 `Web.AsyncContext` carries scoped values across promise and stream task boundaries.
 
 ```elixir
@@ -163,6 +180,42 @@ encoded =
 
 await(Response.text(Response.new(body: encoded)))
 # => "Hello, 🌍"
+```
+
+Byte-oriented streams also support WHATWG-style BYOB reads. Consumers can
+reuse their own `Uint8Array` buffers while producers fill them through a
+capability-scoped `ReadableStreamBYOBRequest`, with
+`ReadableByteStreamController` exposing the active BYOB request and
+byte-oriented desired-size flow control.
+
+```elixir
+use Web
+
+stream =
+  ReadableStream.new(%{
+    type: "bytes",
+    pull: fn controller ->
+      case ReadableByteStreamController.byob_request(controller) do
+        %ReadableStreamBYOBRequest{} = request ->
+          ReadableStreamBYOBRequest.respond(request, "hello")
+
+        nil ->
+          :ok
+      end
+    end
+  })
+
+reader = ReadableStream.get_reader(stream, mode: "byob")
+view = Uint8Array.new(ArrayBuffer.new(5))
+
+await(ReadableStreamBYOBReader.read(reader, view))
+# => %{value: %Web.Uint8Array<...>, done: false}
+```
+
+For a full buffer-reuse example, run:
+
+```shell
+mix run examples/secure_byob_stream.exs
 ```
 
 ### 🔌 Capability Sockets

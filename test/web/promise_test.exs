@@ -36,6 +36,60 @@ defmodule Web.PromiseTest do
     assert Promise.resolve(original) == original
   end
 
+  test "with_resolvers/0 resolves with the external resolver" do
+    {promise, resolve, _reject} = Promise.with_resolvers()
+
+    assert :ok == resolve.(:hello)
+    assert :hello == await(promise)
+  end
+
+  test "with_resolvers/0 rejects with the external rejector" do
+    {promise, _resolve, reject} = Promise.with_resolvers()
+
+    assert :ok == reject.(:boom)
+    assert :boom == catch_exit(await(promise))
+  end
+
+  test "with_resolvers/0 settles asynchronously" do
+    {promise, resolve, _reject} = Promise.with_resolvers()
+
+    Task.start(fn ->
+      Process.sleep(10)
+      resolve.(:later)
+    end)
+
+    assert :later == await(promise)
+  end
+
+  test "with_resolvers/0 ignores later settlement attempts" do
+    {promise, resolve, reject} = Promise.with_resolvers()
+
+    assert :ok == resolve.(:first)
+    assert :ok == reject.(:second)
+    assert :first == await(promise)
+  end
+
+  test "with_resolvers/0 exits the promise task when the creator dies before settlement" do
+    parent = self()
+
+    creator_pid =
+      spawn(fn ->
+        {promise, _resolve, _reject} = Promise.with_resolvers()
+        send(parent, {:with_resolvers_task, promise.task.pid})
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert_receive {:with_resolvers_task, task_pid}, 1_000
+
+    task_monitor = Process.monitor(task_pid)
+    Process.exit(creator_pid, :kill)
+
+    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :normal}, 1_000
+  end
+
   # ---------------------------------------------------------------------------
   # then/2 — catch clause (rejected upstream)
   # ---------------------------------------------------------------------------
@@ -201,6 +255,11 @@ defmodule Web.PromiseTest do
     assert is_struct(result, RuntimeError)
   end
 
+  test "executor returning without settlement resolves to nil" do
+    promise = Promise.new(fn _resolve, _reject -> :ok end)
+    assert nil == await(promise)
+  end
+
   # ---------------------------------------------------------------------------
   # Inspect protocol
   # ---------------------------------------------------------------------------
@@ -235,9 +294,12 @@ defmodule Web.PromiseTest do
   end
 
   test "inspect shows pending for in-progress promise" do
-    promise = Promise.new(fn _resolve, _reject -> Process.sleep(50) end)
+    {promise, resolve, _reject} = Promise.with_resolvers()
+
     assert inspect(promise) =~ "pending"
-    Process.sleep(100)
+
+    assert :ok == resolve.(:done)
+    assert :done == await(promise)
   end
 
   test "inspect resolved: shows {:ok, value} result variant" do

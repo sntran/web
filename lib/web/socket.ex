@@ -412,12 +412,12 @@ defmodule Web.Socket do
   end
 
   defp settle_opened(%{opened_settled?: false} = state, {:ok, value}) do
-    send(state.opened_info.pid, {state.opened_info.ref, {:ok, value}})
+    state.opened_info.resolve.(value)
     %{state | opened_settled?: true}
   end
 
   defp settle_opened(%{opened_settled?: false} = state, {:error, reason}) do
-    send(state.opened_info.pid, {state.opened_info.ref, {:error, reason}})
+    state.opened_info.reject.(reason)
     %{state | opened_settled?: true}
   end
 
@@ -426,19 +426,19 @@ defmodule Web.Socket do
   defp settle_opened_if_needed(state, result), do: settle_opened(state, result)
 
   defp settle_closed_if_needed(%{closed_settled?: false} = state, reason) do
-    send(state.closed_info.pid, {state.closed_info.ref, {:ok, reason}})
+    state.closed_info.resolve.(reason)
     %{state | closed_settled?: true}
   end
 
   defp settle_closed_if_needed(state, _reason), do: state
 
   defp settle_upgraded(%{upgraded_settled?: false} = state, {:ok, value}) do
-    send(state.upgraded_info.pid, {state.upgraded_info.ref, {:ok, value}})
+    state.upgraded_info.resolve.(value)
     %{state | upgraded_settled?: true}
   end
 
   defp settle_upgraded(%{upgraded_settled?: false} = state, {:error, reason}) do
-    send(state.upgraded_info.pid, {state.upgraded_info.ref, {:error, reason}})
+    state.upgraded_info.reject.(reason)
     %{state | upgraded_settled?: true}
   end
 
@@ -488,8 +488,8 @@ defmodule Web.Socket do
 
     ReadableStream.close(old_readable_pid)
     WritableStream.error(old_writable_pid, :upgraded)
-    send(state.closed_info.pid, {state.closed_info.ref, {:ok, :upgraded}})
-    send(state.upgraded_info.pid, {state.upgraded_info.ref, {:ok, tls_socket}})
+    state.closed_info.resolve.(:upgraded)
+    state.upgraded_info.resolve.(tls_socket)
     Process.unalias(old_address)
 
     {next_state, tls_socket}
@@ -670,17 +670,8 @@ defmodule Web.Socket do
   end
 
   defp deferred_promise do
-    ref = make_ref()
-
-    promise =
-      Promise.new(fn resolve, reject ->
-        receive do
-          {^ref, {:ok, value}} -> resolve.(value)
-          {^ref, {:error, reason}} -> reject.(reason)
-        end
-      end)
-
-    {promise, %{pid: promise.task.pid, ref: ref}}
+    {promise, resolve, reject} = Promise.with_resolvers()
+    {promise, %{resolve: resolve, reject: reject}}
   end
 
   defp promise_request(%__MODULE__{} = socket, body) do

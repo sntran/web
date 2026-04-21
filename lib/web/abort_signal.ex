@@ -29,6 +29,8 @@ defmodule Web.AbortSignal do
   use GenServer
   @reason_key __MODULE__
 
+  alias Web.DOMException
+
   defstruct aborted: false, reason: nil, pid: nil, ref: nil
 
   @type t :: %__MODULE__{
@@ -88,23 +90,15 @@ defmodule Web.AbortSignal do
       :ok
   """
   def any(signals) do
-    case Enum.find(signals, &already_aborted?/1) do
-      %__MODULE__{reason: reason} ->
+    case Enum.find_value(signals, &any_abort_result/1) do
+      {:aborted, reason} ->
         abort(reason)
 
-      _ ->
+      nil ->
         controller = Web.AbortController.new()
 
         spawn_link(fn ->
-          subscriptions =
-            signals
-            |> Enum.map(&subscribe/1)
-            |> Enum.flat_map(fn
-              {:ok, subscription} -> [subscription]
-              {:error, :aborted} -> []
-            end)
-
-          wait_for_any_abort(subscriptions, controller)
+          wait_for_any_abort(signals, controller)
         end)
 
         controller.signal
@@ -234,6 +228,26 @@ defmodule Web.AbortSignal do
   end
 
   def reason(_), do: nil
+
+  @doc """
+  Raises a `Web.DOMException` when the signal has already aborted.
+  """
+  @spec throw_if_aborted(t() | nil) :: :ok
+  def throw_if_aborted(nil), do: :ok
+
+  def throw_if_aborted(%__MODULE__{aborted: true, reason: reason}) do
+    raise DOMException, name: "AbortError", message: inspect(reason)
+  end
+
+  def throw_if_aborted(%__MODULE__{} = signal) do
+    case any_abort_result(signal) do
+      {:aborted, reason} ->
+        raise DOMException, name: "AbortError", message: inspect(reason)
+
+      nil ->
+        :ok
+    end
+  end
 
   defp normalize_reason(signal, :aborted), do: reason(signal) || :aborted
   defp normalize_reason(_signal, reason), do: reason
@@ -387,27 +401,134 @@ defmodule Web.AbortSignal do
     {:noreply, %{state | subscribers: subscribers}}
   end
 
-  defp already_aborted?(%__MODULE__{aborted: true}), do: true
-  defp already_aborted?(_signal), do: false
+  defp any_abort_result(%__MODULE__{aborted: true, reason: reason}), do: {:aborted, reason}
 
-  # credo:disable-for-next-line
-  defp wait_for_any_abort(subscriptions, controller) do
-    case Enum.find_value(subscriptions, fn subscription ->
-           case receive_abort(subscription, 0, true) do
-             {:error, :aborted, reason} -> reason
-             :ok -> nil
-           end
-         end) do
-      nil ->
-        receive do
+  defp any_abort_result(%__MODULE__{} = signal) do
+    case subscribe(signal) do
+      {:ok, subscription} ->
+        try do
+          case receive_abort(subscription, 0, true) do
+            {:error, :aborted, reason} -> {:aborted, reason}
+            :ok -> nil
+          end
         after
-          10 -> wait_for_any_abort(subscriptions, controller)
+          unsubscribe(subscription)
         end
 
-      reason ->
-        Web.AbortController.abort(controller, reason)
+      {:error, :aborted} ->
+        reason = reason(signal)
+        if(is_nil(reason), do: nil, else: {:aborted, reason})
     end
-  after
-    Enum.each(subscriptions, &unsubscribe/1)
+  end
+
+  defp any_abort_result(_signal), do: nil
+
+  defp wait_for_any_abort(signals, controller) do
+    address = Process.alias([:reply])
+    coordinator = self()
+
+    Enum.each(signals, &start_any_abort_waiter(&1, coordinator, address))
+
+    try do
+      receive do
+        {:abort_signal_any, ^address, reason} ->
+          Process.unalias(address)
+          Web.AbortController.abort(controller, reason)
+      end
+    after
+      Process.unalias(address)
+    end
+  end
+
+  defp start_any_abort_waiter(nil, _coordinator, _address), do: :ok
+
+  defp start_any_abort_waiter(signal, coordinator, address) do
+    spawn(fn ->
+      coordinator_monitor = Process.monitor(coordinator)
+
+      try do
+        case subscribe(signal) do
+          {:ok, subscription} ->
+            try do
+              case wait_for_subscription_or_coordinator(
+                     subscription,
+                     coordinator,
+                     coordinator_monitor
+                   ) do
+                {:aborted, reason} -> send(address, {:abort_signal_any, address, reason})
+                :ok -> :ok
+              end
+            after
+              unsubscribe(subscription)
+            end
+
+          {:error, :aborted} ->
+            maybe_forward_any_abort(signal, address)
+        end
+      after
+        Process.demonitor(coordinator_monitor, [:flush])
+      end
+    end)
+  end
+
+  defp maybe_forward_any_abort(signal, address) do
+    case any_abort_result(signal) do
+      {:aborted, reason} -> send(address, {:abort_signal_any, address, reason})
+      nil -> :ok
+    end
+  end
+
+  defp wait_for_subscription_or_coordinator(
+         %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: monitor_ref},
+         coordinator,
+         coordinator_monitor
+       ) do
+    receive do
+      {:abort, ^ref, reason} ->
+        {:aborted, reason}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:aborted, reason}}} ->
+        {:aborted, reason}
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:aborted, reason}
+
+      {:DOWN, ^coordinator_monitor, :process, ^coordinator, _reason} ->
+        :ok
+    end
+  end
+
+  defp wait_for_subscription_or_coordinator(
+         %{type: :pid, pid: pid, monitor_ref: monitor_ref},
+         coordinator,
+         coordinator_monitor
+       ) do
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:aborted, reason}
+
+      {:abort, ^pid, reason} ->
+        {:aborted, reason}
+
+      {:DOWN, ^coordinator_monitor, :process, ^coordinator, _reason} ->
+        :ok
+    end
+  end
+
+  defp wait_for_subscription_or_coordinator(
+         %{type: :token, token: token},
+         coordinator,
+         coordinator_monitor
+       ) do
+    receive do
+      {:abort, ^token} ->
+        {:aborted, :aborted}
+
+      {:abort, ^token, reason} ->
+        {:aborted, reason}
+
+      {:DOWN, ^coordinator_monitor, :process, ^coordinator, _reason} ->
+        :ok
+    end
   end
 end

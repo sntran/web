@@ -1,3 +1,5 @@
+Code.require_file("line_transform_stream.ex", __DIR__)
+
 defmodule SMTPClientExample do
   @moduledoc """
   Demonstrates an SMTP `STARTTLS` login sequence using `Web.connect/2`.
@@ -21,7 +23,7 @@ defmodule SMTPClientExample do
     socket = Web.connect(%{hostname: config.host, port: config.port}, secureTransport: "starttls")
     await(socket.opened)
 
-    reader = ReadableStream.get_reader(socket.readable)
+    reader = line_reader(socket)
     writer = WritableStream.get_writer(socket.writable)
 
     banner = recv_line(reader)
@@ -45,7 +47,7 @@ defmodule SMTPClientExample do
     socket = await(Socket.start_tls(socket, tls_options(config.verify)))
     await(socket.opened)
 
-    reader = ReadableStream.get_reader(socket.readable)
+    reader = line_reader(socket)
     writer = WritableStream.get_writer(socket.writable)
 
     send_line(writer, "EHLO #{config.client_name}")
@@ -102,6 +104,13 @@ defmodule SMTPClientExample do
   defp tls_options("none"), do: [verify: :verify_none]
   defp tls_options(_mode), do: []
 
+  defp line_reader(socket) do
+    socket.readable
+    |> ReadableStream.pipe_through(TextDecoderStream.new("utf-8"))
+    |> ReadableStream.pipe_through(LineTransformStream.new("\r\n"))
+    |> ReadableStream.get_reader()
+  end
+
   defp send_line(writer, line) do
     IO.puts("C: #{line}")
     await(WritableStreamDefaultWriter.write(writer, line <> "\r\n"))
@@ -121,41 +130,13 @@ defmodule SMTPClientExample do
     end
   end
 
-  defp recv_line(reader, buffer \\ "") do
-    case String.split(buffer, "\r\n", parts: 2) do
-      [line, rest] when rest != buffer ->
-        if rest == "" do
-          line
-        else
-          Process.put({__MODULE__, :smtp_buffer}, rest)
-          line
-        end
+  defp recv_line(reader) do
+    case await(ReadableStreamDefaultReader.read(reader)) do
+      %{done: false, value: line} ->
+        line
 
-      _ ->
-        buffer = buffer <> flush_buffer()
-
-        case String.split(buffer, "\r\n", parts: 2) do
-          [line, rest] when rest != buffer ->
-            Process.put({__MODULE__, :smtp_buffer}, rest)
-            line
-
-          _ ->
-            case await(ReadableStreamDefaultReader.read(reader)) do
-              %{done: false, value: chunk} -> recv_line(reader, buffer <> chunk)
-              %{done: true} -> raise "socket closed while waiting for an SMTP line"
-            end
-        end
-    end
-  end
-
-  defp flush_buffer do
-    case Process.get({__MODULE__, :smtp_buffer}, "") do
-      "" ->
-        ""
-
-      buffer ->
-        Process.delete({__MODULE__, :smtp_buffer})
-        buffer
+      %{done: true} ->
+        raise "socket closed while waiting for an SMTP line"
     end
   end
 

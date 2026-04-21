@@ -881,7 +881,7 @@ defmodule Web.AsyncContextTest do
       await(Web.WritableStreamDefaultWriter.close(writer))
     end
 
-    test "upstream pull rate is throttled by readable_strategy high water mark" do
+    test "writer readiness stays independent from readable_strategy saturation" do
       pull_count = :counters.new(1, [])
 
       strategy = Web.CountQueuingStrategy.new(2)
@@ -904,19 +904,15 @@ defmodule Web.AsyncContextTest do
       await(Web.WritableStreamDefaultWriter.write(writer, "a"))
       await(Web.WritableStreamDefaultWriter.write(writer, "b"))
 
-      # Writer.ready should now block because readable side is at capacity
+      # Writer.ready should remain write-side only even when the readable side is saturated.
       ready_task = Task.async(fn -> await(Web.WritableStreamDefaultWriter.ready(writer)) end)
-      assert Task.yield(ready_task, 100) == nil
-
-      # Consume from readable side to free capacity
-      reader = ReadableStream.get_reader(ts.readable)
-      %{value: "a"} = await(ReadableStreamDefaultReader.read(reader))
-
-      # Now ready should complete
       assert {:ok, :ok} = Task.yield(ready_task, 2_000)
 
-      # Write a 3rd chunk now that there's capacity
+      # A third write is accepted immediately even before the readable side drains.
       await(Web.WritableStreamDefaultWriter.write(writer, "c"))
+
+      reader = ReadableStream.get_reader(ts.readable)
+      %{value: "a"} = await(ReadableStreamDefaultReader.read(reader))
 
       %{value: "b"} = await(ReadableStreamDefaultReader.read(reader))
       %{value: "c"} = await(ReadableStreamDefaultReader.read(reader))

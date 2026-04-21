@@ -138,6 +138,39 @@ defmodule Web.ReadableStreamTest do
       send(pid, {:internal, :flush_requests})
     end
 
+    test "new/2 honors byte-length strategies for desired size" do
+      stream =
+        ReadableStream.new(%{},
+          high_water_mark: 5,
+          strategy: Web.ByteLengthQueuingStrategy.new(5)
+        )
+
+      ReadableStream.enqueue(stream.controller_pid, "ab")
+
+      assert ReadableStream.get_desired_size(stream.controller_pid) == 3
+    end
+
+    test "new/2 normalizes defaults and source strategy metadata" do
+      function_stream = ReadableStream.new(fn _controller -> :ok end)
+
+      assert ReadableStream.get_desired_size(function_stream.controller_pid) == 1
+
+      source_strategy = Web.ByteLengthQueuingStrategy.new(7)
+
+      source_stream =
+        ReadableStream.new(%{
+          high_water_mark: 7,
+          strategy: source_strategy,
+          pull: fn controller ->
+            ReadableStreamDefaultController.enqueue(controller, "abc")
+            ReadableStreamDefaultController.close(controller)
+          end
+        })
+
+      assert ReadableStream.get_desired_size(source_stream.controller_pid) == 7
+      assert Enum.join(source_stream, "") == "abc"
+    end
+
     test "DOWN monitoring" do
       {:ok, pid} = ReadableStream.start_link()
       stream = %ReadableStream{controller_pid: pid}

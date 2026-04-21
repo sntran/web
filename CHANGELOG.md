@@ -2,10 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased] - 2026-04-18
+## [Unreleased] - 2026-04-20
 
 ### Added
 
+- `Web.Socket` plus `Web.connect/1-2` for capability-gated TCP/TLS sockets
+  with WHATWG stream endpoints, lifecycle promises, and `STARTTLS` upgrade
+  support.
+- `examples/smtp_client.exs`, demonstrating an SMTP `STARTTLS` login flow
+  built on `Web.connect/2` and `Socket.start_tls/2`.
 - `Web.Symbol` and `Web.Symbol.Protocol` for TC39-style well-known
   symbols, including disposable-resource support for `BroadcastChannel`
   and `Port`.
@@ -42,6 +47,12 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- `Web.ReadableStream.new/2` now accepts explicit queueing options and
+  inherits high-water-mark and strategy metadata from the underlying source
+  when present.
+- `Web.ReadableStream.tee/1` now provisions branch `TransformStream`
+  readable-side strategy metadata explicitly so branch backpressure matches
+  the configured buffer size.
 - `use Web` now imports `structured_clone/1`, `structured_clone/2`, and
   `using/2`, and now aliases `Web.Symbol`.
 - `Web.EventTarget` now exposes a public, opaque-ref interface for
@@ -72,6 +83,9 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.TransformStream` readable queue accounting now falls back to the
+  writable-side high-water mark when a supplied readable strategy reports an
+  invalid watermark, keeping readiness and desired-size tracking stable.
 - `Web.BroadcastChannel` close and `onmessage` control paths now treat missing
   runtime registrations defensively, raising clear argument errors for unknown
   refs and returning safe no-op behavior where appropriate.

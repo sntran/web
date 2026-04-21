@@ -18,6 +18,7 @@
 * **Structured Data**: WHATWG-style `structured_clone/2` with transferable `ArrayBuffer`s.
 * **Capability Messaging**: `MessageChannel` and `MessagePort` for unforgeable, transferable process-backed handles.
 * **Cluster Coordination**: `BroadcastChannel` fan-out across BEAM nodes with sender-origin metadata.
+* **Capability Sockets**: WINTERCG-style `Socket` handles with readable/writable streams and `STARTTLS` upgrades.
 * **Resource Disposal**: TC39-inspired `Symbol.dispose` support with a `using` macro for deterministic cleanup.
 * **Zero-Buffer Performance**: Native streaming with backpressure-aware engines.
 
@@ -162,6 +163,34 @@ encoded =
 
 await(Response.text(Response.new(body: encoded)))
 # => "Hello, 🌍"
+```
+
+### 🔌 Capability Sockets
+
+WINTERCG-style sockets expose a capability-safe handle plus WHATWG
+`ReadableStream` and `WritableStream` endpoints, so raw TCP/TLS sessions use
+the same backpressure-aware primitives as the rest of the runtime.
+
+```elixir
+use Web
+
+socket = Web.connect("example.com:443", secureTransport: "on")
+await(socket.opened)
+
+writer = WritableStream.get_writer(socket.writable)
+reader = ReadableStream.get_reader(socket.readable)
+
+await(WritableStreamDefaultWriter.write(writer, "GET / HTTP/1.1\r\nhost: example.com\r\n\r\n"))
+chunk = await(ReadableStreamDefaultReader.read(reader))
+
+chunk.value
+```
+
+Explicit `STARTTLS` upgrades are supported through `Socket.start_tls/2`. For a
+full SMTP handshake example, run:
+
+```shell
+mix run examples/smtp_client.exs
 ```
 
 ### 🌍 Data & Metadata

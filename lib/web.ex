@@ -35,6 +35,8 @@ defmodule Web do
     quote do
       import Web,
         only: [
+          connect: 1,
+          connect: 2,
           fetch: 1,
           fetch: 2,
           await: 1,
@@ -74,6 +76,7 @@ defmodule Web do
       alias Web.ReadableStreamDefaultController
       alias Web.Request
       alias Web.Response
+      alias Web.Socket
       alias Web.Symbol
       alias Web.TextDecoder
       alias Web.TextDecoderStream
@@ -174,6 +177,14 @@ defmodule Web do
   @spec structured_clone(term(), keyword()) :: term()
   def structured_clone(value, options \\ []) do
     StructuredData.clone(value, options)
+  end
+
+  @doc """
+  Opens a capability-gated TCP or TLS socket.
+  """
+  @spec connect(String.t() | map() | keyword(), map() | keyword()) :: Web.Socket.t()
+  def connect(address, options \\ %{}) do
+    Web.Socket.start_socket(self(), address, options)
   end
 
   @doc """

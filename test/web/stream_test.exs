@@ -23,6 +23,12 @@ defmodule Web.StreamTest do
     end
   end
 
+  defmodule InvalidReadableHwmStrategy do
+    defstruct high_water_mark: :invalid
+
+    def size(_chunk), do: 1
+  end
+
   alias Web.ReadableStream
   alias Web.TransformStream
   alias Web.TypeError
@@ -427,6 +433,18 @@ defmodule Web.StreamTest do
       assert slots.desired_size == 5
     end
 
+    test "TransformStream falls back to writable high water mark for invalid readable strategy hwm" do
+      ts =
+        TransformStream.new(%{},
+          high_water_mark: 3,
+          readable_strategy: %InvalidReadableHwmStrategy{}
+        )
+
+      slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
+      assert slots.readable_hwm == 3
+      assert slots.desired_size == 3
+    end
+
     test "readable side can be locked independently" do
       ts = TransformStream.new(%{})
       reader = ReadableStream.get_reader(ts.readable)
@@ -577,7 +595,7 @@ defmodule Web.StreamTest do
       assert message in ["The stream is errored.", "This writer is no longer locked."]
     end
 
-    test "transform bridge check blocks ready when readable queue is saturated" do
+    test "transform bridge check keeps writer readiness independent from readable saturation" do
       ts = TransformStream.new(%{}, high_water_mark: 1)
       writer = WritableStream.get_writer(ts.writable)
 
@@ -585,22 +603,29 @@ defmodule Web.StreamTest do
       assert ReadableStream.__get_slots__(ts.readable.controller_pid).desired_size == 0
 
       ready_task = Task.async(fn -> await(WritableStreamDefaultWriter.ready(writer)) end)
-      assert Task.yield(ready_task, 100) == nil
+      assert {:ok, :ok} = Task.yield(ready_task, 1_000)
+
+      assert :ok = await(WritableStreamDefaultWriter.write(writer, "b"))
+      assert :queue.len(ReadableStream.__get_slots__(ts.readable.controller_pid).queue) == 2
 
       reader = ReadableStream.get_reader(ts.readable)
       assert await(Web.ReadableStreamDefaultReader.read(reader)) == %{value: "a", done: false}
-      assert {:ok, :ok} = Task.yield(ready_task, 1_000)
+      assert await(Web.ReadableStreamDefaultReader.read(reader)) == %{value: "b", done: false}
       assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
       assert :ok = WritableStreamDefaultWriter.release_lock(writer)
     end
 
-    test "transform desired size reflects readable queue occupancy" do
+    test "transform desired size separates readable and writable accounting" do
       ts = TransformStream.new(%{}, high_water_mark: 2)
       writer = WritableStream.get_writer(ts.writable)
       assert :ok = await(WritableStreamDefaultWriter.write(writer, "a"))
-      assert ReadableStream.__get_slots__(ts.readable.controller_pid).desired_size == 1
 
-      assert WritableStream.desired_size(ts.writable) == 1
+      slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
+      assert slots.desired_size == 1
+      assert slots.readable_desired_size == 1
+      assert slots.writable_desired_size == 2
+
+      assert WritableStream.desired_size(ts.writable) == 2
       assert :ok = WritableStreamDefaultWriter.release_lock(writer)
     end
 

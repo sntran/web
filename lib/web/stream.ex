@@ -92,6 +92,8 @@ defmodule Web.Stream do
     # Producer (readable) side
     queue: :queue.new(),
     hwm: 1,
+    readable_hwm: 1,
+    writable_hwm: 1,
     total_queued_size: 0,
     strategy: %Web.CountQueuingStrategy{},
     pulling: false,
@@ -170,11 +172,15 @@ defmodule Web.Stream do
         {t, s, a} -> {t, s, a}
       end
 
+    {readable_hwm, writable_hwm} = init_capacities(type, hwm, strategy)
+
     data = %__MODULE__{
       module: module,
       type: type,
       impl_state: impl_state,
       hwm: hwm,
+      readable_hwm: readable_hwm,
+      writable_hwm: writable_hwm,
       total_queued_size: 0,
       strategy: strategy,
       timeout_ms: timeout_ms,
@@ -492,7 +498,7 @@ defmodule Web.Stream do
       state == :closed ->
         {:keep_state_and_data, [{:reply, from, :ok}]}
 
-      internal_desired_size(data) > 0 ->
+      writable_ready?(data) ->
         {:keep_state_and_data, [{:reply, from, :ok}]}
 
       true ->
@@ -545,19 +551,31 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, desired}]}
   end
 
-  defp handle_common({:call, from}, :get_desired_size, _state, data) do
-    {:keep_state_and_data, [{:reply, from, data.hwm - :queue.len(data.queue)}]}
+  defp handle_common({:call, from}, :get_desired_size, state, data) do
+    desired =
+      if state in [:closed, :errored] do
+        nil
+      else
+        readable_desired_size(data)
+      end
+
+    {:keep_state_and_data, [{:reply, from, desired}]}
   end
 
   defp handle_common({:call, from}, :get_slots, state, data) do
+    readable_desired_size =
+      if(state in [:closed, :errored], do: nil, else: readable_desired_size(data))
+
+    writable_desired_size =
+      if(state in [:closed, :errored], do: nil, else: internal_desired_size(data))
+
     slots =
       data
       |> Map.from_struct()
       |> Map.put(:state, state)
-      |> Map.put(
-        :desired_size,
-        if(state in [:closed, :errored], do: nil, else: internal_desired_size(data))
-      )
+      |> Map.put(:desired_size, slot_desired_size(data, state))
+      |> Map.put(:readable_desired_size, readable_desired_size)
+      |> Map.put(:writable_desired_size, writable_desired_size)
 
     {:keep_state_and_data, [{:reply, from, slots}]}
   end
@@ -612,7 +630,7 @@ defmodule Web.Stream do
         priority_send(waiter_pid, {:ready, ref})
         :keep_state_and_data
 
-      internal_desired_size(data) > 0 ->
+      writable_ready?(data) ->
         priority_send(waiter_pid, {:ready, ref})
         :keep_state_and_data
 
@@ -772,7 +790,7 @@ defmodule Web.Stream do
 
     actions = [{:reply, from, {:ok, chunk}}]
     {new_data, actions} = maybe_refresh_read_actions(new_data, actions)
-    {:keep_state, new_data, maybe_request_pull(new_queue, data.hwm, actions)}
+    {:keep_state, new_data, maybe_request_pull(new_data, actions)}
   end
 
   defp maybe_refresh_read_actions(%{type: :producer_consumer} = data, actions) do
@@ -784,8 +802,8 @@ defmodule Web.Stream do
 
   defp maybe_refresh_read_actions(data, actions), do: {data, actions}
 
-  defp maybe_request_pull(new_queue, hwm, actions) do
-    if :queue.len(new_queue) < hwm do
+  defp maybe_request_pull(data, actions) do
+    if readable_desired_size(data) > 0 do
       [{:next_event, :internal, :maybe_pull} | actions]
     else
       actions
@@ -873,7 +891,7 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   defp handle_maybe_pull(data) do
-    effective_ds = data.hwm - :queue.len(data.queue)
+    effective_ds = readable_desired_size(data)
 
     if not data.pulling and effective_ds > 0 do
       do_trigger_pull(data)
@@ -1344,25 +1362,35 @@ defmodule Web.Stream do
   end
 
   defp refresh_backpressure(data) do
-    %{data | backpressure: internal_desired_size(data) <= 0}
+    %{data | backpressure: not writable_ready?(data)}
   end
 
   defp internal_desired_size(%{type: :consumer} = data) do
-    data.hwm - pending_write_count(data)
+    writable_capacity(data)
   end
 
   defp internal_desired_size(%{type: :producer_consumer} = data) do
-    writable_capacity = data.hwm - pending_write_count(data)
-    readable_capacity = readable_capacity(data)
-    min(writable_capacity, readable_capacity)
+    writable_capacity(data)
   end
 
   defp internal_desired_size(data) do
-    data.hwm - :queue.len(data.queue)
+    readable_desired_size(data)
+  end
+
+  defp readable_desired_size(data) do
+    readable_capacity(data)
   end
 
   defp readable_capacity(data) do
-    strategy_high_water_mark(data) - data.total_queued_size
+    data.readable_hwm - data.total_queued_size
+  end
+
+  defp writable_capacity(data) do
+    data.writable_hwm - pending_write_count(data)
+  end
+
+  defp writable_ready?(data) do
+    writable_capacity(data) > 0
   end
 
   defp pending_write_count(data) do
@@ -1447,6 +1475,16 @@ defmodule Web.Stream do
 
   defp waiter_error_action(from, reason), do: {:reply, from, {:error, {:errored, reason}}}
 
+  defp slot_desired_size(_data, state) when state in [:closed, :errored], do: nil
+
+  defp slot_desired_size(%{type: :consumer} = data, _state) do
+    internal_desired_size(data)
+  end
+
+  defp slot_desired_size(data, _state) do
+    readable_desired_size(data)
+  end
+
   defp reply_keep_state(data) do
     {:keep_state, data, []}
   end
@@ -1461,11 +1499,18 @@ defmodule Web.Stream do
 
   defp strategy_size(%{__struct__: strategy}, chunk), do: strategy.size(chunk)
 
-  defp strategy_high_water_mark(%{strategy: %{high_water_mark: hwm}}), do: hwm
-
   defp normalize_strategy(%{__struct__: _} = strategy), do: strategy
   # coveralls-ignore-next-line
   defp normalize_strategy(_), do: %Web.CountQueuingStrategy{}
+
+  defp init_capacities(:producer_consumer, writable_hwm, strategy) do
+    {strategy_high_water_mark(strategy, writable_hwm), writable_hwm}
+  end
+
+  defp init_capacities(_type, hwm, _strategy), do: {hwm, hwm}
+
+  defp strategy_high_water_mark(%{high_water_mark: hwm}, _fallback) when is_number(hwm), do: hwm
+  defp strategy_high_water_mark(_strategy, fallback), do: fallback
 
   defp timeout_operation(operation) do
     case operation do

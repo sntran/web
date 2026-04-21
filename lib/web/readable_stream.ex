@@ -144,8 +144,16 @@ defmodule Web.ReadableStream do
       iex> Enum.to_list(stream)
       ["hello"]
   """
-  def new(underlying_source \\ %{}) do
-    {:ok, pid} = start_link(source: underlying_source, strategy: Web.CountQueuingStrategy.new(1))
+  def new(underlying_source \\ %{}, opts \\ []) when is_list(opts) do
+    {high_water_mark, strategy} = normalize_stream_options(underlying_source, opts)
+
+    {:ok, pid} =
+      start_link(
+        source: underlying_source,
+        high_water_mark: high_water_mark,
+        strategy: strategy
+      )
+
     %__MODULE__{controller_pid: pid}
   end
 
@@ -242,6 +250,30 @@ defmodule Web.ReadableStream do
     else
       raise ArgumentError, "cannot normalize body from #{inspect(enumerable)}"
     end
+  end
+
+  defp normalize_stream_options(underlying_source, opts) do
+    default_hwm =
+      case underlying_source do
+        %{} = source -> Map.get(source, :high_water_mark, 1)
+        _ -> 1
+      end
+
+    strategy_from_source =
+      case underlying_source do
+        %{} = source -> Map.get(source, :strategy)
+        _ -> nil
+      end
+
+    strategy =
+      Keyword.get_lazy(opts, :strategy, fn ->
+        strategy_from_source || Web.CountQueuingStrategy.new(default_hwm)
+      end)
+
+    high_water_mark =
+      Keyword.get(opts, :high_water_mark, Map.get(strategy, :high_water_mark, default_hwm))
+
+    {high_water_mark, strategy}
   end
 
   defp start_blob_parts_queue(parts) do
@@ -742,8 +774,9 @@ defmodule Web.ReadableStream do
 
   defp do_tee(%__MODULE__{} = source) do
     strategy = Web.CountQueuingStrategy.new(16)
-    ts1 = Web.TransformStream.new(%{}, writable_strategy: strategy)
-    ts2 = Web.TransformStream.new(%{}, writable_strategy: strategy)
+    branch_hwm = Map.get(strategy, :high_water_mark, 16)
+    ts1 = Web.TransformStream.new(%{}, high_water_mark: branch_hwm, readable_strategy: strategy)
+    ts2 = Web.TransformStream.new(%{}, high_water_mark: branch_hwm, readable_strategy: strategy)
 
     writer1 = Web.WritableStream.get_writer(ts1.writable)
     writer2 = Web.WritableStream.get_writer(ts2.writable)

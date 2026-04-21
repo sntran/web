@@ -237,6 +237,63 @@ defmodule Web.ReadableStreamTest do
       assert "abc" = Enum.join(stream, "")
     end
 
+    test "from/1 halts suspended stream resources on cancel" do
+      parent = self()
+
+      resource =
+        Stream.resource(
+          fn -> 0 end,
+          fn counter ->
+            {[Integer.to_string(counter)], counter + 1}
+          end,
+          fn _counter ->
+            send(parent, :resource_halted)
+          end
+        )
+
+      stream = ReadableStream.from(resource)
+
+      assert ["0"] = Enum.take(stream, 1)
+      assert :ok = await(ReadableStream.cancel(stream, :stop))
+      assert_receive :resource_halted, 1_000
+    end
+
+    test "from/1 halts untouched enumerators on cancel" do
+      stream = ReadableStream.from(["a", "b", "c"])
+
+      assert :ok = await(ReadableStream.cancel(stream, :stop))
+    end
+
+    test "from/1 swallows continuation halt exceptions on cancel" do
+      stream =
+        ReadableStream.from(fn
+          {:cont, nil} ->
+            {:suspended, "a",
+             fn
+               {:halt, _acc} -> raise "boom"
+               {:cont, _acc} -> {:done, nil}
+             end}
+        end)
+
+      assert ["a"] = Enum.take(stream, 1)
+      assert :ok = await(ReadableStream.cancel(stream, :stop))
+    end
+
+    test "from/1 swallows continuation halt throws on cancel" do
+      stream =
+        ReadableStream.from(fn
+          {:cont, nil} ->
+            {:suspended, "a",
+             fn
+               {:halt, _acc} -> throw(:boom)
+               {:cont, _acc} -> {:done, nil}
+             end}
+        end)
+
+      assert ["a"] = Enum.take(stream, 1)
+      assert :ok = await(ReadableStream.cancel(stream, :stop))
+    end
+
     test "from/1 normalizes URLSearchParams, Blob, ArrayBuffer, and Uint8Array" do
       params = Web.URLSearchParams.new(%{"a" => "1", "b" => "2"})
       assert "a=1&b=2" = params |> ReadableStream.from() |> Enum.join("")

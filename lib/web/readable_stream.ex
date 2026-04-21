@@ -147,12 +147,14 @@ defmodule Web.ReadableStream do
   def new(underlying_source \\ %{}, opts \\ []) when is_list(opts) do
     {high_water_mark, strategy} = normalize_stream_options(underlying_source, opts)
 
+    stream_opts =
+      opts
+      |> Keyword.put(:source, underlying_source)
+      |> Keyword.put(:high_water_mark, high_water_mark)
+      |> Keyword.put(:strategy, strategy)
+
     {:ok, pid} =
-      start_link(
-        source: underlying_source,
-        high_water_mark: high_water_mark,
-        strategy: strategy
-      )
+      start_link(stream_opts)
 
     %__MODULE__{controller_pid: pid}
   end
@@ -226,27 +228,30 @@ defmodule Web.ReadableStream do
     if Enumerable.impl_for(enumerable) do
       enumerator_pid = start_enumerator(enumerable)
 
-      new(%{
-        pull: fn controller ->
-          next_chunk = ask_enumerator(enumerator_pid)
+      new(
+        %{
+          pull: fn controller ->
+            next_chunk = ask_enumerator(enumerator_pid)
 
-          case next_chunk do
-            :done ->
-              Web.ReadableStreamDefaultController.close(controller)
+            case next_chunk do
+              :done ->
+                Web.ReadableStreamDefaultController.close(controller)
 
-            chunk ->
-              Web.ReadableStreamDefaultController.enqueue(controller, chunk)
+              chunk ->
+                Web.ReadableStreamDefaultController.enqueue(controller, chunk)
+            end
+          end,
+          cancel: fn _reason ->
+            # coveralls-ignore-start
+            if Process.alive?(enumerator_pid) do
+              send(enumerator_pid, :stop)
+            end
+
+            # coveralls-ignore-stop
           end
-        end,
-        cancel: fn _reason ->
-          # coveralls-ignore-start
-          if Process.alive?(enumerator_pid) do
-            send(enumerator_pid, :stop)
-          end
-
-          # coveralls-ignore-stop
-        end
-      })
+        },
+        cancel_on_reader_exit: true
+      )
     else
       raise ArgumentError, "cannot normalize body from #{inspect(enumerable)}"
     end
@@ -378,10 +383,25 @@ defmodule Web.ReadableStream do
             end
         end
 
-      # coveralls-ignore-next-line
       :stop ->
-        :ok
+        halt_enumerator(state)
     end
+  end
+
+  # coveralls-ignore-next-line
+  defp halt_enumerator(:done), do: :ok
+  # coveralls-ignore-next-line
+  defp halt_enumerator({:initial, _enumerable}), do: :ok
+
+  defp halt_enumerator({:continuation, continuation}) do
+    _ = continuation.({:halt, nil})
+    :ok
+  rescue
+    # coveralls-ignore-next-line
+    _error -> :ok
+  catch
+    # coveralls-ignore-next-line
+    _kind, _reason -> :ok
   end
 
   defp ask_enumerator(pid) do

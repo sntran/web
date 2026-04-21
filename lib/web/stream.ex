@@ -113,7 +113,8 @@ defmodule Web.Stream do
     backpressure: false,
     # Shared
     timeout_ms: 30_000,
-    error_reason: nil
+    error_reason: nil,
+    cancel_on_reader_exit: false
   ]
 
   # ---------------------------------------------------------------------------
@@ -178,6 +179,7 @@ defmodule Web.Stream do
       module: module,
       type: type,
       impl_state: impl_state,
+      cancel_on_reader_exit: Keyword.get(opts, :cancel_on_reader_exit, false),
       hwm: hwm,
       readable_hwm: readable_hwm,
       writable_hwm: writable_hwm,
@@ -690,10 +692,10 @@ defmodule Web.Stream do
   end
 
   # Task DOWN monitoring
-  defp handle_common(:info, {:DOWN, ref, :process, _pid, reason}, _state, data) do
+  defp handle_common(:info, {:DOWN, ref, :process, _pid, reason}, state, data) do
     cond do
       ref == data.reader_ref ->
-        {:keep_state, %{data | reader_pid: nil, reader_ref: nil}}
+        maybe_cancel_on_reader_exit(reason, state, data)
 
       ref == data.writer_ref ->
         {:keep_state, %{data | writer_pid: nil, writer_ref: nil}}
@@ -1443,6 +1445,15 @@ defmodule Web.Stream do
 
       {%{data | enqueue_waiters: :queue.new()}, actions}
     end
+  end
+
+  defp maybe_cancel_on_reader_exit(reason, state, %{cancel_on_reader_exit: true} = data)
+       when state not in [:closed, :errored] do
+    handle_termination(:cancel, {:reader_down, reason}, data)
+  end
+
+  defp maybe_cancel_on_reader_exit(_reason, _state, data) do
+    {:keep_state, %{data | reader_pid: nil, reader_ref: nil}}
   end
 
   defp handle_terminate_request(type, reason, state, data) do

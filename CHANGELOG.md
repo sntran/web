@@ -50,6 +50,15 @@ All notable changes to this project are documented in this file.
 - `Web.ReadableStream.new/2` now accepts explicit queueing options and
   inherits high-water-mark and strategy metadata from the underlying source
   when present.
+- `Web.Dispatcher.TCP` now routes all body streaming through a dedicated
+  bridge built on `Web.Socket`, pulling exactly on downstream demand instead
+  of autonomously pumping the transport.
+- `Web.Dispatcher.TCP` now normalizes request bodies before connect-time
+  writes, accepting `nil`, binaries, iodata, `ReadableStream` bodies, and
+  enumerable iodata while rejecting unreadable payloads with `TypeError`.
+- `Web.Socket` readable streams and `ReadableStream.from/1` enumerable-backed
+  streams now opt into reader-owner revocation, so reader death cancels the
+  underlying producer path automatically.
 - `Web.ReadableStream.tee/1` now provisions branch `TransformStream`
   readable-side strategy metadata explicitly so branch backpressure matches
   the configured buffer size.
@@ -83,6 +92,25 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.Dispatcher.TCP` now seals end-to-end TCP backpressure by reading from
+  the socket only inside the proxy stream's `pull` callback, allowing the
+  socket transport to enter passive mode once its internal readable high-water
+  mark is saturated.
+- `Web.Dispatcher.TCP` cancellation, abort, reader-owner exit, and mid-pull
+  socket failures now all converge on prompt bridge shutdown, socket close,
+  and capability revocation without leaking reader locks.
+- `Web.ReadableStream.from/1` now halts suspended enumerable continuations on
+  cancellation, ensuring `Stream.resource/3` finalizers run even when the
+  stream is cancelled before exhaustion.
+- `Web.Stream` now supports optional `cancel_on_reader_exit` handling for
+  readable producers, allowing transports and enumerable helpers to revoke
+  themselves as soon as the locked reader disappears.
+- `Web.Socket` write failures now close the readable side cleanly while
+  surfacing the write error through the writable side, instead of reporting a
+  generic transport teardown across both directions.
+- Added targeted dispatcher and compression termination coverage, restoring
+  the full suite to stable `100.0%` coverage with empirical TCP saturation
+  proof and strict Credo compliance for the refactor.
 - `Web.TransformStream` readable queue accounting now falls back to the
   writable-side high-water mark when a supplied readable strategy reports an
   invalid watermark, keeping readiness and desired-size tracking stable.

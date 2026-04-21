@@ -244,7 +244,8 @@ defmodule Web.Socket do
           cancel: fn reason -> cast_target(address, token, {:readable_cancel, reason}) end
         },
         high_water_mark: readable_hwm,
-        strategy: ByteLengthQueuingStrategy.new(readable_hwm)
+        strategy: ByteLengthQueuingStrategy.new(readable_hwm),
+        cancel_on_reader_exit: true
       )
 
     writable =
@@ -299,7 +300,7 @@ defmodule Web.Socket do
       {:reply, :ok, state}
     else
       {:error, reason} ->
-        next_state = shutdown_state(state, {:transport_error, reason}, :transport_error)
+        next_state = shutdown_state(state, {:transport_error, reason}, :write_error)
         {:stop, :normal, {:error, reason}, next_state}
     end
   end
@@ -388,6 +389,12 @@ defmodule Web.Socket do
   defp notify_streams(state, _reason, :transport_closed) do
     ReadableStream.close(state.readable_pid)
     WritableStream.error(state.writable_pid, :closed)
+    state
+  end
+
+  defp notify_streams(state, reason, :write_error) do
+    ReadableStream.close(state.readable_pid)
+    WritableStream.error(state.writable_pid, reason)
     state
   end
 

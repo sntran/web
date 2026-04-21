@@ -393,6 +393,16 @@ defmodule Web.CompressionPBTTest do
       await(WritableStreamDefaultWriter.abort(writer, :test_cancel))
       :ok
     end
+
+    test "DecompressionStream terminate closes the zlib agent" do
+      ds = DecompressionStream.new("gzip")
+      pid = ds.readable.controller_pid
+      agent = Web.ReadableStream.__get_slots__(pid).impl_state.zlib_agent
+
+      Web.Stream.terminate(pid, :cancel, :manual)
+
+      assert wait_until(2_000, fn -> not Process.alive?(agent) end)
+    end
   end
 
   # ---------------------------------------------------------------------------

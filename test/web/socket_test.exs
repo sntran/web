@@ -551,7 +551,6 @@ defmodule Web.SocketTest do
     ssl_error_socket =
       Web.connect("localhost:0",
         secureTransport: "on",
-        ssl_start_fun: fn :ssl -> {:ok, []} end,
         ssl_connect_fun: fn _host, _port, _opts, _timeout -> {:ok, ssl_error_handle} end
       )
 
@@ -565,7 +564,6 @@ defmodule Web.SocketTest do
     ssl_closed_socket =
       Web.connect("localhost:0",
         secureTransport: "on",
-        ssl_start_fun: fn :ssl -> {:ok, []} end,
         ssl_connect_fun: fn _host, _port, _opts, _timeout -> {:ok, ssl_closed_handle} end
       )
 
@@ -634,25 +632,6 @@ defmodule Web.SocketTest do
     assert :closed = await(Socket.close(socket))
   end
 
-  test "start_tls rejects when the connection probe never attached a transport" do
-    socket =
-      Web.connect("localhost:0",
-        secureTransport: "starttls",
-        connect_fun: fn _host, _port, _opts, _timeout -> {:ok, nil} end
-      )
-
-    assert_opened_remote(socket, "localhost:0")
-
-    info = socket_debug(socket)
-    assert info.active == false
-    assert info.transport == :tcp
-    refute Map.has_key?(info, :socket)
-
-    assert :not_connected = catch_exit(await(Socket.start_tls(socket)))
-    assert :closed = await(Socket.close(socket))
-    assert_stopped(socket)
-  end
-
   test "starttls connection failures reject opened and closed" do
     socket =
       Web.connect("localhost:25",
@@ -664,15 +643,24 @@ defmodule Web.SocketTest do
     assert catch_exit(await(socket.closed)) == :starttls_timeout
   end
 
-  test "ssl bootstrap failures reject secure connections" do
+  test "a write that the transport refuses rejects, and the socket closes with the error" do
+    # A socket of Erlang/OTP that is closed: each send gives an error.
+    {:ok, closed} = :gen_tcp.listen(0, [:binary])
+    :ok = :gen_tcp.close(closed)
+
     socket =
-      Web.connect("localhost:443",
-        secureTransport: "on",
-        ssl_start_fun: fn :ssl -> {:error, :ssl_boot_failed} end
+      Web.connect("localhost:0",
+        connect_fun: fn _host, _port, _opts, _timeout -> {:ok, closed} end
       )
 
-    assert :ssl_boot_failed = catch_exit(await(socket.opened))
-    assert catch_exit(await(socket.closed)) == :ssl_boot_failed
+    assert_opened_remote(socket, "localhost:0")
+    writer = Web.WritableStream.get_writer(socket.writable)
+
+    reason = catch_exit(await(WritableStreamDefaultWriter.write(writer, "data")))
+    assert reason in [:closed, :einval]
+    assert catch_exit(await(socket.closed)) == {:transport_error, reason}
+    assert catch_exit(await(WritableStreamDefaultWriter.write(writer, "late"))) == reason
+    assert_stopped(socket)
   end
 
   test "a close of the writer waits for the connection, then closes the socket" do

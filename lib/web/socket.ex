@@ -115,9 +115,8 @@ defmodule Web.Socket do
   `closed` fulfils with `:upgraded`, and its streams end. `options` are
   options of the Erlang application `:ssl`.
 
-  The promise rejects with `:not_starttls`, `:already_tls`, or
-  `:not_connected` when the socket cannot start TLS, and with `:closed` when
-  the socket is closed. It rejects with `{:tls_upgrade_failed, reason}`
+  The promise rejects with `:not_starttls` or `:already_tls` when the socket
+  cannot start TLS, and with `:closed` when the socket is closed. It rejects with `{:tls_upgrade_failed, reason}`
   when the handshake fails: the socket then closes.
   """
   @spec start_tls(t(), map() | keyword()) :: Web.Promise.t()
@@ -339,6 +338,7 @@ defmodule Web.Socket do
     }
   end
 
+  # A request for the tests of this library: the state of the transport.
   defp do_handle_call(:debug, state) do
     {:reply, debug_info(state), state}
   end
@@ -355,24 +355,15 @@ defmodule Web.Socket do
     {:stop, :normal, :ok, next_state}
   end
 
-  # The process of the sink sends the bytes: see `sink_write/2`.
+  # The process of the sink sends the bytes: see `sink_write/2`. The server
+  # handles this request after the connection is open.
   defp do_handle_call(:transport, state) do
-    case ensure_connected(state) do
-      :ok -> {:reply, {:ok, state.transport, state.socket}, state}
-      error -> {:reply, error, state}
-    end
-  end
-
-  defp do_handle_call({:write_failed, reason}, state) do
-    next_state = shutdown_state(state, reason, :write_error)
-    {:stop, :normal, :ok, next_state}
+    {:reply, {:ok, state.transport, state.socket}, state}
   end
 
   defp do_handle_call({:start_tls, options, promises}, state) do
-    with :ok <- ensure_connected(state),
-         :ok <- ensure_starttls(state),
+    with :ok <- ensure_starttls(state),
          :ok <- ensure_tcp(state),
-         :ok <- ensure_ssl_started(state.options),
          {:ok, ssl_socket} <- upgrade_transport(state, options) do
       {next_state, tls_socket} = upgrade_generation(state, ssl_socket, promises)
       {:reply, tls_socket, next_state}
@@ -381,9 +372,6 @@ defmodule Web.Socket do
         {:reply, error, state}
 
       {:error, :not_starttls} = error ->
-        {:reply, error, state}
-
-      {:error, :not_connected} = error ->
         {:reply, error, state}
 
       {:error, reason} ->
@@ -401,6 +389,13 @@ defmodule Web.Socket do
     {:noreply, maybe_resume_transport(state)}
   end
 
+  # A write failed in the process of the sink. The write rejects with its
+  # error, thus the writable side has that error already.
+  defp do_handle_cast({:write_failed, reason}, state) do
+    next_state = shutdown_state(state, reason, :write_error)
+    {:stop, :normal, next_state}
+  end
+
   defp do_handle_cast({:readable_cancel, reason}, state) do
     next_state = shutdown_state(state, {:readable_cancel, reason}, :readable_cancel)
     {:stop, :normal, next_state}
@@ -415,8 +410,6 @@ defmodule Web.Socket do
     ReadableStream.enqueue(state.readable_pid, Web.Uint8Array.from(data))
     maybe_resume_transport(state)
   end
-
-  defp maybe_resume_transport(%{socket: nil} = state), do: state
 
   defp maybe_resume_transport(state) do
     case ReadableStream.get_desired_size(state.readable_pid) do
@@ -585,6 +578,9 @@ defmodule Web.Socket do
 
   defp transport_mode(other), do: {:error, {:unsupported_secure_transport, other}}
 
+  # The options `:connect_fun` and `:ssl_connect_fun` are for the tests of
+  # this library: a test gives a function in the place of the connect
+  # function of Erlang/OTP.
   defp transport_connect(:tcp, state, timeout) do
     connect_fun = Map.get(state.options, :connect_fun, &:gen_tcp.connect/4)
 
@@ -599,18 +595,12 @@ defmodule Web.Socket do
   end
 
   defp transport_connect(:ssl, state, timeout) do
-    with :ok <- ensure_ssl_started(state.options) do
-      connect_fun = Map.get(state.options, :ssl_connect_fun, &:ssl.connect/4)
+    connect_fun = Map.get(state.options, :ssl_connect_fun, &:ssl.connect/4)
+    options = ssl_connect_options(state.options, state.host)
 
-      case connect_fun.(
-             state.endpoint,
-             state.port,
-             ssl_connect_options(state.options, state.host),
-             timeout
-           ) do
-        {:ok, socket} -> {:ok, socket, :ssl}
-        {:error, reason} -> {:error, reason}
-      end
+    case connect_fun.(state.endpoint, state.port, options, timeout) do
+      {:ok, socket} -> {:ok, socket, :ssl}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -623,23 +613,11 @@ defmodule Web.Socket do
     end
   end
 
-  defp ensure_connected(%{socket: nil}), do: {:error, :not_connected}
-  defp ensure_connected(_state), do: :ok
-
   defp ensure_starttls(%{secure_transport: "starttls"}), do: :ok
   defp ensure_starttls(_state), do: {:error, :not_starttls}
 
   defp ensure_tcp(%{transport: :tcp}), do: :ok
   defp ensure_tcp(_state), do: {:error, :already_tls}
-
-  defp ensure_ssl_started(options) do
-    ssl_start_fun = Map.get(options, :ssl_start_fun, &Application.ensure_all_started/1)
-
-    case ssl_start_fun.(:ssl) do
-      {:ok, _apps} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
-  end
 
   defp normalize_payload(chunk) do
     case Bytes.to_binary(chunk) do
@@ -721,6 +699,7 @@ defmodule Web.Socket do
       try do
         Keyword.put(options, :cacerts, :public_key.cacerts_get())
       rescue
+        # Only an operating system with no trust store comes here.
         # coveralls-ignore-next-line
         _error -> Keyword.put(options, :cacertfile, CAStore.file_path())
       end
@@ -793,18 +772,19 @@ defmodule Web.Socket do
     else
       # A chunk that is not bytes is an error of the caller. The write
       # rejects with the `TypeError`, and the socket closes.
-      {:error, %TypeError{} = error} ->
-        _reply = MessageTarget.call(handle, {:write_failed, error})
-        Promise.reject(error)
-
-      # The socket is closed, or it started TLS.
-      {:error, reason} when reason in [:closed, :detached, :not_connected] ->
-        Promise.reject(:closed)
-
-      {:error, reason} ->
-        _reply = MessageTarget.call(handle, {:write_failed, {:transport_error, reason}})
-        Promise.reject(reason)
+      {:error, %TypeError{} = error} -> fail_write(handle, error, error)
+      # The transport failed, or the socket closed during the write.
+      {:error, reason} -> fail_write(handle, {:transport_error, reason}, reason)
     end
+  end
+
+  # The write rejects with `reason`, and the socket closes with
+  # `close_reason`. The server gets the notice with no wait: it stops the
+  # process of the sink when it closes.
+  defp fail_write(handle, close_reason, reason) do
+    rejection = Promise.reject(reason)
+    GenServer.cast(handle.address, {handle.token, {:write_failed, close_reason}})
+    rejection
   end
 
   # A close and an abort of the writable side close the socket.

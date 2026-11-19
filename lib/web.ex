@@ -102,10 +102,11 @@ defmodule Web do
   end
 
   @doc """
-  Awaits a `Web.Promise` and returns its fulfilled value.
+  Waits for a `Web.Promise` and returns its value, as `await` of ECMAScript.
 
   If the promise rejects, the calling process exits with the reason. See
-  `Web.Promise.await/1`.
+  `Web.Promise.await/1`. A value that is not a promise is returned with no
+  change, as in ECMAScript.
 
   ## Examples
 
@@ -114,15 +115,13 @@ defmodule Web do
 
       iex> catch_exit(Web.await(Web.Promise.reject(:not_found)))
       :not_found
+
+      iex> Web.await(:not_a_promise)
+      :not_a_promise
   """
-  defmacro await(expr) do
-    quote do
-      case unquote(expr) do
-        %Web.Promise{} = promise -> Web.Promise.await(promise)
-        other -> raise "await: unexpected result: #{inspect(other)}"
-      end
-    end
-  end
+  @spec await(term()) :: term()
+  def await(%Web.Promise{} = promise), do: Web.Promise.await(promise)
+  def await(value), do: value
 
   @doc """
   Runs a block with a resource, and releases the resource at the end of the

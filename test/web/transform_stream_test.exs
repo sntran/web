@@ -44,7 +44,12 @@ defmodule Web.TransformStreamTest do
     end
 
     test "refuses a transformer that is not valid" do
-      assert_raise TypeError, ~r/must be a map/, fn -> TransformStream.new(:nope) end
+      # The call is not correct for the type checker too, thus the test makes
+      # it at run time.
+      assert_raise TypeError, ~r/must be a map/, fn ->
+        # credo:disable-for-next-line Credo.Check.Refactor.Apply
+        apply(TransformStream, :new, [:nope])
+      end
 
       for {name, bad} <- [
             start: fn -> :ok end,

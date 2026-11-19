@@ -114,10 +114,10 @@ defmodule WebTest do
              catch_exit(await(Web.fetch("mock://error/", dispatcher: MockDispatcher)))
   end
 
-  test "await macro raises on unexpected result" do
-    assert_raise RuntimeError, ~r/await: unexpected result: :something_else/, fn ->
-      await(:something_else)
-    end
+  test "await returns a value that is not a promise, as ECMAScript" do
+    assert await(:something_else) == :something_else
+    # The function needs no require.
+    assert Web.await(Web.Promise.resolve(1)) == 1
   end
 
   test "use Web imports await macro" do

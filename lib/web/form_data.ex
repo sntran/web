@@ -1312,7 +1312,7 @@ defmodule Web.FormData do
       opening_size = byte_size(data.opening_boundary)
 
       case data.buffer do
-        <<opening::binary-size(opening_size), rest::binary>>
+        <<opening::binary-size(^opening_size), rest::binary>>
         when opening == data.opening_boundary ->
           parse_opening_boundary_rest(data, rest)
 

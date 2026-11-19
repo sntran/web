@@ -2,8 +2,6 @@ defmodule Web.StreamDocTest do
   # The examples in the documents of the stream modules.
   use ExUnit.Case, async: true
 
-  require Web
-
   doctest Web.ReadableStream
   doctest Web.ReadableStreamDefaultReader
   doctest Web.ReadableStreamDefaultController

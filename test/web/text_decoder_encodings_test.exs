@@ -33,7 +33,7 @@ defmodule Web.TextDecoderEncodingsTest do
 
   defp divide(binary, [size | sizes]) do
     size = min(size, byte_size(binary))
-    <<head::binary-size(size), rest::binary>> = binary
+    <<head::binary-size(^size), rest::binary>> = binary
     [head | divide(rest, sizes)]
   end
 

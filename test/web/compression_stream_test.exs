@@ -556,7 +556,7 @@ defmodule Web.CompressionPBTTest do
 
   defp do_chunk(binary, size, acc) do
     take = min(byte_size(binary), size)
-    <<chunk::binary-size(take), rest::binary>> = binary
+    <<chunk::binary-size(^take), rest::binary>> = binary
     do_chunk(rest, size, [chunk | acc])
   end
 

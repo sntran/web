@@ -228,7 +228,8 @@ defmodule Web.Dispatcher.HTTPTest do
 
     # The body is shorter than its content length. The reader gets an error,
     # not a part of the body.
-    assert is_exception(body_error(resp))
+    assert %Web.TypeError{message: message} = body_error(resp)
+    assert message =~ "body"
   end
 
   test "fetch/1 handles query variables in path explicitly correctly" do

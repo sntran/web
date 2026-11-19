@@ -219,8 +219,8 @@ defmodule Web.PromiseTest do
       assert await(promise) == :shared
     end
 
-    test "await/1 raises for a value that is not a promise" do
-      assert_raise RuntimeError, ~r/await: unexpected result/, fn -> await(:not_a_promise) end
+    test "await/1 of Web returns a value that is not a promise" do
+      assert await(:not_a_promise) == :not_a_promise
     end
 
     test "wait/1 returns the outcome as data" do

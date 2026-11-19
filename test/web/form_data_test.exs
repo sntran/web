@@ -1442,7 +1442,7 @@ defmodule Web.FormDataTest do
     marker = "--" <> boundary <> "\r\n"
     split_at = byte_size(marker) - 1
 
-    <<left::binary-size(split_at), right::binary>> = payload
+    <<left::binary-size(^split_at), right::binary>> = payload
     stream = ReadableStream.from([left, right])
 
     parsed = Web.FormData.parse(stream, boundary)
@@ -1881,7 +1881,7 @@ defmodule Web.FormDataTest do
 
   defp do_chunk_binary(binary, [size | rest_sizes], original_sizes, acc) do
     current_size = min(size, byte_size(binary))
-    <<chunk::binary-size(current_size), rest::binary>> = binary
+    <<chunk::binary-size(^current_size), rest::binary>> = binary
     do_chunk_binary(rest, rest_sizes, original_sizes, [chunk | acc])
   end
 
@@ -2341,7 +2341,7 @@ defmodule Web.FormDataEdgeTest do
 
   defp do_chunk_binary(binary, [size | rest_sizes], original_sizes, acc) do
     current_size = min(size, byte_size(binary))
-    <<chunk::binary-size(current_size), rest::binary>> = binary
+    <<chunk::binary-size(^current_size), rest::binary>> = binary
     do_chunk_binary(rest, rest_sizes, original_sizes, [chunk | acc])
   end
 

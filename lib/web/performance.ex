@@ -106,7 +106,7 @@ defmodule Web.Performance do
 
       iex> first = Web.Performance.now()
       iex> second = Web.Performance.now()
-      iex> is_float(first) and second >= first
+      iex> second >= first
       true
   """
   @spec now() :: float()

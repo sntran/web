@@ -220,7 +220,10 @@ defmodule Web.PerformanceTest do
       end
 
       assert_raise Web.TypeError, ~r/cannot have an end mark/, fn ->
-        Performance.measure("m", [start: 1], "end")
+        # The call is not correct for the type checker too, thus the test
+        # makes it at run time.
+        # credo:disable-for-next-line Credo.Check.Refactor.Apply
+        apply(Performance, :measure, ["m", [start: 1], "end"])
       end
 
       assert_raise Web.TypeError, ~r/Unknown options/, fn ->

@@ -26,7 +26,7 @@ defmodule Web.CompressionStandardTest do
 
   defp split(binary, [size | sizes]) do
     size = min(size, byte_size(binary))
-    <<head::binary-size(size), rest::binary>> = binary
+    <<head::binary-size(^size), rest::binary>> = binary
     [head | split(rest, sizes)]
   end
 

@@ -38,7 +38,7 @@ defmodule Web.WritableStream do
     ctrl = %WritableStreamDefaultController{pid: pid}
 
     case invoke_sink_callback(sink, :write, [chunk, ctrl]) do
-      %Web.Promise{task: task} -> Task.await(task, :infinity)
+      %Web.Promise{} = promise -> Web.Promise.await(promise)
       _ -> :ok
     end
 
@@ -54,7 +54,7 @@ defmodule Web.WritableStream do
     ctrl = %WritableStreamDefaultController{pid: pid}
 
     case invoke_sink_callback(sink, :close, [ctrl]) do
-      %Web.Promise{task: task} -> Task.await(task, :infinity)
+      %Web.Promise{} = promise -> Web.Promise.await(promise)
       _ -> :ok
     end
 
@@ -173,7 +173,7 @@ defmodule Web.WritableStream do
   end
 
   def close(pid) when is_pid(pid) do
-    Web.Promise.new(fn resolve, _reject ->
+    Web.Promise.detached(fn resolve, _reject ->
       if Process.alive?(pid) do
         :ok = Web.Stream.control_call(pid, {:terminate, :close, nil})
       end
@@ -191,7 +191,7 @@ defmodule Web.WritableStream do
   end
 
   def abort(pid, reason) when is_pid(pid) do
-    Web.Promise.new(fn resolve, _reject ->
+    Web.Promise.detached(fn resolve, _reject ->
       if Process.alive?(pid) do
         :ok = Web.Stream.control_call(pid, {:terminate, :abort, reason})
       end

@@ -79,14 +79,14 @@ defmodule Web.WritableStreamTest do
     assert :ok = WritableStream.get_writer(stream.controller_pid)
     assert :ok = WritableStream.write(stream.controller_pid, "chunk")
     assert :ok = WritableStream.ready(stream.controller_pid)
-    assert :ok = Task.await(WritableStream.close(stream.controller_pid).task, 1_000)
+    assert :ok = Web.Promise.await(WritableStream.close(stream.controller_pid))
     assert {:error, :not_locked_by_writer} = WritableStream.release_lock(stream.controller_pid)
 
     abort_stream = WritableStream.new(%{})
     assert :ok = WritableStream.get_writer(abort_stream.controller_pid)
 
     assert :ok =
-             Task.await(WritableStream.abort(abort_stream.controller_pid, :pid_abort).task, 1_000)
+             Web.Promise.await(WritableStream.abort(abort_stream.controller_pid, :pid_abort))
 
     assert WritableStream.__get_slots__(abort_stream.controller_pid).state == :errored
   end

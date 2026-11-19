@@ -108,25 +108,25 @@ defmodule Web.ReadableStreamTest do
       # PID source
       {:ok, p1} = ReadableStream.start_link(source: parent)
       receive do: ({:pull, ^p1} -> :ok)
-      assert :ok = Task.await(ReadableStream.cancel(p1, :r1).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.cancel(p1, :r1))
       receive do: ({:web_stream_cancel, ^p1, :r1} -> :ok)
 
       # Function source
       {:ok, p2} = ReadableStream.start_link(source: fn x -> send(parent, {:f, x}) end)
       receive do: ({:f, %Web.ReadableStreamDefaultController{pid: ^p2}} -> :ok)
-      assert :ok = Task.await(ReadableStream.cancel(p2, :r2).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.cancel(p2, :r2))
       receive do: ({:f, :r2} -> :ok)
 
       # MFA source
       {:ok, p3} = ReadableStream.start_link(source: {Kernel, :send, [parent]})
       receive do: (%Web.ReadableStreamDefaultController{pid: ^p3} -> :ok)
-      assert :ok = Task.await(ReadableStream.cancel(p3, :r3).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.cancel(p3, :r3))
       receive do: (:r3 -> :ok)
 
       # Nil source
       {:ok, p4} = ReadableStream.start_link(source: nil)
       ReadableStream.enqueue(p4, "a")
-      assert :ok = Task.await(ReadableStream.cancel(p4, :r4).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.cancel(p4, :r4))
     end
 
     test "internal events and desired size", %{controller_pid: pid} do
@@ -447,17 +447,17 @@ defmodule Web.ReadableStreamTest do
 
     test "from/1 enumerable cancellation and nil-source cancel paths do not crash" do
       stream = ReadableStream.from(1..10)
-      assert :ok = Task.await(ReadableStream.cancel(stream.controller_pid, :stop_now).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.cancel(stream.controller_pid, :stop_now))
 
       {:ok, nil_pid} = ReadableStream.start_link(source: nil)
-      assert :ok = Task.await(ReadableStream.cancel(nil_pid, :noop).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.cancel(nil_pid, :noop))
       assert ReadableStream.__get_slots__(nil_pid).state == :closed
     end
 
     test "from/1 blob cancellation stops the lazy parts queue" do
       stream = ReadableStream.from(Web.Blob.new(["a", "b", "c"]))
 
-      assert :ok = Task.await(ReadableStream.cancel(stream.controller_pid, :stop_now).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.cancel(stream.controller_pid, :stop_now))
 
       assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
     end
@@ -874,7 +874,7 @@ defmodule Web.ReadableStreamTest do
       assert Process.alive?(task_pid)
 
       # Cancel stream
-      assert :ok = Task.await(ReadableStream.cancel(stream.controller_pid, :abort).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.cancel(stream.controller_pid, :abort))
 
       # Task should be shut down
       Process.sleep(100)
@@ -1032,7 +1032,7 @@ defmodule Web.ReadableStreamTest do
       {:ok, pid} = ReadableStream.start_link()
       stream = %ReadableStream{controller_pid: pid}
       result = ReadableStream.cancel(stream, :test_cancel)
-      assert :ok == Task.await(result.task, 1_000)
+      assert :ok == Web.Promise.await(result)
     end
 
     # --- await_stream_state retry loop (lines 741-742) ---
@@ -1044,7 +1044,7 @@ defmodule Web.ReadableStreamTest do
       stream = %ReadableStream{controller_pid: pid}
       ReadableStream.enqueue(pid, "a")
       cancel_promise = ReadableStream.cancel(stream, :slow_cancel)
-      assert :ok == Task.await(cancel_promise.task, 2_000)
+      assert :ok == Web.Promise.await(cancel_promise)
     end
 
     # --- safe_get_slots dead-pid catch (line 749) ---
@@ -1057,7 +1057,7 @@ defmodule Web.ReadableStreamTest do
       Process.sleep(20)
       refute Process.alive?(pid)
       cancel_promise = ReadableStream.cancel(stream, :already_dead)
-      assert :ok == Task.await(cancel_promise.task, 1_000)
+      assert :ok == Web.Promise.await(cancel_promise)
     end
 
     # --- desired_size/1 (ReadableStreamDefaultController line 61) ---

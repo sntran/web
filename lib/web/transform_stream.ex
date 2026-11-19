@@ -46,7 +46,7 @@ defmodule Web.TransformStream do
         ctrl = %Web.ReadableStreamDefaultController{pid: pid}
 
         case start_fn.(ctrl) do
-          %Web.Promise{task: task} -> Task.await(task, :infinity)
+          %Web.Promise{} = promise -> Web.Promise.await(promise)
           _ -> :ok
         end
 
@@ -73,7 +73,7 @@ defmodule Web.TransformStream do
       end
 
     case result do
-      %Web.Promise{task: task} -> Task.await(task, :infinity)
+      %Web.Promise{} = promise -> Web.Promise.await(promise)
       _ -> :ok
     end
 
@@ -94,7 +94,7 @@ defmodule Web.TransformStream do
       end
 
     case result do
-      %Web.Promise{task: task} -> Task.await(task, :infinity)
+      %Web.Promise{} = promise -> Web.Promise.await(promise)
       _ -> :ok
     end
 

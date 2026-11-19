@@ -101,6 +101,9 @@ defmodule Web do
   @doc """
   Awaits a `Web.Promise` and returns its fulfilled value.
 
+  If the promise rejects, the calling process exits with the reason. See
+  `Web.Promise.await/1`.
+
   ## Examples
 
       iex> Web.await(Web.Promise.resolve("success"))
@@ -112,19 +115,8 @@ defmodule Web do
   defmacro await(expr) do
     quote do
       case unquote(expr) do
-        %Web.Promise{task: task} ->
-          try do
-            Task.await(task, :infinity)
-          catch
-            :exit, {{:shutdown, reason}, {Task, :await, _details}} ->
-              exit(reason)
-
-            :exit, reason ->
-              exit(reason)
-          end
-
-        other ->
-          raise "await: unexpected result: #{inspect(other)}"
+        %Web.Promise{} = promise -> Web.Promise.await(promise)
+        other -> raise "await: unexpected result: #{inspect(other)}"
       end
     end
   end

@@ -256,8 +256,7 @@ defmodule Web.BroadcastChannel.Dispatcher do
           fun.()
           :ok
         end)
-        |> Map.fetch!(:task)
-        |> Task.await(:infinity)
+        |> Web.Promise.await()
     end
   end
 

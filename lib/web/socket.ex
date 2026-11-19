@@ -670,12 +670,14 @@ defmodule Web.Socket do
   end
 
   defp deferred_promise do
-    {promise, resolve, reject} = Promise.with_resolvers()
+    # The `opened`, `closed`, and `upgraded` promises are attributes of the
+    # socket. A caller can await them at any time, thus they do not expire.
+    {promise, resolve, reject} = Promise.with_resolvers(linger: :infinity)
     {promise, %{resolve: resolve, reject: reject}}
   end
 
   defp promise_request(%__MODULE__{} = socket, body) do
-    Promise.new(fn resolve, reject ->
+    Promise.detached(fn resolve, reject ->
       case request_target(socket.address, socket.token, body, @call_timeout) do
         {:error, reason} -> reject.(reason)
         value -> resolve.(value)
@@ -684,7 +686,7 @@ defmodule Web.Socket do
   end
 
   defp write_promise(address, token, chunk, timeout) do
-    Promise.new(fn resolve, reject ->
+    Promise.detached(fn resolve, reject ->
       case request_target(address, token, {:write, chunk}, timeout) do
         :ok -> resolve.(:ok)
         {:error, reason} -> reject.(reason)
@@ -693,7 +695,7 @@ defmodule Web.Socket do
   end
 
   defp close_promise(address, token, timeout) do
-    Promise.new(fn resolve, reject ->
+    Promise.detached(fn resolve, reject ->
       case request_target(address, token, {:close, :closed}, timeout) do
         :ok -> resolve.(:ok)
         {:error, reason} -> reject.(reason)
@@ -702,7 +704,7 @@ defmodule Web.Socket do
   end
 
   defp abort_promise(address, token, reason, timeout) do
-    Promise.new(fn resolve, reject ->
+    Promise.detached(fn resolve, reject ->
       case request_target(address, token, {:close, :closed}, timeout) do
         :ok -> resolve.(:ok)
         {:error, abort_reason} -> reject.({reason, abort_reason})

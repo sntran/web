@@ -104,7 +104,7 @@ defmodule Web.ReadableStream do
   defp controller_for(:bytes, pid), do: %ReadableByteStreamController{pid: pid}
   defp controller_for(:default, pid), do: %Web.ReadableStreamDefaultController{pid: pid}
 
-  defp await_pull_result(%Promise{task: task}), do: Task.await(task, :infinity)
+  defp await_pull_result(%Promise{} = promise), do: Promise.await(promise)
   defp await_pull_result(_result), do: :ok
 
   defp do_terminate(reason, source) do
@@ -577,7 +577,7 @@ defmodule Web.ReadableStream do
   end
 
   def cancel(pid, reason) do
-    Promise.new(fn resolve, _reject ->
+    Promise.detached(fn resolve, _reject ->
       if Process.alive?(pid) do
         :ok = Web.Stream.control_call(pid, {:terminate, :cancel, reason})
       end
@@ -659,7 +659,7 @@ defmodule Web.ReadableStream do
   - `:signal` - optional `%Web.AbortSignal{}` to interrupt piping
   """
   def pipe_to(readable, writable, options \\ []) do
-    Promise.new(fn resolve, reject ->
+    Promise.detached(fn resolve, reject ->
       reader = nil
       writer = nil
 
@@ -931,8 +931,7 @@ defmodule Web.ReadableStream do
   end
 
   defp tee_await_all(promises) do
-    %Promise{task: task} = Promise.all(promises)
-    Task.await(task, :infinity)
+    promises |> Promise.all() |> Promise.await()
   end
 
   defp tee_await_source_lock(pid) do
@@ -995,18 +994,8 @@ defimpl Enumerable, for: Web.ReadableStream do
   end
 
   defp do_reduce(reader, {:cont, acc}, fun) do
-    %Web.Promise{task: task} = ReadableStreamDefaultReader.read(reader)
-
-    result =
-      try do
-        Task.await(task, :infinity)
-      catch
-        :exit, reason ->
-          {:__rejected__, normalize_reader_exit_reason(reason)}
-      end
-
-    case result do
-      {:__rejected__, _reason} ->
+    case Web.Promise.wait(ReadableStreamDefaultReader.read(reader)) do
+      {:rejected, _reason} ->
         try do
           ReadableStreamDefaultReader.release_lock(reader)
         rescue
@@ -1016,7 +1005,7 @@ defimpl Enumerable, for: Web.ReadableStream do
 
         raise Web.TypeError, "The stream is errored."
 
-      %{done: true} ->
+      {:fulfilled, %{done: true}} ->
         try do
           ReadableStreamDefaultReader.release_lock(reader)
         rescue
@@ -1026,7 +1015,7 @@ defimpl Enumerable, for: Web.ReadableStream do
 
         {:done, acc}
 
-      %{value: chunk, done: false} ->
+      {:fulfilled, %{value: chunk, done: false}} ->
         try do
           do_reduce(reader, fun.(chunk, acc), fun)
         rescue
@@ -1046,10 +1035,4 @@ defimpl Enumerable, for: Web.ReadableStream do
   def count(_stream), do: {:error, __MODULE__}
   def member?(_stream, _element), do: {:error, __MODULE__}
   def slice(_stream), do: {:error, __MODULE__}
-
-  defp normalize_reader_exit_reason({{:shutdown, reason}, {Task, :await, _}}), do: reason
-  # coveralls-ignore-next-line
-  defp normalize_reader_exit_reason({:shutdown, reason}), do: reason
-  # coveralls-ignore-next-line
-  defp normalize_reader_exit_reason(reason), do: reason
 end

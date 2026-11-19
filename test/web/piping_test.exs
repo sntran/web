@@ -27,7 +27,7 @@ defmodule Web.PipingTest do
 
     promise = ReadableStream.pipe_to(source, sink)
 
-    assert Task.await(promise.task, 1_000) == :ok
+    assert Web.Promise.await(promise) == :ok
     assert_receive {:chunk, "a"}
     assert_receive {:chunk, "b"}
     assert_receive {:chunk, "c"}
@@ -80,7 +80,7 @@ defmodule Web.PipingTest do
 
     promise = ReadableStream.pipe_to(source, sink, preventClose: true)
 
-    assert Task.await(promise.task, 1_000) == :ok
+    assert Web.Promise.await(promise) == :ok
     refute_received :sink_closed
     assert WritableStream.__get_slots__(sink.controller_pid).state == :writable
   end
@@ -232,7 +232,7 @@ defmodule Web.PipingTest do
       })
 
     promise = ReadableStream.pipe_to(source.controller_pid, sink.controller_pid)
-    assert Task.await(promise.task, 1_000) == :ok
+    assert Web.Promise.await(promise) == :ok
   end
 
   test "pipe_to/3 fails fast when source or sink is already locked" do
@@ -341,7 +341,7 @@ defmodule Web.PipingTest do
     promise = ReadableStream.pipe_to(source, sink, signal: :pipe_token)
 
     assert_receive :token_pull_started
-    send(promise.task.pid, {:abort, :pipe_token, :token_reason})
+    send(pipe_process(source), {:abort, :pipe_token, :token_reason})
 
     assert catch_exit(await(promise)) == {:aborted, :token_reason}
     assert_receive {:token_source_cancelled, :token_reason}
@@ -377,10 +377,22 @@ defmodule Web.PipingTest do
     promise = ReadableStream.pipe_to(source, sink, signal: :pipe_token_default)
 
     assert_receive :token_default_pull_started
-    send(promise.task.pid, {:abort, :pipe_token_default})
+    send(pipe_process(source), {:abort, :pipe_token_default})
 
     assert catch_exit(await(promise)) == {:aborted, :aborted}
     assert_receive {:token_default_source_cancelled, :aborted}
     assert_receive {:token_default_sink_aborted, :aborted}
+  end
+
+  # The process that does the pipe holds the reader lock of the source.
+  defp pipe_process(%ReadableStream{controller_pid: pid}, attempts \\ 100) do
+    case ReadableStream.__get_slots__(pid).reader_pid do
+      nil when attempts > 0 ->
+        Process.sleep(5)
+        pipe_process(%ReadableStream{controller_pid: pid}, attempts - 1)
+
+      reader_pid ->
+        reader_pid
+    end
   end
 end

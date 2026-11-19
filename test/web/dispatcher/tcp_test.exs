@@ -227,7 +227,7 @@ defmodule Web.Dispatcher.TCPTest do
       120
     )
 
-    assert :ok = Task.await(ReadableStream.cancel(resp.body, :backpressure_proven).task, 1_000)
+    assert :ok = Web.Promise.await(ReadableStream.cancel(resp.body, :backpressure_proven))
     assert_receive :tcp_client_closed, 1_000
   end
 
@@ -429,7 +429,7 @@ defmodule Web.Dispatcher.TCPTest do
     {:ok, resp} = TCP.fetch(req)
 
     assert %ReadableStream{} = resp.body
-    assert :ok = Task.await(ReadableStream.cancel(resp.body, :manual_cancel).task, 1_000)
+    assert :ok = Web.Promise.await(ReadableStream.cancel(resp.body, :manual_cancel))
     assert_receive :tcp_client_closed, 1_000
   end
 

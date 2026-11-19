@@ -96,13 +96,11 @@ defmodule Web.Governor do
   defp invoke_fun(fun, _token) when is_function(fun, 0), do: fun.()
   defp invoke_fun(fun, token) when is_function(fun, 1), do: fun.(token)
 
-  defp await_settled(%Promise{task: task}) do
-    {:ok, Task.await(task, :infinity)}
-  catch
-    :exit, {{:shutdown, reason}, {Task, :await, _details}} -> {:error, reason}
-    # coveralls-ignore-next-line
-    :exit, {:shutdown, reason} -> {:error, reason}
-    :exit, reason -> {:error, reason}
+  defp await_settled(%Promise{} = promise) do
+    case Promise.wait(promise) do
+      {:fulfilled, value} -> {:ok, value}
+      {:rejected, reason} -> {:error, reason}
+    end
   end
 
   defp await_settled(value), do: {:ok, value}

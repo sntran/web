@@ -275,7 +275,7 @@ defmodule Web.StreamTest do
 
       # Cancel the stream
       assert :ok =
-               Task.await(ReadableStream.cancel(stream.controller_pid, :user_cancel).task, 1_000)
+               Web.Promise.await(ReadableStream.cancel(stream.controller_pid, :user_cancel))
 
       assert_receive {:cancelled, :user_cancel}
       assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
@@ -473,7 +473,7 @@ defmodule Web.StreamTest do
         })
 
       assert :ok =
-               Task.await(ReadableStream.cancel(ts.readable.controller_pid, :stop).task, 1_000)
+               Web.Promise.await(ReadableStream.cancel(ts.readable.controller_pid, :stop))
 
       assert_receive {:transform_cancelled, :stop}
     end
@@ -554,7 +554,7 @@ defmodule Web.StreamTest do
 
     test "terminate without cancel function completes gracefully on cancel" do
       ts = TransformStream.new(%{})
-      assert :ok = Task.await(ReadableStream.cancel(ts.readable.controller_pid).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.cancel(ts.readable.controller_pid))
       slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
       assert slots.state == :closed
     end
@@ -1348,7 +1348,7 @@ defmodule Web.StreamTest do
       {:ok, shutdown_pid} =
         PromiseResultReadableStream.start_link(
           promise_factory: fn ->
-            %Web.Promise{task: Task.async(fn -> exit({:shutdown, :promise_shutdown}) end)}
+            Web.Promise.reject(:promise_shutdown)
           end
         )
 
@@ -1373,7 +1373,7 @@ defmodule Web.StreamTest do
       {:ok, generic_exit_pid} =
         PromiseResultReadableStream.start_link(
           promise_factory: fn ->
-            %Web.Promise{task: Task.async(fn -> exit(:promise_boom) end)}
+            Web.Promise.new(fn _resolve, _reject -> exit(:promise_boom) end)
           end
         )
 

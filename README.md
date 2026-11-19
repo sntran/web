@@ -113,6 +113,19 @@ pair = await Promise.all([
 
 ```
 
+A promise behaves as it does on the Web. Any process can `await` it, and can
+`await` it more than one time. `Promise.then/2`, `Promise.catch/2`, and
+`Promise.finally/2` return a new promise immediately. `Promise.all/1`,
+`Promise.all_settled/1`, `Promise.any/1`, and `Promise.race/1` accept pending
+promises.
+
+The BEAM has one rule that the Web does not have: a pending promise has an
+owner, which is the process that made it. The promise stops when its owner
+stops. After a promise settles, it keeps its outcome until the first `await`,
+and then for a linger time (5000 ms by default,
+`config :web, promise_linger: ms`). Keep the awaited value, not the promise,
+when you need the value later.
+
 For externally controlled promise settlement, use
 `Promise.with_resolvers/0` to get a promise plus explicit `resolve` and
 `reject` functions.

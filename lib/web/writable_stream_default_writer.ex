@@ -39,7 +39,7 @@ defmodule Web.WritableStreamDefaultWriter do
   # ---------------------------------------------------------------------------
 
   defp promise_call(pid, message) do
-    Web.Promise.new(fn resolve, reject ->
+    Web.Promise.detached(fn resolve, reject ->
       case :gen_statem.call(pid, message, :infinity) do
         :ok -> resolve.(:ok)
         {:error, reason} -> reject.(map_stream_error(reason))

@@ -1876,19 +1876,14 @@ defmodule Web.Stream do
   # adopting its state. Falls back to `fallback` if the promise resolves to
   # something unexpected. Non-promise values pass through unchanged.
   # coveralls-ignore-start
-  defp resolve_if_promise(%Web.Promise{task: task}, fallback) do
-    result = Task.await(task, :infinity)
-
-    case result do
-      {:ok, _} -> result
-      {:ok, _, _} -> result
-      {:error, _} -> result
-      _ -> fallback
+  defp resolve_if_promise(%Web.Promise{} = promise, fallback) do
+    case Web.Promise.wait(promise) do
+      {:fulfilled, {:ok, _} = result} -> result
+      {:fulfilled, {:ok, _, _} = result} -> result
+      {:fulfilled, {:error, _} = result} -> result
+      {:fulfilled, _other} -> fallback
+      {:rejected, reason} -> {:error, reason}
     end
-  catch
-    :exit, {:shutdown, reason} -> {:error, reason}
-    :exit, {{:shutdown, reason}, _} -> {:error, reason}
-    :exit, reason -> {:error, reason}
   end
 
   # coveralls-ignore-stop

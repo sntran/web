@@ -2,10 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased] - 2026-04-20
+## [Unreleased] - 2026-11-19
 
 ### Added
 
+- `Web.Promise.finally/2`, `Web.Promise.await/1`, and `Web.Promise.wait/1`.
+  `wait/1` returns the outcome as `{:fulfilled, value}` or
+  `{:rejected, reason}`.
+- The options `:linger` and `:detached` for `Web.Promise.new/2`, and the
+  option `:linger` for `Web.Promise.with_resolvers/1`.
+- The application setting `config :web, promise_linger: ms` for the default
+  linger time of a promise. The default is 5000 ms.
+- Tests that count the processes of the VM, to find promises that a
+  long-lived process keeps.
 - `Web.Promise.with_resolvers/0` for externally settled promises with explicit
   `resolve` and `reject` functions, including creator-lifecycle cleanup when
   the owning process exits before settlement.
@@ -57,6 +66,33 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Breaking:** `Web.Promise` has a new engine. A pending promise is a small
+  process, not a `Task`. The struct has the fields `:pid` and `:state`, and
+  the field `:task` is removed.
+  - Any process can await a promise, and can await it more than one time.
+  - The executor can call `resolve` or `reject` at a later time, from any
+    process. A promise stays pending when its executor returns and does not
+    settle it. Before, the promise resolved to `nil`.
+  - `then/2` and `catch/2` return immediately. The callback runs in a
+    different process, with the `Web.AsyncContext` values of the caller.
+    Before, these functions blocked the caller.
+  - `all/1`, `all_settled/1`, `any/1`, and `race/1` work with pending
+    promises. `race/1` does not stop the other promises.
+  - A rejection is a state. The combinators handle the value
+    `{:error, reason}` as a usual value. Before, `all_settled/1`, `any/1`,
+    and `race/1` handled it as a rejection.
+  - `resolve/1` and `reject/1` return plain data and start no process.
+    `resolve/1` does not accept a `Task`.
+  - A pending promise stops when its owner stops, and the work of its
+    executor stops at the same time. Commands to a stream or a socket
+    (`cancel`, `close`, `abort`, `write`, `pipe_to`) continue to their end.
+  - A settled promise keeps its outcome until its first delivery, and then
+    for the linger time. An `await` after that time rejects with
+    `Web.TypeError`. The `opened`, `closed`, and `upgraded` promises of
+    `Web.Socket` do not expire.
+- The WPT fixtures are pinned to one commit of `web-platform-tests/wpt`
+  (`@wpt_revision` in `test/support/wpt.ex`). A change upstream cannot change
+  the test results.
 - `Web.ReadableStream.new/2` now recognizes `%{type: "bytes"}` sources,
   provisions byte-length queueing defaults, supports `get_reader(..., mode:
   "byob")`, and surfaces pending BYOB requests through

@@ -118,7 +118,7 @@ defmodule Web.Dispatcher.TCP do
 
       # coveralls-ignore-start
       {:DOWN, ^bridge_monitor, :process, ^bridge_pid, reason} ->
-        {:error, normalize_await_exit_reason(reason)}
+        {:error, normalize_exit_reason(reason)}
         # coveralls-ignore-stop
     after
       @bridge_boot_timeout ->
@@ -400,17 +400,17 @@ defmodule Web.Dispatcher.TCP do
     :exit, _reason -> :ok
   end
 
-  defp await_promise(%Web.Promise{task: task}) do
-    {:ok, Task.await(task, :infinity)}
-  catch
-    :exit, reason -> {:error, normalize_await_exit_reason(reason)}
-  end
+  # coveralls-ignore-start
+  defp normalize_exit_reason({:shutdown, reason}), do: reason
+  defp normalize_exit_reason(reason), do: reason
+  # coveralls-ignore-stop
 
-  defp normalize_await_exit_reason({{:shutdown, reason}, {Task, :await, _details}}), do: reason
-  # coveralls-ignore-next-line
-  defp normalize_await_exit_reason({:shutdown, reason}), do: reason
-  # coveralls-ignore-next-line
-  defp normalize_await_exit_reason(reason), do: reason
+  defp await_promise(%Web.Promise{} = promise) do
+    case Web.Promise.wait(promise) do
+      {:fulfilled, value} -> {:ok, value}
+      {:rejected, reason} -> {:error, reason}
+    end
+  end
 
   defp release_writer_lock(writer) do
     WritableStream.release_lock(writer.controller_pid, writer.owner_pid)

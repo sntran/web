@@ -1,7 +1,6 @@
 defmodule Web.GovernorTest do
   use ExUnit.Case, async: false
 
-  import ExUnit.CaptureLog
   import Web, only: [await: 1]
 
   alias Web.AbortableGovernor
@@ -272,38 +271,47 @@ defmodule Web.GovernorTest do
     assert :closed == catch_exit(await(Governor.with(governor, fn -> :ok end)))
   end
 
-  test "Governor.with/2 propagates task exits returned as promise tasks" do
+  test "Governor.with/2 gives the rejection of a promise that the callback returns" do
     governor = CountingGovernor.new(1)
 
-    capture_log(fn ->
-      assert :task_shutdown ==
-               catch_exit(
-                 await(
-                   Governor.with(governor, fn ->
-                     %Promise{
-                       task:
-                         Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
-                           exit({:shutdown, :task_shutdown})
-                         end)
-                     }
-                   end)
-                 )
+    assert :callback_rejected ==
+             catch_exit(
+               await(
+                 Governor.with(governor, fn ->
+                   Promise.new(fn _resolve, reject -> reject.(:callback_rejected) end)
+                 end)
                )
+             )
 
-      assert {:task_exit, {Task, :await, _}} =
-               catch_exit(
-                 await(
-                   Governor.with(governor, fn ->
-                     %Promise{
-                       task:
-                         Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
-                           exit(:task_exit)
-                         end)
-                     }
-                   end)
-                 )
-               )
-    end)
+    assert :settled_rejection ==
+             catch_exit(
+               await(Governor.with(governor, fn -> Promise.reject(:settled_rejection) end))
+             )
+
+    eventually(fn -> governor_state(governor).in_use == 0 end)
+  end
+
+  test "Governor.with/2 limits pending promises to the capacity" do
+    governor = CountingGovernor.new(2)
+    counter = :counters.new(2, [])
+
+    work = fn ->
+      Promise.new(fn resolve, _reject ->
+        :counters.add(counter, 1, 1)
+        active = :counters.get(counter, 1)
+        if active > :counters.get(counter, 2), do: :counters.put(counter, 2, active)
+        Process.sleep(20)
+        :counters.sub(counter, 1, 1)
+        resolve.(active)
+      end)
+    end
+
+    promises = for _ <- 1..8, do: Governor.with(governor, work)
+    results = await(Promise.all(promises))
+
+    assert length(results) == 8
+    assert :counters.get(counter, 2) == 2
+    eventually(fn -> governor_state(governor).in_use == 0 end)
   end
 
   test "acquire_abortable/1 is best-effort after grant" do

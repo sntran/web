@@ -15,6 +15,15 @@ All notable changes to this project are documented in this file.
   settled promise or an ended stream stays available. The default is 5000 ms.
 - Tests that count the processes of the VM, to find streams that stay after
   their work is complete.
+- TLA+ specifications in the directory `tla/` for the promise, the lifetime
+  of a stream, the abort signal, and the body of a `fetch` response.
+  `mix test` examines each specification with the native checker of the
+  package `accord`, which needs no Java. Each specification has a constant
+  `Bug`. Each value of `Bug` removes one rule of the design, and a test
+  makes sure that the checker then finds the violation.
+- Conformance tests in `test/tla/`. They do random operations on the real
+  promise, stream, and signal, do the same steps on the specification, and
+  compare the two states after each step.
 - The application setting `config :web, unread_body_timeout: ms` for the
   body of a `Web.fetch/2` response. A body that no process starts to read in
   that time releases its connection, and a later read rejects. The default

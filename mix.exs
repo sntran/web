@@ -75,6 +75,10 @@ defmodule Web.MixProject do
       {:jason, "~> 1.4"},
       {:benchee, "~> 1.5", only: [:dev, :test]},
       {:stream_data, "~> 1.3", only: :test},
+      # The TLA+ model checker, in Elixir. It checks the specifications in
+      # `tla/`, and the property tests use it to compare the code with them.
+      {:accord,
+       github: "sntran/accord", branch: "feat/native-tla-checker", only: :test, runtime: false},
       {:excoveralls, "~> 0.18", only: :test},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false}

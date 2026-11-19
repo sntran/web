@@ -411,6 +411,29 @@ mix precommit
 mix test --cover
 ```
 
+### Specifications
+
+The directory `tla/` has TLA+ specifications of the parts where an error is
+easy to make and hard to find with an example test:
+
+| Specification        | Subject                                                    |
+| -------------------- | ---------------------------------------------------------- |
+| `Promise.tla`        | One promise: it settles one time, and it stops.            |
+| `StreamLifetime.tla` | When a stream process stops, and when it must stay.        |
+| `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
+| `ResponseBody.tla`   | The body of a response: all its chunks, or an error.       |
+
+`mix test` examines each specification with the checker of
+[`accord`](https://github.com/sntran/accord), which is written in Elixir and
+needs no Java. The tests in `test/tla/` also do random operations on the
+real code and on the specification together, and compare the two states
+after each step.
+
+```shell
+# Examine the specifications and run the conformance tests
+mix test test/tla
+```
+
 * * * * *
 
 Built with ❤️ for the Elixir community.

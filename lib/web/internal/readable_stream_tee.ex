@@ -180,22 +180,30 @@ defmodule Web.Internal.ReadableStreamTee do
     %{state | request: request, pull_wanted?: false}
   end
 
+  # The message is the reply to the read that is in progress, the reply to
+  # the request for the end of the source, or a message with no use.
   defp handle_response(message, state) do
-    case check_response(message, state.request) do
-      {:reply, reply} -> handle_read(reply, %{state | request: nil})
-      {:error, {_reason, _server}} -> handle_read({:error, :released}, %{state | request: nil})
-      :no_reply -> handle_closed_response(message, state)
-    end
-  end
+    read = check_response(message, state.request)
+    closed = check_response(message, state.closed_request)
 
-  # The source is errored, or it stopped. A source that is closed has no
-  # effect here: the read that gets the end closes the branches.
-  defp handle_closed_response(message, state) do
-    case check_response(message, state.closed_request) do
-      {:reply, {:error, {:errored, _reason} = error}} -> handle_read({:error, error}, state)
-      {:reply, _closed_or_released} -> {:noreply, %{state | closed_request: nil}}
-      {:error, {_reason, _server}} -> handle_read({:error, :released}, state)
-      :no_reply -> {:noreply, state}
+    case {read, closed} do
+      {{:reply, reply}, _closed} ->
+        handle_read(reply, %{state | request: nil})
+
+      # The source is errored. A source that is closed has no effect here:
+      # the read that gets the end closes the branches.
+      {_read, {:reply, {:error, {:errored, _reason} = error}}} ->
+        handle_read({:error, error}, state)
+
+      {_read, {:reply, _closed_or_released}} ->
+        {:noreply, %{state | closed_request: nil}}
+
+      {:no_reply, :no_reply} ->
+        {:noreply, state}
+
+      # The source stopped: one of the two requests got no reply.
+      _source_stopped ->
+        handle_read({:error, :released}, %{state | request: nil})
     end
   end
 

@@ -399,7 +399,9 @@ defmodule Web.Dispatcher.TCPTest do
   end
 
   test "__debug_await_socket_chunk__/1 maps socket readable cancellation to done" do
-    {:ok, pid} = ReaderReplyServer.start_link({:error, {:readable_cancel, :bridge_cancelled}})
+    # The answer of a stream that has the error of the cancel.
+    reply = {:error, {:errored, {:readable_cancel, :bridge_cancelled}}}
+    {:ok, pid} = ReaderReplyServer.start_link(reply)
     reader = %Web.ReadableStreamDefaultReader{controller_pid: pid}
 
     assert {:done, :bridge_cancelled} = TCP.__debug_await_socket_chunk__(reader)

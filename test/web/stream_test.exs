@@ -15,11 +15,17 @@ defmodule Web.StreamTest do
     @impl Web.Stream
     def start(_pid, _opts), do: {:producer, %{sent?: false}}
 
+    # The first pull gives a chunk and asks for hibernation. The stream is
+    # open at that time, thus the engine uses the result of the pull.
     @impl Web.Stream
     def pull(ctrl, %{sent?: false} = state) do
       Web.ReadableStreamDefaultController.enqueue(ctrl, "x")
-      Web.ReadableStreamDefaultController.close(ctrl)
       {:ok, %{state | sent?: true}, :hibernate}
+    end
+
+    def pull(ctrl, %{sent?: true} = state) do
+      Web.ReadableStreamDefaultController.close(ctrl)
+      {:ok, state}
     end
   end
 
@@ -156,6 +162,13 @@ defmodule Web.StreamTest do
         })
 
       assert "x" == Enum.join(stream, "")
+    end
+
+    test "a cancel of a stream whose module has no callback terminate is complete" do
+      {:ok, pid} = UsingMacroStream.start_link([])
+
+      assert :ok = await(ReadableStream.cancel(%ReadableStream{controller_pid: pid}, :stop))
+      assert ReadableStream.__get_slots__(pid).state == :closed
     end
 
     test "pull callbacks can request hibernation" do

@@ -105,48 +105,27 @@ defmodule Web.CompressionStream do
   def write(chunk, ctrl, %{zlib_agent: agent} = state) do
     bin = to_binary!(chunk, "CompressionStream")
     maybe_log_runtime_event("write", byte_size(bin))
-    result = run_zlib(agent, fn z -> :zlib.deflate(z, bin) end, "CompressionStream")
-
-    case result do
-      {:ok, compressed_chunks} ->
-        for c <- compressed_chunks do
-          ReadableStreamDefaultController.wait_for_capacity(ctrl)
-          ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
-        end
-
-        {:ok, state}
-
-      # coveralls-ignore-start
-      {:error, e} ->
-        stop_agent(agent)
-        raise TypeError, zlib_error_message(e)
-        # coveralls-ignore-stop
+    # A deflate of bytes cannot fail.
+    for c <- Agent.get(agent, fn z -> :zlib.deflate(z, bin) end) do
+      ReadableStreamDefaultController.wait_for_capacity(ctrl)
+      ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
     end
+
+    {:ok, state}
   end
 
   @impl Web.Stream
   def flush(ctrl, %{zlib_agent: agent} = state) do
     maybe_log_runtime_event("flush", 0)
-    result = run_zlib(agent, fn z -> :zlib.deflate(z, <<>>, :finish) end, "CompressionStream")
-
-    # Always stop the agent — whether flush succeeds or fails.
+    final_chunks = Agent.get(agent, fn z -> :zlib.deflate(z, <<>>, :finish) end)
     stop_agent(agent)
 
-    case result do
-      {:ok, final_chunks} ->
-        # The last chunks do not wait for the reader, thus the close of
-        # the writable side does not need a reader, as in the Streams
-        # Standard.
-        for c <- final_chunks,
-            do: ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
+    # The last chunks do not wait for the reader, thus the close of the
+    # writable side does not need a reader, as in the Streams Standard.
+    for c <- final_chunks,
+        do: ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
 
-        {:ok, state}
-
-      # coveralls-ignore-start
-      {:error, e} ->
-        raise TypeError, zlib_error_message(e)
-        # coveralls-ignore-stop
-    end
+    {:ok, state}
   end
 
   @impl Web.Stream
@@ -172,28 +151,6 @@ defmodule Web.CompressionStream do
   # Stop the Agent idempotently.
   defp stop_agent(agent) do
     if Process.alive?(agent), do: Agent.stop(agent, :normal)
-  end
-
-  defp run_zlib(agent, operation, context) do
-    metadata = runtime_metadata()
-
-    case Agent.get(agent, fn z ->
-           try do
-             {:ok, operation.(z)}
-           rescue
-             # coveralls-ignore-next-line
-             e in ErlangError -> {:error, e}
-           end
-         end) do
-      {:ok, _result} = ok ->
-        ok
-
-      {:error, e} ->
-        # coveralls-ignore-next-line
-        maybe_log_zlib_failure(metadata, context, e)
-
-        {:error, e}
-    end
   end
 
   defp maybe_log_runtime_event(stage, bytes) do
@@ -224,36 +181,4 @@ defmodule Web.CompressionStream do
     context = Map.take(metadata, [:group_depth, :request_id, :user])
     if context == %{}, do: "", else: " metadata=" <> inspect(context)
   end
-
-  defp maybe_log_zlib_failure(metadata, context, error) do
-    # coveralls-ignore-start
-    # CompressionStream's zlib failure logging is defensive only.
-    # On current OTP runtimes the public stream API transitions to an errored
-    # stream before :zlib.deflate/2 surfaces a recoverable ErlangError here.
-    if Map.get(metadata, :web_runtime_observe, false) do
-      Logger.error(
-        runtime_log_prefix(metadata) <>
-          "#{context} zlib failure: #{Exception.message(error)}#{runtime_context_suffix(metadata)}"
-      )
-    end
-
-    # coveralls-ignore-stop
-  end
-
-  # coveralls-ignore-start
-  # All zlib_error_message clauses for CompressionStream are defensive only:
-  # :zlib.deflate/2 does not produce ErlangErrors on valid input in normal usage.
-  defp zlib_error_message(%ErlangError{original: :data_error}),
-    do: "Compression failed: invalid data"
-
-  defp zlib_error_message(%ErlangError{original: :stream_error}),
-    do: "Compression failed: stream error"
-
-  defp zlib_error_message(%ErlangError{original: {:error, reason}}),
-    do: "Compression failed: #{inspect(reason)}"
-
-  defp zlib_error_message(%ErlangError{original: reason}),
-    do: "Compression failed: #{inspect(reason)}"
-
-  # coveralls-ignore-stop
 end

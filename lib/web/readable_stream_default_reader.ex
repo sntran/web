@@ -65,12 +65,7 @@ defmodule Web.ReadableStreamDefaultReader do
     {:error, %TypeError{message: "This reader is no longer locked."}}
   end
 
-  defp read_result({:error, :errored}) do
-    {:error, %TypeError{message: "The stream is errored."}}
-  end
-
   defp read_result({:error, {:errored, reason}}), do: {:error, reason}
-  defp read_result({:error, reason}), do: {:error, reason}
 
   # The process that has the lock. A reader from `get_reader/1` has it in
   # the struct, thus each process can use the reader.

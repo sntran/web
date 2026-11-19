@@ -15,7 +15,6 @@ defmodule Web.Stream do
   - `pull(ctrl, state)` — **Optional.** Called when the producer needs more data.
   - `write(chunk, ctrl, state)` — **Optional.** Called to process an incoming write.
   - `flush(ctrl, state)` — **Optional.** Called just before the stream closes.
-  - `error(reason, state)` — **Optional.** Called when the stream encounters an error.
   - `terminate(event, state)` — **Optional.** Called when the stream terminates.
 
   ## Stream Types
@@ -54,13 +53,10 @@ defmodule Web.Stream do
   @doc "Called by the engine just before the stream closes (flush/finalize)."
   @callback flush(ctrl :: term(), state :: term()) :: {:ok, new_state :: term()}
 
-  @doc "Called by the engine to notify the module of a stream error."
-  @callback error(reason :: term(), state :: term()) :: {:ok, new_state :: term()}
-
   @doc "Called by the engine when the stream terminates."
   @callback terminate(event :: term(), state :: term()) :: :ok
 
-  @optional_callbacks [pull: 2, write: 3, flush: 2, error: 2, terminate: 2]
+  @optional_callbacks [pull: 2, write: 3, flush: 2, terminate: 2]
 
   @doc """
   Sets up an implementing stream module with the `Web.Stream` behaviour and
@@ -509,8 +505,6 @@ defmodule Web.Stream do
                   try do
                     fun.()
                     {:ok, :init_done}
-                  rescue
-                    e -> {:error, e}
                   catch
                     _kind, r -> {:error, r}
                   end
@@ -523,10 +517,9 @@ defmodule Web.Stream do
           {:internal, :maybe_pull} ->
             handle_maybe_pull(data)
 
-          # coveralls-ignore-start
+          # The stream ignores a message that it does not know.
           _ ->
-            {:keep_state_and_data, [:postpone]}
-            # coveralls-ignore-stop
+            :keep_state_and_data
         end
 
       result ->
@@ -566,8 +559,6 @@ defmodule Web.Stream do
                 try do
                   fun.()
                   {:ok, :start_done}
-                rescue
-                  e -> {:error, e}
                 catch
                   _kind, r -> {:error, r}
                 end
@@ -577,10 +568,8 @@ defmodule Web.Stream do
 
           {:keep_state, set_active_task(data, task, :start)}
 
-        # coveralls-ignore-start
         _ ->
           :keep_state_and_data
-          # coveralls-ignore-stop
       end
     end
   end
@@ -698,25 +687,6 @@ defmodule Web.Stream do
   defp handle_common({:call, from}, {:get_reader, _pid, _mode}, _state, data)
        when data.type in [:producer, :producer_consumer] do
     {:keep_state_and_data, [{:reply, from, {:error, :already_locked}}]}
-  end
-
-  # Force-error helpers for testing
-  defp handle_common(
-         {:call, from},
-         {:read, _pid},
-         _state,
-         %{error_reason: :force_unexpected_read} = data
-       ) do
-    {:keep_state, %{data | error_reason: nil}, [{:reply, from, {:error, :unexpected}}]}
-  end
-
-  defp handle_common(
-         {:call, from},
-         {:read, _pid},
-         _state,
-         %{error_reason: :force_error_no_reason} = data
-       ) do
-    {:keep_state, %{data | error_reason: nil}, [{:reply, from, {:error, :errored}}]}
   end
 
   # Read a chunk
@@ -947,16 +917,6 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, is_pid(data.writer_pid)}]}
   end
 
-  defp handle_common({:call, from}, :locked?, _state, data) do
-    locked =
-      cond do
-        data.type in [:producer, :producer_consumer] -> not is_nil(data.reader_pid)
-        data.type == :consumer -> not is_nil(data.writer_pid)
-      end
-
-    {:keep_state_and_data, [{:reply, from, locked}]}
-  end
-
   defp handle_common({:call, from}, :backpressure?, _state, data) do
     {:keep_state_and_data, [{:reply, from, data.backpressure}]}
   end
@@ -1019,11 +979,6 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, slots}]}
   end
 
-  defp handle_common({:call, from}, :force_unknown_error, _state, _data) do
-    {:keep_state_and_data, [{:reply, from, {:error, :unexpected}}]}
-  end
-
-  # Error injection (cast)
   # A cancel or an abort from a caller that waits for the result. The stream
   # goes to its terminal state immediately. The callback of the source or
   # sink runs in a task, and the caller gets its reply when the callback is
@@ -1097,6 +1052,12 @@ defmodule Web.Stream do
        )
        when data.type in [:consumer, :producer_consumer] do
     cond do
+      # A pipe to a destination that is errored gets the error of the
+      # destination, as the Streams Standard specifies.
+      state == :errored ->
+        send(waiter_pid, {:stream_error, ref, {:errored, data.error_reason}})
+        :keep_state_and_data
+
       state == :closed and match?({:errored, _reason}, data.writable_error) ->
         {:errored, reason} = data.writable_error
         send(waiter_pid, {:stream_error, ref, {:errored, reason}})
@@ -1132,7 +1093,8 @@ defmodule Web.Stream do
           send(waiter_pid, {:ready, ref})
           :keep_state_and_data
 
-        readable_capacity(data) > 0 ->
+        # The queue is below its limit, or a read waits.
+        readable_wants_chunk?(data) ->
           send(waiter_pid, {:ready, ref})
           :keep_state_and_data
 
@@ -1213,21 +1175,16 @@ defmodule Web.Stream do
     end
   end
 
-  # Task DOWN monitoring
-  # The process of the ambient AbortSignal stopped.
+  # The process of the ambient AbortSignal stopped with no abort. A signal
+  # that aborts sends its reason before it stops: see the clause for
+  # `{:abort, ref, reason}`.
   defp handle_common(
          :info,
-         {:DOWN, monitor_ref, :process, _pid, down_reason},
+         {:DOWN, monitor_ref, :process, _pid, _reason},
          state,
          %{signal_subscription: %{monitor_ref: monitor_ref}} = data
        ) do
-    reason =
-      case down_reason do
-        {:shutdown, {:aborted, reason}} -> reason
-        _other -> AbortSignal.default_reason()
-      end
-
-    handle_ambient_abort(reason, state, data)
+    handle_ambient_abort(AbortSignal.default_reason(), state, data)
   end
 
   defp handle_common(
@@ -1365,9 +1322,7 @@ defmodule Web.Stream do
     reply_to_writer(from, pid, data.writer_pid, :ok)
   end
 
-  # coveralls-ignore-start
-  defp handle_closed_event(_type, _content, _data), do: {:keep_state_and_data, [:postpone]}
-  # coveralls-ignore-stop
+  defp handle_closed_event(_type, _content, _data), do: :keep_state_and_data
 
   defp reply_to_writer(from, pid, writer_pid, success_reply) when pid == writer_pid do
     {:keep_state_and_data, [{:reply, from, success_reply}]}
@@ -1408,9 +1363,12 @@ defmodule Web.Stream do
   end
 
   defp queue_or_complete_read(from, _state, data) do
-    new_requests = :queue.in(from, data.read_requests)
+    data = %{data | read_requests: :queue.in(from, data.read_requests)}
+    # A read that waits is a request for a chunk: a transform that waits for
+    # capacity continues.
+    {data, waiter_actions} = maybe_resolve_enqueue_waiters(data)
 
-    {:keep_state, %{data | read_requests: new_requests}, [{:next_event, :internal, :maybe_pull}]}
+    {:keep_state, data, [{:next_event, :internal, :maybe_pull} | waiter_actions]}
   end
 
   defp pop_queued_chunk(from, data) do
@@ -1908,15 +1866,14 @@ defmodule Web.Stream do
   end
 
   # An abort of a writable stream aborts the signal of its controller.
-  defp abort_signal(%{abort_controller: nil} = data, reason) do
-    %{data | abort_controller: {:aborted, reason}}
-  end
-
-  defp abort_signal(%{abort_controller: {:aborted, _first}} = data, _reason), do: data
-
-  defp abort_signal(%{abort_controller: controller} = data, reason) do
+  defp abort_signal(%{abort_controller: %Web.AbortController{} = controller} = data, reason) do
     :ok = Web.AbortController.abort(controller, reason)
     data
+  end
+
+  # No process asked for the signal. The stream keeps the first reason.
+  defp abort_signal(data, reason) do
+    %{data | abort_controller: data.abort_controller || {:aborted, reason}}
   end
 
   # Runs the cancel or abort callback of the module in a task.
@@ -1979,49 +1936,19 @@ defmodule Web.Stream do
     fail_stream(reason, data)
   end
 
-  # Producer pull completed
-  defp handle_task_result(
-         {:ok, new_impl_state, :pause},
-         _state,
-         %{active_operation: :pull} = data
-       ) do
-    actions = after_pull_actions(data)
-
+  # The pull of a producer is complete. The result `:pause` has the same
+  # effect as no third element: the engine pulls again only when the stream
+  # wants a chunk. With `:hibernate`, the stream process also hibernates.
+  defp handle_task_result(result, _state, %{active_operation: :pull} = data)
+       when tuple_size(result) in [2, 3] and elem(result, 0) == :ok do
     new_data =
       data
-      |> Map.put(:impl_state, new_impl_state)
+      |> Map.put(:impl_state, elem(result, 1))
       |> clear_active_operation()
       |> Map.merge(%{pulling: false, pull_again: false})
 
-    {:keep_state, new_data, actions}
-  end
-
-  defp handle_task_result(
-         {:ok, new_impl_state, :hibernate},
-         _state,
-         %{active_operation: :pull} = data
-       ) do
-    actions = after_pull_actions(data)
-
-    new_data =
-      data
-      |> Map.put(:impl_state, new_impl_state)
-      |> clear_active_operation()
-      |> Map.merge(%{pulling: false, pull_again: false})
-
-    {:keep_state, new_data, actions ++ [:hibernate]}
-  end
-
-  defp handle_task_result({:ok, new_impl_state}, _state, %{active_operation: :pull} = data) do
-    actions = after_pull_actions(data)
-
-    new_data =
-      data
-      |> Map.put(:impl_state, new_impl_state)
-      |> clear_active_operation()
-      |> Map.merge(%{pulling: false, pull_again: false})
-
-    {:keep_state, new_data, actions}
+    hibernate = if match?({:ok, _state, :hibernate}, result), do: [:hibernate], else: []
+    {:keep_state, new_data, after_pull_actions(data) ++ hibernate}
   end
 
   # Producer init (start_task) completed
@@ -2038,21 +1965,29 @@ defmodule Web.Stream do
   end
 
   # Write task completed
-  defp handle_task_result(result, state, %{active_operation: {:write, from}} = data) do
+  defp handle_task_result(
+         {:ok, new_impl_state},
+         state,
+         %{active_operation: {:write, from}} = data
+       ) do
     data
     |> clear_active_operation()
     |> Map.put(:pending_write_request, nil)
-    |> Map.put(:impl_state, extract_new_state_from_result(result, data.impl_state))
+    |> Map.put(:impl_state, new_impl_state)
     |> refresh_backpressure()
     |> continue_after_consumer_completion(state, [{:reply, from, :ok}])
   end
 
   # Flush task completed
-  defp handle_task_result(result, _state, %{active_operation: {:flush, from}} = data) do
+  defp handle_task_result(
+         {:ok, new_impl_state},
+         _state,
+         %{active_operation: {:flush, from}} = data
+       ) do
     data
     |> clear_active_operation()
     |> Map.put(:pending_close_request, nil)
-    |> Map.put(:impl_state, extract_new_state_from_result(result, data.impl_state))
+    |> Map.put(:impl_state, new_impl_state)
     |> close_consumer_stream([{:reply, from, :ok}])
   end
 
@@ -2069,13 +2004,6 @@ defmodule Web.Stream do
   defp clear_abort_request({:keep_state, data, actions}) do
     {:keep_state, %{data | pending_abort_request: nil}, actions}
   end
-
-  # coveralls-ignore-start
-  defp extract_new_state_from_result({:ok, new_state}, _old_state) do
-    new_state
-  end
-
-  # coveralls-ignore-stop
 
   defp continue_after_consumer_completion(data, state, actions) do
     cond do
@@ -2633,7 +2561,7 @@ defmodule Web.Stream do
 
   # Resolve transform tasks that are parked waiting for readable capacity.
   defp maybe_resolve_enqueue_waiters(data) do
-    if :queue.is_empty(data.enqueue_waiters) or readable_capacity(data) <= 0 do
+    if :queue.is_empty(data.enqueue_waiters) or not readable_wants_chunk?(data) do
       {data, []}
     else
       actions =
@@ -2792,7 +2720,7 @@ defmodule Web.Stream do
   defp strategy_size(%{__struct__: strategy}, chunk), do: strategy.size(chunk)
 
   defp normalize_strategy(%{__struct__: _} = strategy), do: strategy
-  # coveralls-ignore-next-line
+  # A value that is not a strategy gives the default strategy.
   defp normalize_strategy(_), do: %Web.CountQueuingStrategy{}
 
   defp init_capacities(:producer_consumer, writable_hwm, strategy) do
@@ -2828,7 +2756,6 @@ defmodule Web.Stream do
   # Resolve a callback result that may be a %Web.Promise{}, awaiting it and
   # adopting its state. Falls back to `fallback` if the promise resolves to
   # something unexpected. Non-promise values pass through unchanged.
-  # coveralls-ignore-start
   defp resolve_if_promise(%Web.Promise{} = promise, fallback) do
     case Web.Promise.wait(promise) do
       {:fulfilled, {:ok, _} = result} -> result
@@ -2838,8 +2765,6 @@ defmodule Web.Stream do
       {:rejected, reason} -> {:error, reason}
     end
   end
-
-  # coveralls-ignore-stop
 
   defp resolve_if_promise(result, _fallback), do: result
 

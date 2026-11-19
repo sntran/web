@@ -77,12 +77,6 @@ defmodule Web.WritableStreamDefaultWriter do
   defp map_stream_error(:released),
     do: TypeError.exception("The stream is not available. It ended, or its owner stopped.")
 
-  # coveralls-ignore-start
-  defp map_stream_error(reason),
-    do: TypeError.exception("Unknown error: #{inspect(reason)}")
-
-  # coveralls-ignore-stop
-
   @doc """
   Releases the writer's lock on the stream.
   """

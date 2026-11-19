@@ -68,10 +68,7 @@ defmodule Web.WritableStreamTest do
     assert :ok = WritableStreamDefaultWriter.release_lock(abort_writer)
   end
 
-  test "pid convenience wrappers and callback error clause are covered" do
-    callback_state = %{sink: %{}, pid: self()}
-    assert {:ok, ^callback_state} = WritableStream.error(:boom, callback_state)
-
+  test "the functions that take the pid of a stream" do
     stream =
       WritableStream.new(%{
         write: fn _chunk, _controller -> :ok end

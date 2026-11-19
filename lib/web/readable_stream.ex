@@ -283,14 +283,7 @@ defmodule Web.ReadableStream do
                 Web.ReadableStreamDefaultController.enqueue(controller, chunk)
             end
           end,
-          cancel: fn _reason ->
-            # coveralls-ignore-start
-            if Process.alive?(enumerator_pid) do
-              send(enumerator_pid, :stop)
-            end
-
-            # coveralls-ignore-stop
-          end
+          cancel: fn _reason -> send(enumerator_pid, :stop) end
         },
         Keyword.put(opts, :cancel_on_reader_exit, true)
       )
@@ -607,10 +600,6 @@ defmodule Web.ReadableStream do
     Web.Stream.call(pid, {:byob_read, self(), view}, {:error, :not_locked_by_reader})
   end
 
-  def force_unknown_error(pid) do
-    :gen_statem.call(pid, :force_unknown_error)
-  end
-
   def release_lock(pid, owner \\ self()) do
     Web.Stream.call(pid, {:release_lock, :reader, owner}, :ok)
   end
@@ -669,11 +658,9 @@ defmodule Web.ReadableStream do
     raise TypeError, "Cannot #{action}: the stream is #{state}."
   end
 
-  @impl Web.Stream
-  def error(_reason, %{source: _} = state) do
-    {:ok, state}
-  end
-
+  @doc false
+  # `error` with no check, for a source that is a process of this library:
+  # see `enqueue/2`.
   def error(pid, reason) when is_pid(pid) do
     Web.Stream.control_cast(pid, {:error, reason})
   end
@@ -683,19 +670,24 @@ defmodule Web.ReadableStream do
   # A cancel of the stream object. The Streams Standard refuses it when the
   # stream has a reader: use the cancel function of the reader.
   def cancel(%__MODULE__{controller_pid: pid}, reason) do
-    Web.Stream.promise_call(pid, {:terminate_unlocked, :cancel, reason}, :ok, fn
-      :ok -> {:ok, :ok}
-      {:error, :locked} -> {:error, %TypeError{message: "Cannot cancel a locked stream."}}
-      {:error, thrown} -> {:error, thrown}
-    end)
+    Web.Stream.promise_call(pid, {:terminate_unlocked, :cancel, reason}, :ok, &cancel_result/1)
   end
 
+  # A cancel by a reader, or by the code of this library: it has no check of
+  # the lock.
   def cancel(pid, reason) do
-    Web.Stream.promise_call(pid, {:terminate, :cancel, reason}, :ok, fn
-      :ok -> {:ok, :ok}
-      {:error, thrown} -> {:error, thrown}
-    end)
+    Web.Stream.promise_call(pid, {:terminate, :cancel, reason}, :ok, &cancel_result/1)
   end
+
+  # A value that the cancel callback of the source throws is the rejection
+  # reason, with no change.
+  defp cancel_result(:ok), do: {:ok, :ok}
+
+  defp cancel_result({:error, :locked}) do
+    {:error, %TypeError{message: "Cannot cancel a locked stream."}}
+  end
+
+  defp cancel_result({:error, thrown}), do: {:error, thrown}
 
   @doc false
   def __get_slots__(pid) do
@@ -871,8 +863,6 @@ defmodule Web.ReadableStream do
         maybe_abort_writer(writer, reason, options)
         {:error, reason}
     end
-  rescue
-    error in TypeError -> {:error, error}
   end
 
   @doc """
@@ -894,21 +884,24 @@ defmodule Web.ReadableStream do
   # Private pipe helpers
   # ---------------------------------------------------------------------------
 
+  # The error of a stream that is errored. A stream that is closed, or that
+  # stopped, gives a `TypeError`, as the Streams Standard specifies for a
+  # pipe to a destination that is closed.
   defp stored_error({:errored, reason}), do: reason
-  defp stored_error(reason), do: reason
+  defp stored_error(_closed_or_stopped), do: TypeError.exception(@released_message)
 
   defp pump(reader, writer, options) do
     owner_pid = self()
 
     try do
-      ensure_pipe_signal_active!(options[:signal])
-
+      # Each step stops when the signal aborts. A signal that aborted before
+      # the step makes the step throw the reason.
       with :ok <-
              await_pipe_step(
                fn -> WritableStream.ready(writer.controller_pid, writer.owner_pid) end,
                options
              ),
-           :ok <- ensure_pipe_signal_active!(options[:signal]),
+           :ok <- AbortSignal.check!(options[:signal]),
            read_result <-
              await_pipe_step(fn -> read_for_pipe(reader.controller_pid, owner_pid) end, options) do
         case read_result do
@@ -928,7 +921,7 @@ defmodule Web.ReadableStream do
             {:source_error, reason}
         end
       else
-        # coveralls-ignore-next-line
+        # The destination is errored, or it is closed.
         {:error, reason} -> {:sink_error, reason}
       end
     catch
@@ -943,15 +936,15 @@ defmodule Web.ReadableStream do
       fun.()
     else
       case AbortSignal.subscribe(signal) do
+        # The signal aborted before this step. The check throws the reason.
         {:error, :aborted} ->
-          # coveralls-ignore-next-line
           AbortSignal.check!(signal)
 
         {:ok, subscription} ->
           task = Task.async(fun)
 
           try do
-            await_pipe_step_result(task, subscription, signal)
+            await_pipe_step_result(task, subscription)
           after
             AbortSignal.unsubscribe(subscription)
             Task.shutdown(task, :brutal_kill)
@@ -960,22 +953,17 @@ defmodule Web.ReadableStream do
     end
   end
 
-  defp await_pipe_step_result(task, subscription, signal) do
+  defp await_pipe_step_result(task, subscription) do
     case Task.yield(task, 10) do
       {:ok, result} ->
         result
 
-      # coveralls-ignore-start
+      # The step waits. Stop it when the signal aborted.
       nil ->
         case AbortSignal.receive_abort(subscription, 0, true) do
-          {:error, :aborted, reason} ->
-            throw({:abort, normalize_abort_reason(signal, reason)})
-
-          :ok ->
-            await_pipe_step_result(task, subscription, signal)
+          {:error, :aborted, reason} -> throw({:abort, reason})
+          :ok -> await_pipe_step_result(task, subscription)
         end
-
-        # coveralls-ignore-stop
     end
   end
 
@@ -986,25 +974,6 @@ defmodule Web.ReadableStream do
       {:error, _} = error -> error
     end
   end
-
-  defp ensure_pipe_signal_active!(nil), do: :ok
-
-  defp ensure_pipe_signal_active!(%AbortSignal{} = signal) do
-    AbortSignal.throw_if_aborted(signal)
-  rescue
-    _error in Web.DOMException ->
-      throw({:abort, normalize_abort_reason(signal, :aborted)})
-  end
-
-  defp ensure_pipe_signal_active!(signal), do: AbortSignal.check!(signal)
-
-  # coveralls-ignore-start
-  defp normalize_abort_reason(signal, :aborted) do
-    AbortSignal.reason(signal) || AbortSignal.default_reason()
-  end
-
-  defp normalize_abort_reason(_signal, reason), do: reason
-  # coveralls-ignore-stop
 
   defp maybe_close_writer(writer, options) do
     if pipe_option(options, :prevent_close, :preventClose) do

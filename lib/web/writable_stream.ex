@@ -65,19 +65,13 @@ defmodule Web.WritableStream do
     invoke_sink_callback(sink, :close, [%WritableStreamDefaultController{pid: pid}])
   end
 
-  def terminate({type, reason}, %{sink: sink}) when type in [:abort, :error] do
+  # An abort, an error, or a cancel: the sink gets the reason.
+  def terminate({_type, reason}, %{sink: sink}) do
     invoke_abort(sink, reason)
   end
 
-  def terminate(reason, %{sink: sink}) do
-    invoke_abort(sink, reason)
-  end
-
-  @impl Web.Stream
-  def error(_reason, %{sink: _} = state) do
-    {:ok, state}
-  end
-
+  @doc false
+  # `error` of the controller of the stream.
   def error(pid, reason) when is_pid(pid) do
     Web.Stream.control_cast(pid, {:error, reason})
   end

@@ -15,7 +15,8 @@ defmodule Web.TestCluster do
       true
     else
       start_epmd()
-      name = String.to_atom("web_test_#{System.unique_integer([:positive])}")
+      # Two test runs on one machine at the same time need different names.
+      name = String.to_atom("web_test_#{System.pid()}")
 
       case Node.start(name, :shortnames) do
         {:ok, _pid} ->
@@ -40,7 +41,7 @@ defmodule Web.TestCluster do
   stops when the process that calls this function stops.
   """
   def start_peer do
-    name = String.to_atom("web_test_peer_#{System.unique_integer([:positive])}")
+    name = String.to_atom("web_test_peer_#{System.pid()}_#{System.unique_integer([:positive])}")
     cookie = Atom.to_charlist(Node.get_cookie())
 
     {:ok, peer, node} = :peer.start_link(%{name: name, args: [~c"-setcookie", cookie]})

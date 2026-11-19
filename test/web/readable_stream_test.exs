@@ -69,35 +69,42 @@ defmodule Web.ReadableStreamTest do
       assert {:done, "ab"} = next.({:cont, "a"})
     end
 
-    test "Enumerable release_lock rescues", %{stream: stream, controller_pid: pid} do
+    test "a halt after the reducer released the lock", %{stream: stream, controller_pid: pid} do
       ReadableStream.enqueue(pid, "a")
-      # Rescue in halt
-      Enum.reduce_while(stream, 0, fn _x, _acc ->
-        ReadableStream.release_lock(pid)
-        {:halt, :stopped}
-      end)
 
-      # Rescue in done
-      {:ok, p2} = ReadableStream.start_link()
-      s2 = %ReadableStream{controller_pid: p2}
-      ReadableStream.enqueue(p2, "a")
-      ReadableStream.close(p2)
+      assert Enum.reduce_while(stream, 0, fn _chunk, _acc ->
+               ReadableStream.release_lock(pid)
+               {:halt, :stopped}
+             end) == :stopped
+    end
 
-      Enum.each(s2, fn _ ->
-        ReadableStream.error(p2, :force_unexpected_release)
-      end)
+    test "an enumeration raises the error of a stream that fails during the reduce", %{
+      stream: stream,
+      controller_pid: pid
+    } do
+      ReadableStream.enqueue(pid, "a")
 
-      # Rescue in error/rescue
-      {:ok, p3} = ReadableStream.start_link()
-      s3 = %ReadableStream{controller_pid: p3}
-      ReadableStream.enqueue(p3, "a")
+      error =
+        assert_raise TypeError, "The stream is errored.", fn ->
+          Enum.each(stream, fn _chunk -> ReadableStream.error(pid, :failed) end)
+        end
 
-      assert_raise RuntimeError, fn ->
-        Enum.each(s3, fn _ ->
-          ReadableStream.error(p3, :force_unexpected_release)
-          raise "bomb"
-        end)
-      end
+      assert error.cause == :failed
+      refute ReadableStream.locked?(stream)
+    end
+
+    test "a reducer that throws or exits releases the lock", %{
+      stream: stream,
+      controller_pid: pid
+    } do
+      ReadableStream.enqueue(pid, "a")
+      ReadableStream.enqueue(pid, "b")
+
+      assert catch_throw(Enum.each(stream, fn _chunk -> throw(:stop) end)) == :stop
+      refute ReadableStream.locked?(stream)
+
+      assert catch_exit(Enum.each(stream, fn _chunk -> exit(:stop) end)) == :stop
+      refute ReadableStream.locked?(stream)
     end
   end
 
@@ -478,11 +485,6 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
     end
 
-    test "error callback is callable" do
-      callback_state = %{source: %{}, pid: self(), started: false}
-      assert {:ok, ^callback_state} = ReadableStream.error(:boom, callback_state)
-    end
-
     test "default controller error helper transitions stream to errored" do
       stream = ReadableStream.new()
       controller = %ReadableStreamDefaultController{pid: stream.controller_pid}
@@ -662,9 +664,6 @@ defmodule Web.ReadableStreamTest do
       # This sends flush_requests, but queue not empty
       ReadableStream.close(p2)
 
-      # force_unknown_error
-      assert {:error, :unexpected} = ReadableStream.force_unknown_error(p1)
-
       # disturbed and desired size
       {:ok, p3} = ReadableStream.start_link(high_water_mark: 5)
       assert ReadableStream.__get_slots__(p3).disturbed == false
@@ -728,24 +727,6 @@ defmodule Web.ReadableStreamTest do
       ReadableStream.__get_slots__(pid)
 
       assert :fail = catch_exit(await(ReadableStreamDefaultReader.read(reader)))
-
-      # Errored WITHOUT reason (forced) — promise rejects with TypeError
-      {:ok, p2} = ReadableStream.start_link()
-      s2 = %ReadableStream{controller_pid: p2}
-      r2 = ReadableStream.get_reader(s2)
-      ReadableStream.error(p2, :force_error_no_reason)
-      ReadableStream.__get_slots__(p2)
-
-      assert %TypeError{message: "The stream is errored."} =
-               catch_exit(await(ReadableStreamDefaultReader.read(r2)))
-
-      # Unexpected read — promise rejects with the error
-      {:ok, p3} = ReadableStream.start_link()
-      s3 = %ReadableStream{controller_pid: p3}
-      r3 = ReadableStream.get_reader(s3)
-      ReadableStream.error(p3, :force_unexpected_read)
-      ReadableStream.__get_slots__(p3)
-      assert :unexpected = catch_exit(await(ReadableStreamDefaultReader.read(r3)))
     end
 
     test "PID mismatch", %{controller_pid: pid} do

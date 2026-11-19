@@ -228,6 +228,148 @@ defmodule Web.EventTargetTest do
     assert_receive :later
   end
 
+  describe "the listener process of a port or a channel" do
+    import ExUnit.CaptureLog
+
+    defp start_server(opts \\ []) do
+      {:ok, server} = Server.start_link([target: %BareTarget{label: "bare"}] ++ opts)
+      server
+    end
+
+    def build_event(type, detail), do: Web.CustomEvent.new(type, detail: detail)
+    def build_nothing, do: nil
+    def build_failure, do: raise("the event cannot be made")
+
+    defp task(build, reply_to \\ nil) do
+      task = %{build: build, snapshot: Snapshot.take()}
+      if reply_to, do: Map.put(task, :reply_to, reply_to), else: task
+    end
+
+    test "an event handler has the place of its first callback" do
+      test = self()
+      server = start_server()
+      note = fn name -> fn event -> send(test, {name, event.detail}) end end
+
+      :ok = Server.add_event_listener(server, "tick", note.(:before), %{})
+      :ok = Server.set_handler(server, :tick, note.(:handler))
+      :ok = Server.add_event_listener(server, "tick", note.(:after), %{})
+      :ok = Server.set_handler(server, "tick", note.(:handler_2))
+
+      Server.dispatch_event(server, Web.CustomEvent.new("tick", detail: 1), Snapshot.take())
+
+      assert {:messages, [before: 1, handler_2: 1, after: 1]} = Process.info(self(), :messages)
+
+      # A handler of nil keeps its place, and does not run.
+      :ok = Server.set_handler(server, "tick", nil)
+      Server.dispatch_event(server, Web.CustomEvent.new("tick", detail: 2), Snapshot.take())
+      assert_received {:before, 2}
+      assert_received {:after, 2}
+      refute_received {:handler_2, 2}
+
+      # The place of a handler is not a listener that a caller can remove.
+      assert [_before, %{callback: :handler}, _after] = :sys.get_state(server).listeners["tick"]
+    end
+
+    test "a task makes its event in the process, and answers" do
+      test = self()
+      server = start_server()
+      :ok = Server.add_event_listener(server, "made", fn event -> send(test, event) end, %{})
+
+      :ok = Server.run_task(server, task({__MODULE__, :build_event, ["made", 7]}, {self(), :one}))
+
+      assert_receive {:event_done, :one}
+      assert_received %Web.CustomEvent{type: "made", detail: 7}
+
+      # A task with no address for the answer.
+      :ok = Server.run_task(server, task({__MODULE__, :build_event, ["made", 8]}))
+      assert_receive %Web.CustomEvent{detail: 8}
+    end
+
+    test "a task that makes no event, or that fails, has no event" do
+      test = self()
+      server = start_server()
+      :ok = Server.add_event_listener(server, "made", fn event -> send(test, event) end, %{})
+
+      :ok = Server.run_task(server, task({__MODULE__, :build_nothing, []}, {self(), :nothing}))
+      assert_receive {:event_done, :nothing}
+
+      log =
+        capture_log(fn ->
+          :ok = Server.run_task(server, task({__MODULE__, :build_failure, []}, {self(), :failed}))
+          assert_receive {:event_done, :failed}
+        end)
+
+      assert log =~ "The task of an event failed."
+      assert log =~ "the event cannot be made"
+      refute_received %Web.CustomEvent{}
+      assert Process.alive?(server)
+    end
+
+    test "a closed gate stops the events, and a task comes back" do
+      test = self()
+      gate = :atomics.new(1, signed: false)
+      server = start_server(gate: gate)
+      :ok = Server.add_event_listener(server, "made", fn event -> send(test, event) end, %{})
+
+      :atomics.put(gate, 1, 1)
+
+      :ok = Server.run_task(server, task({__MODULE__, :build_event, ["made", 1]}, {self(), :one}))
+      assert_receive {:event_returned, :one}
+
+      :ok = Server.run_task(server, task({__MODULE__, :build_event, ["made", 2]}))
+      GenServer.cast(server, {:dispatch_event, Web.CustomEvent.new("made"), Snapshot.take()})
+      assert Server.dispatch_event(server, Web.CustomEvent.new("made"), Snapshot.take())
+
+      refute_received %Web.CustomEvent{}
+    end
+
+    test "a listener that fails goes to the log, and the next listener runs" do
+      test = self()
+      server = start_server()
+      :ok = Server.add_event_listener(server, "tick", fn -> exit(:the_listener_stopped) end, %{})
+      :ok = Server.add_event_listener(server, "tick", fn -> send(test, :next) end, %{})
+
+      log =
+        capture_log(fn ->
+          Server.dispatch_event(server, Web.CustomEvent.new("tick"), Snapshot.take())
+        end)
+
+      assert log =~ ~s(A listener of the event "tick" failed.)
+      assert log =~ "the_listener_stopped"
+      assert_received :next
+    end
+
+    test "two functions with different values are two callbacks" do
+      test = self()
+      server = start_server()
+      make = fn value -> fn -> send(test, value) end end
+
+      :ok = Server.add_event_listener(server, "tick", make.(1), %{})
+      :ok = Server.add_event_listener(server, "tick", make.(2), %{})
+      # The same function with the same value is the same callback.
+      :ok = Server.add_event_listener(server, "tick", make.(2), %{})
+      assert length(:sys.get_state(server).listeners["tick"]) == 2
+
+      :ok = Server.remove_event_listener(server, "tick", make.(1))
+      Server.dispatch_event(server, Web.CustomEvent.new("tick"), Snapshot.take())
+
+      assert_received 2
+      refute_received 1
+    end
+
+    test "the process stops after the event that it does, and ignores other messages" do
+      server = start_server()
+      monitor = Process.monitor(server)
+
+      send(server, :unexpected)
+      assert Server.dispatch_event(server, Web.CustomEvent.new("tick"), Snapshot.take())
+
+      Process.unlink(server)
+      :ok = Server.stop(server)
+      assert_receive {:DOWN, ^monitor, :process, ^server, :normal}
+    end
+  end
+
   test "event target public surface does not export pid helpers" do
     exported = Web.EventTarget.__info__(:functions)
 

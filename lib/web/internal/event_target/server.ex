@@ -1,7 +1,30 @@
 defmodule Web.Internal.EventTarget.Server do
   @moduledoc false
 
+  # The process that keeps the listeners of one event target, and that runs
+  # them. The listeners of one target run one at a time, in the sequence of
+  # the events.
+  #
+  # A value that a listener throws does not stop the process: the process
+  # writes it to the log and continues, as a browser reports an exception of
+  # a listener and continues.
+  #
+  # ## Event handlers
+  #
+  # An event handler is the callback of an attribute such as `onmessage`.
+  # It has one place in the list of the listeners of its event: the place
+  # where it got its first callback. A new callback uses the same place.
+  #
+  # ## The gate
+  #
+  # The option `:gate` is an `:atomics` array with one slot. When the slot
+  # is not 0, the process drops each event that it did not start. The owner
+  # of a target closes the gate to stop the events immediately, also when
+  # the mailbox of this process has events.
+
   use GenServer
+
+  require Logger
 
   alias Web.AbortSignal
   alias Web.AsyncContext.Snapshot
@@ -10,7 +33,7 @@ defmodule Web.Internal.EventTarget.Server do
 
   @type listener :: %{
           id: non_neg_integer(),
-          callback: Web.EventTarget.callback(),
+          callback: Web.EventTarget.callback() | :handler,
           once: boolean(),
           watcher: pid() | nil
         }
@@ -19,7 +42,21 @@ defmodule Web.Internal.EventTarget.Server do
           target: struct(),
           callback_module: module(),
           listeners: %{optional(String.t()) => [listener()]},
+          handlers: %{optional(String.t()) => Web.EventTarget.callback()},
+          gate: :atomics.atomics_ref() | nil,
           next_id: non_neg_integer()
+        }
+
+  @typedoc """
+  A task makes its event in this process, immediately before the dispatch.
+  `build` is a module, a function, and its arguments. The function returns
+  the event. `reply_to` gets `{:event_done, tag}` after the dispatch, or
+  `{:event_returned, tag}` when the gate was closed.
+  """
+  @type task :: %{
+          required(:build) => {module(), atom(), list()},
+          required(:snapshot) => Snapshot.t(),
+          optional(:reply_to) => {pid(), term()}
         }
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -50,6 +87,22 @@ defmodule Web.Internal.EventTarget.Server do
     GenServer.call(pid, {:dispatch_event, event, snapshot}, :infinity)
   end
 
+  @doc "Sets or removes the event handler of an event type. Does not wait."
+  @spec set_handler(pid(), String.t() | atom(), Web.EventTarget.callback() | nil) :: :ok
+  def set_handler(pid, type, callback) when is_pid(pid) do
+    GenServer.cast(pid, {:set_handler, type, callback})
+  end
+
+  @doc "Adds a task to the events of the target. Does not wait."
+  @spec run_task(pid(), task()) :: :ok
+  def run_task(pid, %{build: {_module, _function, _args}} = task) when is_pid(pid) do
+    GenServer.cast(pid, {:task, task})
+  end
+
+  @doc "Stops the process after the event that it does now. Does not wait."
+  @spec stop(pid()) :: :ok
+  def stop(pid) when is_pid(pid), do: GenServer.cast(pid, :stop)
+
   @impl true
   def init(opts) do
     Process.flag(:message_queue_data, :off_heap)
@@ -63,6 +116,8 @@ defmodule Web.Internal.EventTarget.Server do
        target: target,
        callback_module: callback_module,
        listeners: %{},
+       handlers: %{},
+       gate: Keyword.get(opts, :gate),
        next_id: 0
      }}
   end
@@ -93,6 +148,23 @@ defmodule Web.Internal.EventTarget.Server do
   def handle_cast({:dispatch_event, event, snapshot}, state) do
     {:noreply, do_dispatch_event(state, event, snapshot)}
   end
+
+  def handle_cast({:set_handler, type, callback}, state) do
+    {:noreply, do_set_handler(state, normalize_type(type), callback)}
+  end
+
+  def handle_cast({:task, task}, state) do
+    if gate_closed?(state) do
+      reply(task, :event_returned)
+      {:noreply, state}
+    else
+      next_state = do_task(state, task)
+      reply(task, :event_done)
+      {:noreply, next_state}
+    end
+  end
+
+  def handle_cast(:stop, state), do: {:stop, :normal, state}
 
   @impl true
   def handle_info({@abort_message_prefix, listener_id}, state) do
@@ -150,11 +222,60 @@ defmodule Web.Internal.EventTarget.Server do
   end
 
   defp do_dispatch_event(state, event, %Snapshot{} = snapshot) do
-    Snapshot.run(snapshot, fn ->
+    if gate_closed?(state) do
       state
-      |> invoke_handle_dispatch(event)
-      |> invoke_listeners(event)
-    end)
+    else
+      Snapshot.run(snapshot, fn ->
+        state
+        |> invoke_handle_dispatch(event)
+        |> invoke_listeners(event)
+      end)
+    end
+  end
+
+  # The function of the task makes the event. A task that gives `nil` has
+  # no event.
+  defp do_task(state, %{build: build, snapshot: snapshot}) do
+    Snapshot.run(snapshot, fn -> dispatch_built(state, build) end)
+  end
+
+  defp dispatch_built(state, {module, function, args}) do
+    case guarded(fn -> apply(module, function, args) end, "The task of an event") do
+      {:ok, %{type: _type} = event} ->
+        state
+        |> invoke_handle_dispatch(event)
+        |> invoke_listeners(event)
+
+      _other ->
+        state
+    end
+  end
+
+  defp reply(%{reply_to: {pid, tag}}, result), do: send(pid, {result, tag})
+  defp reply(_task, _result), do: :ok
+
+  defp gate_closed?(%{gate: nil}), do: false
+  defp gate_closed?(%{gate: gate}), do: :atomics.get(gate, 1) != 0
+
+  defp do_set_handler(state, type, nil) do
+    %{state | handlers: Map.delete(state.handlers, type)}
+  end
+
+  defp do_set_handler(state, type, callback) do
+    state = %{state | handlers: Map.put(state.handlers, type, callback)}
+    listeners = Map.get(state.listeners, type, [])
+
+    if Enum.any?(listeners, &(&1.callback == :handler)) do
+      state
+    else
+      slot = %{id: state.next_id, callback: :handler, once: false, watcher: nil}
+
+      %{
+        state
+        | listeners: Map.put(state.listeners, type, listeners ++ [slot]),
+          next_id: state.next_id + 1
+      }
+    end
   end
 
   defp invoke_listeners(state, %{type: type} = event) do
@@ -162,7 +283,7 @@ defmodule Web.Internal.EventTarget.Server do
     listeners = Map.get(state.listeners, type, [])
 
     Enum.reduce(listeners, state, fn listener, acc ->
-      invoke_callback(listener.callback, event)
+      invoke_listener(listener.callback, event, type, acc)
 
       if listener.once do
         remove_listener_by_id(acc, type, listener.id)
@@ -170,6 +291,29 @@ defmodule Web.Internal.EventTarget.Server do
         acc
       end
     end)
+  end
+
+  defp invoke_listener(:handler, event, type, state) do
+    case state.handlers do
+      %{^type => callback} -> invoke_listener(callback, event, type, state)
+      _ -> :ok
+    end
+  end
+
+  defp invoke_listener(callback, event, type, _state) do
+    guarded(
+      fn -> invoke_callback(callback, event) end,
+      "A listener of the event #{inspect(type)}"
+    )
+  end
+
+  # Runs user code. A value that it throws goes to the log.
+  defp guarded(fun, name) do
+    {:ok, fun.()}
+  catch
+    kind, reason ->
+      Logger.error(name <> " failed.\n" <> Exception.format(kind, reason, __STACKTRACE__))
+      :error
   end
 
   defp invoke_handle_add_listener(
@@ -224,13 +368,10 @@ defmodule Web.Internal.EventTarget.Server do
     |> Enum.any?(&same_callback?(&1.callback, callback))
   end
 
-  defp same_callback?(left, right) do
-    module_matches? = :erlang.fun_info(left, :module) == :erlang.fun_info(right, :module)
-    index_matches? = :erlang.fun_info(left, :new_index) == :erlang.fun_info(right, :new_index)
-    uniq_matches? = :erlang.fun_info(left, :uniq) == :erlang.fun_info(right, :uniq)
-
-    module_matches? and index_matches? and uniq_matches?
-  end
+  # Two functions are the same callback when they are equal: they come
+  # from the same code, and they have the same values of the variables that
+  # they use. The place of an event handler is not a callback.
+  defp same_callback?(left, right), do: left === right
 
   defp maybe_start_signal_watcher(_owner, nil, _listener_id), do: nil
 

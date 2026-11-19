@@ -12,6 +12,10 @@ All notable changes to this project are documented in this file.
   response headers or for the next part of a body. The default is
   300000 ms. A request that fails for one of these limits rejects with
   `Web.TypeError`.
+- `Web.WritableStreamDefaultController.signal/1`, as the attribute `signal`:
+  an abort signal that aborts when the stream is aborted.
+- `Web.TransformStreamDefaultController`, the controller that the callbacks
+  of a transform stream get.
 - `closed/1` for `Web.ReadableStreamDefaultReader`,
   `Web.ReadableStreamBYOBReader`, and `Web.WritableStreamDefaultWriter`, as
   the attribute `closed`.
@@ -170,6 +174,16 @@ All notable changes to this project are documented in this file.
   before its promise settles.
 - The pipe options have Elixir names: `:prevent_close`, `:prevent_abort`, and
   `:prevent_cancel`. The names of the Standard are accepted also.
+- `Web.URLPattern` accepts the class syntax of the regular expression flag
+  `v` in a group: a nested class, a subtraction (`[[a-z]--[aeiou]]`), and an
+  intersection (`[\\d&&[0-4]]`). Before, the library replaced two fixed
+  texts of the conformance tests, and each other use of this syntax gave a
+  result that was not correct.
+- The response body of a `tcp:` request has the unread limit of
+  `unread_body_timeout`, as an HTTP response body has.
+- The control messages of a stream are usual messages. The code asked for
+  priority messages, but that request had no effect, and it would put a
+  `close` before the chunks that were enqueued before it.
 - **Breaking:** `Web.TextDecoder.new/2` and `Web.TextDecoderStream.new/2`
   raise `Web.RangeError` for a label that is not a label of UTF-8, as the
   Encoding Standard specifies. Before, they raised `Web.TypeError`. All the

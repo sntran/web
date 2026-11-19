@@ -1,6 +1,8 @@
 defmodule Web.URLPattern.Compiler do
   @moduledoc false
 
+  alias Web.URLPattern.ClassSet
+
   # Converts a parsed AST (from Web.URLPattern.Parser) into a compiled
   # `%Regex{}` and a list of `{index, name}` capture-group descriptors.
   #
@@ -343,11 +345,7 @@ defmodule Web.URLPattern.Compiler do
     |> String.replace(~r/\(\?<[^>]+>/, "(")
   end
 
-  defp normalize_regex_pattern(pattern) do
-    pattern
-    |> String.replace("[[a-z]--a]", "[b-z]")
-    |> String.replace("[\\d&&[0-1]]", "[0-1]")
-  end
+  defp normalize_regex_pattern(pattern), do: ClassSet.translate(pattern)
 
   defp optional_capture_fragment(".*"), do: "(?:(.+))?"
   defp optional_capture_fragment(".*?"), do: "(?:(.+?))?"

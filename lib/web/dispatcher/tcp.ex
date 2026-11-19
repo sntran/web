@@ -55,9 +55,12 @@ defmodule Web.Dispatcher.TCP do
   end
 
   defp build_body_stream(bridge_pid, socket, signal) do
+    # A body that no process starts to read releases its socket after the
+    # unread time, as the body of an HTTP response does.
     ReadableStream.new(
       body_source(bridge_pid, socket, signal),
-      cancel_on_reader_exit: true
+      cancel_on_reader_exit: true,
+      unread_timeout: Web.Application.unread_body_timeout()
     )
   end
 

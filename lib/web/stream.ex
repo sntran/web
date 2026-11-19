@@ -123,6 +123,10 @@ defmodule Web.Stream do
     pending_close_request: nil,
     # The caller of an abort, until the abort callback of the sink is complete.
     pending_abort_request: nil,
+    # The abort signal of the controller of a writable stream: `nil`, an
+    # `AbortController` after the first request for the signal, or
+    # `{:aborted, reason}` after an abort with no controller.
+    abort_controller: nil,
     # The callers that wait for the end of the stream: {from, pid}.
     closed_waiters: [],
     queued_write_requests: :queue.new(),
@@ -226,8 +230,10 @@ defmodule Web.Stream do
   end
 
   @doc false
+  # A control message is a usual message. Thus the stream handles a `close`
+  # after the chunks that the same process enqueued before it.
   def control_cast(pid, message) when is_pid(pid) do
-    priority_send(pid, {:"$gen_cast", message})
+    send(pid, {:"$gen_cast", message})
     :ok
   end
 
@@ -235,7 +241,7 @@ defmodule Web.Stream do
   def control_call(pid, message, timeout \\ :infinity) when is_pid(pid) do
     monitor_ref = Process.monitor(pid)
     ref = make_ref()
-    priority_send(pid, {:"$gen_call", {self(), ref}, message})
+    send(pid, {:"$gen_call", {self(), ref}, message})
 
     receive do
       {^ref, reply} ->
@@ -751,6 +757,23 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, data.disturbed}]}
   end
 
+  # The signal of the controller of a writable stream, as the attribute
+  # `signal` of the Streams Standard. The stream makes it for the first
+  # request, thus a stream that does not use it has no process for it.
+  defp handle_common({:call, from}, :abort_signal, _state, data) do
+    case data.abort_controller do
+      nil ->
+        controller = Web.AbortController.new()
+        {:keep_state, %{data | abort_controller: controller}, [{:reply, from, controller.signal}]}
+
+      {:aborted, reason} ->
+        {:keep_state_and_data, [{:reply, from, Web.AbortSignal.abort(reason)}]}
+
+      controller ->
+        {:keep_state_and_data, [{:reply, from, controller.signal}]}
+    end
+  end
+
   # The two sides of a transform stream have separate locks.
   defp handle_common({:call, from}, {:locked?, :reader}, _state, data) do
     {:keep_state_and_data, [{:reply, from, is_pid(data.reader_pid)}]}
@@ -910,15 +933,15 @@ defmodule Web.Stream do
        when data.type in [:consumer, :producer_consumer] do
     cond do
       owner_pid != data.writer_pid ->
-        priority_send(waiter_pid, {:stream_error, ref, :not_locked_by_writer})
+        send(waiter_pid, {:stream_error, ref, :not_locked_by_writer})
         :keep_state_and_data
 
       state == :closed ->
-        priority_send(waiter_pid, {:ready, ref})
+        send(waiter_pid, {:ready, ref})
         :keep_state_and_data
 
       writable_ready?(data) ->
-        priority_send(waiter_pid, {:ready, ref})
+        send(waiter_pid, {:ready, ref})
         :keep_state_and_data
 
       true ->
@@ -936,11 +959,11 @@ defmodule Web.Stream do
     if type in [:producer, :producer_consumer] do
       cond do
         state in [:closed, :errored] ->
-          priority_send(waiter_pid, {:ready, ref})
+          send(waiter_pid, {:ready, ref})
           :keep_state_and_data
 
         readable_capacity(data) > 0 ->
-          priority_send(waiter_pid, {:ready, ref})
+          send(waiter_pid, {:ready, ref})
           :keep_state_and_data
 
         true ->
@@ -1690,8 +1713,21 @@ defmodule Web.Stream do
     {:next_state, :closing, set_active_task(data, task, {:flush, data.pending_close_request})}
   end
 
+  # An abort of a writable stream aborts the signal of its controller.
+  defp abort_signal(%{abort_controller: nil} = data, reason) do
+    %{data | abort_controller: {:aborted, reason}}
+  end
+
+  defp abort_signal(%{abort_controller: {:aborted, _first}} = data, _reason), do: data
+
+  defp abort_signal(%{abort_controller: controller} = data, reason) do
+    :ok = Web.AbortController.abort(controller, reason)
+    data
+  end
+
   # Runs the cancel or abort callback of the module in a task.
   defp start_terminal_task(data, type, reason) do
+    data = if type == :abort, do: abort_signal(data, reason), else: data
     module = data.module
     impl_state = data.impl_state
 
@@ -2404,7 +2440,7 @@ defmodule Web.Stream do
   end
 
   defp waiter_ok_action({:signal, pid, ref}) do
-    priority_send(pid, {:ready, ref})
+    send(pid, {:ready, ref})
     []
   end
 
@@ -2413,7 +2449,7 @@ defmodule Web.Stream do
   defp waiter_closed_action(from), do: {:reply, from, {:error, :closed}}
 
   defp waiter_error_action({:signal, pid, ref}, reason) do
-    priority_send(pid, {:stream_error, ref, {:errored, reason}})
+    send(pid, {:stream_error, ref, {:errored, reason}})
     []
   end
 
@@ -2501,10 +2537,6 @@ defmodule Web.Stream do
 
   defp reply_keep_state(data) do
     {:keep_state, data, []}
-  end
-
-  defp priority_send(pid, message) do
-    :erlang.send(pid, message, [:priority])
   end
 
   defp queue_chunk_size(%{strategy: strategy}, chunk) do

@@ -1,6 +1,8 @@
 defmodule Web.URLPattern.Parser do
   @moduledoc false
 
+  alias Web.URLPattern.ClassSet
+
   # Recursive-descent parser for URLPattern syntax.
   #
   # Grammar (simplified):
@@ -234,11 +236,7 @@ defmodule Web.URLPattern.Parser do
     end
   end
 
-  defp normalize_regex_pattern(pattern) do
-    pattern
-    |> String.replace("[[a-z]--a]", "[b-z]")
-    |> String.replace("[\\d&&[0-1]]", "[0-1]")
-  end
+  defp normalize_regex_pattern(pattern), do: ClassSet.translate(pattern)
 
   defp validate_no_duplicate_names!(parts) do
     names = collect_names(parts, [])

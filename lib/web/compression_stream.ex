@@ -129,10 +129,10 @@ defmodule Web.CompressionStream do
 
     case result do
       {:ok, final_chunks} ->
-        for c <- final_chunks do
-          ReadableStreamDefaultController.wait_for_capacity(ctrl)
-          ReadableStreamDefaultController.enqueue(ctrl, c)
-        end
+        # The last chunks do not wait for the reader, thus the close of
+        # the writable side does not need a reader, as in the Streams
+        # Standard.
+        for c <- final_chunks, do: ReadableStreamDefaultController.enqueue(ctrl, c)
 
         {:ok, state}
 

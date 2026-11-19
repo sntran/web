@@ -152,6 +152,50 @@ defmodule Web.FetchTimeoutTest do
     end
   end
 
+  describe "the unread time of a tcp: response" do
+    test "releases the socket of a body that no process reads, and the read rejects" do
+      set_env(:unread_body_timeout, 100)
+      test = self()
+
+      {:ok, listener} =
+        :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+      {:ok, port} = :inet.port(listener)
+
+      spawn(fn ->
+        {:ok, socket} = :gen_tcp.accept(listener)
+        :gen_tcp.send(socket, "data")
+        # The server sees the close of the client.
+        send(test, {:server_recv, :gen_tcp.recv(socket, 0, 2_000)})
+      end)
+
+      response = await(fetch("tcp://localhost:#{port}"))
+      assert_receive {:server_recv, {:error, :closed}}, 2_000
+
+      assert %Web.TypeError{message: message} = catch_exit(await(Response.text(response)))
+      assert message =~ "was not read"
+    end
+
+    test "does not stop a body that a process reads" do
+      set_env(:unread_body_timeout, 100)
+
+      {:ok, listener} =
+        :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+      {:ok, port} = :inet.port(listener)
+
+      spawn(fn ->
+        {:ok, socket} = :gen_tcp.accept(listener)
+        Process.sleep(300)
+        :gen_tcp.send(socket, "late data")
+        :gen_tcp.close(socket)
+      end)
+
+      response = await(fetch("tcp://localhost:#{port}"))
+      assert await(Response.text(response)) == "late data"
+    end
+  end
+
   describe "the connect timeout" do
     test "has the default of 10 seconds, and comes from the application setting" do
       assert Web.Application.connect_timeout() == 10_000

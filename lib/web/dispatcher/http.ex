@@ -4,7 +4,6 @@ defmodule Web.Dispatcher.HTTP do
   @behaviour Web.Dispatcher
 
   @max_redirects 20
-  @default_unread_body_timeout 300_000
   @default_receive_timeout 300_000
   @redirect_statuses [301, 302, 303, 307, 308]
   @credential_headers ["authorization", "cookie", "proxy-authorization"]
@@ -147,11 +146,9 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp response_body(stream, _method, _status) do
-    Web.ReadableStream.from_enumerable(stream, unread_timeout: unread_body_timeout())
-  end
-
-  defp unread_body_timeout do
-    Application.get_env(:web, :unread_body_timeout, @default_unread_body_timeout)
+    Web.ReadableStream.from_enumerable(stream,
+      unread_timeout: Web.Application.unread_body_timeout()
+    )
   end
 
   defp receive_timeout do

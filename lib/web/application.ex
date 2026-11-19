@@ -25,6 +25,15 @@ defmodule Web.Application do
   end
 
   @default_connect_timeout 10_000
+  @default_unread_body_timeout 300_000
+
+  @doc false
+  # The time that the body of a `Web.fetch/2` response stays when no process
+  # starts to read it. After that time the body releases its connection.
+  @spec unread_body_timeout() :: non_neg_integer() | :infinity
+  def unread_body_timeout do
+    Application.get_env(:web, :unread_body_timeout, @default_unread_body_timeout)
+  end
 
   @doc false
   # The time that `Web.fetch/2` and `Web.connect/2` wait for a connection.

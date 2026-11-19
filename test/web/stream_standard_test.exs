@@ -636,6 +636,65 @@ defmodule Web.StreamStandardTest do
     end
   end
 
+  describe "the signal of a writable stream controller" do
+    test "aborts with the reason when the writer aborts, also during a write" do
+      test = self()
+
+      sink = %{
+        write: fn _chunk, controller ->
+          signal = WritableStreamDefaultController.signal(controller)
+          send(test, {:signal, signal, WritableStreamDefaultController.signal(controller)})
+          Process.sleep(:infinity)
+        end
+      }
+
+      writer = WritableStream.get_writer(WritableStream.new(sink))
+      write = Writer.write(writer, :chunk)
+
+      assert_receive {:signal, signal, same_signal}
+      assert signal == same_signal
+      refute AbortSignal.aborted?(signal)
+
+      assert await(Writer.abort(writer, :stop)) == :ok
+      assert AbortSignal.aborted?(signal)
+      assert AbortSignal.reason(signal) == :stop
+      assert rejection(write) == :stop
+    end
+
+    test "is aborted already when the sink asks for it after the abort" do
+      test = self()
+
+      stream =
+        WritableStream.new(%{
+          abort: fn _reason -> send(test, :abort_called) end,
+          start: fn controller -> send(test, {:controller, controller}) end
+        })
+
+      assert_receive {:controller, controller}
+      assert await(WritableStream.abort(stream, :stop)) == :ok
+
+      signal = WritableStreamDefaultController.signal(controller)
+      assert AbortSignal.aborted?(signal)
+      assert AbortSignal.reason(signal) == :stop
+    end
+
+    test "starts no process for a stream that does not use it" do
+      stream = WritableStream.new()
+      assert WritableStream.__get_slots__(stream.controller_pid).abort_controller == nil
+
+      assert await(WritableStream.abort(stream, :stop)) == :ok
+
+      assert WritableStream.__get_slots__(stream.controller_pid).abort_controller ==
+               {:aborted, :stop}
+    end
+
+    test "is an aborted signal for a stream that stopped" do
+      controller = %WritableStreamDefaultController{pid: spawn(fn -> :ok end)}
+      Process.sleep(20)
+      assert AbortSignal.aborted?(WritableStreamDefaultController.signal(controller))
+    end
+  end
+
   describe "a readable stream controller" do
     test "gives the desired size 0 after a close, and nil after an error" do
       closed = ReadableStream.new(%{})

@@ -496,6 +496,162 @@ defmodule Web.Dispatcher.HTTPTest do
     end
   end
 
+  # Runs the request, and returns the response with the bridge process of
+  # its connection. The bridge is the first process that the request makes.
+  defp fetch_with_bridge(req) do
+    task =
+      Task.async(fn ->
+        receive do
+          :go -> HTTP.fetch(req)
+        end
+      end)
+
+    :erlang.trace(task.pid, true, [:procs])
+    send(task.pid, :go)
+    assert_receive {:trace, _fetcher, :spawn, bridge, _mfa}, 1_000
+    assert {:ok, resp} = Task.await(task)
+    {resp, bridge}
+  end
+
+  defp monitored(pid) do
+    {:monitors, monitors} = Process.info(pid, :monitors)
+    for {:process, monitored} <- monitors, do: monitored
+  end
+
+  # The two processes that the bridge monitors when a reader waits: the
+  # worker, which runs the request of the HTTP client, and the process that
+  # reads the body.
+  defp worker_and_consumer(bridge) do
+    eventually(fn -> length(monitored(bridge)) == 2 end)
+    {[worker], [consumer]} = Enum.split_with(monitored(bridge), &in_http_client?/1)
+    {worker, consumer}
+  end
+
+  defp in_http_client?(pid) do
+    {:current_stacktrace, stacktrace} = Process.info(pid, :current_stacktrace)
+
+    Enum.any?(stacktrace, fn {module, _function, _arity, _location} ->
+      module |> Atom.to_string() |> String.starts_with?("Elixir.Finch")
+    end)
+  end
+
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
+  end
+
+  # A response whose body has one chunk, and then nothing for a long time.
+  defp stalled_response(options) do
+    port =
+      HTTPServer.start_link([
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata",
+        {:sleep, 2_000}
+      ])
+
+    fetch_with_bridge(Request.new("http://localhost:#{port}/stalled", options))
+  end
+
+  # Reads the first chunk, then starts the read of the subsequent one.
+  defp read_until_stalled(resp) do
+    reader = Web.ReadableStream.get_reader(resp.body)
+    assert %{done: false} = Web.await(Web.ReadableStreamDefaultReader.read(reader))
+    Web.ReadableStreamDefaultReader.read(reader)
+  end
+
+  test "an informational response before the response is ignored" do
+    for informational <- [
+          "HTTP/1.1 100 Continue\r\n\r\n",
+          "HTTP/1.1 103 Early Hints\r\nlink: </style.css>; rel=preload\r\n\r\n"
+        ] do
+      port =
+        HTTPServer.start_link([
+          informational,
+          "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-final: yes\r\n\r\nok"
+        ])
+
+      assert {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/informational"))
+      assert resp.status == 200
+      assert Web.Headers.get(resp.headers, "x-final") == "yes"
+      assert Web.Headers.get(resp.headers, "link") == nil
+      assert Web.await(Web.Response.text(resp)) == "ok"
+    end
+  end
+
+  test "the trailers of a chunked response are not in the body" do
+    port =
+      HTTPServer.start_link([
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-sum\r\n\r\n",
+        "2\r\nok\r\n0\r\nx-sum: 1\r\n\r\n"
+      ])
+
+    assert {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/trailers"))
+    assert Web.await(Web.Response.text(resp)) == "ok"
+    assert Web.Headers.get(resp.headers, "x-sum") == nil
+  end
+
+  test "a redirect of a request with no response body follows the redirect mode" do
+    port =
+      HTTPServer.start_link([
+        "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n"
+      ])
+
+    req = Request.new("http://localhost:#{port}/head", method: "HEAD", redirect: "error")
+    assert HTTP.fetch(req) == {:error, :redirect_error}
+  end
+
+  test "a reader that waits gets an error when the bridge process stops" do
+    {resp, bridge} = stalled_response([])
+    read = read_until_stalled(resp)
+
+    {_worker, _consumer} = worker_and_consumer(bridge)
+    Process.exit(bridge, :kill)
+
+    assert %Web.TypeError{
+             message: "The response body is not complete.",
+             cause: {:connection_process_stopped, :killed}
+           } = catch_exit(Web.await(read))
+  end
+
+  test "a reader that waits gets an error when the connection process stops" do
+    {resp, bridge} = stalled_response([])
+    read = read_until_stalled(resp)
+
+    {worker, _consumer} = worker_and_consumer(bridge)
+    Process.exit(worker, :kill)
+
+    assert %Web.TypeError{
+             message: "The response body is not complete.",
+             cause: {:connection_process_stopped, :killed}
+           } = catch_exit(Web.await(read))
+  end
+
+  test "the connection processes stop when the process that reads the body stops" do
+    {resp, bridge} = stalled_response([])
+    _read = read_until_stalled(resp)
+
+    {worker, consumer} = worker_and_consumer(bridge)
+    Process.exit(consumer, :kill)
+
+    eventually(fn -> not Process.alive?(bridge) and not Process.alive?(worker) end)
+  end
+
+  test "an abort with an exception as the reason gives that exception to the reader" do
+    controller = Web.AbortController.new()
+    {resp, bridge} = stalled_response(signal: controller.signal)
+    read = read_until_stalled(resp)
+    {worker, _consumer} = worker_and_consumer(bridge)
+
+    reason = %RuntimeError{message: "the caller stopped the request"}
+    assert :ok = Web.AbortController.abort(controller, reason)
+
+    assert catch_exit(Web.await(read)) == reason
+    # The abort stops the connection processes.
+    eventually(fn -> not Process.alive?(bridge) and not Process.alive?(worker) end)
+  end
+
   test "fetch/1 aborts on next pull after first chunk" do
     controller = Web.AbortController.new()
 

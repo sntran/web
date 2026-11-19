@@ -393,16 +393,11 @@ defmodule Web.Dispatcher.HTTP do
         |> maybe_send_ready()
         |> bridge_loop()
 
-      {:bridge_headers, ref, headers} when ref == state.ref and not state.headers_received? ->
+      {:bridge_headers, ref, headers} when ref == state.ref ->
         state
-        |> Map.put(:headers, headers)
-        |> Map.put(:headers_received?, true)
+        |> put_headers(headers)
         |> maybe_send_ready()
         |> bridge_loop()
-
-      {:bridge_headers, ref, _trailers} when ref == state.ref ->
-        # coveralls-ignore-next-line
-        bridge_loop(state)
 
       {:bridge_data, ref, chunk, worker_pid}
       when ref == state.ref and is_nil(state.waiting_consumer) ->
@@ -423,21 +418,7 @@ defmodule Web.Dispatcher.HTTP do
         bridge_loop(%{state | waiting_consumer: nil})
 
       {:bridge_error, ref, reason} when ref == state.ref ->
-        state = %{state | terminal: {:error, reason}}
-
-        cond do
-          state.waiting_consumer ->
-            send(state.waiting_consumer, {:bridge_error, ref, reason})
-
-          not state.ready_sent? ->
-            send(state.owner, {:bridge_failed, ref, reason})
-
-          # The reader gets the error with its subsequent request.
-          true ->
-            :ok
-        end
-
-        bridge_loop(%{state | waiting_consumer: nil})
+        state |> fail(reason, reason) |> bridge_loop()
 
       {:bridge_next, ref, consumer} when ref == state.ref ->
         state |> monitor_consumer(consumer) |> answer_consumer(consumer) |> bridge_loop()
@@ -492,23 +473,38 @@ defmodule Web.Dispatcher.HTTP do
 
   # A worker that stopped before it gave the end of the body is an error.
   defp worker_stopped(%{terminal: nil} = state, reason) do
-    error = {:connection_process_stopped, reason}
+    fail(state, {:connection_process_stopped, reason}, reason)
+  end
 
+  defp worker_stopped(state, _reason), do: state
+
+  # The request failed. The process that waits gets the error: the reader of
+  # the body, or the process that waits for the head of the response. A
+  # reader that does not wait gets the error with its subsequent request.
+  defp fail(state, body_error, head_error) do
     cond do
       state.waiting_consumer ->
-        send(state.waiting_consumer, {:bridge_error, state.ref, error})
+        send(state.waiting_consumer, {:bridge_error, state.ref, body_error})
 
       not state.ready_sent? ->
-        send(state.owner, {:bridge_failed, state.ref, reason})
+        send(state.owner, {:bridge_failed, state.ref, head_error})
 
       true ->
         :ok
     end
 
-    %{state | terminal: {:error, error}, waiting_consumer: nil}
+    %{state | terminal: {:error, body_error}, waiting_consumer: nil}
   end
 
-  defp worker_stopped(state, _reason), do: state
+  # An informational response (a status from 100 to 199, but not 101) comes
+  # before the response. The Fetch Standard ignores it: the bridge waits for
+  # the subsequent status and headers.
+  defp put_headers(%{status: status} = state, _headers)
+       when status in 100..199 and status != 101 do
+    %{state | status: nil}
+  end
+
+  defp put_headers(state, headers), do: %{state | headers: headers, headers_received?: true}
 
   defp bridge_worker(bridge_pid, ref, finch_request) do
     result =
@@ -528,20 +524,14 @@ defmodule Web.Dispatcher.HTTP do
           {:data, chunk}, acc ->
             send(bridge_pid, {:bridge_data, ref, chunk, self()})
 
+            # The bridge stops this process when the reader cancels.
             receive do
-              {:bridge_ack, ^ref} ->
-                acc
-
-              # coveralls-ignore-start
-              {:bridge_cancel, ^ref} ->
-                exit(:normal)
-                # coveralls-ignore-stop
+              {:bridge_ack, ^ref} -> acc
             end
 
-          # coveralls-ignore-start
+          # The Fetch Standard does not give the trailers to the caller.
           {:trailers, _trailers}, acc ->
             acc
-            # coveralls-ignore-stop
         end,
         # The time to wait for the response headers, and for each subsequent
         # part of the body. It does not include the time that the reader of
@@ -561,9 +551,6 @@ defmodule Web.Dispatcher.HTTP do
         send(bridge_pid, {:bridge_error, ref, reason})
     end
   end
-
-  # coveralls-ignore-next-line
-  defp maybe_send_ready(%{ready_sent?: true} = state), do: state
 
   defp maybe_send_ready(%{status: status, headers_received?: true} = state)
        when not is_nil(status) do
@@ -656,17 +643,12 @@ defmodule Web.Dispatcher.HTTP do
     cancel_bridge(state.bridge_pid, state.bridge_ref)
 
     case reason do
-      :aborted -> raise abort_reason(state.signal)
+      # The signal aborted before the read of the body started.
+      :aborted -> raise Web.AbortSignal.reason(state.signal) || Web.AbortSignal.default_reason()
       reason when is_exception(reason) -> raise reason
       reason -> raise Web.DOMException, name: "AbortError", message: inspect(reason)
     end
   end
-
-  defp abort_reason(%Web.AbortSignal{} = signal) do
-    Web.AbortSignal.reason(signal) || Web.AbortSignal.default_reason()
-  end
-
-  defp abort_reason(_signal), do: Web.AbortSignal.default_reason()
 
   # A network error in the body is a `TypeError`, as the Fetch Standard
   # specifies.

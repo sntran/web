@@ -1298,10 +1298,19 @@ defmodule Web.Stream do
         total_queued_size: data.total_queued_size - queue_chunk_size(data, chunk)
     }
 
-    actions = [{:reply, from, {:ok, chunk}}]
+    actions = [{:reply, from, {:ok, default_read_chunk(data, chunk)}}]
     {new_data, actions} = maybe_refresh_read_actions(new_data, actions)
     {:keep_state, new_data, maybe_request_pull(new_data, actions)}
   end
+
+  # A default read of a byte stream gives a `Web.Uint8Array`, as the Streams
+  # Standard specifies. The queue of a byte stream holds binaries, thus a
+  # BYOB read can take a part of a chunk.
+  defp default_read_chunk(%{stream_type: :bytes}, chunk) when is_binary(chunk) do
+    Web.Uint8Array.from(chunk)
+  end
+
+  defp default_read_chunk(_data, chunk), do: chunk
 
   defp handle_byob_read_request(from, _pid, _view, :errored, data) do
     disturbed_data = %{data | disturbed: true}
@@ -1462,6 +1471,12 @@ defmodule Web.Stream do
   # Producer enqueue logic (used from readable/3 and producer_consumer states)
   # ---------------------------------------------------------------------------
 
+  # The queue of a byte stream holds binaries, thus a BYOB read can take a
+  # part of a chunk. A branch of `tee` gets its chunks as views.
+  defp handle_producer_enqueue(%Web.Uint8Array{} = chunk, state, %{stream_type: :bytes} = data) do
+    handle_producer_enqueue(Web.Uint8Array.to_binary(chunk), state, data)
+  end
+
   defp handle_producer_enqueue(chunk, _state, %{pending_byob_request: %{}} = data)
        when is_binary(chunk) do
     fulfill_pending_byob_enqueue(chunk, data)
@@ -1489,7 +1504,7 @@ defmodule Web.Stream do
         }
 
         new_data = refresh_backpressure(new_data)
-        :gen_statem.reply(from, {:ok, c})
+        :gen_statem.reply(from, {:ok, default_read_chunk(data, c)})
 
         {:keep_state, new_data, [{:next_event, :internal, :maybe_pull}]}
 

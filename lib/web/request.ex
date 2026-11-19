@@ -245,7 +245,7 @@ defmodule Web.Request do
     # A request with no body has the body `nil`, as the Fetch Standard
     # specifies, and starts no stream. The stream starts after all the
     # checks, thus an input that is not valid starts no process.
-    body = if is_nil(raw_body), do: nil, else: Web.ReadableStream.from(raw_body)
+    body = if is_nil(raw_body), do: nil, else: Web.Body.stream(raw_body)
     dispatcher = Keyword.get(init, :dispatcher)
 
     snapshot = AsyncContext.Snapshot.take()
@@ -292,7 +292,7 @@ defmodule Web.Request do
         {:ok, raw_body} ->
           :ok = validate_body(method, raw_body)
           headers = Web.Body.put_inferred_content_type(headers, raw_body)
-          {Web.ReadableStream.from(raw_body), body_source(raw_body), headers}
+          {Web.Body.stream(raw_body), body_source(raw_body), headers}
 
         :error ->
           :ok = validate_body(method, request.body)

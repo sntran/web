@@ -268,8 +268,13 @@ defmodule Web.ReadableByteStreamTest do
     waiter = Task.async(fn -> ReadableByteStreamController.wait_for_capacity(controller) end)
     assert Task.yield(waiter, 20) == nil
 
+    # A default read of a byte stream gives a Uint8Array.
     reader = ReadableStream.get_reader(stream)
-    assert %{value: "ab", done: false} = await(Web.ReadableStreamDefaultReader.read(reader))
+
+    assert %{value: %Uint8Array{} = chunk, done: false} =
+             await(Web.ReadableStreamDefaultReader.read(reader))
+
+    assert Uint8Array.to_binary(chunk) == "ab"
     assert {:ok, :ok} = Task.yield(waiter, 1_000)
   end
 

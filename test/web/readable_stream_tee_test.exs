@@ -284,7 +284,7 @@ defmodule Web.ReadableStreamTeeTest do
                await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(5))))
 
       assert Uint8Array.to_binary(value) == "hello"
-      assert Enum.join(right) == "hello world"
+      assert Web.TestBytes.join(right) == "hello world"
     end
   end
 

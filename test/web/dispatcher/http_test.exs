@@ -90,8 +90,7 @@ defmodule Web.Dispatcher.HTTPTest do
     assert resp.status_text == "OK"
     assert Web.Headers.get(resp.headers, "content-length") == "5"
 
-    chunks = resp.body |> Enum.to_list()
-    assert Enum.join(chunks) == "hello"
+    assert Web.TestBytes.join(resp.body) == "hello"
   end
 
   test "fetch/1 accepts a raw request with a nil body" do
@@ -109,7 +108,7 @@ defmodule Web.Dispatcher.HTTPTest do
     }
 
     assert {:ok, resp} = HTTP.fetch(req)
-    assert Enum.to_list(resp.body) == ["ok"]
+    assert Web.TestBytes.binaries(resp.body) == ["ok"]
   end
 
   test "fetch/1 streams enumerable request bodies without normalizing them to readable streams" do
@@ -124,7 +123,7 @@ defmodule Web.Dispatcher.HTTPTest do
       )
 
     assert {:ok, resp} = HTTP.fetch(req)
-    assert Enum.to_list(resp.body) == ["ok"]
+    assert Web.TestBytes.binaries(resp.body) == ["ok"]
   end
 
   test "fetch/1 accepts raw iodata list bodies" do
@@ -142,7 +141,7 @@ defmodule Web.Dispatcher.HTTPTest do
     }
 
     assert {:ok, resp} = HTTP.fetch(req)
-    assert Enum.to_list(resp.body) == ["ok"]
+    assert Web.TestBytes.binaries(resp.body) == ["ok"]
   end
 
   test "fetch/1 surfaces raw invalid body types as request build errors" do
@@ -200,8 +199,7 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/path", method: :get)
     {:ok, resp} = HTTP.fetch(req)
 
-    chunks = resp.body |> Enum.to_list()
-    assert Enum.join(chunks) == "hello"
+    assert Web.TestBytes.join(resp.body) == "hello"
   end
 
   test "fetch/1 covers invalid connection path cleanly" do
@@ -291,7 +289,7 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert resp.status == 200
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
   end
 
   test "fetch/1 keeps polling when chunk framing arrives incomplete" do
@@ -308,7 +306,7 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert resp.status == 200
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
   end
 
   test "fetch/1 keeps reading when headers arrive across multiple socket reads" do
@@ -323,7 +321,7 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert resp.status == 200
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
   end
 
   test "fetch/1 reads body data that arrives after headers in later recv cycles" do
@@ -337,7 +335,7 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/deferred-body")
     {:ok, resp} = HTTP.fetch(req)
 
-    assert Enum.to_list(resp.body) == ["data"]
+    assert Web.TestBytes.binaries(resp.body) == ["data"]
   end
 
   test "fetch/1 aborts an in-flight body stream and closes the connection" do
@@ -423,7 +421,7 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/delayed-body", signal: controller.signal)
     {:ok, resp} = HTTP.fetch(req)
 
-    assert Enum.to_list(resp.body) == ["data"]
+    assert Web.TestBytes.binaries(resp.body) == ["data"]
   end
 
   test "fetch/1 gives an error when the transport closes before the body is complete" do
@@ -516,7 +514,7 @@ defmodule Web.Dispatcher.HTTPTest do
     # An abort after the first chunk stops the body with an error.
     assert_raise Web.TypeError, "The stream is errored.", fn ->
       Enum.each(resp.body, fn chunk ->
-        send(parent, {:chunk, chunk})
+        send(parent, {:chunk, Web.TestBytes.binary(chunk)})
         :ok = Web.AbortController.abort(controller, :timeout)
       end)
     end

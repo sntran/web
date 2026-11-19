@@ -207,7 +207,7 @@ defmodule Web.FetchRedirectTest do
 
     assert resp.status == 200
     assert resp.url == "http://localhost:#{port}/success"
-    assert Enum.to_list(resp.body) == ["success"]
+    assert Web.TestBytes.binaries(resp.body) == ["success"]
   end
 
   test "redirect loop stops after the fetch maximum", %{port: port} do
@@ -238,7 +238,7 @@ defmodule Web.FetchRedirectTest do
       )
 
     assert resp.status == 200
-    assert Enum.to_list(resp.body) == ["GET:"]
+    assert Web.TestBytes.binaries(resp.body) == ["GET:"]
   end
 
   test "307 keeps method and body while following a relative location", %{port: port} do
@@ -253,7 +253,7 @@ defmodule Web.FetchRedirectTest do
 
     assert resp.status == 200
     assert resp.url == "http://localhost:#{port}/keep-method"
-    assert Enum.to_list(resp.body) == ["POST:payload"]
+    assert Web.TestBytes.binaries(resp.body) == ["POST:payload"]
   end
 
   test "307 rejects a request body from a stream", %{port: port} do
@@ -281,7 +281,7 @@ defmodule Web.FetchRedirectTest do
   test "follow closes the previous response body before opening the next request", %{port: port} do
     resp = await(Web.fetch("http://localhost:#{port}/redirect-stream", redirect: "follow"))
 
-    assert Enum.to_list(resp.body) == ["success"]
+    assert Web.TestBytes.binaries(resp.body) == ["success"]
   end
 
   test "308 sends a request body from memory again", %{port: port} do
@@ -290,13 +290,13 @@ defmodule Web.FetchRedirectTest do
 
     assert resp.status == 200
     assert_receive {:stream_target_body, "payload"}
-    assert Enum.to_list(resp.body) == ["POST:payload"]
+    assert Web.TestBytes.binaries(resp.body) == ["POST:payload"]
   end
 
   test "redirect with no location returns the original response", %{port: port} do
     resp = await(Web.fetch("http://localhost:#{port}/redir-no-location", redirect: "follow"))
 
     assert resp.status == 301
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
   end
 end

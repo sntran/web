@@ -43,7 +43,7 @@ defmodule Web.FormDataTest do
     assert %Web.File{name: "upload", filename: "hello.txt", type: "text/plain"} =
              file = Web.FormData.get(form_data, "upload")
 
-    assert Enum.join(Web.File.stream(file), "") == "hello file"
+    assert Web.TestBytes.join(Web.File.stream(file)) == "hello file"
   end
 
   test "parse raises on malformed multipart payload" do
@@ -91,7 +91,7 @@ defmodule Web.FormDataTest do
     assert Task.yield(later_field, 0) == nil
     assert stable_source_pulls(tracker) == pulls_before
 
-    assert Enum.join(Web.File.stream(file), "") == "hello file"
+    assert Web.TestBytes.join(Web.File.stream(file)) == "hello file"
     assert Task.await(later_field) == "done"
     assert source_pulls(tracker) > pulls_before
   end
@@ -121,7 +121,7 @@ defmodule Web.FormDataTest do
     assert Task.yield(get_waiter, 0) == nil
     assert Task.yield(has_waiter, 0) == nil
 
-    assert Enum.join(Web.File.stream(file), "") == String.duplicate("a", 64)
+    assert Web.TestBytes.join(Web.File.stream(file)) == String.duplicate("a", 64)
     assert Task.await(get_waiter) == "done"
     assert Task.await(has_waiter) == true
   end
@@ -193,7 +193,7 @@ defmodule Web.FormDataTest do
 
   test "static files stream from blob parts when no live stream is attached" do
     file = Web.File.new(["hello"], name: "upload", filename: "hello.txt", type: "text/plain")
-    assert Enum.join(Web.File.stream(file), "") == "hello"
+    assert Web.TestBytes.join(Web.File.stream(file)) == "hello"
   end
 
   test "live forms drain before eager mutations" do
@@ -362,7 +362,7 @@ defmodule Web.FormDataTest do
 
     later_values = Task.async(fn -> Web.FormData.get_all(form, "tail") end)
 
-    assert Enum.join(Web.File.stream(file), "") == "payload"
+    assert Web.TestBytes.join(Web.File.stream(file)) == "payload"
     assert Task.await(later_values) == ["a", "b"]
   end
 
@@ -403,7 +403,7 @@ defmodule Web.FormDataTest do
     send(form.coordinator, :unrelated_message)
 
     assert_eventually(fn -> Process.alive?(form.coordinator) end)
-    assert Enum.join(Web.File.stream(file), "") == file_body
+    assert Web.TestBytes.join(Web.File.stream(file)) == file_body
     assert Web.FormData.get(form, "after") == "ok"
   end
 
@@ -429,7 +429,7 @@ defmodule Web.FormDataTest do
     send(form.coordinator, :unrelated_message)
 
     assert_eventually(fn -> Process.alive?(form.coordinator) end)
-    assert Enum.join(Web.File.stream(file), "") == file_body
+    assert Web.TestBytes.join(Web.File.stream(file)) == file_body
     assert Web.FormData.get(form, "after") == "ok"
   end
 
@@ -444,7 +444,7 @@ defmodule Web.FormDataTest do
       |> Web.FormData.parse(boundary)
 
     file = Web.FormData.get(form, "upload")
-    assert Enum.join(Web.File.stream(file), "") == file_body
+    assert Web.TestBytes.join(Web.File.stream(file)) == file_body
   end
 
   test "quoted filename parameters unescape quoted-string escapes" do
@@ -1036,7 +1036,7 @@ defmodule Web.FormDataTest do
 
     Process.sleep(50)
     assert Task.yield(waiter, 0) == nil
-    assert Enum.join(Web.File.stream(file), "") == "payload"
+    assert Web.TestBytes.join(Web.File.stream(file)) == "payload"
 
     assert {:error, %Web.TypeError{message: message}} = Task.await(waiter)
     assert message =~ "part headers are incomplete"
@@ -1060,7 +1060,7 @@ defmodule Web.FormDataTest do
     result =
       Task.async(fn ->
         try do
-          Enum.join(Web.File.stream(file), "")
+          Web.TestBytes.join(Web.File.stream(file))
         rescue
           error in Web.TypeError -> {:raised, error}
         catch
@@ -1099,7 +1099,7 @@ defmodule Web.FormDataTest do
     result =
       Task.async(fn ->
         try do
-          {:ok, Enum.join(Web.File.stream(file), "")}
+          {:ok, Web.TestBytes.join(Web.File.stream(file))}
         rescue
           e in Web.TypeError -> {:error, e}
         catch
@@ -1461,7 +1461,7 @@ defmodule Web.FormDataTest do
     parsed = Web.FormData.parse(ReadableStream.from(byte_chunks(payload)), boundary)
 
     assert %Web.File{filename: "tiny.txt"} = file = Web.FormData.get(parsed, "upload")
-    assert Enum.join(Web.File.stream(file), "") == "abc"
+    assert Web.TestBytes.join(Web.File.stream(file)) == "abc"
     assert Web.FormData.get(parsed, "after") == "done"
   end
 
@@ -1478,7 +1478,7 @@ defmodule Web.FormDataTest do
       form = Web.FormData.parse(ReadableStream.from(byte_chunks(multipart)), boundary)
       file = Web.FormData.get(form, "upload")
 
-      assert Enum.join(Web.File.stream(file), "") == payload
+      assert Web.TestBytes.join(Web.File.stream(file)) == payload
       assert Web.FormData.get(form, "tail") == "ok"
     end
   end
@@ -1826,7 +1826,7 @@ defmodule Web.FormDataTest do
       # the next entry. This matches the correct streaming usage pattern.
       result =
         Enum.reduce(form, [], fn [name, value], acc ->
-          content = value |> Web.File.stream() |> Enum.join("")
+          content = value |> Web.File.stream() |> Web.TestBytes.join()
           acc ++ [{name, content}]
         end)
 
@@ -2274,7 +2274,7 @@ defmodule Web.FormDataEdgeTest do
     reader_task =
       Task.async(fn ->
         try do
-          {:ok, Enum.join(Web.File.stream(file), "")}
+          {:ok, Web.TestBytes.join(Web.File.stream(file))}
         catch
           :exit, reason -> {:exit, reason}
         end

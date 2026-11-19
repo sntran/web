@@ -288,7 +288,7 @@ defmodule Web.BodyTest do
     assert %Web.File{name: "upload", filename: "a.txt", type: "text/plain"} =
              file = Web.FormData.get(form_data, "upload")
 
-    assert Enum.join(Web.File.stream(file), "") == "hello"
+    assert Web.TestBytes.join(Web.File.stream(file)) == "hello"
   end
 
   test "Response.form_data/1 parses application/x-www-form-urlencoded payload" do

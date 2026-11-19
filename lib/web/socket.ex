@@ -7,6 +7,7 @@ defmodule Web.Socket do
 
   alias Web.AsyncContext.Snapshot
   alias Web.ByteLengthQueuingStrategy
+  alias Web.Internal.Bytes
   alias Web.Internal.Envelope
   alias Web.Promise
   alias Web.ReadableStream
@@ -366,8 +367,9 @@ defmodule Web.Socket do
     {:noreply, state}
   end
 
+  # Each chunk of the readable side is a `Web.Uint8Array`.
   defp handle_transport_data(data, state) do
-    ReadableStream.enqueue(state.readable_pid, data)
+    ReadableStream.enqueue(state.readable_pid, Web.Uint8Array.from(data))
     maybe_resume_transport(state)
   end
 
@@ -590,9 +592,14 @@ defmodule Web.Socket do
   end
 
   defp normalize_payload(chunk) do
-    {:ok, IO.iodata_to_binary(chunk)}
-  rescue
-    _error -> {:error, TypeError.exception("Socket writes must be binary or iodata")}
+    case Bytes.to_binary(chunk) do
+      {:ok, payload} ->
+        {:ok, payload}
+
+      :error ->
+        {:error,
+         TypeError.exception("Socket writes must be a binary, a Uint8Array, or an ArrayBuffer")}
+    end
   end
 
   defp debug_info(state) do

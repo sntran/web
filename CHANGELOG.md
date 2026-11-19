@@ -12,6 +12,10 @@ All notable changes to this project are documented in this file.
   response headers or for the next part of a body. The default is
   300000 ms. A request that fails for one of these limits rejects with
   `Web.TypeError`.
+- `Web.Uint8Array.from/1`, which makes a view with a new buffer from a
+  binary, iodata, a `Web.ArrayBuffer`, or a `Web.Uint8Array`.
+- A short form for `inspect/1` of a `Web.Uint8Array`:
+  `#Web.Uint8Array<"hello">`.
 - `Web.WritableStreamDefaultController.signal/1`, as the attribute `signal`:
   an abort signal that aborts when the stream is aborted.
 - `Web.TransformStreamDefaultController`, the controller that the callbacks
@@ -225,6 +229,28 @@ All notable changes to this project are documented in this file.
   - `new/2` does not wait for a promise that the function `start` returns.
     The writes wait until that promise fulfils. A rejection puts the two
     sides in the errored state.
+- **Breaking:** each stream of bytes gives its chunks as `Web.Uint8Array`
+  values, as the Web standards specify. Before, most of them gave binaries.
+  This applies to:
+  - the body of a `Web.Request` and of a `Web.Response`, for each form of
+    the body and for each dispatcher;
+  - `Web.Blob.stream/1` and `Web.File.stream/1`, and the file streams of
+    `Web.FormData`;
+  - the readable side of a `Web.Socket`, of `Web.CompressionStream`, and of
+    `Web.DecompressionStream`;
+  - a default read of a byte stream;
+  - `Web.ReadableStream.from/1` for a `Web.Blob`, a `Web.ArrayBuffer`, or a
+    `Web.Uint8Array`.
+
+  Thus `Enum.join/1` on a body does not work. Use `Web.Response.text/1` or
+  `Web.Response.bytes/1` for all the bytes, or `Web.Uint8Array.to_binary/1`
+  for one chunk. A stream that the caller made is not changed.
+- Each consumer of bytes accepts a binary, a `Web.Uint8Array`, a
+  `Web.ArrayBuffer`, or iodata: the functions of a body, the body of a
+  request that a dispatcher sends, a write to a `Web.Socket`, a part of a
+  `Web.Blob`, and a chunk for `Web.ReadableByteStreamController.enqueue/2`.
+  The stream takes the buffer of a view that a byte source enqueues: that
+  buffer becomes detached.
 - **Breaking:** `enqueue/2` and `close/1` of a controller raise
   `Web.TypeError` when the readable side is closed or errored, as the
   Streams Standard specifies. This applies to

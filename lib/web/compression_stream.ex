@@ -28,15 +28,20 @@ defmodule Web.CompressionStream do
       :ok
       iex> Web.await(Web.WritableStreamDefaultWriter.close(writer))
       :ok
-      iex> compressed = Enum.join(cs.readable, "")
-      iex> is_binary(compressed) and byte_size(compressed) > 0
-      true
+      iex> [%Web.Uint8Array{} | _] = chunks = Enum.to_list(cs.readable)
+      iex> chunks |> Enum.map_join(&Web.Uint8Array.to_binary/1) |> :zlib.gunzip()
+      "hello"
+
+  Each chunk of the readable side is a `Web.Uint8Array`, as the Compression
+  Standard specifies. A chunk for the writable side is a binary, a
+  `Web.Uint8Array`, or a `Web.ArrayBuffer`.
   """
 
   use Web.Stream
 
   require Logger
 
+  alias Web.Internal.Bytes
   alias Web.ReadableStreamDefaultController
   alias Web.TypeError
   alias Web.Uint8Array
@@ -106,7 +111,7 @@ defmodule Web.CompressionStream do
       {:ok, compressed_chunks} ->
         for c <- compressed_chunks do
           ReadableStreamDefaultController.wait_for_capacity(ctrl)
-          ReadableStreamDefaultController.enqueue(ctrl, c)
+          ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
         end
 
         {:ok, state}
@@ -132,7 +137,8 @@ defmodule Web.CompressionStream do
         # The last chunks do not wait for the reader, thus the close of
         # the writable side does not need a reader, as in the Streams
         # Standard.
-        for c <- final_chunks, do: ReadableStreamDefaultController.enqueue(ctrl, c)
+        for c <- final_chunks,
+            do: ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
 
         {:ok, state}
 
@@ -157,12 +163,11 @@ defmodule Web.CompressionStream do
   defp window_bits_for("deflate"), do: 15
   defp window_bits_for("deflate-raw"), do: -15
 
-  defp to_binary!(bin, _ctx) when is_binary(bin), do: bin
-  defp to_binary!(%Uint8Array{} = arr, _ctx), do: Uint8Array.to_binary(arr)
-  defp to_binary!(%Web.ArrayBuffer{} = buffer, _ctx), do: Web.ArrayBuffer.data(buffer)
+  defp to_binary!(chunk, ctx) when is_list(chunk) do
+    raise TypeError, "#{ctx} chunk must be a binary, a Uint8Array, or an ArrayBuffer"
+  end
 
-  defp to_binary!(_, ctx),
-    do: raise(TypeError, "#{ctx} chunk must be a binary, a Uint8Array, or an ArrayBuffer")
+  defp to_binary!(chunk, ctx), do: Bytes.to_binary!(chunk, ctx)
 
   # Stop the Agent idempotently.
   defp stop_agent(agent) do

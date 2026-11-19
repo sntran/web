@@ -10,6 +10,7 @@ defmodule Web.Dispatcher.TCP do
 
   @behaviour Web.Dispatcher
 
+  alias Web.Internal.Bytes
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController
   alias Web.ReadableStreamDefaultReader
@@ -284,7 +285,7 @@ defmodule Web.Dispatcher.TCP do
       # The bridge runs at the same time as a cancel of the stream, thus
       # these calls have no check.
       {:chunk, chunk} ->
-        Web.ReadableStream.enqueue(controller.pid, chunk)
+        Web.ReadableStream.enqueue(controller.pid, Bytes.chunk(chunk))
         reply_pull(reply_to)
         process_pending_pulls(state)
 
@@ -453,18 +454,21 @@ defmodule Web.Dispatcher.TCP do
     end
   end
 
-  defp iodata_to_binary(body) do
-    if iodata?(body) do
-      IO.iodata_to_binary(body)
-    else
-      raise TypeError, "body is not readable"
+  # The chunks of a body are chunks of bytes: binaries, `Web.Uint8Array`
+  # values, `Web.ArrayBuffer` values, or iodata.
+  defp iodata_to_binary(body) when is_list(body) do
+    case Bytes.to_binary(body) do
+      {:ok, binary} -> binary
+      :error -> Enum.map_join(body, &body_chunk_to_binary/1)
     end
   end
 
-  defp iodata?(body) when is_binary(body), do: true
-  defp iodata?(body) when is_integer(body), do: body >= 0 and body <= 255
-  defp iodata?(body) when is_list(body), do: Enum.all?(body, &iodata?/1)
-  defp iodata?(_body), do: false
+  defp body_chunk_to_binary(chunk) do
+    case Bytes.to_binary(chunk) do
+      {:ok, binary} -> binary
+      :error -> raise TypeError, "body is not readable"
+    end
+  end
 
   defp connection_target(url) do
     if Web.URL.rclone?(url) or remote_like_url?(url) do

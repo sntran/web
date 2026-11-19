@@ -9,9 +9,24 @@ defmodule Web.ReadableByteStreamController do
 
   @type t :: %__MODULE__{pid: pid()}
 
-  @spec enqueue(t(), binary()) :: :ok
+  @doc """
+  Puts a chunk of bytes in the queue of the stream.
+
+  The chunk is a binary or a `Web.Uint8Array`. The stream takes the buffer
+  of a `Web.Uint8Array`, as the Streams Standard specifies: that buffer
+  becomes detached.
+
+  Raises `Web.TypeError` when the stream is closed or errored.
+  """
+  @spec enqueue(t(), binary() | Web.Uint8Array.t()) :: :ok
   def enqueue(%__MODULE__{pid: pid}, chunk) when is_binary(chunk) do
     ReadableStream.controller_enqueue(pid, chunk)
+  end
+
+  def enqueue(%__MODULE__{pid: pid}, %Web.Uint8Array{} = chunk) do
+    bytes = Web.Uint8Array.to_binary(chunk)
+    Web.ArrayBuffer.detach(chunk.buffer)
+    ReadableStream.controller_enqueue(pid, bytes)
   end
 
   @spec close(t()) :: :ok

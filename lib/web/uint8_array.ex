@@ -5,6 +5,25 @@ defmodule Web.Uint8Array do
   A view does not copy the bytes of its buffer. `to_binary/1` raises
   `Web.TypeError` when the buffer is detached.
 
+  ## Chunks of bytes
+
+  Each stream of bytes of this library gives its chunks as `Web.Uint8Array`
+  values, as the Web standards specify: the body of a request or a response,
+  `Web.Blob.stream/1`, the readable side of a socket, of a compression
+  stream, and of `Web.TextEncoderStream`, and a default read of a byte
+  stream. Use `to_binary/1` to get the binary of a chunk:
+
+      iex> response = Web.Response.new(body: "hello")
+      iex> Enum.map(response.body, &Web.Uint8Array.to_binary/1)
+      ["hello"]
+
+  To get all the bytes of a body, use the functions of the body:
+  `Web.Response.text/1`, `Web.Response.bytes/1`, or
+  `Web.Response.array_buffer/1`.
+
+  Each consumer of bytes of this library accepts a binary, a
+  `Web.Uint8Array`, or a `Web.ArrayBuffer`.
+
   ## Examples
 
       iex> buffer = Web.ArrayBuffer.new("hello")
@@ -39,6 +58,27 @@ defmodule Web.Uint8Array do
 
     build_view(buffer, offset, byte_length)
   end
+
+  @doc """
+  Makes a `Uint8Array` with a new buffer that has the given bytes.
+
+  The bytes are a binary, iodata, a `Web.ArrayBuffer`, or a
+  `Web.Uint8Array`.
+
+  ## Examples
+
+      iex> bytes = Web.Uint8Array.from("hello")
+      iex> {bytes.byte_length, Web.Uint8Array.to_binary(bytes)}
+      {5, "hello"}
+
+      iex> Web.Uint8Array.from([104, "i"]) |> Web.Uint8Array.to_binary()
+      "hi"
+  """
+  @spec from(iodata() | ArrayBuffer.t() | t()) :: t()
+  def from(bytes) when is_binary(bytes), do: bytes |> ArrayBuffer.new() |> new()
+  def from(bytes) when is_list(bytes), do: bytes |> IO.iodata_to_binary() |> from()
+  def from(%ArrayBuffer{} = buffer), do: buffer |> ArrayBuffer.data() |> from()
+  def from(%__MODULE__{} = view), do: view |> to_binary() |> from()
 
   defp ensure_attached!(buffer) do
     if ArrayBuffer.detached?(buffer) do
@@ -102,5 +142,21 @@ defmodule Web.Uint8Array do
   def to_binary(%__MODULE__{buffer: buffer, byte_offset: offset, byte_length: len}) do
     data = ArrayBuffer.data(buffer)
     binary_part(data, offset, len)
+  end
+end
+
+defimpl Inspect, for: Web.Uint8Array do
+  import Inspect.Algebra
+
+  # A short form, because each chunk of a stream of bytes is a view:
+  # `#Web.Uint8Array<"hello">`. The usual limits of `inspect/2` apply to the
+  # bytes.
+  def inspect(%Web.Uint8Array{buffer: buffer} = view, opts) do
+    bytes =
+      if Web.ArrayBuffer.detached?(buffer),
+        do: "detached",
+        else: to_doc(Web.Uint8Array.to_binary(view), opts)
+
+    concat(["#Web.Uint8Array<", bytes, ">"])
   end
 end

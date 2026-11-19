@@ -204,7 +204,7 @@ limit.
 source = ReadableStream.from(["chunk1", "chunk2"])
 
 # Split one stream into two independent branches (Zero-copy)
-{branch_a, branch_b} = ReadableStream.tee(source)
+[branch_a, branch_b] = ReadableStream.tee(source)
 
 # Composable pipelines with pipe_through
 upper =
@@ -232,6 +232,29 @@ encoded =
 await(Response.text(Response.new(body: encoded)))
 # => "Hello, 🌍"
 ```
+
+#### Chunks of bytes
+
+Each stream of bytes gives its chunks as `Uint8Array` values, as the Web
+standards specify. This applies to the body of a request or a response, to
+`Blob.stream/1`, to the readable side of a socket, of a compression stream,
+and of `TextEncoderStream`, and to a default read of a byte stream.
+
+```elixir
+response = await(fetch("https://example.com/data"))
+
+# All the bytes: use the functions of the body.
+text = await(Response.text(response))
+
+# Chunk by chunk: each chunk is a `Uint8Array`.
+for chunk <- response.body do
+  IO.write(Uint8Array.to_binary(chunk))
+end
+```
+
+Each consumer of bytes accepts a binary, a `Uint8Array`, or an
+`ArrayBuffer`: the body of a request, a write to a socket, and a chunk for
+a compression stream or for `TextDecoderStream`.
 
 Byte-oriented streams also support WHATWG-style BYOB reads. The reader
 gives a `Uint8Array` view, and each read gives not more bytes than the view
@@ -297,7 +320,8 @@ reader = ReadableStream.get_reader(socket.readable)
 await(WritableStreamDefaultWriter.write(writer, "GET / HTTP/1.1\r\nhost: example.com\r\n\r\n"))
 chunk = await(ReadableStreamDefaultReader.read(reader))
 
-chunk.value
+# Each chunk of bytes is a `Uint8Array`.
+Uint8Array.to_binary(chunk.value)
 ```
 
 Explicit `STARTTLS` upgrades are supported through `Socket.start_tls/2`. For a

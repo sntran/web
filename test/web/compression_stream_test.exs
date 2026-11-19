@@ -306,7 +306,7 @@ defmodule Web.CompressionPBTTest do
       ds = DecompressionStream.new("gzip")
       source = ReadableStream.from([arr])
       decompressed = source |> ReadableStream.pipe_through(cs) |> ReadableStream.pipe_through(ds)
-      assert Enum.join(decompressed, "") == "hello world"
+      assert Web.TestBytes.join(decompressed) == "hello world"
     end
 
     test "CompressionStream raises TypeError for non-binary non-Uint8Array chunk" do
@@ -323,7 +323,7 @@ defmodule Web.CompressionPBTTest do
       arr = Uint8Array.new(ArrayBuffer.new(compressed))
       ds = DecompressionStream.new("gzip")
       source = ReadableStream.from([arr])
-      assert Enum.join(ReadableStream.pipe_through(source, ds), "") == "hello world"
+      assert Web.TestBytes.join(ReadableStream.pipe_through(source, ds)) == "hello world"
     end
 
     test "DecompressionStream raises TypeError for non-binary non-Uint8Array chunk" do
@@ -342,7 +342,7 @@ defmodule Web.CompressionPBTTest do
             compressed = :zlib.gzip("hello world")
             source = ReadableStream.from([compressed])
             decompressed = ReadableStream.pipe_through(source, DecompressionStream.new("gzip"))
-            assert Enum.join(decompressed, "") == "hello world"
+            assert Web.TestBytes.join(decompressed) == "hello world"
           after
             :logger.set_process_metadata(%{})
           end
@@ -502,7 +502,7 @@ defmodule Web.CompressionPBTTest do
         compressed = ReadableStream.pipe_through(source, cs)
         decompressed = ReadableStream.pipe_through(compressed, ds)
 
-        assert Enum.join(decompressed, "") == data,
+        assert Web.TestBytes.join(decompressed) == data,
                "Pipeline round-trip failed for #{format}"
       end
     end
@@ -518,7 +518,7 @@ defmodule Web.CompressionPBTTest do
       source = ReadableStream.from(chunks)
       decompressed = source |> ReadableStream.pipe_through(cs) |> ReadableStream.pipe_through(ds)
 
-      assert IO.iodata_to_binary(Enum.to_list(decompressed)) == data
+      assert Web.TestBytes.join(decompressed) == data
     end
   end
 
@@ -535,7 +535,7 @@ defmodule Web.CompressionPBTTest do
     compressed = ReadableStream.pipe_through(source, cs)
     decompressed = ReadableStream.pipe_through(compressed, ds)
 
-    IO.iodata_to_binary(Enum.to_list(decompressed))
+    Web.TestBytes.join(decompressed)
   end
 
   # End-to-end compress + decompress of `data`, writing in `chunk_size`-byte pieces.
@@ -548,7 +548,7 @@ defmodule Web.CompressionPBTTest do
     compressed = ReadableStream.pipe_through(source, cs)
     decompressed = ReadableStream.pipe_through(compressed, ds)
 
-    IO.iodata_to_binary(Enum.to_list(decompressed))
+    Web.TestBytes.join(decompressed)
   end
 
   defp chunk_binary(binary, size), do: do_chunk(binary, size, [])

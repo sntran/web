@@ -358,16 +358,23 @@ defmodule Web.ReadableStreamTest do
       assert "a=1&b=2" = params |> ReadableStream.from() |> Enum.join("")
 
       blob = Web.Blob.new(["he", "ll", "o"])
-      assert "hello" = blob |> ReadableStream.from() |> Enum.join("")
+      assert "hello" = blob |> ReadableStream.from() |> Web.TestBytes.join()
 
+      # A stream of bytes gives each chunk as a Uint8Array.
       buffer = Web.ArrayBuffer.new("hello")
-      assert "hello" = buffer |> ReadableStream.from() |> Enum.join("")
+
+      assert [%Web.Uint8Array{byte_length: 5} = chunk] =
+               buffer |> ReadableStream.from() |> Enum.to_list()
+
+      assert Web.Uint8Array.to_binary(chunk) == "hello"
 
       bytes = Web.Uint8Array.new(Web.ArrayBuffer.new("hello"), 1, 3)
-      assert "ell" = bytes |> ReadableStream.from() |> Enum.join("")
+      assert [^bytes] = bytes |> ReadableStream.from() |> Enum.to_list()
 
       nested_blob = Web.Blob.new(["a", Web.Blob.new(["b", "c"]), "d"])
-      assert "abcd" = nested_blob |> ReadableStream.from() |> Enum.join("")
+
+      assert ["a", "b", "c", "d"] =
+               nested_blob |> ReadableStream.from() |> Web.TestBytes.binaries()
     end
 
     test "from/1 streams blob parts lazily across multiple pull cycles" do
@@ -377,16 +384,18 @@ defmodule Web.ReadableStreamTest do
       reader = ReadableStream.get_reader(stream)
 
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "1", done: false}
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "2", done: false}
+
+      read_binary = fn ->
+        assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
+        Web.TestBytes.binary(value)
+      end
+
+      assert read_binary.() == "1"
+      assert read_binary.() == "2"
 
       remaining =
-        3..1_000
-        |> Enum.map(fn expected ->
-          assert await(ReadableStreamDefaultReader.read(reader)) == %{
-                   value: Integer.to_string(expected),
-                   done: false
-                 }
+        Enum.map(3..1_000, fn expected ->
+          assert read_binary.() == Integer.to_string(expected)
         end)
 
       assert length(remaining) == 998
@@ -412,11 +421,14 @@ defmodule Web.ReadableStreamTest do
       reader = ReadableStream.get_reader(stream)
 
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: chunk_a, done: false}
+      assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
+      assert Web.TestBytes.binary(value) == chunk_a
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: chunk_b, done: false}
+      assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
+      assert Web.TestBytes.binary(value) == chunk_b
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: chunk_c, done: false}
+      assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
+      assert Web.TestBytes.binary(value) == chunk_c
       assert await(ReadableStreamDefaultReader.read(reader)) == %{value: nil, done: true}
       assert :ok = ReadableStreamDefaultReader.release_lock(reader)
     end

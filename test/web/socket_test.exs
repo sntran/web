@@ -31,6 +31,32 @@ defmodule Web.SocketTest do
     assert_receive :tcp_server_closed, 1_000
   end
 
+  test "the readable side gives Uint8Array values, and a write accepts each form of bytes" do
+    parent = self()
+    {port, _task} = start_tcp_server(fn socket -> tcp_echo_loop(socket, parent) end)
+
+    socket = Web.connect("localhost:#{port}")
+    assert_opened_remote(socket, "localhost:#{port}")
+
+    reader = ReadableStream.get_reader(socket.readable)
+    writer = Web.WritableStream.get_writer(socket.writable)
+
+    for chunk <- ["ab", Web.Uint8Array.from("cd"), Web.ArrayBuffer.new("ef"), [?g, "h"]] do
+      assert :ok = await(WritableStreamDefaultWriter.write(writer, chunk))
+    end
+
+    assert %{value: %Web.Uint8Array{}} = first = await(ReadableStreamDefaultReader.read(reader))
+    rest = read_bytes!(reader, 8 - first.value.byte_length)
+    assert Web.Uint8Array.to_binary(first.value) <> rest == "abcdefgh"
+
+    assert {:transport_error, %TypeError{message: message}} =
+             catch_exit(await(WritableStreamDefaultWriter.write(writer, :not_bytes)))
+
+    assert message == "Socket writes must be a binary, a Uint8Array, or an ArrayBuffer"
+
+    Socket.close(socket)
+  end
+
   test "wrong authorization tokens cannot close or write to the socket server" do
     parent = self()
 
@@ -797,7 +823,7 @@ defmodule Web.SocketTest do
 
   defp read_chunk!(reader) do
     case await(ReadableStreamDefaultReader.read(reader)) do
-      %{done: false, value: value} -> value
+      %{done: false, value: value} -> Web.TestBytes.binary(value)
       %{done: true} -> flunk("expected a chunk, got stream termination")
     end
   end

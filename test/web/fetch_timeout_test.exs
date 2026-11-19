@@ -107,9 +107,9 @@ defmodule Web.FetchTimeoutTest do
       rest =
         Stream.repeatedly(fn -> await(ReadableStreamDefaultReader.read(reader)) end)
         |> Enum.take_while(&(not &1.done))
-        |> Enum.map_join(& &1.value)
+        |> Enum.map_join(&Web.TestBytes.binary(&1.value))
 
-      assert first <> rest == body
+      assert Web.TestBytes.binary(first) <> rest == body
     end
 
     test "does not stop a response that arrives slowly but with no long pause" do

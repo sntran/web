@@ -828,7 +828,7 @@ defmodule Web.StreamStandardTest do
 
       assert_raise TypeError, fn -> ReadableByteStreamController.enqueue(controller, "late") end
       assert_raise TypeError, fn -> ReadableByteStreamController.close(controller) end
-      assert Enum.join(stream) == "bytes"
+      assert Web.TestBytes.join(stream) == "bytes"
     end
 
     test "keeps a closed stream closed when its pull fails after the close" do

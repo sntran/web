@@ -7,8 +7,12 @@ defmodule Web.CompressionStandardTest do
 
   @formats ~w[gzip deflate deflate-raw]
 
+  # Gives the chunks of the readable side as binaries.
   defp through(chunks, transform) do
-    chunks |> ReadableStream.from() |> ReadableStream.pipe_through(transform) |> Enum.to_list()
+    chunks
+    |> ReadableStream.from()
+    |> ReadableStream.pipe_through(transform)
+    |> Web.TestBytes.binaries()
   end
 
   defp compress(data, format),

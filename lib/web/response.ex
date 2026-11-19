@@ -125,7 +125,7 @@ defmodule Web.Response do
     %__MODULE__{
       # A response with no body has the body `nil`, as the Fetch Standard
       # specifies, and starts no stream.
-      body: if(is_nil(raw_body), do: nil, else: Web.ReadableStream.from(raw_body)),
+      body: if(is_nil(raw_body), do: nil, else: Web.Body.stream(raw_body)),
       headers: headers,
       status: status,
       ok: status in 200..299,

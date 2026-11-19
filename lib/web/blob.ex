@@ -12,7 +12,7 @@ defmodule Web.Blob do
   @enforce_keys [:id, :parts, :size, :type]
   defstruct [:id, :parts, :size, :type]
 
-  @type blob_part :: binary() | t()
+  @type blob_part :: binary() | t() | Web.Uint8Array.t() | Web.ArrayBuffer.t()
   @type t :: %__MODULE__{
           id: reference() | nil,
           parts: [blob_part()],
@@ -22,10 +22,21 @@ defmodule Web.Blob do
 
   @doc """
   Creates a new Blob from parts and optional content type.
+
+  A part is a binary, a `Web.Blob`, a `Web.Uint8Array`, or a
+  `Web.ArrayBuffer`. The blob keeps a copy of the bytes of a view or a
+  buffer, as the File API specifies.
+
+  ## Examples
+
+      iex> blob = Web.Blob.new(["a", Web.Uint8Array.from("bc"), Web.ArrayBuffer.new("d")])
+      iex> {blob.size, Web.Blob.text(blob)}
+      {4, {:ok, "abcd"}}
   """
   @spec new([blob_part()], keyword()) :: t()
   def new(parts_list, opts \\ []) when is_list(parts_list) do
     type = opts |> Keyword.get(:type, "") |> normalize_type()
+    parts_list = Enum.map(parts_list, &normalize_part/1)
 
     size =
       Enum.reduce(parts_list, 0, fn part, acc ->
@@ -74,7 +85,8 @@ defmodule Web.Blob do
   end
 
   @doc """
-  Returns a readable stream view over Blob parts.
+  Returns a readable stream of the bytes of the blob. Each chunk is a
+  `Web.Uint8Array`.
   """
   @spec stream(t()) :: Web.ReadableStream.t()
   def stream(%__MODULE__{} = blob) do
@@ -118,6 +130,10 @@ defmodule Web.Blob do
       {:ok, Web.Uint8Array.new(array_buffer)}
     end
   end
+
+  defp normalize_part(%Web.Uint8Array{} = part), do: Web.Uint8Array.to_binary(part)
+  defp normalize_part(%Web.ArrayBuffer{} = part), do: Web.ArrayBuffer.data(part)
+  defp normalize_part(part), do: part
 
   defp part_size(part) when is_binary(part), do: byte_size(part)
   defp part_size(%__MODULE__{size: size}), do: size

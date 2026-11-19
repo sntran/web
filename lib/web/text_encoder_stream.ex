@@ -17,7 +17,6 @@ defmodule Web.TextEncoderStream do
       ["Hi ", "é"]
   """
 
-  alias Web.ArrayBuffer
   alias Web.TextDecoder
   alias Web.TransformStream
   alias Web.TransformStreamDefaultController, as: Controller
@@ -62,6 +61,6 @@ defmodule Web.TextEncoderStream do
   defp enqueue_text(_controller, ""), do: :ok
 
   defp enqueue_text(controller, text) do
-    Controller.enqueue(controller, text |> ArrayBuffer.new() |> Uint8Array.new())
+    Controller.enqueue(controller, Uint8Array.from(text))
   end
 end

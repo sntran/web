@@ -216,7 +216,7 @@ defmodule Web.ReadableStream do
             Web.ReadableStreamDefaultController.close(controller)
 
           part ->
-            Web.ReadableStreamDefaultController.enqueue(controller, part)
+            Web.ReadableStreamDefaultController.enqueue(controller, Uint8Array.from(part))
         end
       end,
       cancel: fn _reason ->
@@ -227,26 +227,24 @@ defmodule Web.ReadableStream do
     })
   end
 
-  def from(%ArrayBuffer{data: data}) do
-    from(data)
-  end
+  # A buffer or a view gives one chunk, which is a `Web.Uint8Array`.
+  def from(%ArrayBuffer{} = buffer), do: from_chunk(Uint8Array.from(buffer))
+  def from(%Uint8Array{} = bytes), do: from_chunk(bytes)
 
-  def from(%Uint8Array{} = bytes) do
-    from(Uint8Array.to_binary(bytes))
-  end
-
-  def from(data) when is_binary(data) do
-    new(%{
-      start: fn controller ->
-        Web.ReadableStreamDefaultController.enqueue(controller, data)
-        Web.ReadableStreamDefaultController.close(controller)
-      end
-    })
-  end
+  def from(data) when is_binary(data), do: from_chunk(data)
 
   def from(%__MODULE__{} = stream), do: stream
 
   def from(enumerable), do: from_enumerable(enumerable, [])
+
+  defp from_chunk(chunk) do
+    new(%{
+      start: fn controller ->
+        Web.ReadableStreamDefaultController.enqueue(controller, chunk)
+        Web.ReadableStreamDefaultController.close(controller)
+      end
+    })
+  end
 
   @doc false
   # Makes a stream from an enumerable, with options for the stream engine.

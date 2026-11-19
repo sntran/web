@@ -246,6 +246,7 @@ defmodule Web.FormData do
     alias Web.AbortSignal
     alias Web.AsyncContext.Snapshot
     alias Web.File
+    alias Web.Internal.Bytes
     alias Web.ReadableStream
     alias Web.TypeError
 
@@ -752,14 +753,14 @@ defmodule Web.FormData do
     defp produce_file_chunk(data, controller) do
       case scan_body(data.buffer, data.delimiter_prefix, data.retain_bytes) do
         {:data, emit, rest} ->
-          ReadableStream.enqueue(controller.pid, emit)
+          ReadableStream.enqueue(controller.pid, Web.Uint8Array.from(emit))
           {:ok, bump_file_size(%{data | buffer: rest}, byte_size(emit))}
 
         {:boundary, emit, rest, transition} ->
           next_data = bump_file_size(data, byte_size(emit))
 
           if emit != "" do
-            ReadableStream.enqueue(controller.pid, emit)
+            ReadableStream.enqueue(controller.pid, Web.Uint8Array.from(emit))
           end
 
           ReadableStream.close(controller.pid)
@@ -1023,13 +1024,15 @@ defmodule Web.FormData do
       end
     end
 
-    defp normalize_chunk(chunk) when is_binary(chunk), do: {:ok, chunk}
-    defp normalize_chunk(%Web.Uint8Array{} = chunk), do: {:ok, Web.Uint8Array.to_binary(chunk)}
-    defp normalize_chunk(chunk) when is_list(chunk), do: {:ok, IO.iodata_to_binary(chunk)}
+    defp normalize_chunk(chunk) do
+      case Bytes.to_binary(chunk) do
+        {:ok, binary} ->
+          {:ok, binary}
 
-    defp normalize_chunk(_chunk) do
-      {:error,
-       TypeError.exception("Multipart stream chunk must be binary, Uint8Array, or iodata")}
+        :error ->
+          {:error,
+           TypeError.exception("Multipart stream chunk must be binary, Uint8Array, or iodata")}
+      end
     end
 
     defp malformed(message, data), do: {:error, TypeError.exception(message), data}

@@ -3,6 +3,8 @@ defmodule Web.Dispatcher.HTTP do
   @moduledoc "HTTP dispatcher using Finch with zero-buffer streaming."
   @behaviour Web.Dispatcher
 
+  alias Web.Internal.Bytes
+
   @max_redirects 20
   @default_receive_timeout 300_000
   @redirect_statuses [301, 302, 303, 307, 308]
@@ -146,9 +148,11 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp response_body(stream, _method, _status) do
-    Web.ReadableStream.from_enumerable(stream,
-      unread_timeout: Web.Application.unread_body_timeout()
-    )
+    # Each chunk of the body is a `Web.Uint8Array`, as the Fetch Standard
+    # specifies.
+    stream
+    |> Stream.map(&Web.Uint8Array.from/1)
+    |> Web.ReadableStream.from_enumerable(unread_timeout: Web.Application.unread_body_timeout())
   end
 
   defp receive_timeout do
@@ -307,12 +311,14 @@ defmodule Web.Dispatcher.HTTP do
   # has a content length.
   defp request_body(%Web.Request{body: %Web.ReadableStream{} = body, body_source: source})
        when not is_nil(source) do
-    body |> Enum.to_list() |> IO.iodata_to_binary()
+    body |> Enum.map_join(&request_chunk/1)
   end
 
   # The body is a stream. Finch reads it chunk by chunk when it sends the
   # request.
-  defp request_body(%Web.Request{body: %Web.ReadableStream{} = body}), do: {:stream, body}
+  defp request_body(%Web.Request{body: %Web.ReadableStream{} = body}) do
+    {:stream, Stream.map(body, &request_chunk/1)}
+  end
 
   defp request_body(%Web.Request{body: body}) when is_binary(body) or is_list(body), do: body
 
@@ -323,6 +329,10 @@ defmodule Web.Dispatcher.HTTP do
       raise Web.TypeError, "The request body is not valid: #{inspect(body)}"
     end
   end
+
+  # A chunk of a request body is a chunk of bytes, as the Fetch Standard
+  # specifies.
+  defp request_chunk(chunk), do: Bytes.to_binary!(chunk, "The request body")
 
   defp start_stream_bridge(finch_request) do
     bridge_ref = make_ref()

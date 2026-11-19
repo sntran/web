@@ -115,8 +115,7 @@ defmodule Web.Dispatcher.TCPTest do
     {:ok, resp} = TCP.fetch(req)
 
     assert resp.status == 200
-    chunks = resp.body |> Enum.to_list()
-    assert Enum.join(chunks) == "hello"
+    assert Web.TestBytes.join(resp.body) == "hello"
   end
 
   test "fetch/1 writes request bodies for non-GET methods" do
@@ -139,7 +138,7 @@ defmodule Web.Dispatcher.TCPTest do
     req = Request.new("tcp://localhost:#{port}", method: "POST", body: "sent body payload")
     {:ok, resp} = TCP.fetch(req)
 
-    assert Enum.join(resp.body) == "ok"
+    assert Web.TestBytes.join(resp.body) == "ok"
     assert_receive :request_body_received, 1_000
   end
 
@@ -149,7 +148,7 @@ defmodule Web.Dispatcher.TCPTest do
     req = raw_request("tcp://localhost:#{port}", "POST", "")
     {:ok, resp} = TCP.fetch(req)
 
-    assert Enum.join(resp.body) == "ok"
+    assert Web.TestBytes.join(resp.body) == "ok"
   end
 
   test "fetch/1 accepts nil request bodies for non-GET methods" do
@@ -158,7 +157,7 @@ defmodule Web.Dispatcher.TCPTest do
     req = raw_request("tcp://localhost:#{port}", "POST", nil)
     {:ok, resp} = TCP.fetch(req)
 
-    assert Enum.join(resp.body) == "ok"
+    assert Web.TestBytes.join(resp.body) == "ok"
   end
 
   test "fetch/1 rejects non-iodata enumerable request bodies" do
@@ -175,8 +174,7 @@ defmodule Web.Dispatcher.TCPTest do
     req = Request.new("remote:localhost:#{port}/path-item")
     {:ok, resp} = TCP.fetch(req)
 
-    chunks = resp.body |> Enum.to_list()
-    assert Enum.join(chunks) == "remote_resp"
+    assert Web.TestBytes.join(resp.body) == "remote_resp"
   end
 
   test "fetch/1 parses missing port accurately defaulting to 80 erroring as appropriate" do
@@ -205,7 +203,7 @@ defmodule Web.Dispatcher.TCPTest do
     req = Request.new("tcp://localhost:#{port}")
     {:ok, resp} = TCP.fetch(req)
 
-    assert Enum.to_list(resp.body) == ["data"]
+    assert Web.TestBytes.binaries(resp.body) == ["data"]
   end
 
   test "fetch/1 propagates paused consumer backpressure into the socket passive mode" do
@@ -467,7 +465,7 @@ defmodule Web.Dispatcher.TCPTest do
     {:ok, resp} = TCP.fetch(req)
 
     assert :ok = Web.AbortController.abort(controller, :timeout)
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
     assert_receive :tcp_client_closed, 1000
   end
 
@@ -479,7 +477,7 @@ defmodule Web.Dispatcher.TCPTest do
     req = Request.new("tcp://localhost:#{port}", signal: controller.signal)
     {:ok, resp} = TCP.fetch(req)
 
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
     assert_receive :tcp_client_closed, 1000
   end
 

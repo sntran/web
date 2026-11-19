@@ -47,6 +47,8 @@ defmodule Web.Body do
       "hello"
   """
 
+  alias Web.Internal.Bytes
+
   @callback text(struct()) :: Web.Promise.t()
   @callback json(struct()) :: Web.Promise.t()
   @callback form_data(struct()) :: Web.Promise.t()
@@ -131,6 +133,31 @@ defmodule Web.Body do
     end
 
     # coveralls-ignore-stop
+  end
+
+  @doc false
+  # Makes the body stream of a request or a response from the body that the
+  # caller gave. The chunks of the stream are `Web.Uint8Array` values, as
+  # the Fetch Standard specifies. A stream from the caller stays as it is.
+  @spec stream(term()) :: Web.ReadableStream.t()
+  def stream(%Web.ReadableStream{} = stream), do: stream
+  def stream(body) when is_binary(body), do: body |> Bytes.chunk() |> Web.ReadableStream.from()
+
+  def stream(%Web.URLSearchParams{} = params) do
+    params |> Web.URLSearchParams.to_string() |> stream()
+  end
+
+  def stream(%struct{} = body) when struct in [Web.Blob, Web.ArrayBuffer, Web.Uint8Array] do
+    Web.ReadableStream.from(body)
+  end
+
+  # Each binary that an enumerable gives becomes a `Web.Uint8Array`.
+  def stream(body) do
+    if Enumerable.impl_for(body) do
+      body |> Stream.map(&Bytes.chunk/1) |> Web.ReadableStream.from()
+    else
+      Web.ReadableStream.from(body)
+    end
   end
 
   @doc false
@@ -266,7 +293,14 @@ defmodule Web.Body do
   defp read_stream_chunks(pid, acc) do
     case Web.ReadableStream.read(pid) do
       {:ok, chunk} ->
-        read_stream_chunks(pid, [chunk | acc])
+        case Bytes.to_binary(chunk) do
+          {:ok, binary} ->
+            read_stream_chunks(pid, [binary | acc])
+
+          :error ->
+            Web.ReadableStream.release_lock(pid)
+            {:error, chunk_error()}
+        end
 
       :done ->
         Web.ReadableStream.release_lock(pid)
@@ -300,14 +334,14 @@ defmodule Web.Body do
   defp read_stream_text_chunks(pid, decoder_state, acc) do
     case Web.ReadableStream.read(pid) do
       {:ok, chunk} ->
-        case normalize_text_chunk(chunk) do
+        case Bytes.to_binary(chunk) do
           {:ok, binary} ->
             {decoded, decoder_state} = Web.TextDecoder.decode_step(decoder_state, binary, true)
             read_stream_text_chunks(pid, decoder_state, [decoded | acc])
 
-          {:error, reason} ->
+          :error ->
             Web.ReadableStream.release_lock(pid)
-            {:error, reason}
+            {:error, chunk_error()}
         end
 
       :done ->
@@ -335,12 +369,8 @@ defmodule Web.Body do
     {:ok, text}
   end
 
-  defp normalize_text_chunk(chunk) when is_binary(chunk), do: {:ok, chunk}
-  defp normalize_text_chunk(%Web.Uint8Array{} = chunk), do: {:ok, Web.Uint8Array.to_binary(chunk)}
-  defp normalize_text_chunk(chunk) when is_list(chunk), do: {:ok, IO.iodata_to_binary(chunk)}
-
-  defp normalize_text_chunk(_chunk) do
-    {:error, Web.TypeError.exception("Body stream chunk must be binary, Uint8Array, or iodata")}
+  defp chunk_error do
+    Web.TypeError.exception("Body stream chunk must be binary, Uint8Array, or iodata")
   end
 
   @doc false

@@ -29,14 +29,19 @@ defmodule Web.DecompressionStream do
       :ok
       iex> Web.await(Web.WritableStreamDefaultWriter.close(writer))
       :ok
-      iex> Enum.join(ds.readable, "")
+      iex> Enum.map_join(ds.readable, &Web.Uint8Array.to_binary/1)
       "hello world"
+
+  Each chunk of the readable side is a `Web.Uint8Array`, as the Compression
+  Standard specifies. A chunk for the writable side is a binary, a
+  `Web.Uint8Array`, or a `Web.ArrayBuffer`.
   """
 
   use Web.Stream
 
   require Logger
 
+  alias Web.Internal.Bytes
   alias Web.ReadableStreamDefaultController
   alias Web.TypeError
   alias Web.Uint8Array
@@ -108,7 +113,7 @@ defmodule Web.DecompressionStream do
       {:ok, decompressed_chunks} ->
         for c <- decompressed_chunks do
           ReadableStreamDefaultController.wait_for_capacity(ctrl)
-          ReadableStreamDefaultController.enqueue(ctrl, c)
+          ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
         end
 
         {:ok, state}
@@ -151,12 +156,11 @@ defmodule Web.DecompressionStream do
   defp window_bits_for("deflate"), do: 15
   defp window_bits_for("deflate-raw"), do: -15
 
-  defp to_binary!(bin, _ctx) when is_binary(bin), do: bin
-  defp to_binary!(%Uint8Array{} = arr, _ctx), do: Uint8Array.to_binary(arr)
-  defp to_binary!(%Web.ArrayBuffer{} = buffer, _ctx), do: Web.ArrayBuffer.data(buffer)
+  defp to_binary!(chunk, ctx) when is_list(chunk) do
+    raise TypeError, "#{ctx} chunk must be a binary, a Uint8Array, or an ArrayBuffer"
+  end
 
-  defp to_binary!(_, ctx),
-    do: raise(TypeError, "#{ctx} chunk must be a binary, a Uint8Array, or an ArrayBuffer")
+  defp to_binary!(chunk, ctx), do: Bytes.to_binary!(chunk, ctx)
 
   # Stop the Agent idempotently.
   defp stop_agent(agent) do

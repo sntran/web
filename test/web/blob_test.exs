@@ -173,7 +173,7 @@ defmodule Web.BlobTest do
   test "stream/1 returns a readable stream over blob contents" do
     blob = Blob.new(["hel", "lo"])
 
-    assert "hello" == blob |> Blob.stream() |> Enum.join("")
+    assert "hello" == blob |> Blob.stream() |> Web.TestBytes.join()
   end
 
   test "text/json/array_buffer/bytes can be called multiple times" do

@@ -316,7 +316,7 @@ defmodule Web.FetchRulesTest do
       Process.sleep(300)
 
       assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
-      assert value =~ "kept"
+      assert Web.TestBytes.binary(value) =~ "kept"
     end
   end
 

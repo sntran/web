@@ -149,7 +149,7 @@ defmodule Web.Response do
 
   # The reason phrase of HTTP: tab, space, and each visible byte.
   defp validate_status_text!(text) when is_binary(text) do
-    if Regex.match?(~r/\A[\t \x21-\x7E\x80-\xFF]*\z/, text) do
+    if reason_phrase?(text) do
       :ok
     else
       raise Web.TypeError, "Invalid status text: #{inspect(text)}"
@@ -159,6 +159,12 @@ defmodule Web.Response do
   defp validate_status_text!(text) do
     raise Web.TypeError, "Invalid status text: #{inspect(text)}"
   end
+
+  defp reason_phrase?(<<char, rest::binary>>) when char == ?\t or (char >= 0x20 and char != 0x7F),
+    do: reason_phrase?(rest)
+
+  defp reason_phrase?(<<>>), do: true
+  defp reason_phrase?(_text), do: false
 
   defp validate_null_body!(status, body)
        when status in @null_body_statuses and not is_nil(body) do

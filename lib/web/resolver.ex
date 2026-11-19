@@ -4,6 +4,9 @@ defmodule Web.Resolver do
   Matches the rclone-style resolver requirement.
   """
 
+  defguardp alpha?(char) when char in ?A..?Z or char in ?a..?z
+  defguardp digit?(char) when char in ?0..?9
+
   @doc """
   Resolves a given URL or input string to a specific Dispatcher.
 
@@ -57,7 +60,26 @@ defmodule Web.Resolver do
     ArgumentError -> Web.Dispatcher.HTTP
   end
 
-  defp remote_syntax?(input) do
-    String.match?(input, ~r/^[A-Za-z0-9][A-Za-z0-9+.-]*:(?!\/\/).*$/)
+  # A remote name: a letter or a digit, then letters, digits, "+", ".", and
+  # "-", then ":" that is not followed by "//". The rest is one line: it has
+  # no line feed, other than one at its end.
+  defp remote_syntax?(<<char, rest::binary>>) when alpha?(char) or digit?(char),
+    do: remote_name?(rest)
+
+  defp remote_syntax?(_input), do: false
+
+  defp remote_name?(<<char, rest::binary>>)
+       when alpha?(char) or digit?(char) or char in [?+, ?., ?-],
+       do: remote_name?(rest)
+
+  defp remote_name?(<<?:, ?/, ?/, _rest::binary>>), do: false
+  defp remote_name?(<<?:, rest::binary>>), do: one_line?(rest)
+  defp remote_name?(_rest), do: false
+
+  defp one_line?(rest) do
+    case :binary.match(rest, "\n") do
+      :nomatch -> true
+      {index, 1} -> index == byte_size(rest) - 1
+    end
   end
 end

@@ -204,6 +204,15 @@ defmodule Web.URLTest do
   # Custom URL feature tests (NOT covered by WHATWG WPT)
   # ============================================================================
 
+  test "an IPv6 host with bytes after the bracket is not valid" do
+    for input <- ["http://[::1]x/", "foo://[::1]x/", "http://[::1]:x/", "foo://[]/"] do
+      assert_raise ArgumentError, fn -> URL.new(input) end
+    end
+
+    assert URL.href(URL.new("http://[::1]:8080/")) == "http://[::1]:8080/"
+    assert URL.href(URL.new("foo://[::1]:8080/")) == "foo://[::1]:8080/"
+  end
+
   test "rclone style urls are parsed as protocol plus pathname" do
     url = URL.new("my_s3:bucket/file.txt?x=1#frag")
 

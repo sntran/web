@@ -1,14 +1,15 @@
 defmodule Web.MIME do
   @moduledoc false
 
+  alias Web.Internal.Ascii
+
   @sniff_bytes 1445
-  @token_re ~r/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
 
   @spec parse(String.t() | nil) :: String.t() | nil
   def parse(nil), do: nil
 
   def parse(value) do
-    raw = trim_http_whitespace(to_string(value))
+    raw = value |> to_string() |> valid_utf8!() |> trim_http_whitespace()
     {essence, rest} = split_essence_and_params(raw)
 
     case parse_essence(essence) do
@@ -19,7 +20,7 @@ defmodule Web.MIME do
           |> Enum.reverse()
           |> Enum.map_join(fn {name, val} -> ";" <> name <> "=" <> serialize_value(val) end)
 
-        String.downcase(type) <> "/" <> String.downcase(subtype) <> serialized
+        Ascii.downcase(type) <> "/" <> Ascii.downcase(subtype) <> serialized
 
       _ ->
         nil
@@ -248,23 +249,34 @@ defmodule Web.MIME do
     end
   end
 
-  defp valid_token?(value), do: value != "" and Regex.match?(@token_re, value)
+  defp valid_token?(value), do: Ascii.token?(value)
 
-  defp contains_forbidden_controls?(value) do
-    String.match?(value, ~r/[\x00-\x08\x0A-\x1F\x7F]/u)
+  # The text of a MIME type is valid UTF-8. The first version raised
+  # `ArgumentError` for other text, and this version keeps that.
+  defp valid_utf8!(value) do
+    if String.valid?(value),
+      do: value,
+      else: raise(ArgumentError, "The MIME type is not valid UTF-8.")
   end
+
+  # A C0 control character other than tab, or the delete character.
+  defp contains_forbidden_controls?(<<char, _rest::binary>>)
+       when char in 0x00..0x08 or char in 0x0A..0x1F or char == 0x7F,
+       do: true
+
+  defp contains_forbidden_controls?(<<_char, rest::binary>>),
+    do: contains_forbidden_controls?(rest)
+
+  defp contains_forbidden_controls?(<<>>), do: false
 
   defp trim_http_whitespace(value) do
     value |> trim_http_whitespace_leading() |> trim_http_whitespace_trailing()
   end
 
-  defp trim_http_whitespace_leading(value) do
-    String.replace(value, ~r/^[\x09\x0A\x0D\x20]+/u, "")
-  end
+  defp trim_http_whitespace_leading(value), do: Ascii.trim_leading(value, &http_whitespace?/1)
+  defp trim_http_whitespace_trailing(value), do: Ascii.trim_trailing(value, &http_whitespace?/1)
 
-  defp trim_http_whitespace_trailing(value) do
-    String.replace(value, ~r/[\x09\x0A\x0D\x20]+$/u, "")
-  end
+  defp http_whitespace?(char), do: char in [0x09, 0x0A, 0x0D, 0x20]
 
   defp html_signature?(sample) do
     if String.valid?(sample) do

@@ -3,6 +3,7 @@ defmodule Web.URL.IP do
 
   import Bitwise
 
+  alias Web.Internal.Ascii
   alias Web.URL.{Encoding, Punycode}
 
   @default_ports %{"ftp" => "21", "http" => "80", "https" => "443", "ws" => "80", "wss" => "443"}
@@ -34,8 +35,22 @@ defmodule Web.URL.IP do
 
   @spec valid_opaque_host?(String.t()) :: boolean()
   def valid_opaque_host?(hostname) do
-    not String.match?(to_string(hostname), ~r/[\x00\x09\x0A\x0D\x20#\/:<>?@\[\\\]\^|]/u)
+    not has_byte?(to_string(hostname), &forbidden_host_byte?/1)
   end
+
+  # The forbidden host code points of the URL Standard.
+  defp forbidden_host_byte?(char),
+    do: char in [0x00, 0x09, 0x0A, 0x0D, 0x20, ?#, ?/, ?:, ?<, ?>, ??, ?@, ?[, ?\\, ?], ?^, ?|]
+
+  # The characters that a domain host cannot have, after the checks of the
+  # forbidden domain code points of the module `Web.URL.Punycode`.
+  defp forbidden_domain_host_byte?(char),
+    do: char in [0x00, 0x09, 0x0A, 0x0D, 0x20, ?#, ?%, ?/, ?:, ??, ?@, ?[, ?\\, ?]]
+
+  defp has_byte?(<<char, rest::binary>>, member?),
+    do: member?.(char) or has_byte?(rest, member?)
+
+  defp has_byte?(<<>>, _member?), do: false
 
   @spec normalize_opaque_host(String.t()) :: String.t()
   def normalize_opaque_host(hostname) do
@@ -51,7 +66,7 @@ defmodule Web.URL.IP do
     protocol
     |> to_string()
     |> String.trim_trailing(":")
-    |> String.downcase()
+    |> Ascii.downcase()
     |> then(&Map.get(@default_ports, &1))
   end
 
@@ -78,11 +93,13 @@ defmodule Web.URL.IP do
   defp split_host_port_value("[" <> _ = value), do: split_bracketed_host_port(value)
   defp split_host_port_value(value), do: split_regular_host_port(value)
 
-  defp split_bracketed_host_port(value) do
-    case Regex.run(~r/^\[([^\]]+)\](?::(.*))?$/, value, capture: :all_but_first) do
-      [host, port] -> maybe_split_ipv6_host_port(host, port, value)
-      [host] -> maybe_split_ipv6_host_port(host, "", value)
-      _ -> {value, ""}
+  # "[", one or more characters that are not "]", "]", then the end or ":"
+  # and a port.
+  defp split_bracketed_host_port("[" <> rest = value) do
+    case :binary.split(rest, "]") do
+      [host, ""] when host != "" -> maybe_split_ipv6_host_port(host, "", value)
+      [host, ":" <> port] when host != "" -> maybe_split_ipv6_host_port(host, port, value)
+      _other -> {value, ""}
     end
   end
 
@@ -156,7 +173,7 @@ defmodule Web.URL.IP do
   end
 
   defp valid_domain_host?(host) do
-    not String.match?(host, ~r/[\x00\x09\x0A\x0D\x20#%\/:?@\[\\\]]/u) and
+    not has_byte?(host, &forbidden_domain_host_byte?/1) and
       (normalize_ipv4(host) != nil or
          (not numeric_ipv4_candidate?(host) and Punycode.valid_host?(host)))
   end
@@ -230,33 +247,22 @@ defmodule Web.URL.IP do
     end
   end
 
-  defp parse_ipv4_part(part) do
+  # A part of an IPv4 address: "0x" and hexadecimal digits, "0" and octal
+  # digits, or decimal digits.
+  defp parse_ipv4_part(<<?0, x, digits::binary>>) when x in [?x, ?X] do
     cond do
-      Regex.match?(~r/^0[xX][0-9A-Fa-f]*$/, part) ->
-        digits = String.slice(part, 2..-1//1)
-
-        if digits == "" do
-          {:ok, 0}
-        else
-          {int, ""} = Integer.parse(digits, 16)
-          {:ok, int}
-        end
-
-      String.length(part) > 1 and String.starts_with?(part, "0") ->
-        if Regex.match?(~r/^[0-7]+$/, part) do
-          {int, ""} = Integer.parse(part, 8)
-          {:ok, int}
-        else
-          :error
-        end
-
-      Regex.match?(~r/^\d+$/, part) ->
-        {int, ""} = Integer.parse(part, 10)
-        {:ok, int}
-
-      true ->
-        :error
+      digits == "" -> {:ok, 0}
+      Ascii.hex_digits?(digits) -> {:ok, String.to_integer(digits, 16)}
+      true -> :error
     end
+  end
+
+  defp parse_ipv4_part(<<?0, _next, _rest::binary>> = part) do
+    if Ascii.octal_digits?(part), do: {:ok, String.to_integer(part, 8)}, else: :error
+  end
+
+  defp parse_ipv4_part(part) do
+    if Ascii.digits?(part), do: {:ok, String.to_integer(part)}, else: :error
   end
 
   defp valid_ipv4_number_list?(numbers) do
@@ -340,7 +346,7 @@ defmodule Web.URL.IP do
   defp hex_segment(segment) do
     segment
     |> Integer.to_string(16)
-    |> String.downcase()
+    |> Ascii.downcase()
   end
 
   defp numeric_ipv4_candidate?(host) do
@@ -354,7 +360,7 @@ defmodule Web.URL.IP do
         false
 
       label ->
-        String.match?(label, ~r/^\d+$/) or match?({:ok, _}, parse_ipv4_part(label))
+        Ascii.digits?(label) or match?({:ok, _}, parse_ipv4_part(label))
     end
   end
 

@@ -6,6 +6,10 @@ defmodule Web.URL do
   and RClone-style URLs.
   """
 
+  defguardp alpha?(char) when char in ?A..?Z or char in ?a..?z
+  defguardp digit?(char) when char in ?0..?9
+
+  alias Web.Internal.Ascii
   alias Web.URL.{Encoding, IP, Parser}
 
   defstruct protocol: "",
@@ -40,8 +44,6 @@ defmodule Web.URL do
           kind: :standard | :rclone
         }
 
-  @rclone_scheme ~r/^[A-Za-z0-9.+-]*_[A-Za-z0-9_+.-]*:(?!\/\/)/
-
   @doc """
   Creates a URL from a string and optional base URL.
 
@@ -61,9 +63,13 @@ defmodule Web.URL do
   def new(%__MODULE__{} = url, _base), do: url
 
   def new(url, base) when is_binary(url) do
-    trimmed = Encoding.trim_c0_whitespace(url)
+    # The parser checks that the text is valid UTF-8, and removes the C0
+    # characters again. This trim is only for the check of an rclone URL.
+    trimmed = Encoding.trim_c0(url)
 
-    if rclone_url?(trimmed), do: parse_rclone(trimmed), else: parse_standard(trimmed, base)
+    if rclone_url?(trimmed),
+      do: trimmed |> Encoding.valid_utf8!() |> parse_rclone(),
+      else: parse_standard(trimmed, base)
   end
 
   @doc """
@@ -137,8 +143,7 @@ defmodule Web.URL do
       |> hd()
       |> String.downcase()
 
-    if String.match?(protocol, ~r/^[a-z][a-z0-9+.-]*$/) and
-         protocol_transition_allowed?(url, protocol) do
+    if scheme_name?(protocol) and protocol_transition_allowed?(url, protocol) do
       try do
         updated =
           url
@@ -503,7 +508,29 @@ defmodule Web.URL do
   @spec rclone?(t()) :: boolean()
   def rclone?(%__MODULE__{} = url), do: url.kind == :rclone
 
-  defp rclone_url?(value), do: String.match?(value, @rclone_scheme)
+  # An rclone URL starts with a remote name: letters, digits, ".", "+", "-",
+  # and "_", with one "_" or more. Then ":" comes, and not "//".
+  defp rclone_url?(value), do: rclone_remote?(value, false)
+
+  defp rclone_remote?(<<char, rest::binary>>, underscore?)
+       when alpha?(char) or digit?(char) or char in [?., ?+, ?-],
+       do: rclone_remote?(rest, underscore?)
+
+  defp rclone_remote?(<<?_, rest::binary>>, _underscore?), do: rclone_remote?(rest, true)
+  defp rclone_remote?(<<?:, ?/, ?/, _rest::binary>>, _underscore?), do: false
+  defp rclone_remote?(<<?:, _rest::binary>>, underscore?), do: underscore?
+  defp rclone_remote?(_value, _underscore?), do: false
+
+  # A lower-case letter, then lower-case letters, digits, "+", "-", and ".".
+  defp scheme_name?(<<char, rest::binary>>) when char in ?a..?z, do: scheme_rest?(rest)
+  defp scheme_name?(_value), do: false
+
+  defp scheme_rest?(<<char, rest::binary>>)
+       when char in ?a..?z or digit?(char) or char in [?+, ?-, ?.],
+       do: scheme_rest?(rest)
+
+  defp scheme_rest?(<<>>), do: true
+  defp scheme_rest?(_value), do: false
 
   defp parse_standard(value, base) do
     value
@@ -652,16 +679,16 @@ defmodule Web.URL do
   defp normalize_port_value(current_port, value) do
     stripped = value |> to_string() |> Encoding.strip_ascii_tab_and_newline()
 
-    case Regex.run(~r/^\d+/, stripped) do
-      [digits] ->
+    case Ascii.split_digits(stripped) do
+      {"", _rest} ->
+        current_port
+
+      {digits, _rest} ->
         if String.to_integer(digits) <= 65_535 do
           digits
         else
           current_port
         end
-
-      nil ->
-        current_port
     end
   end
 
@@ -695,10 +722,15 @@ defmodule Web.URL do
 
   defp host_value_includes_port?(candidate) do
     if String.starts_with?(candidate, "[") do
-      Regex.match?(~r/^\[[^\]]+\]:/, candidate)
+      bracketed_with_port?(candidate)
     else
       String.contains?(candidate, ":")
     end
+  end
+
+  # "[", one or more characters that are not "]", "]", then ":".
+  defp bracketed_with_port?("[" <> rest) do
+    match?([inside, ":" <> _port] when inside != "", :binary.split(rest, "]"))
   end
 
   defp normalize_default_port_for_setter(protocol, port) do
@@ -949,15 +981,7 @@ defmodule Web.URL do
 
   defp pop_path_segment(segments, _preserve_drive_root?), do: Enum.drop(segments, -1)
 
-  defp dot_segment_type(segment) do
-    normalized = Regex.replace(~r/%2e/i, segment, ".")
-
-    case normalized do
-      "." -> :single
-      ".." -> :double
-      _ -> :none
-    end
-  end
+  defp dot_segment_type(segment), do: Encoding.dot_segment_type(segment)
 
   defp maybe_bracket_ipv6(hostname) do
     if String.contains?(hostname, ":") do

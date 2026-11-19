@@ -423,17 +423,39 @@ defmodule Web do
     |> :erlang.list_to_binary()
   end
 
+  defp base64_text?(<<char, rest::binary>>)
+       when char in ?A..?Z or char in ?a..?z or char in ?0..?9 or char in [?+, ?/, ?=],
+       do: base64_text?(rest)
+
+  defp base64_text?(<<>>), do: true
+  defp base64_text?(_text), do: false
+
+  # A "=", one character or more, and then a character that is not "=".
+  defp data_after_padding?(text) do
+    case :binary.match(text, "=") do
+      :nomatch ->
+        false
+
+      {index, 1} ->
+        tail_start = index + 2
+
+        tail_start < byte_size(text) and
+          binary_part(text, tail_start, byte_size(text) - tail_start) |> String.replace("=", "") !=
+            ""
+    end
+  end
+
   defp normalize_base64(string) do
-    trimmed = String.replace(string, ~r/[\t\n\f\r ]+/, "")
+    trimmed = :binary.replace(string, ["\t", "\n", "\f", "\r", " "], "", [:global])
 
     cond do
       trimmed == "" ->
         {:ok, ""}
 
-      Regex.match?(~r/[^A-Za-z0-9+\/=]/, trimmed) ->
+      not base64_text?(trimmed) ->
         {:error, :invalid}
 
-      Regex.match?(~r/=.+[^=]/, trimmed) ->
+      data_after_padding?(trimmed) ->
         {:error, :invalid}
 
       true ->

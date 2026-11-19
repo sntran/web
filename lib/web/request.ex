@@ -147,6 +147,9 @@ defmodule Web.Request do
     method |> Atom.to_string() |> String.upcase(:ascii) |> normalize_method()
   end
 
+  # The usual case: a method that is in its normalized form already.
+  defp normalize_method(method) when method in @normalized_methods, do: method
+
   defp normalize_method(method) when is_binary(method) do
     upper = String.upcase(method, :ascii)
 

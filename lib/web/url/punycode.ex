@@ -13,9 +13,17 @@ defmodule Web.URL.Punycode do
   # the `encode` function of that package, because it applies the IDNA2008
   # rules, which are not the rules of the URL Standard.
 
+  alias Web.Internal.Ascii
+
   @virama_combining_class 9
   @right_to_left_classes [~c"R", ~c"AL", ~c"AN"]
-  @forbidden_domain_code_points ~r/[\x00-\x20\x7F#%\/:<>?@\[\\\]\^|]/
+  # The forbidden domain code points of the URL Standard that are ASCII.
+  defguardp forbidden_domain_byte?(char)
+            when char <= 0x20 or char == 0x7F or
+                   char in [?#, ?%, ?/, ?:, ?<, ?>, ??, ?@, ?[, ?\\, ?], ?^, ?|]
+
+  # The full stops that the URL Standard changes to ".".
+  @separators ["\u3002", "\uFF0E", "\uFF61"]
 
   @spec host_to_ascii(String.t()) :: String.t()
   def host_to_ascii(hostname) do
@@ -58,7 +66,7 @@ defmodule Web.URL.Punycode do
   defp valid_text_to_ascii(normalized) do
     cond do
       normalized == "" -> {:ok, ""}
-      ascii_passthrough_host?(normalized) -> {:ok, String.downcase(normalized)}
+      ascii_passthrough_host?(normalized) -> {:ok, Ascii.downcase(normalized)}
       ends_in_number?(normalized) -> :error
       true -> unicode_to_ascii(normalized)
     end
@@ -68,9 +76,14 @@ defmodule Web.URL.Punycode do
   # result of Unicode ToASCII for it. This is also applicable to a label with
   # the prefix "xn--" that is not valid, because browsers accept such a label.
   defp ascii_passthrough_host?(hostname) do
-    String.match?(hostname, ~r/^[\x00-\x7F]+$/) and
-      not String.match?(hostname, @forbidden_domain_code_points)
+    hostname != "" and Ascii.ascii?(hostname) and not forbidden_domain_text?(hostname)
   end
+
+  defp forbidden_domain_text?(<<char, _rest::binary>>) when forbidden_domain_byte?(char),
+    do: true
+
+  defp forbidden_domain_text?(<<_char, rest::binary>>), do: forbidden_domain_text?(rest)
+  defp forbidden_domain_text?(<<>>), do: false
 
   # A host that ends in a number is an IPv4 address, not a domain.
   defp ends_in_number?(hostname) do
@@ -80,7 +93,7 @@ defmodule Web.URL.Punycode do
       |> String.split(".", trim: false)
       |> List.last()
 
-    String.match?(last_label, ~r/^[0-9]+$/)
+    Ascii.digits?(last_label)
   end
 
   defp unicode_to_ascii(domain) do
@@ -90,7 +103,7 @@ defmodule Web.URL.Punycode do
          true <- valid_labels?(labels),
          ascii = Enum.map_join(labels, ".", &label_to_ascii/1),
          false <- ascii == "",
-         false <- String.match?(ascii, @forbidden_domain_code_points) do
+         false <- forbidden_domain_text?(ascii) do
       {:ok, ascii}
     else
       _ -> :error
@@ -285,7 +298,12 @@ defmodule Web.URL.Punycode do
 
   defp ascii?(code_points), do: Enum.all?(code_points, &(&1 < 0x80))
 
+  # The separators are not ASCII: an ASCII host has none of them.
   defp normalize_separators(hostname) do
-    String.replace(hostname, ~r/[。．｡]/u, ".")
+    cond do
+      Ascii.ascii?(hostname) -> hostname
+      :binary.match(hostname, @separators) == :nomatch -> hostname
+      true -> :binary.replace(hostname, @separators, ".", [:global])
+    end
   end
 end

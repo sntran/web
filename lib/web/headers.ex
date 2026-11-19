@@ -13,6 +13,8 @@ defmodule Web.Headers do
 
   @behaviour Access
 
+  alias Web.Internal.Ascii
+
   @set_cookie "set-cookie"
 
   defstruct data: %{}
@@ -192,19 +194,16 @@ defmodule Web.Headers do
   defp join_values(@set_cookie, values), do: Enum.join(values, ", ")
   defp join_values(_name, values), do: Enum.join(values, ", ")
 
-  # A header name is an HTTP token (RFC 9110).
-  @token ~r/\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/
-
   @doc false
-  # Returns `true` if `value` is an HTTP token.
+  # Returns `true` if `value` is an HTTP token (RFC 9110).
   @spec token?(term()) :: boolean()
-  def token?(value), do: is_binary(value) and Regex.match?(@token, value)
+  def token?(value), do: Ascii.token?(value)
 
+  # A header name is an HTTP token. The map keeps it in lower case.
   defp normalize_name(name) when is_binary(name) do
-    if token?(name) do
-      String.downcase(name, :ascii)
-    else
-      raise Web.TypeError, "Invalid header name: #{inspect(name)}"
+    case Ascii.downcase_token(name) do
+      :error -> raise Web.TypeError, "Invalid header name: #{inspect(name)}"
+      lower -> lower
     end
   end
 
@@ -221,10 +220,10 @@ defmodule Web.Headers do
   defp normalize_value(value) when is_binary(value) do
     value = value |> trim_leading_whitespace() |> trim_trailing_whitespace()
 
-    if :binary.match(value, [<<0>>, "\r", "\n"]) == :nomatch do
-      value
-    else
+    if forbidden_value_byte?(value) do
       raise Web.TypeError, "Invalid header value: #{inspect(value)}"
+    else
+      value
     end
   end
 
@@ -235,6 +234,10 @@ defmodule Web.Headers do
   defp normalize_value(value) do
     raise Web.TypeError, "Invalid header value: #{inspect(value)}"
   end
+
+  defp forbidden_value_byte?(<<char, _rest::binary>>) when char in [0, ?\r, ?\n], do: true
+  defp forbidden_value_byte?(<<_char, rest::binary>>), do: forbidden_value_byte?(rest)
+  defp forbidden_value_byte?(<<>>), do: false
 
   defp trim_leading_whitespace(<<byte, rest::binary>>) when byte in @http_whitespace,
     do: trim_leading_whitespace(rest)

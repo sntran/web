@@ -1,16 +1,18 @@
 defmodule Web.URL.Parser do
   @moduledoc false
 
-  alias Web.URL.{Encoding, IP}
+  defguardp alpha?(char) when char in ?A..?Z or char in ?a..?z
+  defguardp upper?(char) when char in ?A..?Z
 
-  @special_schemes MapSet.new(["file", "ftp", "http", "https", "ws", "wss"])
+  alias Web.Internal.Ascii
+  alias Web.URL.{Encoding, IP, URIParser}
 
   @spec parse(String.t(), String.t() | map() | nil) :: {:ok, map()} | {:error, String.t()}
   def parse(input, base \\ nil) when is_binary(input) do
     source =
       input
       |> Encoding.trim_c0_whitespace()
-      |> Encoding.strip_ascii_tab_and_newline()
+      |> Encoding.strip_tab_newline()
 
     do_parse(source, base)
   end
@@ -28,9 +30,11 @@ defmodule Web.URL.Parser do
     scheme
     |> to_string()
     |> String.trim_trailing(":")
-    |> String.downcase()
-    |> then(&MapSet.member?(@special_schemes, &1))
+    |> Ascii.downcase()
+    |> special_name?()
   end
+
+  defp special_name?(name), do: name in ["file", "ftp", "http", "https", "ws", "wss"]
 
   defp do_parse("", base) when base != nil, do: build_relative("", base)
   defp do_parse("", _base), do: {:error, "Invalid URL"}
@@ -70,13 +74,13 @@ defmodule Web.URL.Parser do
     base_href = href_from_base(base)
 
     with {:ok, base_scheme, _rest} <- split_scheme(base_href),
-         true <- String.downcase(base_scheme) == String.downcase(scheme) do
+         true <- Ascii.downcase(base_scheme) == Ascii.downcase(scheme) do
       if scheme == "file" and file_windows_drive_reference?(rest) do
         build_file_drive_reference(rest, base_file_host(base_href))
       else
         normalized_base = normalize_for_scheme(base_href, base_scheme)
         normalized_rest = Encoding.normalize_special_path_separators(rest, true)
-        merged = URI.merge(URI.parse(normalized_base), normalized_rest)
+        merged = URI.merge(URIParser.parse(normalized_base), URIParser.parse(normalized_rest))
 
         authority_present? =
           Enum.any?([
@@ -107,7 +111,7 @@ defmodule Web.URL.Parser do
         build_empty_authority_fields("", scheme)
 
       _ ->
-        source |> URI.parse() |> build_fields(scheme, true, source)
+        source |> URIParser.parse() |> build_fields(scheme, true, source)
     end
   end
 
@@ -190,20 +194,23 @@ defmodule Web.URL.Parser do
   defp split_scheme(<<?#, _rest::binary>>, _acc, _at_start), do: :error
   defp split_scheme(<<"\\", _rest::binary>>, _acc, _at_start), do: :error
 
-  defp split_scheme(<<char::utf8, rest::binary>>, acc, at_start) do
+  # A scheme is ASCII, thus the function examines bytes. A byte of a
+  # character that is not ASCII is not a scheme character.
+  defp split_scheme(<<char, rest::binary>>, acc, at_start) do
     if scheme_char?(char, at_start) do
-      split_scheme(rest, [String.downcase(<<char::utf8>>) | acc], false)
+      split_scheme(rest, [lower(char) | acc], false)
     else
       :error
     end
   end
 
-  defp scheme_char?(char, true) do
-    (char >= ?a and char <= ?z) or (char >= ?A and char <= ?Z)
-  end
+  defp lower(char) when upper?(char), do: char + 32
+  defp lower(char), do: char
+
+  defp scheme_char?(char, true), do: alpha?(char)
 
   defp scheme_char?(char, false) do
-    scheme_char?(char, true) or (char >= ?0 and char <= ?9) or char in [?+, ?-, ?.]
+    alpha?(char) or (char >= ?0 and char <= ?9) or char in [?+, ?-, ?.]
   end
 
   defp normalize_for_scheme(source, scheme) do
@@ -213,13 +220,13 @@ defmodule Web.URL.Parser do
   defp normalize_opaque_path(pathname, search, fragment) do
     normalized = percent_encode_opaque_path(pathname)
 
-    case Regex.run(~r/( +)$/u, normalized, capture: :all_but_first) do
-      [spaces] when search != nil or fragment != nil ->
-        String.trim_trailing(normalized, " ") <>
-          String.duplicate(" ", String.length(spaces) - 1) <> "%20"
+    trimmed = String.trim_trailing(normalized, " ")
+    spaces = byte_size(normalized) - byte_size(trimmed)
 
-      _ ->
-        String.trim_trailing(normalized, " ")
+    if spaces > 0 and (search != nil or fragment != nil) do
+      trimmed <> String.duplicate(" ", spaces - 1) <> "%20"
+    else
+      trimmed
     end
   end
 
@@ -230,14 +237,14 @@ defmodule Web.URL.Parser do
 
     cond do
       String.contains?(host_port, ["[", "]"]) ->
-        String.match?(host_port, ~r/^\[[^\]]+\](?::\d+)?$/)
+        bracketed_host_port?(host_port)
 
-      String.graphemes(host_port) |> Enum.count(&(&1 == ":")) > 1 ->
+      length(:binary.matches(host_port, ":")) > 1 ->
         false
 
       String.contains?(host_port, ":") ->
         [_host, port] = String.split(host_port, ":", parts: 2)
-        port == "" or Regex.match?(~r/^\d+$/, port)
+        port == "" or Ascii.digits?(port)
 
       true ->
         true
@@ -413,11 +420,11 @@ defmodule Web.URL.Parser do
   defp build_relative_with_base_scheme(source, base_href, scheme) do
     normalized_base = normalize_for_scheme(base_href, scheme)
     normalized_source = normalize_for_scheme(source, scheme)
-    base_uri = URI.parse(normalized_base)
+    base_uri = URIParser.parse(normalized_base)
 
     merged =
       base_uri
-      |> URI.merge(normalized_source)
+      |> URI.merge(URIParser.parse(normalized_source))
       |> preserve_file_drive_root(base_uri, normalized_source, scheme)
 
     authority_present? =
@@ -469,13 +476,20 @@ defmodule Web.URL.Parser do
     |> starts_with_windows_drive_letter?()
   end
 
-  defp starts_with_windows_drive_letter?(value) do
-    String.match?(value, ~r/^[A-Za-z](?::|\|)(?:$|[\/\\?#])/)
+  # A letter, ":" or "|", then the end or one of "/", "\\", "?", "#".
+  defp starts_with_windows_drive_letter?(<<letter, mark, rest::binary>>)
+       when alpha?(letter) and mark in [?:, ?|] do
+    case rest do
+      <<>> -> true
+      <<char, _rest::binary>> -> char in [?/, ?\\, ??, ?#]
+    end
   end
+
+  defp starts_with_windows_drive_letter?(_value), do: false
 
   defp base_file_host(base_href) do
     base_href
-    |> URI.parse()
+    |> URIParser.parse()
     |> Map.get(:host, "")
   end
 
@@ -665,7 +679,7 @@ defmodule Web.URL.Parser do
 
   defp parse_and_build_fields(source, scheme, authority_present?) do
     source
-    |> URI.parse()
+    |> URIParser.parse()
     |> build_fields(scheme, authority_present?, source)
   end
 
@@ -813,11 +827,11 @@ defmodule Web.URL.Parser do
         not String.contains?(authority, "@")
 
       String.contains?(host_port, ["[", "]"]) ->
-        String.match?(host_port, ~r/^\[[^\]]+\](?::\d+)?$/) and host != ""
+        bracketed_host_port?(host_port) and host != ""
 
       String.contains?(host_port, ":") ->
         [host_part, port] = String.split(host_port, ":", parts: 2)
-        host_part != "" and Regex.match?(~r/^\d+$/, port)
+        host_part != "" and Ascii.digits?(port)
 
       true ->
         true
@@ -833,7 +847,7 @@ defmodule Web.URL.Parser do
       value
       |> Kernel.||("")
       |> to_string()
-      |> String.downcase()
+      |> Ascii.downcase()
       |> String.trim_trailing(":")
 
     if protocol == "", do: "", else: protocol <> ":"
@@ -843,8 +857,16 @@ defmodule Web.URL.Parser do
     if port == IP.default_port(protocol), do: "", else: port
   end
 
+  # The authority ends with ":" and one or more digits.
   defp explicit_port?(%URI{authority: authority}) when is_binary(authority) do
-    String.match?(authority, ~r/:\d+$/)
+    case :binary.matches(authority, ":") do
+      [] ->
+        false
+
+      matches ->
+        {index, 1} = List.last(matches)
+        Ascii.digits?(binary_part(authority, index + 1, byte_size(authority) - index - 1))
+    end
   end
 
   defp explicit_port?(_uri), do: false
@@ -932,15 +954,7 @@ defmodule Web.URL.Parser do
 
   defp pop_path_segment(segments, _preserve_drive_root?), do: Enum.drop(segments, -1)
 
-  defp dot_segment_type(segment) do
-    normalized = Regex.replace(~r/%2e/i, segment, ".")
-
-    case normalized do
-      "." -> :single
-      ".." -> :double
-      _ -> :none
-    end
-  end
+  defp dot_segment_type(segment), do: Encoding.dot_segment_type(segment)
 
   defp percent_encode_opaque_path(path) do
     path
@@ -968,18 +982,13 @@ defmodule Web.URL.Parser do
     do_percent_encode_opaque_path(rest, [<<char::utf8>> | acc])
   end
 
-  defp windows_drive_root_path?(path) do
-    String.match?(path, ~r/^\/[A-Za-z]:\/$/)
-  end
+  defp windows_drive_root_path?(<<?/, letter, ?:, ?/>>) when alpha?(letter), do: true
+  defp windows_drive_root_path?(_path), do: false
 
-  defp windows_drive_prefix?(path) do
-    String.match?(path, ~r/^\/[A-Za-z]:\//)
-  end
+  defp windows_drive_prefix?(<<?/, letter, ?:, ?/, _rest::binary>>) when alpha?(letter), do: true
+  defp windows_drive_prefix?(_path), do: false
 
-  defp windows_drive_root(path) do
-    [prefix | _rest] = Regex.run(~r/^\/[A-Za-z]:\//, path)
-    prefix
-  end
+  defp windows_drive_root(<<prefix::binary-size(4), _rest::binary>>), do: prefix
 
   defp parse_userinfo(nil), do: {"", ""}
 
@@ -1004,4 +1013,22 @@ defmodule Web.URL.Parser do
         false
     end
   end
+
+  # `[` and one or more characters that are not `]`, then `]`, then an
+  # optional ":" with one or more digits. Nothing comes after.
+  defp bracketed_host_port?("[" <> rest) do
+    case :binary.split(rest, "]") do
+      [inside, tail] when inside != "" ->
+        case tail do
+          "" -> true
+          ":" <> port -> Ascii.digits?(port)
+          _other -> false
+        end
+
+      _other ->
+        false
+    end
+  end
+
+  defp bracketed_host_port?(_host_port), do: false
 end

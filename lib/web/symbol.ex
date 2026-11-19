@@ -1,23 +1,164 @@
 defmodule Web.Symbol do
   @moduledoc """
-  TC39-style well-known symbols used by the `Web` runtime.
+  The well-known symbols of ECMAScript that this library uses.
+
+  In ECMAScript, a well-known symbol is the key of a function that the
+  language calls: `Symbol.dispose` is the key of the function that releases
+  a resource at the end of a `using` block. In Elixir, an atom is the key,
+  and the protocol `Web.Symbol.Protocol` has the function.
+
+  ## Disposable resources
+
+  A value is disposable when its type has an implementation of
+  `Web.Symbol.Protocol`. `Web.using/2` releases such a value at the end of
+  its block. The library has implementations for:
+
+    * `Web.MessagePort` and `Web.BroadcastChannel` - closes it;
+    * `Web.Socket` - closes it;
+    * `Web.ReadableStreamDefaultReader`, `Web.ReadableStreamBYOBReader`, and
+      `Web.WritableStreamDefaultWriter` - releases the lock;
+    * `Port` - closes it.
+
+  The Streams Standard does not specify the disposal of a reader and a
+  writer at this time. The library follows the proposal for that Standard.
+
+  To make a struct disposable, implement the protocol:
+
+      defimpl Web.Symbol.Protocol, for: MyApp.Connection do
+        def symbol(connection, :dispose, _args), do: MyApp.Connection.close(connection)
+        def symbol(_connection, _symbol, _args), do: :unsupported
+      end
   """
 
-  @type t :: :dispose | :async_dispose | :iterator
+  @type t :: :dispose | :async_dispose | :iterator | :async_iterator
 
+  @doc "The symbol of the function that releases a resource."
   @spec dispose() :: :dispose
   def dispose, do: :dispose
 
+  @doc """
+  The symbol of the function that releases a resource and returns a
+  `Web.Promise`.
+  """
   @spec async_dispose() :: :async_dispose
   def async_dispose, do: :async_dispose
 
+  @doc "The symbol of the function that returns an iterator."
   @spec iterator() :: :iterator
   def iterator, do: :iterator
+
+  @doc "The symbol of the function that returns an async iterator."
+  @spec async_iterator() :: :async_iterator
+  def async_iterator, do: :async_iterator
+
+  @doc """
+  Tells if a value is disposable: its type has an implementation of
+  `Web.Symbol.Protocol`.
+
+  ## Examples
+
+      iex> {port1, port2} = Web.MessageChannel.new()
+      iex> Web.Symbol.disposable?(port1)
+      true
+      iex> Web.MessagePort.close(port1)
+      iex> Web.MessagePort.close(port2)
+      iex> Web.Symbol.disposable?("text")
+      false
+  """
+  @spec disposable?(term()) :: boolean()
+  def disposable?(value), do: Web.Symbol.Protocol.impl_for(value) != Web.Symbol.Protocol.Any
+
+  # ---------------------------------------------------------------------------
+  # The functions of the macro `Web.using/2`
+  # ---------------------------------------------------------------------------
+
+  @doc false
+  # The check that ECMAScript does at the declaration: the value is `nil`,
+  # or it is disposable.
+  @spec check_disposable!(term()) :: :ok
+  def check_disposable!(nil), do: :ok
+
+  def check_disposable!(value) do
+    if disposable?(value) do
+      :ok
+    else
+      raise Web.TypeError, "The value is not disposable: #{inspect(value)}"
+    end
+  end
+
+  @doc false
+  # Runs the block of `Web.using/2`, then releases the resource. The rules
+  # are those of ECMAScript:
+  #
+  #   * the resource is released also when the block throws;
+  #   * a value that the block throws is thrown again after the disposal;
+  #   * a value that the disposal throws is thrown. When the block threw
+  #     too, the two values are in a `Web.SuppressedError`.
+  @spec run_using(term(), (-> result)) :: result when result: term()
+  def run_using(nil, block), do: block.()
+
+  def run_using(resource, block) do
+    outcome = capture(block)
+    disposal = capture(fn -> dispose!(resource) end)
+
+    case {outcome, disposal} do
+      {{:ok, value}, {:ok, _result}} ->
+        value
+
+      {{:ok, _value}, {kind, reason, stacktrace}} ->
+        :erlang.raise(kind, reason, stacktrace)
+
+      {{kind, reason, stacktrace}, {:ok, _result}} ->
+        :erlang.raise(kind, reason, stacktrace)
+
+      {{_kind, suppressed, _stacktrace}, {_disposal_kind, error, stacktrace}} ->
+        reraise %Web.SuppressedError{error: error, suppressed: suppressed}, stacktrace
+    end
+  end
+
+  defp capture(fun) do
+    {:ok, fun.()}
+  catch
+    kind, reason -> {kind, reason, __STACKTRACE__}
+  end
+
+  # Uses the function of `:dispose`. A resource that has only the function
+  # of `:async_dispose` uses that one. A promise is awaited.
+  defp dispose!(resource) do
+    case Web.Symbol.Protocol.symbol(resource, :dispose, []) do
+      :unsupported -> async_dispose!(resource)
+      result -> settle(result)
+    end
+  end
+
+  defp async_dispose!(resource) do
+    case Web.Symbol.Protocol.symbol(resource, :async_dispose, []) do
+      :unsupported -> raise Web.TypeError, "The value is not disposable: #{inspect(resource)}"
+      result -> settle(result)
+    end
+  end
+
+  defp settle(%Web.Promise{} = promise), do: Web.Promise.await(promise)
+  defp settle(result), do: result
 end
 
 defprotocol Web.Symbol.Protocol do
+  @moduledoc """
+  The functions of a value for the well-known symbols of `Web.Symbol`.
+
+  An implementation returns `:unsupported` for a symbol that the value does
+  not have.
+  """
+
   @fallback_to_any true
 
+  @doc """
+  Calls the function of the value for the symbol, with the arguments.
+
+  For `:dispose` and `:async_dispose`, the function releases the resource.
+  It can return a `Web.Promise`: `Web.using/2` awaits it. The function must
+  accept a resource that is released already.
+  """
   @spec symbol(term(), Web.Symbol.t(), list()) :: term()
   def symbol(resource, symbol_type, args)
 end
@@ -27,32 +168,56 @@ defimpl Web.Symbol.Protocol, for: Any do
 end
 
 defimpl Web.Symbol.Protocol, for: Port do
-  def symbol(port, :dispose, _args) do
-    if Port.info(port) do
-      Port.close(port)
-    end
-
+  def symbol(port, symbol, _args) when symbol in [:dispose, :async_dispose] do
+    Port.close(port)
     :ok
+  rescue
+    # The port is closed already, or a different process has it.
+    ArgumentError -> :ok
   end
 
-  def symbol(port, :async_dispose, args), do: symbol(port, :dispose, args)
-  def symbol(_port, :iterator, _args), do: :unsupported
+  def symbol(_port, _symbol, _args), do: :unsupported
 end
 
 defimpl Web.Symbol.Protocol, for: Web.BroadcastChannel do
-  def symbol(channel, :dispose, _args) do
+  def symbol(channel, symbol, _args) when symbol in [:dispose, :async_dispose] do
     Web.BroadcastChannel.close(channel)
   end
 
-  def symbol(channel, :async_dispose, args), do: symbol(channel, :dispose, args)
-  def symbol(_channel, :iterator, _args), do: :unsupported
+  def symbol(_channel, _symbol, _args), do: :unsupported
 end
 
 defimpl Web.Symbol.Protocol, for: Web.MessagePort do
-  def symbol(port, :dispose, _args) do
+  def symbol(port, symbol, _args) when symbol in [:dispose, :async_dispose] do
     Web.MessagePort.close(port)
   end
 
-  def symbol(port, :async_dispose, args), do: symbol(port, :dispose, args)
-  def symbol(_port, :iterator, _args), do: :unsupported
+  def symbol(_port, _symbol, _args), do: :unsupported
+end
+
+defimpl Web.Symbol.Protocol, for: Web.Socket do
+  def symbol(socket, symbol, _args) when symbol in [:dispose, :async_dispose] do
+    Web.Socket.close(socket)
+  end
+
+  def symbol(_socket, _symbol, _args), do: :unsupported
+end
+
+defimpl Web.Symbol.Protocol,
+  for: [Web.ReadableStreamDefaultReader, Web.ReadableStreamBYOBReader] do
+  def symbol(%module{} = reader, symbol, _args) when symbol in [:dispose, :async_dispose] do
+    module.release_lock(reader)
+    :ok
+  end
+
+  def symbol(_reader, _symbol, _args), do: :unsupported
+end
+
+defimpl Web.Symbol.Protocol, for: Web.WritableStreamDefaultWriter do
+  def symbol(writer, symbol, _args) when symbol in [:dispose, :async_dispose] do
+    Web.WritableStreamDefaultWriter.release_lock(writer)
+    :ok
+  end
+
+  def symbol(_writer, _symbol, _args), do: :unsupported
 end

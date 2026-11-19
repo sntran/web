@@ -174,6 +174,30 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "Disposal" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("Disposal"))
+    end
+
+    test "a block that starts with a value that is not disposable is found" do
+      assert_violates(
+        SpecModel.check("Disposal", bug("value_is_not_examined")),
+        "BlockHasDisposableValue"
+      )
+    end
+
+    test "a resource that stays after an error of the block is found" do
+      assert_violates(SpecModel.check("Disposal", bug("no_disposal_after_error")), "AllReleased")
+    end
+
+    test "an error of a disposal that replaces the error of the block is found" do
+      assert_violates(
+        SpecModel.check("Disposal", bug("disposal_error_replaces")),
+        "NoErrorIsLost"
+      )
+    end
+  end
+
   describe "ResponseBody" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("ResponseBody"))

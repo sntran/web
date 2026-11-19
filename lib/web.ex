@@ -125,10 +125,49 @@ defmodule Web do
   end
 
   @doc """
-  Runs a block with a disposable resource and guarantees `:dispose` runs after.
+  Runs a block with a resource, and releases the resource at the end of the
+  block, as the `using` declaration of ECMAScript.
 
-  Supports `using resource <- expression do ... end`,
-  `using resource = expression do ... end`, and `using expression do ... end`.
+  The three forms are:
+
+      using resource <- expression do ... end
+      using resource = expression do ... end
+      using expression do ... end
+
+  The macro returns the value of the block.
+
+  ## Rules
+
+    * The value of the expression must be disposable, or `nil`. See
+      `Web.Symbol` for the disposable values. For each other value, the
+      macro raises `Web.TypeError` and does not run the block.
+    * A `nil` value has no disposal: the block runs.
+    * The resource is released also when the block raises, throws, or
+      exits. The value that the block threw is thrown again after the
+      disposal.
+    * When the disposal fails, its error is raised. When the block failed
+      too, the macro raises `Web.SuppressedError` with the two errors.
+    * A disposal that returns a `Web.Promise` is awaited.
+
+  For more than one resource, put one `using` in a different one. The
+  resources are then released in the opposite sequence.
+
+  ## Examples
+
+      iex> use Web
+      iex> channel =
+      ...>   using channel <- BroadcastChannel.new("example") do
+      ...>     BroadcastChannel.post_message(channel, %{status: "started"})
+      ...>     channel
+      ...>   end
+      iex> BroadcastChannel.post_message(channel, "after the block")
+      ** (Web.DOMException) The BroadcastChannel is closed.
+
+      iex> use Web
+      iex> using value <- 5 do
+      ...>   value
+      ...> end
+      ** (Web.TypeError) The value is not disposable: 5
   """
   defmacro using(binding, do: block) do
     build_using(binding, block, __CALLER__)
@@ -346,31 +385,26 @@ defmodule Web do
 
   defp build_using({operator, _meta, [pattern, resource]}, block, caller)
        when operator in [:<-, :=] do
-    resource_var = Macro.unique_var(:using_resource, caller.module || __MODULE__)
-
-    quote do
-      unquote(resource_var) = unquote(resource)
-      unquote(pattern) = unquote(resource_var)
-
-      try do
-        unquote(block)
-      after
-        Web.Symbol.Protocol.symbol(unquote(resource_var), Web.Symbol.dispose(), [])
-      end
-    end
+    using_ast(pattern, resource, block, caller)
   end
 
   defp build_using(resource, block, caller) do
+    using_ast(quote(do: _), resource, block, caller)
+  end
+
+  # The match of the pattern is in the function: the resource is released
+  # also when the match fails.
+  defp using_ast(pattern, resource, block, caller) do
     resource_var = Macro.unique_var(:using_resource, caller.module || __MODULE__)
 
     quote do
       unquote(resource_var) = unquote(resource)
+      :ok = Web.Symbol.check_disposable!(unquote(resource_var))
 
-      try do
+      Web.Symbol.run_using(unquote(resource_var), fn ->
+        unquote(pattern) = unquote(resource_var)
         unquote(block)
-      after
-        Web.Symbol.Protocol.symbol(unquote(resource_var), Web.Symbol.dispose(), [])
-      end
+      end)
     end
   end
 

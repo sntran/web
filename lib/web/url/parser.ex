@@ -47,7 +47,11 @@ defmodule Web.URL.Parser do
     end
   end
 
-  defp build_absolute(source, scheme, rest, base) do
+  # The scheme is in lower case from here: the parser examines the input
+  # with the lower-case scheme. Before, an input such as "HTTP://host" lost
+  # its host, because a prefix "http:" was not found in it.
+  defp build_absolute(_source, scheme, rest, base) do
+    source = scheme <> ":" <> rest
     normalized = normalize_for_scheme(source, scheme)
     authority_present? = authority_present_in_input?(normalized)
     normalized_rest = String.replace_prefix(normalized, scheme <> ":", "")

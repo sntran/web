@@ -204,6 +204,21 @@ defmodule Web.URLTest do
   # Custom URL feature tests (NOT covered by WHATWG WPT)
   # ============================================================================
 
+  test "a scheme in upper case is changed to lower case, and the host stays" do
+    for {input, href} <- [
+          {"HTTPS://Example.COM:443/a/b?c=d#e", "https://example.com/a/b?c=d#e"},
+          {"Http://h/x", "http://h/x"},
+          {"HTTP://User:Pass@Host:8080/", "http://User:Pass@host:8080/"},
+          {"FOO://Host/P", "foo://Host/P"},
+          {"FILE:///C:/x", "file:///C:/x"},
+          {"Mailto:A@B", "mailto:A@B"}
+        ] do
+      assert URL.href(URL.new(input)) == href, input
+    end
+
+    assert URL.hostname(URL.new("HTTPS://Example.COM/")) == "example.com"
+  end
+
   test "an IPv6 host with bytes after the bracket is not valid" do
     for input <- ["http://[::1]x/", "foo://[::1]x/", "http://[::1]:x/", "foo://[]/"] do
       assert_raise ArgumentError, fn -> URL.new(input) end

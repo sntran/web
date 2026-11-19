@@ -57,6 +57,24 @@ defmodule Web.ReadableStreamDefaultReader do
     |> read_result()
   end
 
+  @doc false
+  # A batch read with no promise, for the code of this library that reads
+  # many chunks of a stream. It has the effect of `max` reads with no await:
+  # see the request `:read_batch` of `Web.Stream`. Returns `{:ok, chunks}`
+  # with one chunk or more, `:done`, or `{:error, reason}` with the
+  # rejection reason of a read.
+  def read_batch_now(%__MODULE__{controller_pid: pid} = reader, max) do
+    pid
+    |> ReadableStream.read_batch(owner(reader), max)
+    |> batch_result()
+  end
+
+  @doc false
+  def batch_result({:chunks, chunks}), do: {:ok, chunks}
+  def batch_result({:ok, chunk}), do: {:ok, [chunk]}
+  def batch_result(:done), do: :done
+  def batch_result(error), do: read_result(error)
+
   # The answer of the stream to a read request, as the result of a read.
   defp read_result({:ok, chunk}), do: {:ok, %{value: chunk, done: false}}
   defp read_result(:done), do: {:ok, %{value: nil, done: true}}

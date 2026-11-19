@@ -296,26 +296,38 @@ defmodule Web.Body do
     Web.TypeError.exception(message: "The body stream stopped.", cause: reason)
   end
 
+  # The body reads the chunks in batches of 64 at most: it reads all of
+  # them, thus the source can work ahead.
   defp read_stream_chunks(pid, acc) do
-    case Web.ReadableStream.read(pid) do
-      {:ok, chunk} ->
-        case Bytes.to_binary(chunk) do
-          {:ok, binary} ->
-            read_stream_chunks(pid, [binary | acc])
-
-          :error ->
-            Web.ReadableStream.release_lock(pid)
-            {:error, chunk_error()}
-        end
-
-      :done ->
-        Web.ReadableStream.release_lock(pid)
-        {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary()}
-
-      {:error, reason} ->
-        Web.ReadableStream.release_lock(pid)
-        {:error, stream_error(reason)}
+    case Web.ReadableStream.read_batch(pid, self(), 64) do
+      {:chunks, chunks} -> add_chunks(pid, chunks, acc)
+      {:ok, chunk} -> add_chunks(pid, [chunk], acc)
+      :done -> finish_chunks(pid, :done, acc)
+      {:error, _reason} = error -> finish_chunks(pid, error, acc)
     end
+  end
+
+  defp add_chunks(pid, [], acc), do: read_stream_chunks(pid, acc)
+
+  defp add_chunks(pid, [chunk | chunks], acc) do
+    case Bytes.to_binary(chunk) do
+      {:ok, binary} ->
+        add_chunks(pid, chunks, [binary | acc])
+
+      :error ->
+        Web.ReadableStream.release_lock(pid)
+        {:error, chunk_error()}
+    end
+  end
+
+  defp finish_chunks(pid, :done, acc) do
+    Web.ReadableStream.release_lock(pid)
+    {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary()}
+  end
+
+  defp finish_chunks(pid, {:error, reason}, _acc) do
+    Web.ReadableStream.release_lock(pid)
+    {:error, stream_error(reason)}
   end
 
   # The text of a body is the UTF-8 decode of its bytes, with no byte order

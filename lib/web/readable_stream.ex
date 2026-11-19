@@ -270,20 +270,15 @@ defmodule Web.ReadableStream do
   # body.
   def from_enumerable(enumerable, opts) when is_list(opts) do
     if Enumerable.impl_for(enumerable) do
-      enumerator_pid = start_enumerator(enumerable)
+      enumerator = start_enumerator(enumerable)
 
       new(
         %{
-          pull: fn controller ->
-            case ask_enumerator(enumerator_pid) do
-              :done ->
-                Web.ReadableStreamDefaultController.close(controller)
-
-              {:chunk, chunk} ->
-                Web.ReadableStreamDefaultController.enqueue(controller, chunk)
-            end
-          end,
-          cancel: fn _reason -> send(enumerator_pid, :stop) end
+          # The enumerator gives the chunks to the stream, and the pull waits
+          # until it gave the chunks that the stream wants: see
+          # `enumerator_loop/1`.
+          pull: fn controller -> produce(enumerator, controller.pid, Web.Stream.pull_demand()) end,
+          cancel: fn _reason -> send(enumerator, :stop) end
         },
         Keyword.put(opts, :cancel_on_reader_exit, true)
       )
@@ -446,25 +441,74 @@ defmodule Web.ReadableStream do
   defp enumerable_step({:halted, {:chunk, chunk}}), do: {:chunk, chunk, :done}
   defp enumerable_step({_done_or_halted, :none}), do: :done
 
+  # The process of an enumerable. A slow enumerable thus does not stop the
+  # stream process, and a cancel can stop the enumerable while it waits.
+  #
+  # For each pull, the enumerator gives the chunks that the stream wants,
+  # each in its own message, as the enumerable gives them. Thus a chunk does
+  # not wait for the next one. The enumerator also closes the stream, or
+  # puts it in the errored state. These messages come from one process, thus
+  # the stream gets them in their sequence.
   defp start_enumerator(enumerable) do
-    spawn(fn -> enumerator_loop({:initial, enumerable}) end)
+    spawn(fn -> enumerator_loop(%{enumerable: {:initial, enumerable}, stream: nil}) end)
   end
 
   defp enumerator_loop(state) do
     receive do
-      {:next, from, ref} ->
-        case safe_enumerator_next(state) do
-          {:chunk, chunk, next_state} ->
-            send(from, {ref, {:chunk, chunk}})
-            enumerator_loop(next_state)
+      {:produce, stream, demand, from, ref} ->
+        state = watch_stream(state, stream)
 
-          # The enumerable is complete, or it failed. The enumerator stops.
-          last_reply ->
-            send(from, {ref, last_reply})
+        case produce_chunks(state.enumerable, stream, demand) do
+          {:more, enumerable} ->
+            send(from, {ref, :ok})
+            enumerator_loop(%{state | enumerable: enumerable})
+
+          # The enumerable is complete, or it failed, or a cancel stopped it.
+          :ended ->
+            send(from, {ref, :ok})
         end
 
+      # The cancel callback of the stream sends `:stop`. The enumerator also
+      # stops when the stream stopped.
       :stop ->
-        halt_enumerator(state)
+        halt_enumerator(state.enumerable)
+
+      {:DOWN, _ref, :process, _stream, _reason} ->
+        halt_enumerator(state.enumerable)
+    end
+  end
+
+  defp watch_stream(%{stream: nil} = state, stream) do
+    Process.monitor(stream)
+    %{state | stream: stream}
+  end
+
+  defp watch_stream(state, _stream), do: state
+
+  defp produce_chunks(enumerable, _stream, 0), do: {:more, enumerable}
+
+  defp produce_chunks(enumerable, stream, demand) do
+    receive do
+      :stop ->
+        halt_enumerator(enumerable)
+        :ended
+    after
+      0 ->
+        case safe_enumerator_next(enumerable) do
+          {:chunk, chunk, next} ->
+            enqueue(stream, chunk)
+            produce_chunks(next, stream, demand - 1)
+
+          :done ->
+            close(stream)
+            :ended
+
+          # The stream gets the error as the error of a pull: an exception
+          # for a raise, and the value for a throw or an exit.
+          {:raised, kind, reason, stacktrace} ->
+            :gen_statem.cast(stream, {:error, Exception.normalize(kind, reason, stacktrace)})
+            :ended
+        end
     end
   end
 
@@ -479,23 +523,23 @@ defmodule Web.ReadableStream do
 
   defp halt_enumerator(_initial_or_done), do: :ok
 
-  defp ask_enumerator(pid) do
-    ref = Process.monitor(pid)
-    send(pid, {:next, self(), ref})
+  # The pull of a stream from an enumerable: it waits until the enumerator
+  # gave the chunks that the stream wants, or stopped. An enumerator that
+  # stopped with no error ends the stream. The error of an enumerator that
+  # failed is the error of the pull.
+  defp produce(enumerator, stream, demand) do
+    ref = Process.monitor(enumerator)
+    send(enumerator, {:produce, stream, demand, self(), ref})
 
     receive do
-      {^ref, {:raised, kind, reason, stacktrace}} ->
+      {^ref, :ok} ->
         Process.demonitor(ref, [:flush])
-        :erlang.raise(kind, reason, stacktrace)
+        :ok
 
-      {^ref, reply} ->
-        Process.demonitor(ref, [:flush])
-        reply
+      {:DOWN, ^ref, :process, ^enumerator, reason} when reason in [:normal, :noproc] ->
+        close(stream)
 
-      {:DOWN, ^ref, :process, ^pid, reason} when reason in [:normal, :noproc] ->
-        :done
-
-      {:DOWN, ^ref, :process, ^pid, reason} ->
+      {:DOWN, ^ref, :process, ^enumerator, reason} ->
         exit(reason)
     end
   end
@@ -593,6 +637,14 @@ defmodule Web.ReadableStream do
 
   def read(pid) do
     Web.Stream.call(pid, {:read, self()}, {:error, :not_locked_by_reader})
+  end
+
+  @doc false
+  # A batch read of `max` chunks at most, for the lock of `owner`. See the
+  # request `:read_batch` of `Web.Stream`. The answer is `{:chunks, list}`,
+  # `{:ok, chunk}`, `:done`, or `{:error, reason}`.
+  def read_batch(pid, owner, max) when is_pid(pid) and is_integer(max) and max > 0 do
+    Web.Stream.request(pid, {:read_batch, owner, max}, {:error, :not_locked_by_reader})
   end
 
   @doc false
@@ -890,44 +942,108 @@ defmodule Web.ReadableStream do
   defp stored_error({:errored, reason}), do: reason
   defp stored_error(_closed_or_stopped), do: TypeError.exception(@released_message)
 
+  # The pipe reads the chunks in batches. The first batch has one chunk, and
+  # each batch after it two times the chunks, up to 64. A batch is never
+  # larger than the desired size of the destination, thus the pipe reads
+  # no chunk that the destination does not want, as the Streams Standard
+  # specifies.
+  #
+  # Each write waits for its end, and only the pipe writes to the
+  # destination: it has the lock. Thus after a write the desired size of the
+  # destination is its high water mark again, and the pipe asks for it only
+  # one time. A destination that fails, or that closes, makes the next write
+  # fail.
   defp pump(reader, writer, options) do
-    owner_pid = self()
+    wanted =
+      case WritableStream.desired_size(writer.controller_pid) do
+        size when is_integer(size) and size > 0 -> size
+        _no_capacity -> :ready
+      end
 
-    try do
-      # Each step stops when the signal aborts. A signal that aborted before
-      # the step makes the step throw the reason.
-      with :ok <-
-             await_pipe_step(
-               fn -> WritableStream.ready(writer.controller_pid, writer.owner_pid) end,
-               options
-             ),
-           :ok <- AbortSignal.check!(options[:signal]),
-           read_result <-
-             await_pipe_step(fn -> read_for_pipe(reader.controller_pid, owner_pid) end, options) do
-        case read_result do
-          %{value: chunk, done: false} ->
-            case WritableStream.write(writer.controller_pid, writer.owner_pid, chunk) do
-              :ok ->
-                pump(reader, writer, options)
+    pump(reader, writer, options, {1, wanted})
+  catch
+    {:abort, reason} -> {:aborted, reason}
+  end
 
-              {:error, reason} ->
-                {:sink_error, reason}
-            end
-
-          %{done: true} ->
-            :done
-
-          {:error, reason} ->
-            {:source_error, reason}
-        end
-      else
-        # The destination is errored, or it is closed.
+  # Each step stops when the signal aborts. A signal that aborted before
+  # the step makes the step throw the reason. The read of each batch is a
+  # step, thus the pipe examines the signal before each read.
+  defp pump(reader, writer, options, state) do
+    with {:ok, chunks, state} <- next_pipe_chunks(reader, writer, state, options) do
+      case write_chunks(writer, chunks) do
+        :ok when chunks == [] -> :done
+        :ok -> pump(reader, writer, options, state)
         {:error, reason} -> {:sink_error, reason}
       end
-    catch
-      {:abort, reason} -> {:aborted, reason}
     end
   end
+
+  defp next_pipe_chunks(reader, writer, {batch, wanted}, options) do
+    with {:ok, size} <- batch_size(writer, batch, wanted, options) do
+      owner_pid = self()
+      read = fn -> read_batch(reader.controller_pid, owner_pid, size) end
+      next_batch = min(batch * 2, 64)
+
+      case await_pipe_step(read, options) do
+        {:chunks, chunks} -> {:ok, chunks, {next_batch, wanted}}
+        {:ok, chunk} -> {:ok, [chunk], {next_batch, wanted}}
+        :done -> {:ok, [], {batch, wanted}}
+        {:error, reason} -> {:source_error, reason}
+      end
+    end
+  end
+
+  # Sends the writes of a batch with no wait between them, and then waits
+  # for their ends, in their sequence. The batch is not larger than the
+  # desired size of the destination, thus the destination wants each write.
+  defp write_chunks(_writer, []), do: :ok
+
+  defp write_chunks(%{controller_pid: pid, owner_pid: owner}, [chunk]) do
+    WritableStream.write(pid, owner, chunk)
+  end
+
+  defp write_chunks(%{controller_pid: pid, owner_pid: owner}, chunks) do
+    monitor = Process.monitor(pid)
+
+    tags =
+      Enum.map(chunks, fn chunk ->
+        tag = make_ref()
+        send(pid, {:"$gen_call", {self(), tag}, {:write, owner, chunk}})
+        tag
+      end)
+
+    result = await_writes(tags, :ok, monitor)
+    Process.demonitor(monitor, [:flush])
+    result
+  end
+
+  # The first failure is the result. The answers after it are also read.
+  defp await_writes([], result, _monitor), do: result
+
+  defp await_writes([tag | tags], result, monitor) do
+    receive do
+      {^tag, reply} ->
+        await_writes(tags, if(result == :ok, do: reply, else: result), monitor)
+
+      # The destination stopped: no more answer comes.
+      {:DOWN, ^monitor, :process, _pid, _reason} ->
+        {:error, :released}
+    end
+  end
+
+  # A destination with no capacity at the start of the pipe makes the pipe
+  # wait for its promise `ready` before each chunk.
+  defp batch_size(writer, _batch, :ready, options) do
+    step = fn -> WritableStream.ready(writer.controller_pid, writer.owner_pid) end
+
+    case await_pipe_step(step, options) do
+      :ok -> {:ok, 1}
+      # The destination is errored, or it is closed.
+      {:error, reason} -> {:sink_error, reason}
+    end
+  end
+
+  defp batch_size(_writer, batch, wanted, _options), do: {:ok, min(batch, wanted)}
 
   defp await_pipe_step(fun, options) do
     signal = Keyword.get(options, :signal)
@@ -964,14 +1080,6 @@ defmodule Web.ReadableStream do
           {:error, :aborted, reason} -> throw({:abort, reason})
           :ok -> await_pipe_step_result(task, subscription)
         end
-    end
-  end
-
-  defp read_for_pipe(pid, owner_pid) do
-    case Web.Stream.call(pid, {:read, owner_pid}, {:error, :released}) do
-      {:ok, chunk} -> %{value: chunk, done: false}
-      :done -> %{value: nil, done: true}
-      {:error, _} = error -> error
     end
   end
 
@@ -1086,33 +1194,44 @@ end
 defimpl Enumerable, for: Web.ReadableStream do
   alias Web.ReadableStreamDefaultReader
 
+  # The largest batch of a read: see `ReadableStreamDefaultReader.read_batch_now/2`.
+  @max_batch 64
+
+  # The enumeration reads the chunks in batches. The first batch has one
+  # chunk, and each batch after it has two times the chunks of the batch
+  # before, up to 64. Thus an enumeration that takes few chunks, such as
+  # `Enum.take/2`, does not make the source give many chunks.
   def reduce(stream, acc, fun) do
     reader = Web.ReadableStream.get_reader(stream)
-    do_reduce(reader, acc, fun)
+    do_reduce({reader, [], 1}, acc, fun)
   end
 
   # A halt is the end of the enumeration. Cancel the stream, thus its source
   # stops and the stream process can stop.
-  defp do_reduce(reader, {:halt, acc}, _fun) do
+  defp do_reduce({reader, _chunks, _batch}, {:halt, acc}, _fun) do
     # The stream is cancelled when this call returns. The call does not
     # wait for the cancel callback of the source.
     _ = Web.Stream.call(reader.controller_pid, {:terminate_detached, :cancel, :halted}, :ok)
     {:halted, acc}
   end
 
-  defp do_reduce(reader, {:suspend, acc}, fun) do
-    {:suspended, acc, &do_reduce(reader, &1, fun)}
+  defp do_reduce(state, {:suspend, acc}, fun) do
+    {:suspended, acc, &do_reduce(state, &1, fun)}
+  end
+
+  defp do_reduce({reader, [chunk | chunks], batch}, {:cont, acc}, fun) do
+    do_reduce({reader, chunks, batch}, apply_reducer(reader, fun, chunk, acc), fun)
   end
 
   # The read has no promise: a promise is a process that keeps the chunk
   # for some seconds. The call of the reducer is not in the path of the
   # recursion, thus the stack does not increase with the number of chunks.
-  defp do_reduce(reader, {:cont, acc}, fun) do
-    case ReadableStreamDefaultReader.read_now(reader) do
-      {:ok, %{value: chunk, done: false}} ->
-        do_reduce(reader, apply_reducer(reader, fun, chunk, acc), fun)
+  defp do_reduce({reader, [], batch}, {:cont, acc}, fun) do
+    case ReadableStreamDefaultReader.read_batch_now(reader, batch) do
+      {:ok, chunks} ->
+        do_reduce({reader, chunks, min(batch * 2, @max_batch)}, {:cont, acc}, fun)
 
-      {:ok, %{done: true}} ->
+      :done ->
         ReadableStreamDefaultReader.release_lock(reader)
         {:done, acc}
 

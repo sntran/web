@@ -141,6 +141,35 @@ All notable changes to this project are documented in this file.
   could fail after 5000 ms.
 - The default connect time of `Web.connect/2` changes from 5000 ms to
   10000 ms, which is the new setting `connect_timeout`.
+- **Breaking:** a cancel and an abort settle after the callback of the
+  source or sink, as the Streams Standard specifies.
+  - The callback runs in a task. A promise that it returns is awaited, and
+    a value that it throws is the rejection reason. Before, the callback
+    ran in the process of the stream, and its promise was ignored.
+  - A cancel of a closed stream, and a second cancel, call no callback.
+  - A halt of an enumeration, such as `Enum.take/2`, cancels the stream and
+    does not wait for the callback.
+  - The promise of a cancel of one branch of `tee/1` stays pending until
+    the second branch is cancelled or the stream ends. It rejects with the
+    value that the cancel callback of the stream throws.
+- **Breaking:** the constructors of the streams validate their input.
+  - `Web.ReadableStream.new/2` raises `Web.TypeError` for an underlying
+    source that is not valid, for a callback that is not a function, and
+    for a type that is not `"bytes"`.
+  - `Web.WritableStream.new/1` raises `Web.TypeError` for a sink that is not
+    a map, and `Web.RangeError` for a sink with the key `:type`.
+  - A limit that is not a number, or that is below zero, raises
+    `Web.RangeError`.
+  - `get_reader/2` accepts only the mode `"byob"`. The mode `"default"`
+    raises `Web.TypeError`, as in the Standard.
+  - `Web.ReadableStream.from/1` raises `Web.TypeError` for a value that is
+    not enumerable. Before, it raised `ArgumentError`.
+- **Breaking:** `pipe_to/3` and `pipe_through/3` have the two locks when they
+  return. `pipe_through/3` raises `Web.TypeError` for a locked stream.
+  Before, it returned and the pipe did nothing. A pipe releases its locks
+  before its promise settles.
+- The pipe options have Elixir names: `:prevent_close`, `:prevent_abort`, and
+  `:prevent_cancel`. The names of the Standard are accepted also.
 - **Breaking:** `Web.TransformStream` follows the Streams Standard.
   - The transform of a chunk starts only when the readable side wants a
     chunk, and until then the write waits. Before, a transform stream gave

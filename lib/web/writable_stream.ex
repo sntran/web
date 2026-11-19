@@ -94,8 +94,13 @@ defmodule Web.WritableStream do
   """
   def new(underlying_sink \\ %{})
 
-  def new(underlying_sink) when is_map(underlying_sink) do
+  def new(underlying_sink) when is_map(underlying_sink) and not is_struct(underlying_sink) do
+    :ok = validate_sink!(underlying_sink)
     hwm = Map.get(underlying_sink, :high_water_mark, 1)
+
+    if not is_number(hwm) or hwm < 0 do
+      raise Web.RangeError, "Invalid high water mark: #{inspect(hwm)}"
+    end
 
     {:ok, pid} =
       start_link(
@@ -108,7 +113,26 @@ defmodule Web.WritableStream do
   end
 
   def new(underlying_sink) do
-    raise ArgumentError, "underlying_sink must be a map, got: #{inspect(underlying_sink)}"
+    raise Web.TypeError, "The underlying sink must be a map, got: #{inspect(underlying_sink)}"
+  end
+
+  @sink_callbacks [start: 1, write: 2, close: 1, abort: 1]
+
+  # The checks of the Streams Standard for an underlying sink.
+  defp validate_sink!(sink) do
+    if is_map_key(sink, :type) do
+      raise Web.RangeError, "The underlying sink key :type is not permitted"
+    end
+
+    for {name, arity} <- @sink_callbacks, callback = Map.get(sink, name), not is_nil(callback) do
+      if not is_function(callback, arity) do
+        raise Web.TypeError,
+              "The underlying sink function #{inspect(name)} must be a function with " <>
+                "#{arity} argument(s), got: #{inspect(callback)}"
+      end
+    end
+
+    :ok
   end
 
   @doc """

@@ -9,7 +9,7 @@ defmodule Web.WritableStreamTest do
   alias Web.WritableStreamDefaultWriter
 
   test "new/1 validates the underlying sink type" do
-    assert_raise ArgumentError, ~r/underlying_sink must be a map/, fn ->
+    assert_raise TypeError, ~r/underlying sink must be a map/, fn ->
       WritableStream.new(:not_a_map)
     end
   end

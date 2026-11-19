@@ -357,6 +357,285 @@ defmodule Web.StreamStandardTest do
     end
   end
 
+  describe "the checks of the constructors" do
+    test "refuse an underlying source that is not valid" do
+      for source <- [:nope, 123, "text", [1, 2]] do
+        assert_raise TypeError, ~r/Invalid underlying source/, fn ->
+          ReadableStream.new(source)
+        end
+      end
+
+      for {name, bad} <- [start: :nope, pull: fn -> :ok end, cancel: fn _a, _b -> :ok end] do
+        assert_raise TypeError, ~r/must be a function/, fn ->
+          ReadableStream.new(%{name => bad})
+        end
+      end
+
+      assert_raise TypeError, ~r/Invalid type/, fn -> ReadableStream.new(%{type: "nope"}) end
+      assert %ReadableStream{} = ReadableStream.new(%{type: "bytes"})
+    end
+
+    test "refuse a limit that is not a number or that is below zero" do
+      for limit <- [-1, :big, "1"] do
+        assert_raise Web.RangeError, ~r/Invalid high water mark/, fn ->
+          ReadableStream.new(%{}, high_water_mark: limit)
+        end
+
+        assert_raise Web.RangeError, ~r/Invalid high water mark/, fn ->
+          WritableStream.new(%{high_water_mark: limit})
+        end
+
+        assert_raise Web.RangeError, fn -> CountQueuingStrategy.new(limit) end
+        assert_raise Web.RangeError, fn -> ByteLengthQueuingStrategy.new(limit) end
+      end
+
+      assert ReadableStream.get_desired_size(
+               ReadableStream.new(%{}, high_water_mark: 0).controller_pid
+             ) == 0
+    end
+
+    test "refuse an underlying sink that is not valid" do
+      assert_raise TypeError, ~r/must be a map/, fn -> WritableStream.new(:nope) end
+
+      assert_raise Web.RangeError, ~r/:type is not permitted/, fn ->
+        WritableStream.new(%{type: "bytes"})
+      end
+
+      for {name, bad} <- [
+            start: :nope,
+            write: fn _chunk -> :ok end,
+            close: 1,
+            abort: fn -> :ok end
+          ] do
+        assert_raise TypeError, ~r/must be a function/, fn ->
+          WritableStream.new(%{name => bad})
+        end
+      end
+    end
+
+    test "refuse a value that is not enumerable for from/1" do
+      assert_raise TypeError, ~r/Cannot make a ReadableStream/, fn -> ReadableStream.from(123) end
+    end
+
+    test "give the size of each kind of byte chunk" do
+      assert ByteLengthQueuingStrategy.size("abc") == 3
+      assert ByteLengthQueuingStrategy.size(Uint8Array.new(ArrayBuffer.new("abcd"), 1, 2)) == 2
+      assert ByteLengthQueuingStrategy.size(ArrayBuffer.new("abcde")) == 5
+    end
+  end
+
+  describe "a pipe" do
+    test "has the two locks when pipe_to/3 returns" do
+      source = ReadableStream.new(%{})
+      destination = WritableStream.new()
+      pipe = ReadableStream.pipe_to(source, destination)
+
+      assert ReadableStream.locked?(source)
+      assert WritableStream.locked?(destination)
+
+      ReadableStream.close(source.controller_pid)
+      assert await(pipe) == :ok
+    end
+
+    test "releases its locks before its promise settles" do
+      source = ReadableStream.from(["a"])
+      destination = WritableStream.new()
+
+      assert await(ReadableStream.pipe_to(source, destination, prevent_close: true)) == :ok
+      refute WritableStream.locked?(destination)
+
+      # A second pipe can use the same destination.
+      assert await(ReadableStream.pipe_to(ReadableStream.from(["b"]), destination)) == :ok
+    end
+
+    test "rejects when one of the two streams is locked, and takes no lock" do
+      locked_source = ReadableStream.from(["a"])
+      _reader = ReadableStream.get_reader(locked_source)
+      destination = WritableStream.new()
+
+      assert %TypeError{message: "ReadableStream is already locked"} =
+               rejection(ReadableStream.pipe_to(locked_source, destination))
+
+      refute WritableStream.locked?(destination)
+
+      locked_destination = WritableStream.new()
+      _writer = WritableStream.get_writer(locked_destination)
+      source = ReadableStream.from(["a"])
+
+      assert %TypeError{message: "WritableStream is already locked"} =
+               rejection(ReadableStream.pipe_to(source, locked_destination))
+
+      refute ReadableStream.locked?(source)
+    end
+
+    test "raises from pipe_through/3 when one of the two streams is locked" do
+      locked_source = ReadableStream.from(["a"])
+      _reader = ReadableStream.get_reader(locked_source)
+
+      assert_raise TypeError, "ReadableStream is already locked", fn ->
+        ReadableStream.pipe_through(locked_source, TransformStream.new())
+      end
+
+      transform = TransformStream.new()
+      _writer = WritableStream.get_writer(transform.writable)
+
+      assert_raise TypeError, "WritableStream is already locked", fn ->
+        ReadableStream.pipe_through(ReadableStream.from(["a"]), transform)
+      end
+    end
+
+    test "accepts each option with its Elixir name and with its name in the Standard" do
+      for option <- [:prevent_close, :preventClose] do
+        destination = WritableStream.new(recording_sink(self()))
+
+        assert await(
+                 ReadableStream.pipe_to(ReadableStream.from([1]), destination, [{option, true}])
+               ) == :ok
+
+        assert events() == [{:write, 1}]
+      end
+
+      for option <- [:prevent_abort, :preventAbort] do
+        source = ReadableStream.new(%{})
+        destination = WritableStream.new(recording_sink(self()))
+        pipe = ReadableStream.pipe_to(source, destination, [{option, true}])
+        ReadableStream.error(source.controller_pid, :failed)
+        assert rejection(pipe) == :failed
+        assert events() == []
+      end
+
+      for option <- [:prevent_cancel, :preventCancel] do
+        test = self()
+
+        source =
+          ReadableStream.new(%{
+            pull: fn controller -> ReadableStreamDefaultController.enqueue(controller, 1) end,
+            cancel: fn reason -> send(test, {:cancel, reason}) end
+          })
+
+        destination =
+          WritableStream.new(%{write: fn _chunk, _controller -> raise "sink failed" end})
+
+        pipe = ReadableStream.pipe_to(source, destination, [{option, true}])
+        assert %RuntimeError{} = rejection(pipe)
+        assert events() == []
+
+        # The source is not cancelled, thus the test cancels it.
+        assert await(ReadableStream.cancel(source, :cleanup)) == :ok
+        assert events() == [cancel: :cleanup]
+      end
+    end
+  end
+
+  describe "a cancel" do
+    test "settles after the cancel callback of the source, also when it returns a promise" do
+      test = self()
+
+      for callback <- [
+            fn reason ->
+              Process.sleep(80)
+              send(test, {:cancel_complete, reason})
+            end,
+            fn reason ->
+              Promise.new(fn resolve, _reject ->
+                Process.sleep(80)
+                send(test, {:cancel_complete, reason})
+                resolve.(:ok)
+              end)
+            end
+          ] do
+        stream = ReadableStream.new(%{cancel: callback})
+        cancel = ReadableStream.cancel(stream, :enough)
+
+        # The stream is closed immediately. The promise waits for the callback.
+        assert await(Reader.read(ReadableStream.get_reader(stream))) == %{value: nil, done: true}
+        assert Promise.peek(cancel) == :pending
+        assert await(cancel) == :ok
+        assert_received {:cancel_complete, :enough}
+      end
+    end
+
+    test "rejects with the value that the callback throws, or that its promise rejects with" do
+      for {callback, expected} <- [
+            {fn _reason -> raise "cancel failed" end, %RuntimeError{message: "cancel failed"}},
+            {fn _reason -> throw(:thrown) end, :thrown},
+            {fn _reason -> Promise.reject(:rejected) end, :rejected}
+          ] do
+        stream = ReadableStream.new(%{cancel: callback})
+        assert rejection(ReadableStream.cancel(stream, :enough)) == expected
+
+        # The stream is closed, and its process did not stop.
+        assert Process.alive?(stream.controller_pid)
+        assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
+      end
+    end
+
+    test "has no effect on the result when the callback returns a value that is not a promise" do
+      for value <- [:ok, {:error, :not_a_rejection}, nil, "text"] do
+        stream = ReadableStream.new(%{cancel: fn _reason -> value end})
+        assert await(ReadableStream.cancel(stream, :enough)) == :ok
+      end
+    end
+
+    test "of a closed stream, and a second cancel, call no callback" do
+      test = self()
+      source = %{cancel: fn reason -> send(test, {:cancelled, reason}) end}
+
+      closed = ReadableStream.new(source)
+      ReadableStream.close(closed.controller_pid)
+      assert await(ReadableStream.cancel(closed, :late)) == :ok
+      assert events() == []
+
+      stream = ReadableStream.new(source)
+      assert await(ReadableStream.cancel(stream, :first)) == :ok
+      assert await(ReadableStream.cancel(stream, :second)) == :ok
+      assert events() == [cancelled: :first]
+    end
+
+    test "from a halt of an enumeration does not wait for the callback" do
+      test = self()
+      counter = :counters.new(1, [])
+
+      stream =
+        ReadableStream.new(%{
+          pull: fn controller ->
+            :counters.add(counter, 1, 1)
+            ReadableStreamDefaultController.enqueue(controller, :counters.get(counter, 1))
+          end,
+          cancel: fn reason ->
+            Process.sleep(200)
+            send(test, {:cancel_complete, reason})
+          end
+        })
+
+      {time, taken} = :timer.tc(fn -> Enum.take(stream, 2) end)
+      assert taken == [1, 2]
+      assert time < 150_000
+      assert_receive {:cancel_complete, :halted}, 1_000
+    end
+
+    test "of a writable stream object settles after the abort callback of the sink" do
+      test = self()
+
+      stream =
+        WritableStream.new(%{
+          abort: fn reason ->
+            Promise.new(fn resolve, _reject ->
+              Process.sleep(80)
+              send(test, {:abort_complete, reason})
+              resolve.(:ok)
+            end)
+          end
+        })
+
+      abort = WritableStream.abort(stream, :stop)
+      Process.sleep(20)
+      assert Promise.peek(abort) == :pending
+      assert await(abort) == :ok
+      assert_received {:abort_complete, :stop}
+    end
+  end
+
   describe "a readable stream controller" do
     test "gives the desired size 0 after a close, and nil after an error" do
       closed = ReadableStream.new(%{})

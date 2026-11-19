@@ -836,6 +836,29 @@ defmodule Web.Stream do
   end
 
   # Error injection (cast)
+  # A cancel or an abort from a caller that waits for the result. The stream
+  # goes to its terminal state immediately. The callback of the source or
+  # sink runs in a task, and the caller gets its reply when the callback is
+  # complete: `:ok`, or the value that the callback threw. A promise from
+  # the callback is awaited. This is the rule of the Streams Standard.
+  defp handle_common({:call, from}, {:terminate, type, reason}, state, data)
+       when type in [:cancel, :abort] and state not in [:closed, :errored] do
+    terminate_with_task(type, reason, from, data)
+  end
+
+  # The same, for a caller that does not wait for the callback: the halt of
+  # an enumeration.
+  defp handle_common({:call, from}, {:terminate_detached, :cancel, reason}, state, data) do
+    if state in [:closed, :errored] do
+      {:keep_state_and_data, [{:reply, from, :ok}]}
+    else
+      {:next_state, next_state, new_data, actions} =
+        terminate_with_task(:cancel, reason, nil, data)
+
+      {:next_state, next_state, new_data, [{:reply, from, :ok} | actions]}
+    end
+  end
+
   defp handle_common({:call, from}, {:terminate, type, reason}, state, data)
        when type in [:cancel, :close, :abort, :error] do
     {result, transition} = terminate_request_with_result(type, reason, state, data)
@@ -1606,7 +1629,7 @@ defmodule Web.Stream do
       data
       |> clear_active_operation()
       |> Map.put(:pending_abort_request, from)
-      |> start_abort_task(reason)
+      |> start_terminal_task(:abort, reason)
       |> then(&fail_stream(reason, &1))
     end
   end
@@ -1667,22 +1690,31 @@ defmodule Web.Stream do
     {:next_state, :closing, set_active_task(data, task, {:flush, data.pending_close_request})}
   end
 
-  defp start_abort_task(data, reason) do
+  # Runs the cancel or abort callback of the module in a task.
+  defp start_terminal_task(data, type, reason) do
     module = data.module
     impl_state = data.impl_state
 
     task =
       start_task(
         fn ->
-          # The result of the callback has no use. A value that it throws is
-          # the rejection reason of the abort.
+          # The result of the callback has no use. A value that it throws,
+          # or the reason of a promise that it returns, is the rejection
+          # reason of the cancel or abort.
           try do
             result =
               if function_exported?(module, :terminate, 2) do
-                module.terminate({:abort, reason}, impl_state) |> resolve_if_promise(:ok)
+                module.terminate({type, reason}, impl_state)
               end
 
-            if match?({:error, _reason}, result), do: result, else: :ok
+            # Only a promise that rejects is a failure. Each other value
+            # that the callback returns has no effect.
+            with %Web.Promise{} = promise <- result,
+                 {:rejected, rejection} <- Web.Promise.wait(promise) do
+              {:error, rejection}
+            else
+              _other -> :ok
+            end
           rescue
             error -> {:error, error}
           catch
@@ -2352,16 +2384,22 @@ defmodule Web.Stream do
     transition
   end
 
+  defp terminate_with_task(type, reason, from, data) do
+    data
+    |> clear_owner()
+    |> clear_task()
+    |> Map.put(:pending_abort_request, from)
+    |> start_terminal_task(type, reason)
+    |> finalize_termination(type, reason)
+  end
+
+  # A terminal event for a stream that is closed or errored has no effect,
+  # and calls no callback, as in the Streams Standard.
   defp terminate_request_with_result(type, reason, state, data) do
-    cond do
-      type == :cancel and state == :closed ->
-        {signal_terminate(data, type, reason), :keep_state_and_data}
-
-      state in [:closed, :errored] ->
-        {:ok, :keep_state_and_data}
-
-      true ->
-        termination_with_result(type, reason, data)
+    if state in [:closed, :errored] do
+      {:ok, :keep_state_and_data}
+    else
+      termination_with_result(type, reason, data)
     end
   end
 

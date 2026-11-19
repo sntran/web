@@ -294,12 +294,38 @@ defmodule Web.ReadableStreamTeeTest do
       [left, right] = ReadableStream.tee(stream)
       right_reader = ReadableStream.get_reader(right)
 
-      assert await(ReadableStream.cancel(left, :left_reason)) == :ok
+      left_cancel = ReadableStream.cancel(left, :left_reason)
       refute_receive {:cancelled, _reason}, 100
 
       assert read(right_reader) == %{value: 0, done: false}
       assert read(right_reader) == %{value: 1, done: false}
       assert read(right_reader) == %{value: 2, done: false}
+
+      # The promise of the cancel stays pending until the second branch is
+      # cancelled, as in the Streams Standard.
+      assert Promise.peek(left_cancel) == :pending
+      assert await(ReadableStreamDefaultReader.cancel(right_reader, :right_reason)) == :ok
+      assert await(left_cancel) == :ok
+    end
+
+    test "of one branch settles when the stream ends" do
+      stream = ReadableStream.from([1, 2])
+      [left, right] = ReadableStream.tee(stream)
+
+      left_cancel = ReadableStream.cancel(left, :left_reason)
+      assert Enum.to_list(right) == [1, 2]
+      assert await(left_cancel) == :ok
+    end
+
+    test "rejects for the two branches with the value that the cancel callback throws" do
+      stream = ReadableStream.new(%{cancel: fn _reason -> raise "cancel failed" end})
+      [left, right] = ReadableStream.tee(stream)
+
+      left_cancel = ReadableStream.cancel(left, :one)
+      right_cancel = ReadableStream.cancel(right, :two)
+
+      assert %RuntimeError{message: "cancel failed"} = catch_exit(await(left_cancel))
+      assert %RuntimeError{message: "cancel failed"} = catch_exit(await(right_cancel))
     end
 
     test "of the two branches cancels the stream with the list of the two reasons" do
@@ -307,10 +333,12 @@ defmodule Web.ReadableStreamTeeTest do
       [left, right] = ReadableStream.tee(stream)
       tee = tee_process(stream)
 
-      assert await(ReadableStream.cancel(left, :left_reason)) == :ok
+      left_cancel = ReadableStream.cancel(left, :left_reason)
       assert await(ReadableStream.cancel(right, :right_reason)) == :ok
+      assert await(left_cancel) == :ok
 
-      assert_receive {:cancelled, [:left_reason, :right_reason]}
+      # The two promises settle after the cancel callback of the stream.
+      assert_received {:cancelled, [:left_reason, :right_reason]}
       assert_down(tee)
     end
 
@@ -318,11 +346,12 @@ defmodule Web.ReadableStreamTeeTest do
       stream = ReadableStream.new(counting_source(self()))
       [left, right] = ReadableStream.tee(stream)
 
-      assert await(ReadableStream.cancel(right, :right_reason)) == :ok
+      right_cancel = ReadableStream.cancel(right, :right_reason)
       refute_receive {:cancelled, _reason}, 100
       assert await(ReadableStream.cancel(left, :left_reason)) == :ok
+      assert await(right_cancel) == :ok
 
-      assert_receive {:cancelled, [:left_reason, :right_reason]}
+      assert_received {:cancelled, [:left_reason, :right_reason]}
     end
 
     test "of the two branches is possible while a read is in progress" do
@@ -335,10 +364,11 @@ defmodule Web.ReadableStreamTeeTest do
       pending = Task.async(fn -> Enum.to_list(left) end)
       Process.sleep(50)
 
-      assert await(ReadableStream.cancel(left.controller_pid, :one)) == :ok
+      first = ReadableStream.cancel(left.controller_pid, :one)
       assert await(ReadableStream.cancel(right, :two)) == :ok
+      assert await(first) == :ok
 
-      assert_receive {:cancelled, [:one, :two]}
+      assert_received {:cancelled, [:one, :two]}
       assert Task.await(pending) == []
     end
 

@@ -16,7 +16,8 @@ defmodule Web.Internal.ReadableStreamTee do
   #     in their queues are discarded.
   #   * A cancel of one branch has no effect on the source. When the two
   #     branches are cancelled, the source is cancelled with the list of the
-  #     two reasons.
+  #     two reasons. The promise of a cancel settles when the cancel of the
+  #     source is complete, or when the source ends.
   #
   # A branch that stops is a cancelled branch.
   #
@@ -47,8 +48,29 @@ defmodule Web.Internal.ReadableStreamTee do
   @spec pull(pid()) :: :ok
   def pull(tee), do: GenServer.cast(tee, :pull)
 
-  @spec cancel(pid(), index(), term()) :: :ok
-  def cancel(tee, index, reason), do: GenServer.cast(tee, {:cancel, index, reason})
+  # Records the cancel of a branch, and returns the promise of the Streams
+  # Standard: it fulfils when the source is cancelled or complete, and it
+  # rejects with the value that the cancel callback of the source throws.
+  @spec cancel(pid(), index(), term()) :: Web.Promise.t()
+  def cancel(tee, index, reason) do
+    # The cast keeps the sequence of the cancels, and does not get lost if
+    # the process that waits for the promise stops.
+    GenServer.cast(tee, {:cancel, index, reason})
+
+    Web.Promise.new(fn resolve, reject ->
+      case wait_complete(tee) do
+        :ok -> resolve.(:ok)
+        {:error, thrown} -> reject.(thrown)
+      end
+    end)
+  end
+
+  defp wait_complete(tee) do
+    GenServer.call(tee, :wait_complete, :infinity)
+  catch
+    # The tee stopped: its work is complete.
+    :exit, _reason -> :ok
+  end
 
   @impl true
   def init({source, caller}) do
@@ -71,6 +93,9 @@ defmodule Web.Internal.ReadableStreamTee do
           canceled: %{},
           # The error of the source, if it came before the branches.
           early_error: nil,
+          # The callers that wait for the end of the work, and its result.
+          complete_waiters: [],
+          result: :ok,
           # The monitor of the source, after the work of the tee is complete.
           source_monitor: nil
         }
@@ -99,6 +124,15 @@ defmodule Web.Internal.ReadableStreamTee do
       state.pull_wanted? -> {:reply, :ok, start_read(state)}
       true -> {:reply, :ok, state}
     end
+  end
+
+  def handle_call(:wait_complete, _from, %{source_monitor: monitor} = state)
+      when is_reference(monitor) do
+    {:reply, state.result, state}
+  end
+
+  def handle_call(:wait_complete, from, state) do
+    {:noreply, %{state | complete_waiters: [from | state.complete_waiters]}}
   end
 
   @impl true
@@ -193,11 +227,13 @@ defmodule Web.Internal.ReadableStreamTee do
   # The work is complete. The process waits for the stop of the source.
   defp complete(state) do
     for {_index, {_pid, monitor}} <- state.branches, do: Process.demonitor(monitor, [:flush])
+    for waiter <- state.complete_waiters, do: GenServer.reply(waiter, state.result)
 
     %{
       state
       | request: nil,
         closed_request: nil,
+        complete_waiters: [],
         source_monitor: Process.monitor(state.source)
     }
   end
@@ -219,8 +255,9 @@ defmodule Web.Internal.ReadableStreamTee do
     state = %{state | canceled: canceled}
 
     if map_size(canceled) == 2 do
-      _ = Web.Stream.terminate_and_wait(state.source, :cancel, [canceled[1], canceled[2]])
-      {:noreply, complete(state)}
+      # The call returns when the cancel callback of the source is complete.
+      result = Web.Stream.terminate_and_wait(state.source, :cancel, [canceled[1], canceled[2]])
+      {:noreply, complete(%{state | result: result})}
     else
       {:noreply, state}
     end

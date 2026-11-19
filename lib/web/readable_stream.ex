@@ -99,12 +99,12 @@ defmodule Web.ReadableStream do
   end
 
   @impl Web.Stream
-  def terminate({type, reason}, %{source: source}) when type in [:cancel, :abort] do
-    do_terminate(reason, source)
+  def terminate({type, reason}, %{source: source, pid: pid}) when type in [:cancel, :abort] do
+    do_terminate(reason, source, pid)
   end
 
-  def terminate(reason, %{source: source}) do
-    do_terminate(reason, source)
+  def terminate(reason, %{source: source, pid: pid}) do
+    do_terminate(reason, source, pid)
   end
 
   defp controller_for(:bytes, pid), do: %ReadableByteStreamController{pid: pid}
@@ -113,13 +113,14 @@ defmodule Web.ReadableStream do
   defp await_pull_result(%Promise{} = promise), do: Promise.await(promise)
   defp await_pull_result(_result), do: :ok
 
-  defp do_terminate(reason, source) do
+  # This function can run in a task, thus the stream is `stream`, not `self()`.
+  defp do_terminate(reason, source, stream) do
     case source do
       %{cancel: cancel} when is_function(cancel, 1) ->
         cancel.(reason)
 
       src when is_pid(src) ->
-        send(src, {:web_stream_cancel, self(), reason})
+        send(src, {:web_stream_cancel, stream, reason})
 
       {m, f, a} ->
         apply(m, f, a ++ [reason])
@@ -152,8 +153,13 @@ defmodule Web.ReadableStream do
       ["hello"]
   """
   def new(underlying_source \\ %{}, opts \\ []) when is_list(opts) do
+    :ok = validate_source!(underlying_source)
     stream_type = source_stream_type(underlying_source)
     {high_water_mark, strategy} = normalize_stream_options(underlying_source, opts)
+
+    if not is_number(high_water_mark) or high_water_mark < 0 do
+      raise Web.RangeError, "Invalid high water mark: #{inspect(high_water_mark)}"
+    end
 
     stream_opts =
       opts
@@ -270,7 +276,7 @@ defmodule Web.ReadableStream do
         Keyword.put(opts, :cancel_on_reader_exit, true)
       )
     else
-      raise ArgumentError, "cannot normalize body from #{inspect(enumerable)}"
+      raise TypeError, "Cannot make a ReadableStream from #{inspect(enumerable)}"
     end
   end
 
@@ -300,6 +306,38 @@ defmodule Web.ReadableStream do
     {high_water_mark, strategy}
   end
 
+  @source_callbacks [start: 1, pull: 1, cancel: 1]
+
+  # The checks of the Streams Standard for an underlying source that is a
+  # map. A process, a function, and a module-function-arguments tuple are
+  # sources of this library only, and have no such checks.
+  defp validate_source!(%{} = source) when not is_struct(source) do
+    if Map.get(source, :type) not in [nil, "bytes"] do
+      raise TypeError, "Invalid type of the underlying source: #{inspect(source.type)}"
+    end
+
+    for {name, arity} <- @source_callbacks,
+        callback = Map.get(source, name),
+        not is_nil(callback) do
+      if not is_function(callback, arity) do
+        raise TypeError,
+              "The underlying source function #{inspect(name)} must be a function with " <>
+                "#{arity} argument(s), got: #{inspect(callback)}"
+      end
+    end
+
+    :ok
+  end
+
+  defp validate_source!(source)
+       when is_pid(source) or is_function(source, 1) or
+              (is_tuple(source) and tuple_size(source) == 3),
+       do: :ok
+
+  defp validate_source!(source) do
+    raise TypeError, "Invalid underlying source: #{inspect(source)}"
+  end
+
   defp source_stream_type(%{} = source) do
     if Map.get(source, :type) == "bytes", do: :bytes, else: :default
   end
@@ -321,7 +359,11 @@ defmodule Web.ReadableStream do
   end
 
   defp reader_mode_from_options(opts) do
-    if Keyword.get(opts, :mode) == "byob", do: :byob, else: :default
+    case Keyword.get(opts, :mode) do
+      nil -> :default
+      "byob" -> :byob
+      mode -> raise TypeError, "Invalid reader mode: #{inspect(mode)}"
+    end
   end
 
   defp start_blob_parts_queue(parts) do
@@ -632,8 +674,10 @@ defmodule Web.ReadableStream do
 
   Raises `Web.TypeError` if the stream is locked.
 
-  The promise of `cancel/2` on one branch fulfils immediately. In the
-  Streams Standard, it stays pending until the second branch is cancelled.
+  The promise of a cancel of one branch stays pending until the second
+  branch is cancelled or the stream ends, as in the Streams Standard. Do not
+  await the cancel of one branch while a process reads the other branch.
+  A halt of an enumeration, such as `Enum.take/2`, does not wait.
 
   ## Examples
 
@@ -662,76 +706,127 @@ defmodule Web.ReadableStream do
 
   ## Options
 
-  - `:preventClose` - do not close the writable side when the source is done
-  - `:preventAbort` - do not abort the writable side when the source errors
-  - `:preventCancel` - do not cancel the readable side when the sink errors
+  - `:prevent_close` - do not close the writable side when the source is done
+  - `:prevent_abort` - do not abort the writable side when the source errors
+  - `:prevent_cancel` - do not cancel the readable side when the sink errors
+
+  The names `:preventClose`, `:preventAbort`, and `:preventCancel` of the
+  Streams Standard are accepted also.
   - `:signal` - optional `%Web.AbortSignal{}` to interrupt piping
   """
   def pipe_to(readable, writable, options \\ []) do
-    Promise.detached(fn resolve, reject ->
-      run_pipe(readable, writable, options, resolve, reject)
-    end)
+    {ready, wait_for_locks} = pipe_lock_signal()
+
+    promise =
+      Promise.detached(fn resolve, reject ->
+        run_pipe(readable, writable, options, resolve, reject, ready)
+      end)
+
+    # The pipe has the two locks when this function returns, as in the
+    # Streams Standard. A stream that is locked gives a rejected promise.
+    _ = wait_for_locks.()
+    promise
   end
 
   # Starts a pipe that no process awaits. A promise for such a pipe would
-  # stay until its owner stops, thus this function makes no promise.
+  # stay until its owner stops, thus this function makes no promise. Returns
+  # `:ok` when the pipe has the two locks, or the error of the locks.
   defp start_pipe(readable, writable, options) do
     snapshot = Snapshot.take()
     ignore = fn _outcome -> :ok end
+    {ready, wait_for_locks} = pipe_lock_signal()
 
     {:ok, _pid} =
       Task.Supervisor.start_child(Web.TaskSupervisor, fn ->
         try do
           Snapshot.run(snapshot, fn ->
-            run_pipe(readable, writable, options, ignore, ignore)
+            run_pipe(readable, writable, options, ignore, ignore, ready)
           end)
         catch
           _kind, _reason -> :ok
         end
       end)
 
-    :ok
+    wait_for_locks.()
   end
 
-  defp run_pipe(readable, writable, options, resolve, reject) do
-    reader = nil
-    writer = nil
+  # The process of the pipe calls `ready` after it tried to get the two locks.
+  # The process that started the pipe calls `wait_for_locks`.
+  defp pipe_lock_signal do
+    caller = self()
+    ref = make_ref()
+
+    ready = fn result -> send(caller, {ref, result}) end
+
+    wait_for_locks = fn ->
+      receive do
+        {^ref, result} -> result
+      end
+    end
+
+    {ready, wait_for_locks}
+  end
+
+  defp run_pipe(readable, writable, options, resolve, reject, ready) do
+    case acquire_pipe_locks(readable, writable) do
+      {:ok, reader, writer} ->
+        ready.(:ok)
+        outcome = pipe_outcome(reader, writer, options)
+
+        # The pipe releases its locks before its promise settles.
+        release_reader_lock(reader)
+        release_writer_lock(writer)
+
+        case outcome do
+          :ok -> resolve.(:ok)
+          {:error, reason} -> reject.(reason)
+        end
+
+      {:error, error} ->
+        ready.({:error, error})
+        reject.(error)
+    end
+  end
+
+  defp acquire_pipe_locks(readable, writable) do
+    reader = acquire_reader_for_pipe(readable)
 
     try do
-      try do
-        reader = acquire_reader_for_pipe(readable)
-        writer = acquire_writer_for_pipe(writable)
-
-        case pump(reader, writer, options) do
-          :done ->
-            maybe_close_writer(writer, options)
-            resolve.(:ok)
-
-          # The pipe rejects with the error of the stream, or with the reason
-          # of the signal, as the Streams Standard specifies.
-          {:source_error, reason} ->
-            reason = stored_error(reason)
-            maybe_abort_writer(writer, reason, options)
-            reject.(reason)
-
-          {:sink_error, reason} ->
-            reason = stored_error(reason)
-            maybe_cancel_reader(reader, reason, options)
-            reject.(reason)
-
-          {:aborted, reason} ->
-            maybe_cancel_reader(reader, reason, options)
-            maybe_abort_writer(writer, reason, options)
-            reject.(reason)
-        end
-      rescue
-        error in TypeError ->
-          reject.(error)
-      end
-    after
-      if reader != nil, do: release_reader_lock(reader)
-      if writer != nil, do: release_writer_lock(writer)
+      {:ok, reader, acquire_writer_for_pipe(writable)}
+    rescue
+      error in TypeError ->
+        release_reader_lock(reader)
+        {:error, error}
     end
+  rescue
+    error in TypeError -> {:error, error}
+  end
+
+  defp pipe_outcome(reader, writer, options) do
+    case pump(reader, writer, options) do
+      :done ->
+        maybe_close_writer(writer, options)
+        :ok
+
+      # The pipe rejects with the error of the stream, or with the reason
+      # of the signal, as the Streams Standard specifies.
+      {:source_error, reason} ->
+        reason = stored_error(reason)
+        maybe_abort_writer(writer, reason, options)
+        {:error, reason}
+
+      {:sink_error, reason} ->
+        reason = stored_error(reason)
+        maybe_cancel_reader(reader, reason, options)
+        {:error, reason}
+
+      {:aborted, reason} ->
+        maybe_cancel_reader(reader, reason, options)
+        maybe_abort_writer(writer, reason, options)
+        {:error, reason}
+    end
+  rescue
+    error in TypeError -> {:error, error}
   end
 
   @doc """
@@ -742,8 +837,11 @@ defmodule Web.ReadableStream do
         %{readable: transformed_readable, writable: transformed_writable},
         options \\ []
       ) do
-    :ok = start_pipe(readable, transformed_writable, options)
-    transformed_readable
+    # A stream that is locked raises here, as in the Streams Standard.
+    case start_pipe(readable, transformed_writable, options) do
+      :ok -> transformed_readable
+      {:error, error} -> raise error
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -863,7 +961,7 @@ defmodule Web.ReadableStream do
   # coveralls-ignore-stop
 
   defp maybe_close_writer(writer, options) do
-    if Keyword.get(options, :preventClose, false) do
+    if pipe_option(options, :prevent_close, :preventClose) do
       :ok
     else
       _ = WritableStream.close(writer.controller_pid, writer.owner_pid)
@@ -872,7 +970,7 @@ defmodule Web.ReadableStream do
   end
 
   defp maybe_abort_writer(writer, reason, options) do
-    if Keyword.get(options, :preventAbort, false) do
+    if pipe_option(options, :prevent_abort, :preventAbort) do
       :ok
     else
       _ = WritableStream.abort(writer.controller_pid, writer.owner_pid, reason)
@@ -881,7 +979,7 @@ defmodule Web.ReadableStream do
   end
 
   defp maybe_cancel_reader(reader, reason, options) do
-    if Keyword.get(options, :preventCancel, false) do
+    if pipe_option(options, :prevent_cancel, :preventCancel) do
       :ok
     else
       cancel_now(reader.controller_pid, reason)
@@ -914,13 +1012,21 @@ defmodule Web.ReadableStream do
     end
   end
 
+  # The largest time that the VM accepts for a timer: about 49 days.
+  @no_callback_timeout 4_294_967_295
+
   # The two branches are usual streams of the type of the source. The tee
   # process reads the source for them.
   defp do_tee(%__MODULE__{controller_pid: source}) do
     type = source_type(source)
 
     with {:ok, tee} <- ReadableStreamTee.start(source) do
-      [branch1, branch2] = for index <- [1, 2], do: new(tee_branch_source(tee, index, type))
+      # The cancel callback of a branch waits until the two branches are
+      # cancelled, thus a branch has no time limit for its callbacks.
+      [branch1, branch2] =
+        for index <- [1, 2] do
+          new(tee_branch_source(tee, index, type), timeout_ms: @no_callback_timeout)
+        end
 
       :ok =
         ReadableStreamTee.attach(
@@ -949,26 +1055,17 @@ defmodule Web.ReadableStream do
     end
   end
 
-  # coveralls-ignore-start
-  defp release_reader_lock(reader) do
-    case release_lock(reader.controller_pid) do
-      :ok -> :ok
-      _ -> :ok
-    end
-  catch
-    :exit, _ -> :ok
-  end
+  defp release_reader_lock(reader), do: release_lock(reader.controller_pid)
 
   defp release_writer_lock(writer) do
-    case WritableStream.release_lock(writer.controller_pid, writer.owner_pid) do
-      :ok -> :ok
-      _ -> :ok
-    end
-  catch
-    :exit, _ -> :ok
+    WritableStream.release_lock(writer.controller_pid, writer.owner_pid)
   end
 
-  # coveralls-ignore-stop
+  # An option of a pipe, with its Elixir name or its name in the Streams
+  # Standard.
+  defp pipe_option(options, name, standard_name) do
+    Keyword.get(options, name, Keyword.get(options, standard_name, false)) == true
+  end
 end
 
 defimpl Enumerable, for: Web.ReadableStream do
@@ -982,7 +1079,9 @@ defimpl Enumerable, for: Web.ReadableStream do
   # A halt is the end of the enumeration. Cancel the stream, thus its source
   # stops and the stream process can stop.
   defp do_reduce(reader, {:halt, acc}, _fun) do
-    _ = Web.Stream.terminate_and_wait(reader.controller_pid, :cancel, :halted)
+    # The stream is cancelled when this call returns. The call does not
+    # wait for the cancel callback of the source.
+    _ = Web.Stream.call(reader.controller_pid, {:terminate_detached, :cancel, :halted}, :ok)
     {:halted, acc}
   end
 

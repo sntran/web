@@ -215,10 +215,17 @@ defmodule Web.ReadableStreamTest do
       end
     end
 
-    test "get_reader/2 accepts an explicit default mode" do
+    test "get_reader/2 accepts only the mode byob, as the Streams Standard" do
       stream = ReadableStream.new()
 
-      assert %ReadableStreamDefaultReader{} = ReadableStream.get_reader(stream, mode: "default")
+      for mode <- ["default", "nope", :byob, 1] do
+        assert_raise TypeError, ~r/Invalid reader mode/, fn ->
+          ReadableStream.get_reader(stream, mode: mode)
+        end
+      end
+
+      refute ReadableStream.locked?(stream)
+      assert %ReadableStreamDefaultReader{} = ReadableStream.get_reader(stream, mode: nil)
     end
 
     test "get_reader/2 raises already locked for BYOB mode when a byte stream is locked" do
@@ -424,7 +431,7 @@ defmodule Web.ReadableStreamTest do
       assert %ReadableStream{} =
                ReadableStream.from(fn acc, fun -> Enumerable.List.reduce(["a"], acc, fun) end)
 
-      assert_raise ArgumentError, ~r/cannot normalize body/, fn -> ReadableStream.from(123) end
+      assert_raise TypeError, ~r/Cannot make a ReadableStream/, fn -> ReadableStream.from(123) end
     end
 
     test "from/1 wraps enumerable functions in a readable stream with tee support" do
@@ -816,9 +823,12 @@ defmodule Web.ReadableStreamTest do
       assert await(ReadableStreamDefaultReader.read(left_reader)) == %{value: 0, done: false}
       assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 0, done: false}
 
-      assert :ok = await(ReadableStreamDefaultReader.cancel(left_reader))
+      # The promise of this cancel stays pending until the second branch is
+      # cancelled or the stream ends, as in the Streams Standard.
+      left_cancel = ReadableStreamDefaultReader.cancel(left_reader)
 
       assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 1, done: false}
+      assert Web.Promise.peek(left_cancel) == :pending
       assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 2, done: false}
       assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 3, done: false}
 

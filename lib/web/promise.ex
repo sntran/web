@@ -39,7 +39,7 @@ defmodule Web.Promise do
       outcome for the linger time, and stops.
     * An `await/1` on a promise that stopped rejects with `Web.TypeError`.
 
-  The default linger time is 5000 ms. Set `config :web, promise_linger: ms`
+  The default linger time is 5000 ms. Set `config :web, linger: ms`
   to change it. The value `:infinity` keeps each outcome until the owner
   stops. The option `:linger` of `new/2` and `with_resolvers/1` sets the
   time for one promise.
@@ -350,9 +350,26 @@ defmodule Web.Promise do
   def detached(executor) when is_function(executor, 2), do: new(executor, detached: true)
 
   @doc false
-  # Returns the process that owns the promises made by the calling process.
+  # Returns the process that owns the promises and the streams that the
+  # calling process makes.
   @spec owner() :: pid()
   def owner, do: Process.get(@owner_key) || self()
+
+  @doc false
+  # Makes `owner` the owner of the promises and the streams that the calling
+  # process makes. A process that runs callbacks for a different process
+  # uses this function.
+  @spec put_owner(pid()) :: :ok
+  def put_owner(owner) when is_pid(owner) do
+    Process.put(@owner_key, owner)
+    :ok
+  end
+
+  @doc false
+  # The default time that a settled promise or an ended stream stays
+  # available.
+  @spec default_linger() :: non_neg_integer() | :infinity
+  def default_linger, do: Application.get_env(:web, :linger, @default_linger)
 
   @doc false
   # Returns the outcome if the promise is settled, or `:pending`.
@@ -478,8 +495,6 @@ defmodule Web.Promise do
     {%__MODULE__{pid: pid}, token}
   end
 
-  defp default_linger, do: Application.get_env(:web, :promise_linger, @default_linger)
-
   defp cell_init(%{owner: owner, executor: executor} = init) do
     Process.flag(:trap_exit, true)
 
@@ -510,7 +525,7 @@ defmodule Web.Promise do
     spawn_link(fn ->
       # A detached executor can continue after the owner stops. Thus it owns
       # the promises that it makes.
-      if not init.detached?, do: Process.put(@owner_key, init.owner)
+      if not init.detached?, do: put_owner(init.owner)
       resolve = settle_fun(cell_pid, token, :fulfilled)
       reject = settle_fun(cell_pid, token, :rejected)
 

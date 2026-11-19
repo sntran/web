@@ -13,14 +13,14 @@ defmodule Web.PromiseLeakTest do
   @linger 100
 
   setup do
-    previous = Application.get_env(:web, :promise_linger)
-    Application.put_env(:web, :promise_linger, @linger)
+    previous = Application.get_env(:web, :linger)
+    Application.put_env(:web, :linger, @linger)
 
     on_exit(fn ->
       if previous == nil do
-        Application.delete_env(:web, :promise_linger)
+        Application.delete_env(:web, :linger)
       else
-        Application.put_env(:web, :promise_linger, previous)
+        Application.put_env(:web, :linger, previous)
       end
     end)
   end
@@ -38,6 +38,14 @@ defmodule Web.PromiseLeakTest do
       Process.sleep(20)
       settle(baseline, attempts - 1)
     end
+  end
+
+  test "the application setting gives the default linger time" do
+    promise = Promise.new(fn resolve, _reject -> resolve.(:value) end)
+    assert await(promise) == :value
+
+    ref = Process.monitor(promise.pid)
+    assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 2_000
   end
 
   test "settled promises start no process" do

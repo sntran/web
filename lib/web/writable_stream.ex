@@ -48,7 +48,7 @@ defmodule Web.WritableStream do
   end
 
   def write(pid, owner_pid, chunk) when is_pid(pid) and is_pid(owner_pid) do
-    :gen_statem.call(pid, {:write, owner_pid, chunk}, :infinity)
+    Web.Stream.call(pid, {:write, owner_pid, chunk}, {:error, :released})
   end
 
   @impl Web.Stream
@@ -115,27 +115,27 @@ defmodule Web.WritableStream do
   Returns whether the stream has an active writer lock.
   """
   def locked?(%__MODULE__{controller_pid: pid}), do: locked?(pid)
-  def locked?(pid) when is_pid(pid), do: :gen_statem.call(pid, :locked?)
+  def locked?(pid) when is_pid(pid), do: Web.Stream.call(pid, :locked?, false)
 
   @doc """
   Returns the stream desired size or `nil` once it is closed or errored.
   """
   def desired_size(%__MODULE__{controller_pid: pid}), do: desired_size(pid)
-  def desired_size(pid) when is_pid(pid), do: :gen_statem.call(pid, :desired_size)
+  def desired_size(pid) when is_pid(pid), do: Web.Stream.call(pid, :desired_size, nil)
 
   @doc """
   Returns whether the stream is currently applying backpressure.
   """
   def backpressure?(%__MODULE__{controller_pid: pid}), do: backpressure?(pid)
-  def backpressure?(pid) when is_pid(pid), do: :gen_statem.call(pid, :backpressure?)
+  def backpressure?(pid) when is_pid(pid), do: Web.Stream.call(pid, :backpressure?, false)
 
   @doc """
   Locks the stream and returns a default writer.
   """
   def get_writer(pid) when is_pid(pid) do
-    case :gen_statem.call(pid, {:get_writer, self()}) do
+    case Web.Stream.call(pid, {:get_writer, self()}, {:error, :released}) do
       :ok -> :ok
-      {:error, :already_locked} -> {:error, :already_locked}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -146,11 +146,14 @@ defmodule Web.WritableStream do
 
       {:error, :already_locked} ->
         raise TypeError, "WritableStream is already locked"
+
+      {:error, :released} ->
+        raise TypeError, "The stream is not available. It ended, or its owner stopped."
     end
   end
 
   def write(pid, chunk) when is_pid(pid) do
-    :gen_statem.call(pid, {:write, self(), chunk}, :infinity)
+    Web.Stream.call(pid, {:write, self(), chunk}, {:error, :released})
   end
 
   def ready(pid) when is_pid(pid) do
@@ -159,14 +162,20 @@ defmodule Web.WritableStream do
 
   def ready(pid, owner_pid) when is_pid(pid) and is_pid(owner_pid) do
     ref = make_ref()
+    monitor = Process.monitor(pid)
     Web.Stream.control_cast(pid, {:register_ready_waiter, self(), owner_pid, ref})
 
     receive do
       {:ready, ^ref} ->
+        Process.demonitor(monitor, [:flush])
         :ok
 
       {:stream_error, ^ref, reason} ->
+        Process.demonitor(monitor, [:flush])
         {:error, reason}
+
+      {:DOWN, ^monitor, :process, ^pid, _reason} ->
+        {:error, :released}
     end
   end
 
@@ -176,9 +185,7 @@ defmodule Web.WritableStream do
 
   def close(pid) when is_pid(pid) do
     Web.Promise.detached(fn resolve, _reject ->
-      if Process.alive?(pid) do
-        :ok = Web.Stream.control_call(pid, {:terminate, :close, nil})
-      end
+      :ok = Web.Stream.terminate_and_wait(pid, :close, nil)
 
       resolve.(:ok)
     end)
@@ -194,9 +201,7 @@ defmodule Web.WritableStream do
 
   def abort(pid, reason) when is_pid(pid) do
     Web.Promise.detached(fn resolve, _reject ->
-      if Process.alive?(pid) do
-        :ok = Web.Stream.control_call(pid, {:terminate, :abort, reason})
-      end
+      :ok = Web.Stream.terminate_and_wait(pid, :abort, reason)
 
       resolve.(:ok)
     end)
@@ -207,11 +212,11 @@ defmodule Web.WritableStream do
   end
 
   def release_lock(pid) when is_pid(pid) do
-    :gen_statem.call(pid, {:release_lock, self()})
+    Web.Stream.call(pid, {:release_lock, self()}, :ok)
   end
 
   def release_lock(pid, owner_pid) when is_pid(pid) and is_pid(owner_pid) do
-    :gen_statem.call(pid, {:release_lock, owner_pid})
+    Web.Stream.call(pid, {:release_lock, owner_pid}, :ok)
   end
 
   @doc false

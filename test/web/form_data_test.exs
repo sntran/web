@@ -1059,15 +1059,22 @@ defmodule Web.FormDataTest do
 
     result =
       Task.async(fn ->
-        catch_exit(Enum.join(Web.File.stream(file), ""))
+        try do
+          Enum.join(Web.File.stream(file), "")
+        rescue
+          error in Web.TypeError -> {:raised, error}
+        catch
+          :exit, reason -> {:exit, reason}
+        end
       end)
       |> Task.await()
 
     case result do
-      {{:shutdown, %Web.TypeError{message: message}}, _} ->
+      {:exit, {{:shutdown, %Web.TypeError{message: message}}, _}} ->
         assert message =~ "missing closing boundary"
 
-      {:noproc, _} ->
+      # The child stream stopped before the read.
+      {:raised, %Web.TypeError{}} ->
         assert true
     end
 

@@ -123,7 +123,7 @@ The BEAM has one rule that the Web does not have: a pending promise has an
 owner, which is the process that made it. The promise stops when its owner
 stops. After a promise settles, it keeps its outcome until the first `await`,
 and then for a linger time (5000 ms by default,
-`config :web, promise_linger: ms`). Keep the awaited value, not the promise,
+`config :web, linger: ms`). Keep the awaited value, not the promise,
 when you need the value later.
 
 For externally controlled promise settlement, use
@@ -160,6 +160,12 @@ end)
 ### 🌊 Zero-Buffer Streaming
 
 Managed processes that provide data with spec-compliant backpressure.
+
+A stream is a process, and it has an owner: the process that made it. A
+stream stops after it is ended and all its chunks are read. It also stops
+when its owner stops and no process has locked it. Thus read or cancel each
+response body in a process that stays alive. A halt, such as `Enum.take/2`,
+cancels the stream.
 
 ```elixir
 # Create a stream from any enumerable

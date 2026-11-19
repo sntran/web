@@ -40,7 +40,7 @@ defmodule Web.WritableStreamDefaultWriter do
 
   defp promise_call(pid, message) do
     Web.Promise.detached(fn resolve, reject ->
-      case :gen_statem.call(pid, message, :infinity) do
+      case Web.Stream.call(pid, message, {:error, :released}) do
         :ok -> resolve.(:ok)
         {:error, reason} -> reject.(map_stream_error(reason))
       end
@@ -59,6 +59,9 @@ defmodule Web.WritableStreamDefaultWriter do
   defp map_stream_error({:errored, _reason}),
     do: TypeError.exception("The stream is errored.")
 
+  defp map_stream_error(:released),
+    do: TypeError.exception("The stream is not available. It ended, or its owner stopped.")
+
   # coveralls-ignore-start
   defp map_stream_error(reason),
     do: TypeError.exception("Unknown error: #{inspect(reason)}")
@@ -69,7 +72,7 @@ defmodule Web.WritableStreamDefaultWriter do
   Releases the writer's lock on the stream.
   """
   def release_lock(%__MODULE__{controller_pid: pid, owner_pid: owner_pid}) do
-    case :gen_statem.call(pid, {:release_lock, owner_pid}) do
+    case Web.Stream.call(pid, {:release_lock, owner_pid}, :ok) do
       :ok ->
         :ok
 
@@ -87,6 +90,6 @@ defmodule Web.WritableStreamDefaultWriter do
   Returns the stream's desired size.
   """
   def desired_size(%__MODULE__{controller_pid: pid}) do
-    :gen_statem.call(pid, :desired_size)
+    Web.Stream.call(pid, :desired_size, nil)
   end
 end

@@ -119,7 +119,12 @@ defmodule Web.Stream do
     # Shared
     timeout_ms: 30_000,
     error_reason: nil,
-    cancel_on_reader_exit: false
+    cancel_on_reader_exit: false,
+    # Lifetime
+    owner_ref: nil,
+    owner_down_reason: nil,
+    linger: 5_000,
+    lifetime_timer: nil
   ]
 
   # ---------------------------------------------------------------------------
@@ -129,7 +134,27 @@ defmodule Web.Stream do
   @doc "Starts a stream engine process for the given implementing module."
   def start_link(module, opts) when is_atom(module) do
     snapshot = Snapshot.take()
-    :gen_statem.start_link(__MODULE__, {module, opts, snapshot}, [])
+    owner = Keyword.get_lazy(opts, :owner, &Web.Promise.owner/0)
+    :gen_statem.start_link(__MODULE__, {module, opts, snapshot, owner}, [])
+  end
+
+  @doc false
+  # Calls the stream process. Returns `gone` if the process stopped.
+  def call(pid, message, gone, timeout \\ :infinity) when is_pid(pid) do
+    :gen_statem.call(pid, message, timeout)
+  catch
+    :exit, {reason, {:gen_statem, :call, _args}} when reason in [:noproc, :normal] -> gone
+  end
+
+  @doc false
+  # Sends a terminal event to the stream process and waits for the result.
+  # A stream that stopped needs no terminal event.
+  def terminate_and_wait(pid, type, reason) when is_pid(pid) do
+    control_call(pid, {:terminate, type, reason})
+  catch
+    :exit, {exit_reason, {__MODULE__, :control_call, _args}}
+    when exit_reason in [:noproc, :normal] ->
+      :ok
   end
 
   @doc false
@@ -166,8 +191,11 @@ defmodule Web.Stream do
   def callback_mode, do: :state_functions
 
   @impl true
-  def init({module, opts, snapshot}) do
+  def init({module, opts, snapshot, owner}) do
     Process.flag(:message_queue_data, :off_heap)
+    # The callbacks of this stream run in tasks. The promises and streams that
+    # they make belong to this stream.
+    Web.Promise.put_owner(self())
     hwm = Keyword.get(opts, :high_water_mark, 1)
     strategy = normalize_strategy(Keyword.get(opts, :strategy, %Web.CountQueuingStrategy{}))
     timeout_ms = Keyword.get(opts, :timeout_ms, 30_000)
@@ -193,7 +221,9 @@ defmodule Web.Stream do
       stream_type: Keyword.get(opts, :stream_type, :default),
       auto_allocate_chunk_size: Keyword.get(opts, :auto_allocate_chunk_size),
       timeout_ms: timeout_ms,
-      async_context: snapshot
+      async_context: snapshot,
+      owner_ref: Process.monitor(owner),
+      linger: Keyword.get_lazy(opts, :linger, &Web.Promise.default_linger/0)
     }
 
     {initial_state, default_actions} =
@@ -244,6 +274,10 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   def readable(type, content, data) do
+    type |> do_readable(content, data) |> with_lifetime(:readable, data)
+  end
+
+  defp do_readable(type, content, data) do
     case handle_common(type, content, :readable, data) do
       :not_handled ->
         case {type, content} do
@@ -290,6 +324,10 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   def writable(type, content, data) do
+    type |> do_writable(content, data) |> with_lifetime(:writable, data)
+  end
+
+  defp do_writable(type, content, data) do
     # For producer_consumer, readable-side ops work in any state
     with :not_handled <- maybe_handle_producer_side(type, content, :writable, data),
          :not_handled <- handle_common(type, content, :writable, data) do
@@ -334,6 +372,10 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   def closing(type, content, data) do
+    type |> do_closing(content, data) |> with_lifetime(:closing, data)
+  end
+
+  defp do_closing(type, content, data) do
     with :not_handled <- maybe_handle_producer_side(type, content, :closing, data),
          :not_handled <- handle_common(type, content, :closing, data) do
       handle_closing_event(type, content, data)
@@ -359,6 +401,10 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   def closed(type, content, data) do
+    type |> do_closed(content, data) |> with_lifetime(:closed, data)
+  end
+
+  defp do_closed(type, content, data) do
     with :not_handled <- handle_common(type, content, :closed, data) do
       handle_closed_event(type, content, data)
     end
@@ -369,6 +415,10 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   def errored(type, content, data) do
+    type |> do_errored(content, data) |> with_lifetime(:errored, data)
+  end
+
+  defp do_errored(type, content, data) do
     with :not_handled <- handle_common(type, content, :errored, data) do
       case {type, content} do
         {:internal, :flush_requests} ->
@@ -780,6 +830,16 @@ defmodule Web.Stream do
   end
 
   # Task DOWN monitoring
+  defp handle_common(
+         :info,
+         {:DOWN, ref, :process, _pid, reason},
+         _state,
+         %{owner_ref: ref} = data
+       )
+       when is_reference(ref) do
+    {:keep_state, %{data | owner_ref: nil, owner_down_reason: {:owner_down, reason}}}
+  end
+
   defp handle_common(:info, {:DOWN, ref, :process, _pid, reason}, state, data) do
     cond do
       ref == data.reader_ref ->
@@ -808,6 +868,20 @@ defmodule Web.Stream do
       :keep_state_and_data
     else
       handle_termination(:cancel, reason, data)
+    end
+  end
+
+  # The lifetime timer: see `with_lifetime/3`.
+  defp handle_common({:timeout, :lifetime}, :expired, state, data) do
+    data = %{data | lifetime_timer: nil}
+
+    if state in [:closed, :errored] do
+      {:stop, :normal, data}
+    else
+      # No process can read the chunks in the queue. Discard them, thus the
+      # stream stops immediately after the terminal event.
+      data = %{data | queue: :queue.new(), total_queued_size: 0}
+      handle_termination(owner_down_type(data), data.owner_down_reason, data)
     end
   end
 
@@ -1513,6 +1587,99 @@ defmodule Web.Stream do
   # Helper utilities
   # ---------------------------------------------------------------------------
 
+  # ---------------------------------------------------------------------------
+  # Lifetime
+  #
+  # The BEAM does not collect a process that no one refers to. Thus a stream
+  # stops by these rules:
+  #
+  #   * A stream that has work, or chunks that are not read, does not stop
+  #     while a process holds its reader lock or its writer lock.
+  #   * When the owner stopped and the stream has work or chunks that are
+  #     not read, the stream waits for the linger time. This lets a different
+  #     process, which got the stream in a message, take a lock. Then the
+  #     stream cancels (or aborts) and stops.
+  #   * When the stream is ended and all its chunks are read, it waits for
+  #     the linger time and stops. A lock has no effect, because the stream
+  #     has no more data for the process that holds the lock.
+  #
+  # Each state function sends its result through `with_lifetime/3`, which
+  # starts or cancels the timer.
+  # ---------------------------------------------------------------------------
+
+  @handoff_linger 5_000
+
+  defp with_lifetime(result, state, data) do
+    case transition(result, state, data) do
+      {next_state, new_data, actions} ->
+        timeout = lifetime_timeout(next_state, new_data)
+
+        if timeout == new_data.lifetime_timer do
+          result
+        else
+          {:next_state, next_state, %{new_data | lifetime_timer: timeout},
+           actions ++ [lifetime_action(timeout)]}
+        end
+
+      :stop ->
+        result
+    end
+  end
+
+  defp transition(:keep_state_and_data, state, data), do: {state, data, []}
+  defp transition({:keep_state_and_data, actions}, state, data), do: {state, data, actions}
+  defp transition({:keep_state, new_data}, state, _data), do: {state, new_data, []}
+  defp transition({:keep_state, new_data, actions}, state, _data), do: {state, new_data, actions}
+  defp transition({:next_state, next, new_data}, _state, _data), do: {next, new_data, []}
+
+  defp transition({:next_state, next, new_data, actions}, _state, _data),
+    do: {next, new_data, actions}
+
+  defp transition({:stop, _reason, _new_data}, _state, _data), do: :stop
+
+  defp lifetime_action(nil), do: {{:timeout, :lifetime}, :cancel}
+  defp lifetime_action(timeout), do: {{:timeout, :lifetime}, timeout, :expired}
+
+  # Returns the time to wait before the stream stops, or `nil` if the stream
+  # must stay.
+  defp lifetime_timeout(state, data) when state in [:closed, :errored] do
+    cond do
+      not is_nil(data.active_task) -> nil
+      drained?(data) -> complete_linger(data)
+      true -> unread_linger(data)
+    end
+  end
+
+  defp lifetime_timeout(_state, data), do: unread_linger(data)
+
+  # The stream is ended and has no chunks. A lock has no effect.
+  defp complete_linger(data) do
+    if owner_down?(data) and not locked?(data), do: 0, else: data.linger
+  end
+
+  # The stream has work, or chunks that are not read.
+  defp unread_linger(data) do
+    cond do
+      locked?(data) -> nil
+      owner_down?(data) -> handoff_linger(data.linger)
+      true -> nil
+    end
+  end
+
+  defp owner_down?(data), do: not is_nil(data.owner_down_reason)
+  defp locked?(data), do: is_pid(data.reader_pid) or is_pid(data.writer_pid)
+
+  defp handoff_linger(linger) when is_integer(linger), do: linger
+  defp handoff_linger(_infinity), do: @handoff_linger
+
+  defp drained?(data) do
+    :queue.is_empty(data.queue) and :queue.is_empty(data.read_requests) and
+      is_nil(data.pending_byob_request)
+  end
+
+  defp owner_down_type(%{type: :producer}), do: :cancel
+  defp owner_down_type(_consumer_or_transform), do: :abort
+
   defp handle_termination(type, reason, data) do
     data
     |> clear_owner()
@@ -1864,7 +2031,11 @@ defmodule Web.Stream do
   end
 
   defp start_task(fun, snapshot) do
+    stream = self()
+
     Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
+      Web.Promise.put_owner(stream)
+
       case snapshot do
         %Snapshot{} -> Snapshot.run(snapshot, fun)
         _ -> fun.()

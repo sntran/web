@@ -94,10 +94,10 @@ defmodule Web.StreamTest do
 
     test "init tolerates unexpected async context snapshots" do
       assert {:ok, :readable, %Web.Stream{}, _actions} =
-               Web.Stream.init({UsingMacroStream, [], :not_a_snapshot})
+               Web.Stream.init({UsingMacroStream, [], :not_a_snapshot, self()})
 
       assert {:ok, :readable, %Web.Stream{}, _actions} =
-               Web.Stream.init({UsingMacroStream, [], %{ambient_signal: :not_a_signal}})
+               Web.Stream.init({UsingMacroStream, [], %{ambient_signal: :not_a_signal}, self()})
     end
 
     test "init forwards ambient aborts for signals that abort during subscription" do
@@ -109,7 +109,7 @@ defmodule Web.StreamTest do
       signal = %Web.AbortSignal{pid: pid, ref: make_ref()}
 
       assert {:ok, :readable, %Web.Stream{}, _actions} =
-               Web.Stream.init({UsingMacroStream, [], %{ambient_signal: signal}})
+               Web.Stream.init({UsingMacroStream, [], %{ambient_signal: signal}, self()})
 
       assert_receive {:ambient_signal_abort, :aborted}
     end

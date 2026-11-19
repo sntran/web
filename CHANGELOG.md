@@ -11,8 +11,11 @@ All notable changes to this project are documented in this file.
   `{:rejected, reason}`.
 - The options `:linger` and `:detached` for `Web.Promise.new/2`, and the
   option `:linger` for `Web.Promise.with_resolvers/1`.
-- The application setting `config :web, promise_linger: ms` for the default
-  linger time of a promise. The default is 5000 ms.
+- The application setting `config :web, linger: ms` for the time that a
+  settled promise or an ended stream stays available. The default is 5000 ms.
+- Tests that count the processes of the VM, to find streams that stay after
+  their work is complete.
+- `use Web` aliases `Web.ReadableStreamDefaultReader`.
 - Tests that count the processes of the VM, to find promises that a
   long-lived process keeps.
 - `Web.Promise.with_resolvers/0` for externally settled promises with explicit
@@ -90,6 +93,31 @@ All notable changes to this project are documented in this file.
     for the linger time. An `await` after that time rejects with
     `Web.TypeError`. The `opened`, `closed`, and `upgraded` promises of
     `Web.Socket` do not expire.
+- **Breaking:** each stream has an owner, which is the process that made it,
+  and each stream stops. Before, no stream process stopped, also after the
+  stream was read to its end.
+  - A stream that is ended, with all its chunks read, stops after the linger
+    time.
+  - When the owner stops, a stream that no process has locked waits for the
+    linger time, then cancels (or aborts) and stops. In that time, a
+    different process that got the stream in a message can lock it and
+    continue.
+  - A stream does not stop while it has work or unread chunks and a process
+    holds its lock.
+  - A function that uses a stopped stream does not exit. `locked?` gives
+    `false`, `disturbed?` gives `true`, `cancel`, `close`, `abort`, and
+    `release_lock` give `:ok`, and `get_reader`, `get_writer`, and `write`
+    give `Web.TypeError`.
+  - The promises and streams that a stream callback makes belong to the
+    stream.
+- **Breaking:** a halt of an enumeration cancels the stream. `Enum.take/2`
+  on a `Web.ReadableStream` stops its source. Before, the stream stayed
+  open and the source continued.
+- `Web.ReadableStream.pipe_through/3` and `tee/1` start their pipe without a
+  promise, because no process awaits it.
+- `Web.TextDecoder` keeps its state in a process that stops when its owner
+  stops. `Web.Body` decodes text without a state process. Before, each
+  decoder, and thus each `text/1` and `json/1` call, left one process.
 - **Breaking:** `Web.URL` does the "domain to ASCII" operation in Elixir
   only. It follows Unicode Technical Standard #46 with the settings of the
   URL Standard. Before, the library read the expected results from the
@@ -153,6 +181,14 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.ReadableStream.from/1` accepts an enumerable that halts itself, such
+  as `Stream.take/2`. Before, the stream raised `CaseClauseError`. The
+  chunks `nil` and `:done` are usual chunks.
+- `Web.ReadableStream.from/1` puts the stream in the errored state with the
+  exception of an enumerable that raises. Before, the read waited for the
+  task timeout.
+- `Web.WritableStream.ready/2` returns when the stream stops. Before, it
+  waited with no limit.
 - `Web.URLPattern` uses the Unicode properties `ID_Start` and `ID_Continue`
   for the name of a group. Before, it accepted each character below U+1F000.
   A name with a variation selector after its first letter does not raise

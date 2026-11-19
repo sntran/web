@@ -77,6 +77,7 @@ defmodule Web do
       alias Web.ReadableStreamBYOBReader
       alias Web.ReadableStreamBYOBRequest
       alias Web.ReadableStreamDefaultController
+      alias Web.ReadableStreamDefaultReader
       alias Web.Request
       alias Web.Response
       alias Web.Socket

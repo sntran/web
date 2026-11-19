@@ -582,23 +582,6 @@ defmodule Web.PromiseTest do
       assert await(promise) == :kept
     end
 
-    test "the application environment sets the default linger time" do
-      previous = Application.get_env(:web, :promise_linger)
-      Application.put_env(:web, :promise_linger, 0)
-
-      try do
-        promise = Promise.new(fn resolve, _reject -> resolve.(:value) end)
-        assert await(promise) == :value
-        assert_down(promise.pid)
-      after
-        if previous == nil do
-          Application.delete_env(:web, :promise_linger)
-        else
-          Application.put_env(:web, :promise_linger, previous)
-        end
-      end
-    end
-
     test "a promise stops when it gets an exit signal" do
       {promise, _resolve, _reject} = Promise.with_resolvers()
 

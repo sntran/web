@@ -27,8 +27,11 @@ defmodule Web.ReadableStream do
 
   defstruct [:controller_pid]
 
+  @released_message "The stream is not available. It ended, or its owner stopped."
+
   alias Web.AbortSignal
   alias Web.ArrayBuffer
+  alias Web.AsyncContext.Snapshot
   alias Web.Blob
   alias Web.Promise
   alias Web.ReadableByteStreamController
@@ -240,13 +243,11 @@ defmodule Web.ReadableStream do
       new(
         %{
           pull: fn controller ->
-            next_chunk = ask_enumerator(enumerator_pid)
-
-            case next_chunk do
+            case ask_enumerator(enumerator_pid) do
               :done ->
                 Web.ReadableStreamDefaultController.close(controller)
 
-              chunk ->
+              {:chunk, chunk} ->
                 Web.ReadableStreamDefaultController.enqueue(controller, chunk)
             end
           end,
@@ -354,25 +355,27 @@ defmodule Web.ReadableStream do
     end
   end
 
-  defp next_enumerable_chunk(enumerable) when is_function(enumerable, 1) do
-    case enumerable.({:cont, nil}) do
-      {:suspended, chunk, continuation} -> {chunk, {:continuation, continuation}}
-      {:done, nil} -> {:done, :done}
-      # coveralls-ignore-next-line
-      {:halted, nil} -> {:done, :done}
-    end
+  # The accumulator of the reduction holds the chunk. The value `:none` shows
+  # that the enumerable gave no chunk.
+  defp enumerator_next(:done), do: :done
+
+  defp enumerator_next({:initial, enumerable}) do
+    reducer = fn chunk, _acc -> {:suspend, {:chunk, chunk}} end
+    enumerable_step(Enumerable.reduce(enumerable, {:cont, :none}, reducer))
   end
 
-  defp next_enumerable_chunk(enumerable) do
-    reducer = fn chunk, _acc -> {:suspend, chunk} end
-
-    case Enumerable.reduce(enumerable, {:cont, nil}, reducer) do
-      {:suspended, chunk, continuation} -> {chunk, {:continuation, continuation}}
-      {:done, nil} -> {:done, :done}
-      # coveralls-ignore-next-line
-      {:halted, nil} -> {:done, :done}
-    end
+  defp enumerator_next({:continuation, continuation}) do
+    enumerable_step(continuation.({:cont, :none}))
   end
+
+  defp enumerable_step({:suspended, {:chunk, chunk}, continuation}) do
+    {:chunk, chunk, {:continuation, continuation}}
+  end
+
+  # An enumerable that halts itself, such as `Stream.take/2`, gives its last
+  # chunk together with the halt.
+  defp enumerable_step({:halted, {:chunk, chunk}}), do: {:chunk, chunk, :done}
+  defp enumerable_step({_done_or_halted, :none}), do: :done
 
   defp start_enumerator(enumerable) do
     spawn(fn -> enumerator_loop({:initial, enumerable}) end)
@@ -381,41 +384,13 @@ defmodule Web.ReadableStream do
   defp enumerator_loop(state) do
     receive do
       {:next, from, ref} ->
-        case state do
+        case enumerator_next(state) do
+          {:chunk, chunk, next_state} ->
+            send(from, {ref, {:chunk, chunk}})
+            enumerator_loop(next_state)
+
           :done ->
-            # coveralls-ignore-start
             send(from, {ref, :done})
-            :ok
-
-          # coveralls-ignore-stop
-
-          {:initial, current_enumerable} ->
-            case next_enumerable_chunk(current_enumerable) do
-              {:done, :done} ->
-                # coveralls-ignore-start
-                send(from, {ref, :done})
-                :ok
-
-              # coveralls-ignore-stop
-
-              {chunk, next_state} ->
-                send(from, {ref, chunk})
-                enumerator_loop(next_state)
-            end
-
-          {:continuation, continuation} ->
-            case next_enumerable_chunk(continuation) do
-              {:done, :done} ->
-                # coveralls-ignore-start
-                send(from, {ref, :done})
-                :ok
-
-              # coveralls-ignore-stop
-
-              {chunk, next_state} ->
-                send(from, {ref, chunk})
-                enumerator_loop(next_state)
-            end
         end
 
       :stop ->
@@ -423,28 +398,38 @@ defmodule Web.ReadableStream do
     end
   end
 
-  # coveralls-ignore-next-line
-  defp halt_enumerator(:done), do: :ok
-  # coveralls-ignore-next-line
-  defp halt_enumerator({:initial, _enumerable}), do: :ok
-
+  # Runs the code that the enumerable has for its end, for example the
+  # `after` function of `Stream.resource/3`.
   defp halt_enumerator({:continuation, continuation}) do
-    _ = continuation.({:halt, nil})
+    _ = continuation.({:halt, :none})
     :ok
-  rescue
-    # coveralls-ignore-next-line
-    _error -> :ok
   catch
-    # coveralls-ignore-next-line
     _kind, _reason -> :ok
   end
 
+  defp halt_enumerator(_initial_or_done), do: :ok
+
+  # If the enumerable raises, the enumerator process stops. Then this
+  # function exits with the same reason, and the stream goes to the errored
+  # state.
   defp ask_enumerator(pid) do
-    ref = make_ref()
+    ref = Process.monitor(pid)
     send(pid, {:next, self(), ref})
 
     receive do
-      {^ref, result} -> result
+      {^ref, reply} ->
+        Process.demonitor(ref, [:flush])
+        reply
+
+      {:DOWN, ^ref, :process, ^pid, reason} when reason in [:normal, :noproc] ->
+        :done
+
+      {:DOWN, ^ref, :process, ^pid, {%{__exception__: true} = exception, stacktrace}}
+      when is_list(stacktrace) ->
+        reraise exception, stacktrace
+
+      {:DOWN, ^ref, :process, ^pid, reason} ->
+        exit(reason)
     end
   end
 
@@ -457,7 +442,7 @@ defmodule Web.ReadableStream do
   end
 
   def disturbed?(pid) when is_pid(pid) do
-    :gen_statem.call(pid, :disturbed?)
+    Web.Stream.call(pid, :disturbed?, true)
   end
 
   def disturbed?(_body), do: false
@@ -473,7 +458,7 @@ defmodule Web.ReadableStream do
   end
 
   def locked?(pid) when is_pid(pid) do
-    :gen_statem.call(pid, :locked?)
+    Web.Stream.call(pid, :locked?, false)
   end
 
   def locked?(_body), do: false
@@ -501,6 +486,9 @@ defmodule Web.ReadableStream do
 
           {:error, :not_byte_stream} ->
             raise TypeError, "ReadableStream is not a byte stream"
+
+          {:error, :released} ->
+            raise TypeError, @released_message
         end
 
       :default ->
@@ -515,10 +503,9 @@ defmodule Web.ReadableStream do
         :byob -> {:get_reader, self(), :byob}
       end
 
-    case :gen_statem.call(pid, request) do
+    case Web.Stream.call(pid, request, {:error, :released}) do
       {:ok, _ref} -> :ok
-      {:error, :already_locked} -> {:error, :already_locked}
-      {:error, :not_byte_stream} -> {:error, :not_byte_stream}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -531,16 +518,19 @@ defmodule Web.ReadableStream do
 
       {:error, :already_locked} ->
         raise TypeError, "ReadableStream is already locked"
+
+      {:error, :released} ->
+        raise TypeError, @released_message
     end
   end
 
   def read(pid) do
-    :gen_statem.call(pid, {:read, self()})
+    Web.Stream.call(pid, {:read, self()}, {:error, :not_locked_by_reader})
   end
 
   @doc false
   def byob_read(pid, view) when is_pid(pid) do
-    :gen_statem.call(pid, {:byob_read, self(), view})
+    Web.Stream.call(pid, {:byob_read, self(), view}, {:error, :not_locked_by_reader})
   end
 
   def force_unknown_error(pid) do
@@ -548,11 +538,11 @@ defmodule Web.ReadableStream do
   end
 
   def release_lock(pid) do
-    :gen_statem.call(pid, {:release_lock, self()})
+    Web.Stream.call(pid, {:release_lock, self()}, :ok)
   end
 
   def get_desired_size(pid) do
-    :gen_statem.call(pid, :get_desired_size)
+    Web.Stream.call(pid, :get_desired_size, nil)
   end
 
   def enqueue(pid, chunk) do
@@ -580,9 +570,7 @@ defmodule Web.ReadableStream do
 
   def cancel(pid, reason) do
     Promise.detached(fn resolve, _reject ->
-      if Process.alive?(pid) do
-        :ok = Web.Stream.control_call(pid, {:terminate, :cancel, reason})
-      end
+      :ok = Web.Stream.terminate_and_wait(pid, :cancel, reason)
 
       resolve.(:ok)
     end)
@@ -662,41 +650,65 @@ defmodule Web.ReadableStream do
   """
   def pipe_to(readable, writable, options \\ []) do
     Promise.detached(fn resolve, reject ->
-      reader = nil
-      writer = nil
-
-      try do
-        try do
-          reader = acquire_reader_for_pipe(readable)
-          writer = acquire_writer_for_pipe(writable)
-
-          case pump(reader, writer, options) do
-            :done ->
-              maybe_close_writer(writer, options)
-              resolve.(:ok)
-
-            {:source_error, reason} ->
-              maybe_abort_writer(writer, reason, options)
-              reject.(reason)
-
-            {:sink_error, reason} ->
-              maybe_cancel_reader(reader, reason, options)
-              reject.(reason)
-
-            {:aborted, reason} ->
-              maybe_cancel_reader(reader, reason, options)
-              maybe_abort_writer(writer, reason, options)
-              reject.({:aborted, reason})
-          end
-        rescue
-          error in TypeError ->
-            reject.(error)
-        end
-      after
-        if reader != nil, do: release_reader_lock(reader)
-        if writer != nil, do: release_writer_lock(writer)
-      end
+      run_pipe(readable, writable, options, resolve, reject)
     end)
+  end
+
+  # Starts a pipe that no process awaits. A promise for such a pipe would
+  # stay until its owner stops, thus this function makes no promise.
+  defp start_pipe(readable, writable, options) do
+    snapshot = Snapshot.take()
+    ignore = fn _outcome -> :ok end
+
+    {:ok, _pid} =
+      Task.Supervisor.start_child(Web.TaskSupervisor, fn ->
+        try do
+          Snapshot.run(snapshot, fn ->
+            run_pipe(readable, writable, options, ignore, ignore)
+          end)
+        catch
+          _kind, _reason -> :ok
+        end
+      end)
+
+    :ok
+  end
+
+  defp run_pipe(readable, writable, options, resolve, reject) do
+    reader = nil
+    writer = nil
+
+    try do
+      try do
+        reader = acquire_reader_for_pipe(readable)
+        writer = acquire_writer_for_pipe(writable)
+
+        case pump(reader, writer, options) do
+          :done ->
+            maybe_close_writer(writer, options)
+            resolve.(:ok)
+
+          {:source_error, reason} ->
+            maybe_abort_writer(writer, reason, options)
+            reject.(reason)
+
+          {:sink_error, reason} ->
+            maybe_cancel_reader(reader, reason, options)
+            reject.(reason)
+
+          {:aborted, reason} ->
+            maybe_cancel_reader(reader, reason, options)
+            maybe_abort_writer(writer, reason, options)
+            reject.({:aborted, reason})
+        end
+      rescue
+        error in TypeError ->
+          reject.(error)
+      end
+    after
+      if reader != nil, do: release_reader_lock(reader)
+      if writer != nil, do: release_writer_lock(writer)
+    end
   end
 
   @doc """
@@ -707,7 +719,7 @@ defmodule Web.ReadableStream do
         %{readable: transformed_readable, writable: transformed_writable},
         options \\ []
       ) do
-    _promise = pipe_to(readable, transformed_writable, options)
+    :ok = start_pipe(readable, transformed_writable, options)
     transformed_readable
   end
 
@@ -798,7 +810,7 @@ defmodule Web.ReadableStream do
   end
 
   defp read_for_pipe(pid, owner_pid) do
-    case :gen_statem.call(pid, {:read, owner_pid}) do
+    case Web.Stream.call(pid, {:read, owner_pid}, {:error, :released}) do
       {:ok, chunk} -> %{value: chunk, done: false}
       :done -> %{value: nil, done: true}
       {:error, _} = error -> error
@@ -858,6 +870,7 @@ defmodule Web.ReadableStream do
     case get_reader(pid) do
       :ok -> %Web.ReadableStreamDefaultReader{controller_pid: pid}
       {:error, :already_locked} -> raise TypeError, "ReadableStream is already locked"
+      {:error, :released} -> raise TypeError, @released_message
     end
   end
 
@@ -868,6 +881,7 @@ defmodule Web.ReadableStream do
     case WritableStream.get_writer(pid) do
       :ok -> %Web.WritableStreamDefaultWriter{controller_pid: pid, owner_pid: self()}
       {:error, :already_locked} -> raise TypeError, "WritableStream is already locked"
+      {:error, :released} -> raise TypeError, @released_message
     end
   end
 
@@ -926,7 +940,7 @@ defmodule Web.ReadableStream do
         end
       })
 
-    _promise = pipe_to(source, sink)
+    :ok = start_pipe(source, sink, [])
     tee_await_source_lock(source.controller_pid)
 
     [ts1.readable, ts2.readable]
@@ -980,14 +994,10 @@ defimpl Enumerable, for: Web.ReadableStream do
     do_reduce(reader, acc, fun)
   end
 
+  # A halt is the end of the enumeration. Cancel the stream, thus its source
+  # stops and the stream process can stop.
   defp do_reduce(reader, {:halt, acc}, _fun) do
-    try do
-      ReadableStreamDefaultReader.release_lock(reader)
-    rescue
-      # coveralls-ignore-next-line
-      _ -> :ok
-    end
-
+    :ok = Web.Stream.terminate_and_wait(reader.controller_pid, :cancel, :halted)
     {:halted, acc}
   end
 

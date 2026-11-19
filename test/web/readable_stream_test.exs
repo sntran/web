@@ -321,14 +321,9 @@ defmodule Web.ReadableStreamTest do
 
     test "from/1 swallows continuation halt exceptions on cancel" do
       stream =
-        ReadableStream.from(fn
-          {:cont, nil} ->
-            {:suspended, "a",
-             fn
-               {:halt, _acc} -> raise "boom"
-               {:cont, _acc} -> {:done, nil}
-             end}
-        end)
+        ReadableStream.from(
+          Stream.resource(fn -> :ok end, fn acc -> {["a"], acc} end, fn _acc -> raise "boom" end)
+        )
 
       assert ["a"] = Enum.take(stream, 1)
       assert :ok = await(ReadableStream.cancel(stream, :stop))
@@ -336,14 +331,9 @@ defmodule Web.ReadableStreamTest do
 
     test "from/1 swallows continuation halt throws on cancel" do
       stream =
-        ReadableStream.from(fn
-          {:cont, nil} ->
-            {:suspended, "a",
-             fn
-               {:halt, _acc} -> throw(:boom)
-               {:cont, _acc} -> {:done, nil}
-             end}
-        end)
+        ReadableStream.from(
+          Stream.resource(fn -> :ok end, fn acc -> {["a"], acc} end, fn _acc -> throw(:boom) end)
+        )
 
       assert ["a"] = Enum.take(stream, 1)
       assert :ok = await(ReadableStream.cancel(stream, :stop))

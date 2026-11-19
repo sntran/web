@@ -104,7 +104,9 @@ defmodule Web.URLPropertyTest do
 
   defp relative(reference, base) do
     # A reference that starts with a scheme or with "//" is not relative.
-    if String.match?(reference, ~r/^([a-zA-Z][a-zA-Z0-9+.-]*:|\/\/|\\\\)/) do
+    # The parser removes the spaces at the start, as the URL Standard
+    # specifies, thus the test examines the reference with no such spaces.
+    if String.match?(String.trim_leading(reference), ~r/^([a-zA-Z][a-zA-Z0-9+.-]*:|\/\/|\\\\)/) do
       :error
     else
       {:ok, URL.new(reference, base)}

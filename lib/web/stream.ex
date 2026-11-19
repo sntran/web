@@ -223,6 +223,28 @@ defmodule Web.Stream do
   end
 
   @doc false
+  # Sends `message` to the stream as a call, and waits for the reply in the
+  # process that calls this function. Returns `gone` when the stream
+  # stopped, also when it stops during the request.
+  #
+  # The function makes no promise. The code of this library that reads many
+  # chunks uses it: a promise for each chunk is one process for each chunk,
+  # and that process keeps the chunk for the linger time of a promise.
+  def request(pid, message, gone) when is_pid(pid) do
+    monitor = Process.monitor(pid)
+    send(pid, {:"$gen_call", {self(), monitor}, message})
+
+    receive do
+      {^monitor, reply} ->
+        Process.demonitor(monitor, [:flush])
+        reply
+
+      {:DOWN, ^monitor, :process, _pid, _reason} ->
+        gone
+    end
+  end
+
+  @doc false
   # Sends a terminal event to the stream process and waits for the result.
   # A stream that stopped needs no terminal event.
   def terminate_and_wait(pid, type, reason) when is_pid(pid) do

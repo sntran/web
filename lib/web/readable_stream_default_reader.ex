@@ -35,26 +35,42 @@ defmodule Web.ReadableStreamDefaultReader do
       %{value: nil, done: true}
   """
   def read(%__MODULE__{controller_pid: pid} = reader) do
-    Web.Stream.promise_call(pid, {:read, owner(reader)}, {:error, :not_locked_by_reader}, fn
-      {:ok, chunk} ->
-        {:ok, %{value: chunk, done: false}}
-
-      :done ->
-        {:ok, %{value: nil, done: true}}
-
-      {:error, :not_locked_by_reader} ->
-        {:error, %TypeError{message: "This reader is no longer locked."}}
-
-      {:error, :errored} ->
-        {:error, %TypeError{message: "The stream is errored."}}
-
-      {:error, {:errored, reason}} ->
-        {:error, reason}
-
-      {:error, reason} ->
-        {:error, reason}
-    end)
+    Web.Stream.promise_call(
+      pid,
+      {:read, owner(reader)},
+      {:error, :not_locked_by_reader},
+      &read_result/1
+    )
   end
+
+  @doc false
+  # A read with no promise: the process that calls this function waits for
+  # the chunk. Returns `{:ok, result}` with the result of `read/1`, or
+  # `{:error, reason}` with its rejection reason.
+  #
+  # The code of this library that reads all the chunks of a stream uses this
+  # function. A promise for each chunk is one process for each chunk, and
+  # that process keeps the chunk for the linger time of a promise.
+  def read_now(%__MODULE__{controller_pid: pid} = reader) do
+    pid
+    |> Web.Stream.request({:read, owner(reader)}, {:error, :not_locked_by_reader})
+    |> read_result()
+  end
+
+  # The answer of the stream to a read request, as the result of a read.
+  defp read_result({:ok, chunk}), do: {:ok, %{value: chunk, done: false}}
+  defp read_result(:done), do: {:ok, %{value: nil, done: true}}
+
+  defp read_result({:error, :not_locked_by_reader}) do
+    {:error, %TypeError{message: "This reader is no longer locked."}}
+  end
+
+  defp read_result({:error, :errored}) do
+    {:error, %TypeError{message: "The stream is errored."}}
+  end
+
+  defp read_result({:error, {:errored, reason}}), do: {:error, reason}
+  defp read_result({:error, reason}), do: {:error, reason}
 
   # The process that has the lock. A reader from `get_reader/1` has it in
   # the struct, thus each process can use the reader.

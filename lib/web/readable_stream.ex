@@ -1135,43 +1135,31 @@ defimpl Enumerable, for: Web.ReadableStream do
     {:suspended, acc, &do_reduce(reader, &1, fun)}
   end
 
+  # The read has no promise: a promise is a process that keeps the chunk
+  # for some seconds. The call of the reducer is not in the path of the
+  # recursion, thus the stack does not increase with the number of chunks.
   defp do_reduce(reader, {:cont, acc}, fun) do
-    case Web.Promise.wait(ReadableStreamDefaultReader.read(reader)) do
-      {:rejected, reason} ->
-        try do
-          ReadableStreamDefaultReader.release_lock(reader)
-        rescue
-          # coveralls-ignore-next-line
-          _ -> :ok
-        end
+    case ReadableStreamDefaultReader.read_now(reader) do
+      {:ok, %{value: chunk, done: false}} ->
+        do_reduce(reader, apply_reducer(reader, fun, chunk, acc), fun)
 
-        raise_stream_error(reason)
-
-      {:fulfilled, %{done: true}} ->
-        try do
-          ReadableStreamDefaultReader.release_lock(reader)
-        rescue
-          # coveralls-ignore-next-line
-          _ -> :ok
-        end
-
+      {:ok, %{done: true}} ->
+        ReadableStreamDefaultReader.release_lock(reader)
         {:done, acc}
 
-      {:fulfilled, %{value: chunk, done: false}} ->
-        try do
-          do_reduce(reader, fun.(chunk, acc), fun)
-        rescue
-          e ->
-            try do
-              ReadableStreamDefaultReader.release_lock(reader)
-            rescue
-              # coveralls-ignore-next-line
-              _ -> :ok
-            end
-
-            reraise e, __STACKTRACE__
-        end
+      {:error, reason} ->
+        ReadableStreamDefaultReader.release_lock(reader)
+        raise_stream_error(reason)
     end
+  end
+
+  # An enumeration that stops because the reducer failed releases the lock.
+  defp apply_reducer(reader, fun, chunk, acc) do
+    fun.(chunk, acc)
+  catch
+    kind, reason ->
+      ReadableStreamDefaultReader.release_lock(reader)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   # Gives the error of the stream, when it is an exception.

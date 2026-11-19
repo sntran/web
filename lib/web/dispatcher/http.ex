@@ -16,8 +16,8 @@ defmodule Web.Dispatcher.HTTP do
   #     worker. This is the backpressure: the worker does not read the
   #     connection while it waits;
   #   * at the end of the body, the worker closes the stream. When the
-  #     connection fails, the worker puts the stream in the errored state
-  #     with a `Web.TypeError`.
+  #     connection fails, or the body cannot be decoded, the worker puts the
+  #     stream in the errored state with a `Web.TypeError`.
   #
   # The watcher monitors the worker. A worker that stops with no message,
   # for example a worker that a different process kills, puts the stream in
@@ -26,6 +26,7 @@ defmodule Web.Dispatcher.HTTP do
   # the worker. See `tla/ResponseBody.tla`.
 
   alias Web.Internal.Bytes
+  alias Web.Internal.ContentDecoder
   alias Web.ReadableStream
 
   @max_redirects 20
@@ -358,7 +359,7 @@ defmodule Web.Dispatcher.HTTP do
      Finch.build(
        request.method,
        Web.URL.href(request.url),
-       Web.Headers.to_list(request.headers),
+       Web.Headers.to_list(request_headers(request.headers)),
        request_body(request)
      )}
   rescue
@@ -401,6 +402,18 @@ defmodule Web.Dispatcher.HTTP do
   # A chunk of a request body is a chunk of bytes, as the Fetch Standard
   # specifies.
   defp request_chunk(chunk), do: Bytes.to_binary!(chunk, "The request body")
+
+  # The request has no header `accept-encoding`: it gets the codings that
+  # the body decoder knows. A request with the header `range` gets
+  # `identity`, as the Fetch Standard specifies: the range is a range of the
+  # bytes that the server has.
+  defp request_headers(headers) do
+    cond do
+      Web.Headers.has(headers, "accept-encoding") -> headers
+      Web.Headers.has(headers, "range") -> Web.Headers.set(headers, "accept-encoding", "identity")
+      true -> Web.Headers.set(headers, "accept-encoding", ContentDecoder.accept_encoding())
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # The head of the response
@@ -447,6 +460,10 @@ defmodule Web.Dispatcher.HTTP do
   # specifies.
   defp raise_body_error(reason), do: raise(body_error(reason))
 
+  defp body_error(%ContentDecoder.Error{} = error) do
+    %Web.TypeError{message: "The response body cannot be decoded.", cause: error}
+  end
+
   defp body_error(reason) do
     %Web.TypeError{message: "The response body is not complete.", cause: reason}
   end
@@ -489,7 +506,8 @@ defmodule Web.Dispatcher.HTTP do
       status: nil,
       phase: :head,
       stream: nil,
-      stream_monitor: nil
+      stream_monitor: nil,
+      decoder: nil
     }
 
     result =
@@ -510,8 +528,9 @@ defmodule Web.Dispatcher.HTTP do
           request_timeout: :infinity
         )
       catch
-        # The callback failed, and the HTTP client closed the connection.
-        # The last state of the request is in the process dictionary.
+        # The callback failed, for example on data that cannot be decoded.
+        # The HTTP client closed the connection. The last state of the
+        # request is in the process dictionary.
         :error, reason -> {:error, reason, Process.get(__MODULE__, acc)}
       end
 
@@ -530,7 +549,7 @@ defmodule Web.Dispatcher.HTTP do
 
   defp handle_event({:headers, headers}, %{phase: :head} = acc) do
     send(acc.owner, {:http_head, acc.ref, acc.status, headers})
-    receive_body_target(acc)
+    receive_body_target(acc, headers)
   end
 
   # The trailers of a response. The Fetch Standard does not give them to the
@@ -538,11 +557,17 @@ defmodule Web.Dispatcher.HTTP do
   defp handle_event({:headers, _trailers}, acc), do: {:cont, acc}
   defp handle_event({:trailers, _trailers}, acc), do: {:cont, acc}
   defp handle_event({:data, _chunk}, %{phase: :discard} = acc), do: {:cont, acc}
-  defp handle_event({:data, chunk}, acc), do: {deliver(acc, chunk), acc}
+  defp handle_event({:data, chunk}, %{decoder: nil} = acc), do: {deliver(acc, chunk), acc}
+
+  defp handle_event({:data, chunk}, acc) do
+    {result, decoder} = ContentDecoder.decode(acc.decoder, chunk, &deliver(acc, &1))
+    acc = remember(%{acc | decoder: decoder})
+    {result, acc}
+  end
 
   # The process that called `fetch/1` gives the body stream, or tells that
   # the response has no body. A process that stopped needs no response.
-  defp receive_body_target(acc) do
+  defp receive_body_target(acc, headers) do
     owner_monitor = acc.owner_monitor
 
     receive do
@@ -556,7 +581,8 @@ defmodule Web.Dispatcher.HTTP do
           acc
           | phase: :body,
             stream: stream,
-            stream_monitor: Process.monitor(stream)
+            stream_monitor: Process.monitor(stream),
+            decoder: ContentDecoder.new(headers)
         }
 
         {:cont, remember(acc)}
@@ -617,7 +643,11 @@ defmodule Web.Dispatcher.HTTP do
   # The end of the request. The worker tells the process that waits: the
   # process that called `fetch/1` before the body, and the body stream after.
   defp report({:ok, %{phase: :body} = acc}) do
-    if await_drain(acc) == :cont, do: ReadableStream.close(acc.stream)
+    if finish_decoder(acc) == :cont and await_drain(acc) == :cont do
+      ReadableStream.close(acc.stream)
+    end
+  rescue
+    error in ContentDecoder.Error -> ReadableStream.error(acc.stream, body_error(error))
   end
 
   defp report({:ok, %{phase: :discard} = acc}), do: send(acc.owner, {:http_done, acc.ref})
@@ -628,6 +658,9 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp report({:error, reason, acc}), do: send(acc.owner, {:http_failed, acc.ref, reason})
+
+  defp finish_decoder(%{decoder: nil}), do: :cont
+  defp finish_decoder(acc), do: ContentDecoder.finish(acc.decoder, &deliver(acc, &1))
 
   # The worker closes the stream when its queue is empty. Until then the
   # body is readable: an abort of the request signal puts it in the errored

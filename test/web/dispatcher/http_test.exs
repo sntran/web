@@ -119,7 +119,8 @@ defmodule Web.Dispatcher.HTTPTest do
     req =
       Request.new("http://localhost:#{port}/stream-body",
         method: :post,
-        body: Stream.map(["da", "ta"], & &1)
+        body: Stream.map(["da", "ta"], & &1),
+        duplex: "half"
       )
 
     assert {:ok, resp} = HTTP.fetch(req)

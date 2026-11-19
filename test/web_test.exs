@@ -239,7 +239,7 @@ defmodule WebTest do
       init = [dispatcher: RecordingDispatcher, test: self(), method: "POST"]
 
       for body <- ["in memory", Web.ReadableStream.from(["a", "b"])] do
-        request = Web.Request.new("mock://success/", init ++ [body: body])
+        request = Web.Request.new("mock://success/", init ++ [body: body, duplex: "half"])
         assert is_binary(await(Web.Request.text(request)))
 
         assert {:rejected, %Web.TypeError{message: "Request body is already used"}} =
@@ -259,7 +259,8 @@ defmodule WebTest do
           dispatcher: RecordingDispatcher,
           test: self(),
           method: "POST",
-          body: Web.ReadableStream.from(["a"])
+          body: Web.ReadableStream.from(["a"]),
+          duplex: "half"
         )
 
       reader = Web.ReadableStream.get_reader(request.body)

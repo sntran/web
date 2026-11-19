@@ -49,7 +49,9 @@ defmodule Web.Request do
       `TRACK`;
     * a body together with the method `GET` or `HEAD`;
     * a header name or a header value that is not valid;
-    * a redirect mode that is not `"follow"`, `"error"`, or `"manual"`.
+    * a redirect mode that is not `"follow"`, `"error"`, or `"manual"`;
+    * a body that is a stream with no option `duplex: "half"`. A stream is a
+      `Web.ReadableStream`, or an enumerable that is not a list.
 
   The methods `DELETE`, `GET`, `HEAD`, `OPTIONS`, `POST`, and `PUT` are
   changed to uppercase. Each other method keeps its case, thus `"patch"`
@@ -185,16 +187,31 @@ defmodule Web.Request do
     raise Web.TypeError, "#{inspect(redirect)} is not a valid redirect mode"
   end
 
-  # The Fetch Standard requires `duplex: "half"` for a body that is a stream,
-  # because a browser cannot send and receive at the same time. This library
-  # does not require the option, but it refuses each other value.
-  defp validate_duplex(init) do
+  # The Fetch Standard requires `duplex: "half"` for a body that is a stream:
+  # the request is sent in full before the response is read. No other value
+  # is valid.
+  defp validate_duplex(init, body) do
     case Keyword.fetch(init, :duplex) do
-      :error -> :ok
-      {:ok, duplex} when duplex in ["half", :half] -> :ok
-      {:ok, duplex} -> raise Web.TypeError, "#{inspect(duplex)} is not a valid duplex mode"
+      {:ok, duplex} when duplex in ["half", :half] ->
+        :ok
+
+      {:ok, duplex} ->
+        raise Web.TypeError, "#{inspect(duplex)} is not a valid duplex mode"
+
+      :error ->
+        if stream_body?(body) do
+          raise Web.TypeError,
+                "The option `duplex: \"half\"` is necessary for a body that is a stream"
+        else
+          :ok
+        end
     end
   end
+
+  # A body that is a stream has no source: it can be read only one time.
+  defp stream_body?(nil), do: false
+  defp stream_body?(%Web.FormData{}), do: false
+  defp stream_body?(body), do: is_nil(body_source(body))
 
   defp validate_body(method, body) when method in ["GET", "HEAD"] and not is_nil(body) do
     raise Web.TypeError, "Request with GET/HEAD method cannot have body"
@@ -218,7 +235,7 @@ defmodule Web.Request do
     redirect = init |> Keyword.get(:redirect, "follow") |> normalize_redirect()
     raw_body = Keyword.get(init, :body)
     :ok = validate_body(method, raw_body)
-    :ok = validate_duplex(init)
+    :ok = validate_duplex(init, raw_body)
 
     headers =
       Keyword.get(init, :headers, %{})
@@ -259,7 +276,7 @@ defmodule Web.Request do
   defp override_request(request, init) do
     method = init |> Keyword.get(:method, request.method) |> normalize_method()
     redirect = init |> Keyword.get(:redirect, request.redirect) |> normalize_redirect()
-    :ok = validate_duplex(init)
+    :ok = validate_duplex(init, Keyword.get(init, :body))
 
     headers =
       case Keyword.fetch(init, :headers) do

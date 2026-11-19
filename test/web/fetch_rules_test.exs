@@ -166,14 +166,20 @@ defmodule Web.FetchRulesTest do
     test "rejects when the body is a stream", %{port: port} do
       for status <- [307, 308] do
         body = ReadableStream.from(Stream.map(["a", "b"], & &1))
-        promise = fetch(redirect(port, status, "/echo"), method: "POST", body: body)
+
+        promise =
+          fetch(redirect(port, status, "/echo"), method: "POST", body: body, duplex: "half")
+
         assert %TypeError{cause: :redirect_stream_body} = catch_exit(await(promise))
       end
     end
 
     test "follows 303 when the body is a stream", %{port: port} do
       body = ReadableStream.from(Stream.map(["a", "b"], & &1))
-      response = await(fetch(redirect(port, 303, "/echo"), method: "POST", body: body))
+
+      response =
+        await(fetch(redirect(port, 303, "/echo"), method: "POST", body: body, duplex: "half"))
+
       assert %{method: "GET", body: ""} = echo(response)
     end
   end
@@ -346,7 +352,12 @@ defmodule Web.FetchRulesTest do
           fn _state -> :ok end
         )
 
-      promise = fetch(url(port, "/echo"), method: "POST", body: ReadableStream.from(enumerable))
+      promise =
+        fetch(url(port, "/echo"),
+          method: "POST",
+          body: ReadableStream.from(enumerable),
+          duplex: "half"
+        )
 
       # The server gets the first chunk while the source has more data.
       assert_receive {:server_chunk, "first"}, 2_000

@@ -113,6 +113,9 @@ All notable changes to this project are documented in this file.
   - A body is refused with the methods `GET` and `HEAD`. This is also
     applicable to a `tcp:` request: give a method such as `"POST"`.
   - The redirect mode must be `"follow"`, `"error"`, or `"manual"`.
+  - A body that is a stream needs the option `duplex: "half"`, as the Fetch
+    Standard specifies. A stream is a `Web.ReadableStream`, or an enumerable
+    that is not a list.
   - With a request as its input, `new/2` applies the members of `init`.
     Before, it ignored them.
 - **Breaking:** `Web.Headers` validates each name and each value, and

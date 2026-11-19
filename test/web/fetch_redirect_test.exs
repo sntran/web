@@ -270,7 +270,8 @@ defmodule Web.FetchRedirectTest do
       Web.fetch("http://localhost:#{port}/redir-relative",
         method: "POST",
         headers: %{"content-length" => "7"},
-        body: body
+        body: body,
+        duplex: "half"
       )
 
     # A stream cannot be sent a second time.

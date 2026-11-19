@@ -241,6 +241,56 @@ defmodule Web.RequestTest do
       end
     end
 
+    test "refuse a body that is a stream with no option duplex" do
+      for make_body <- [
+            fn -> Web.ReadableStream.from(["a"]) end,
+            fn -> Stream.map(["a"], & &1) end
+          ] do
+        assert_raise TypeError, ~r/duplex: "half"` is necessary/, fn ->
+          Request.new("https://example.com", method: "POST", body: make_body.())
+        end
+
+        for duplex <- ["half", :half] do
+          assert %Request{body_source: nil} =
+                   Request.new("https://example.com",
+                     method: "POST",
+                     body: make_body.(),
+                     duplex: duplex
+                   )
+        end
+      end
+
+      first = Request.new("https://example.com", method: "POST", body: "x")
+
+      assert_raise TypeError, ~r/duplex: "half"` is necessary/, fn ->
+        Request.new(first, body: Web.ReadableStream.from(["a"]))
+      end
+    end
+
+    test "do not require the option duplex for a body that has a source" do
+      for body <- [
+            "text",
+            ["io", "data"],
+            Web.URLSearchParams.new(%{"a" => "1"}),
+            Web.Blob.new(["blob"]),
+            Web.ArrayBuffer.new("buffer"),
+            Web.Uint8Array.new(Web.ArrayBuffer.new("view")),
+            Web.FormData.new()
+          ] do
+        assert %Request{} = Request.new("https://example.com", method: "POST", body: body)
+      end
+
+      # A request that has a stream body can be the input with no option.
+      first =
+        Request.new("https://example.com",
+          method: "POST",
+          body: Web.ReadableStream.from(["a"]),
+          duplex: "half"
+        )
+
+      assert %Request{method: "PUT"} = Request.new(first, method: "PUT")
+    end
+
     test "refuse a redirect mode or a duplex mode that is not valid" do
       assert_raise TypeError, ~r/is not a valid redirect mode/, fn ->
         Request.new("https://example.com", redirect: "sometimes")

@@ -116,6 +116,13 @@ All notable changes to this project are documented in this file.
 - **Breaking:** a stream goes to the errored state when its ambient
   `Web.AbortSignal` aborts. Before, it closed. An enumeration of an errored
   stream raises the error of the stream when that error is an exception.
+- **Breaking:** a `Web.AbortSignal` that is not aborted has an owner. Its
+  process stops when the owner stops and no process is subscribed to it.
+  Before, the process of a signal that did not abort stayed. A signal that
+  stopped is the same as an aborted signal.
+- The reason of an aborted signal stays available for the linger time.
+  Before, each abort put one entry in `:persistent_term`, and nothing
+  removed it.
 - **Breaking:** each stream has an owner, which is the process that made it,
   and each stream stops. Before, no stream process stopped, also after the
   stream was read to its end.
@@ -204,6 +211,11 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.AbortSignal.unsubscribe/1` removes the subscription from the signal.
+  Before, the signal kept each subscribed process until that process
+  stopped.
+- The helper processes of `Web.AbortSignal.any/1` stop when the new signal
+  stops.
 - `Web.URL` does not keep each host in a table. The table had no limit, and
   it was necessary only for the Node.js call that is now removed.
 - A stream subscribes to its ambient `Web.AbortSignal` in its own process.

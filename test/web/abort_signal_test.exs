@@ -166,7 +166,7 @@ defmodule Web.AbortSignalTest do
   test "handle_info ignores stale subscriber down messages" do
     monitor_ref = make_ref()
     other_ref = make_ref()
-    state = %{ref: make_ref(), subscribers: %{self() => other_ref}}
+    state = %{ref: make_ref(), subscribers: %{self() => {other_ref, 1}}}
 
     assert {:noreply, ^state} =
              Web.AbortSignal.handle_info({:DOWN, monitor_ref, :process, self(), :normal}, state)
@@ -174,7 +174,7 @@ defmodule Web.AbortSignalTest do
 
   test "handle_info removes matching subscribers on down" do
     monitor_ref = make_ref()
-    state = %{ref: make_ref(), subscribers: %{self() => monitor_ref}}
+    state = %{ref: make_ref(), subscribers: %{self() => {monitor_ref, 1}}}
 
     assert {:noreply, %{subscribers: %{}}} =
              Web.AbortSignal.handle_info({:DOWN, monitor_ref, :process, self(), :normal}, state)
@@ -182,7 +182,7 @@ defmodule Web.AbortSignalTest do
 
   test "handle_info timeout triggers the same shutdown path as abort" do
     ref = make_ref()
-    state = %{ref: ref, subscribers: %{self() => make_ref()}}
+    state = %{ref: ref, subscribers: %{self() => {make_ref(), 1}}}
 
     assert {:stop, {:shutdown, {:aborted, :timeout}}, ^state} =
              Web.AbortSignal.handle_info({:abort_signal_timeout, :timeout}, state)

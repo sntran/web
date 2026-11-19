@@ -1,10 +1,68 @@
 # credo:disable-for-this-file Credo.Check.Refactor.Nesting
+defmodule Web.AbortSignal.Reasons do
+  @moduledoc false
+
+  # Keeps the reason of each aborted signal for the linger time. The process
+  # of a signal stops when the signal aborts, thus a later call to
+  # `Web.AbortSignal.reason/1` reads the reason here.
+
+  use GenServer
+
+  @table __MODULE__
+  @sweep_interval 1_000
+
+  def start_link(_init), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @spec put(reference(), term()) :: :ok
+  def put(ref, reason) do
+    true = :ets.insert(@table, {ref, reason, expiry(Web.Promise.default_linger())})
+    :ok
+  rescue
+    # The application is not started.
+    ArgumentError -> :ok
+  end
+
+  @spec get(reference()) :: term() | nil
+  def get(ref) do
+    case :ets.lookup(@table, ref) do
+      [{^ref, reason, _expiry}] -> reason
+      [] -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp expiry(linger) when is_integer(linger), do: now() + linger
+  defp expiry(_infinity), do: :infinity
+
+  defp now, do: System.monotonic_time(:millisecond)
+
+  @impl true
+  def init(nil) do
+    :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+    Process.send_after(self(), :sweep, @sweep_interval)
+    {:ok, nil}
+  end
+
+  @impl true
+  def handle_info(:sweep, state) do
+    expired = [{{:_, :_, :"$1"}, [{:is_integer, :"$1"}, {:<, :"$1", now()}], [true]}]
+    :ets.select_delete(@table, expired)
+    Process.send_after(self(), :sweep, @sweep_interval)
+    {:noreply, state}
+  end
+end
+
 defmodule Web.AbortSignal do
   @moduledoc """
   An implementation of the WHATWG AbortSignal standard.
 
   Represents an abortable signal that can be shared across fetch operations.
   Signals are usually created through `Web.AbortController.new/0`.
+
+  A signal that is not aborted is a small process. It stops when the process
+  that made it stops and no process is subscribed to it. The reason of an
+  aborted signal stays available for the linger time (`config :web, linger: ms`).
 
   ## Examples
 
@@ -27,9 +85,11 @@ defmodule Web.AbortSignal do
   """
 
   use GenServer
-  @reason_key __MODULE__
 
+  alias Web.AbortSignal.Reasons
   alias Web.DOMException
+
+  @handoff_linger 5_000
 
   defstruct aborted: false, reason: nil, pid: nil, ref: nil
 
@@ -106,8 +166,7 @@ defmodule Web.AbortSignal do
   end
 
   def start_link do
-    ref = make_ref()
-    GenServer.start(__MODULE__, %{ref: ref, subscribers: %{}})
+    GenServer.start(__MODULE__, %{ref: make_ref(), subscribers: %{}, owner: Web.Promise.owner()})
   end
 
   @doc false
@@ -116,7 +175,14 @@ defmodule Web.AbortSignal do
   end
 
   @doc false
-  def init(state), do: {:ok, state}
+  def init(%{owner: owner} = state) do
+    state =
+      state
+      |> Map.delete(:owner)
+      |> Map.merge(%{owner_ref: Process.monitor(owner), owner_down?: false})
+
+    {:ok, state}
+  end
 
   @doc false
   def subscribe(nil), do: {:ok, nil}
@@ -151,6 +217,11 @@ defmodule Web.AbortSignal do
 
   @doc false
   def unsubscribe(nil), do: :ok
+
+  def unsubscribe(%{type: :abort_signal, pid: pid, monitor_ref: monitor_ref}) do
+    Process.demonitor(monitor_ref, [:flush])
+    GenServer.cast(pid, {:unsubscribe, self()})
+  end
 
   def unsubscribe(%{monitor_ref: monitor_ref}) do
     Process.demonitor(monitor_ref, [:flush])
@@ -268,14 +339,9 @@ defmodule Web.AbortSignal do
     end
   end
 
-  defp remember_reason(ref, reason) when is_reference(ref) do
-    :persistent_term.put({@reason_key, ref}, reason)
-    :ok
-  end
+  defp remember_reason(ref, reason) when is_reference(ref), do: Reasons.put(ref, reason)
 
-  defp remembered_reason(ref) when is_reference(ref) do
-    :persistent_term.get({@reason_key, ref}, nil)
-  end
+  defp remembered_reason(ref) when is_reference(ref), do: Reasons.get(ref)
 
   @doc false
   def receive_abort(nil, _timeout), do: :ok
@@ -355,9 +421,15 @@ defmodule Web.AbortSignal do
 
   @doc false
   def handle_call({:subscribe, subscriber}, _from, %{subscribers: subscribers} = state) do
-    monitor_ref = Process.monitor(subscriber)
-    subscribers = Map.put(subscribers, subscriber, monitor_ref)
-    {:reply, :ok, %{state | subscribers: subscribers}}
+    # A process can subscribe more than one time. The count shows how many
+    # subscriptions it has.
+    entry =
+      case subscribers do
+        %{^subscriber => {monitor_ref, count}} -> {monitor_ref, count + 1}
+        _ -> {Process.monitor(subscriber), 1}
+      end
+
+    {:reply, :ok, %{state | subscribers: Map.put(subscribers, subscriber, entry)}}
   end
 
   @doc false
@@ -369,6 +441,24 @@ defmodule Web.AbortSignal do
     end)
 
     {:stop, {:shutdown, {:aborted, reason}}, :ok, state}
+  end
+
+  @doc false
+  def handle_cast({:unsubscribe, subscriber}, %{subscribers: subscribers} = state) do
+    subscribers =
+      case subscribers do
+        %{^subscriber => {monitor_ref, 1}} ->
+          Process.demonitor(monitor_ref, [:flush])
+          Map.delete(subscribers, subscriber)
+
+        %{^subscriber => {monitor_ref, count}} ->
+          Map.put(subscribers, subscriber, {monitor_ref, count - 1})
+
+        _ ->
+          subscribers
+      end
+
+    noreply(%{state | subscribers: subscribers})
   end
 
   @doc false
@@ -387,6 +477,17 @@ defmodule Web.AbortSignal do
     handle_cast({:abort, reason}, state)
   end
 
+  # The linger time is complete, and no message came in that time.
+  @doc false
+  def handle_info(:timeout, state) do
+    if unused?(state), do: {:stop, :normal, state}, else: {:noreply, state}
+  end
+
+  @doc false
+  def handle_info({:DOWN, owner_ref, :process, _owner, _reason}, %{owner_ref: owner_ref} = state) do
+    noreply(%{state | owner_down?: true})
+  end
+
   @doc false
   def handle_info(
         {:DOWN, monitor_ref, :process, subscriber, _reason},
@@ -394,11 +495,29 @@ defmodule Web.AbortSignal do
       ) do
     subscribers =
       case Map.get(subscribers, subscriber) do
-        ^monitor_ref -> Map.delete(subscribers, subscriber)
+        {^monitor_ref, _count} -> Map.delete(subscribers, subscriber)
         _ -> subscribers
       end
 
-    {:noreply, %{state | subscribers: subscribers}}
+    noreply(%{state | subscribers: subscribers})
+  end
+
+  # A signal with no owner and no subscriber has no use. It waits for the
+  # linger time, because a different process can have the signal from a
+  # message, and then it stops.
+  defp noreply(state) do
+    if unused?(state), do: {:noreply, state, unused_linger()}, else: {:noreply, state}
+  end
+
+  defp unused?(state) do
+    Map.get(state, :owner_down?, false) and map_size(state.subscribers) == 0
+  end
+
+  defp unused_linger do
+    case Web.Promise.default_linger() do
+      linger when is_integer(linger) -> linger
+      _infinity -> @handoff_linger
+    end
   end
 
   defp any_abort_result(%__MODULE__{aborted: true, reason: reason}), do: {:aborted, reason}
@@ -429,11 +548,18 @@ defmodule Web.AbortSignal do
 
     Enum.each(signals, &start_any_abort_waiter(&1, coordinator, address))
 
+    # The waiters stop when this process stops. Thus this process must stop
+    # when the new signal stops with no abort.
+    signal_monitor = Process.monitor(controller.signal.pid)
+
     try do
       receive do
         {:abort_signal_any, ^address, reason} ->
           Process.unalias(address)
           Web.AbortController.abort(controller, reason)
+
+        {:DOWN, ^signal_monitor, :process, _pid, _reason} ->
+          :ok
       end
     after
       Process.unalias(address)

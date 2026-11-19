@@ -16,6 +16,7 @@ defmodule Web.Application do
       %{id: :pg, start: {:pg, :start_link, []}},
       Web.BroadcastChannel.DispatcherSupervisor,
       {Task.Supervisor, name: Web.TaskSupervisor},
+      Web.AbortSignal.Reasons,
       Web.URLPattern.Cache,
       {Finch,
        name: Web.Finch,

@@ -15,11 +15,12 @@
 * **Predictability**: 100% WPT compliance for core primitives like `URL` and `MIME`.
 * **Flow Control**: TC39-aligned concurrency management via `Web.Governor`.
 * **Context Propagation**: Ambient `AsyncContext` for metadata that survives process boundaries.
-* **Structured Data**: WHATWG-style `structured_clone/2` with transferable `ArrayBuffer`s.
-* **Capability Messaging**: `MessageChannel` and `MessagePort` for unforgeable, transferable process-backed handles.
-* **Cluster Coordination**: `BroadcastChannel` fan-out across BEAM nodes with sender-origin metadata.
+* **Structured Data**: `structured_clone/2` of the HTML Standard, with transferable `ArrayBuffer`s and message ports.
+* **Messaging**: `MessageChannel` and `MessagePort` of the HTML Standard, with the port message queue and transferable ports.
+* **Cluster Coordination**: `BroadcastChannel` to the channels of all the connected BEAM nodes.
+* **Developer Tools**: `Console` for `Logger`, and `Performance` for times, marks, and measures.
 * **Capability Sockets**: WINTERCG-style `Socket` handles with readable/writable streams and `STARTTLS` upgrades.
-* **Resource Disposal**: TC39-inspired `Symbol.dispose` support with a `using` macro for deterministic cleanup.
+* **Resource Disposal**: `Symbol.dispose` and a `using` macro with the rules of ECMAScript.
 * **Zero-Buffer Performance**: Native streaming with backpressure-aware engines.
 
 ---
@@ -61,9 +62,9 @@ end
 Web.await(GitHub.repositories())
 ```
 
-Disposable resources also fit the same runtime-first DSL. `use Web` now
-aliases `Web.Symbol` and imports a `using` macro that guarantees
-`Symbol.dispose` runs in an `after` block.
+`use Web` also imports the macro `using`, which releases a resource at the
+end of its block, as the `using` declaration of ECMAScript. The resource is
+released also when the block raises.
 
 ```elixir
 use Web
@@ -72,6 +73,12 @@ using channel <- BroadcastChannel.new("audit-log") do
   BroadcastChannel.post_message(channel, %{status: "started"})
 end
 ```
+
+A message port, a broadcast channel, a socket, a reader, and a writer are
+disposable. A value that is not disposable raises `Web.TypeError` before
+the block runs. When the block and the disposal fail, the macro raises
+`Web.SuppressedError` with the two errors. See `Web.Symbol` to make a
+struct disposable.
 
 📖 API Usage & Examples
 -----------------------
@@ -367,9 +374,11 @@ mix run examples/smtp_client.exs
 
 ### 🌍 Data & Metadata
 
-Structured cloning is available directly from `Web` and preserves supported
-Web container types, shared references, and transferable `ArrayBuffer`
-semantics.
+`structured_clone/2` is the structured clone of the HTML Standard. All
+data can be cloned: numbers, atoms, binaries, lists, tuples, maps, and
+structs that have only data. A value with an identity, such as an
+`ArrayBuffer` or a `Blob`, gets a new identity. The option `:transfer` moves
+a buffer or a message port, and detaches the source.
 
 ```elixir
 use Web
@@ -377,50 +386,58 @@ use Web
 buffer = ArrayBuffer.new("hello")
 
 clone =
-  structured_clone(%{"payload" => buffer}, transfer: [buffer])
+  structured_clone(%{payload: buffer, tags: [:a, :b]}, transfer: [buffer])
 
-ArrayBuffer.data(clone["payload"])
+ArrayBuffer.data(clone.payload)
 # => "hello"
 
-ArrayBuffer.byte_length(buffer)
-# => 0
+ArrayBuffer.detached?(buffer)
+# => true
 ```
 
-Unsupported values and non-transferable entries raise `Web.DOMException`
-with the standard `DataCloneError` name.
+A value that refers to something that runs cannot be cloned: a pid, a
+function, a stream, a promise. The function then raises `Web.DOMException`
+with the name `DataCloneError`, and changes nothing.
 
-`Web.MessageChannel` and `Web.MessagePort` expose the WHATWG capability
-messaging model directly on the BEAM. Ports are transferable handles,
-delivery restores `AsyncContext`, and the receiving process only gains the
-capabilities you explicitly transfer.
+`Web.MessageChannel` makes two connected ports. A message that one port
+sends arrives at the other port as an event `message`. A port can move to
+the listener that gets a message: put it in the transfer list.
 
 ```elixir
 use Web
 
-{controller, worker} = MessageChannel.new()
+{port1, port2} = MessageChannel.new()
 
-spawn(fn ->
-  worker =
-    MessagePort.onmessage(worker, fn event ->
-      received = event.data["port"]
-      MessagePort.post_message(received, %{"status" => "ok"})
-    end)
-
-  receive do
-    :stop -> MessagePort.close(worker)
-  end
+MessagePort.onmessage(port2, fn event ->
+  # Answer on the port that got the message.
+  MessagePort.post_message(event.target, String.upcase(event.data))
 end)
 
-{client, service} = MessageChannel.new()
+MessagePort.onmessage(port1, fn event -> IO.puts(event.data) end)
+MessagePort.post_message(port1, "hello")
+# Prints "HELLO".
 
-MessagePort.post_message(controller, %{"port" => service}, [service])
+MessagePort.close(port1)
 ```
 
-`Web.BroadcastChannel` turns those structured-clone guarantees into an
-idiomatic, distributed coordination primitive. Every broadcast clones its
-payload before fan-out, preserves sender `origin` metadata across nodes,
-restores `AsyncContext` values while listeners run, and exposes
-WHATWG-style `EventTarget` listener APIs on top of a process-backed runtime.
+The rules are those of a browser:
+
+* A port keeps its messages until it starts. `onmessage/2` starts the port.
+  After `add_event_listener/4`, call `MessagePort.start/1`.
+* The other port gets the event `close` when a port closes, or when the
+  process that holds the port stops.
+* A function on a closed port has no effect and gives no error.
+* The listeners of a port run in a process of that port. A listener can
+  call each function of its port, and a listener that raises does not stop
+  the port.
+
+A port and a channel stay until `close/1`, or until the process that made
+them stops. Close them, or use `using`.
+
+`Web.BroadcastChannel` sends a message to each other open channel with the
+same name, in this VM and on each connected node. The event has the node of
+the sender in `origin`, and the listeners run in the `AsyncContext` of the
+sender.
 
 ```elixir
 use Web
@@ -434,13 +451,13 @@ receiver =
   |> BroadcastChannel.onmessage(fn event ->
     {
       event.origin,
-      event.data["token"],
+      event.data.token,
       AsyncContext.Variable.get(request_id)
     }
   end)
 
 AsyncContext.Variable.run(request_id, "req-42", fn ->
-  BroadcastChannel.post_message(sender, %{"token" => "token-A"})
+  BroadcastChannel.post_message(sender, %{token: "token-A"})
 end)
 
 using receiver do
@@ -448,18 +465,48 @@ using receiver do
 end
 ```
 
+Each channel sends to the other channels with no process between them.
+Thus a slow listener delays only its channel, and the channels of a node
+continue when a different node stops. The messages of one channel arrive
+in their sequence.
+
 For a full cross-node example, run:
 
 ```shell
 mix run examples/cluster_auth_sync.exs
 ```
 
-For a capability-handover example that keeps secrets isolated behind a
-transferred port, run:
+For an example that gives a port to a worker, and keeps the secrets of the
+worker behind that port, run:
 
 ```shell
 mix run examples/secure_worker.exs
 ```
+
+`Web.Console` has the functions of `console` for the `Logger` of Elixir:
+the levels, the format of the Console Standard, tables, groups, timers,
+and counters. `Web.Performance` has `now/0`, marks, and measures of the
+User Timing Standard.
+
+```elixir
+use Web
+
+Console.group("import")
+Console.time("rows")
+Performance.mark("start")
+
+Console.log(["%s has %d rows", "users.csv", 1200])
+Console.table([%{name: "Ada", score: 10}, %{name: "Linus", score: 8}])
+
+Console.time_end("rows")
+# => rows: 3.214 ms
+Performance.measure("import", "start").duration
+# => 3.305
+Console.group_end()
+```
+
+The groups, the timers, the counters, and the entries are the state of the
+process that calls the functions.
 
 Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rclone-style URL support.
 
@@ -532,12 +579,20 @@ easy to make and hard to find with an example test:
 | `StreamLifetime.tla` | When a stream process stops, and when it must stay.        |
 | `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
 | `ResponseBody.tla`   | The body of a response: all its chunks, or an error.       |
+| `MessagePort.tla`    | The port message queue, the start, the transfer, and the close. |
+| `BroadcastChannel.tla` | The channels of one name, with a channel that is slow.   |
+| `Disposal.tla`       | The blocks of `using`: each resource is released one time. |
+| `Console.tla`        | The groups, the timers, and the counters of the console.   |
+| `Performance.tla`    | The marks and the measures of a process.                   |
 
 `mix test` examines each specification with the checker of
 [`accord`](https://github.com/sntran/accord), which is written in Elixir and
 needs no Java. The tests in `test/tla/` also do random operations on the
 real code and on the specification together, and compare the two states
 after each step.
+
+Each specification has a constant `Bug`. Each of its values removes one
+rule of the design, and a test makes sure that the checker finds it.
 
 ```shell
 # Examine the specifications and run the conformance tests

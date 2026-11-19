@@ -141,8 +141,84 @@ All notable changes to this project are documented in this file.
   `Web.ArrayBuffer` coverage tests for transfer detachment,
   shared-reference preservation, and concurrent table startup races.
 
+- `Web.MessagePort.start/1`, and the port message queue of the HTML
+  Standard: a port keeps its messages until `start/1` or `onmessage/2`.
+- The event `close` of a `Web.MessagePort`, with `onclose/1` and
+  `onclose/2`: a port gets it when the other port closes, or when the
+  process that holds the other port stops.
+- The event `messageerror`, with `onmessageerror/1` and `onmessageerror/2`,
+  for `Web.MessagePort` and `Web.BroadcastChannel`.
+- The field `ports` of a `Web.MessageEvent` has the transferred message
+  ports. The transfer list of `Web.MessagePort.post_message/3` can also be
+  `[transfer: list]`.
+- `Web.Event`, the event with no data of the DOM Standard.
+- `Web.SuppressedError`, as the error of ECMAScript for a disposal that
+  fails after a different error.
+- `Web.Symbol.async_iterator/0` and `Web.Symbol.disposable?/1`. A
+  `Web.Socket`, a `Web.ReadableStreamDefaultReader`, a
+  `Web.ReadableStreamBYOBReader`, and a `Web.WritableStreamDefaultWriter`
+  are disposable.
+- `Web.Console`: the format of the Console Standard (`%s`, `%d`, `%i`,
+  `%f`, `%o`, `%O`, `%c`, `%%`), `dir/2`, `dirxml/1`, `clear/0`, the
+  columns of `table/2`, and the data of `trace/1`. Each message has the
+  metadata `console_method`.
+- `Web.Performance`: the options `:start_time` and `:detail` of `mark/2`,
+  the options `:start`, `:end`, `:duration`, and `:detail` of `measure/3`,
+  the type of `get_entries_by_name/2`, and `to_json/0`.
+- TLA+ specifications for the message port, the broadcast channel, the
+  disposal of `using`, the console, and the performance entries, with a
+  model check and a conformance test for each one.
+- A test with a second node for `Web.BroadcastChannel`. It has the tag
+  `:cluster`, and it does not run on a machine that cannot start Erlang
+  distribution.
+
 ### Changed
 
+- **Breaking:** `Web.structured_clone/2` accepts all data: atoms, tuples,
+  bitstrings, improper lists, and structs that have only data. Before, a
+  map with an atom key raised `DataCloneError`. A `Web.Promise`, a
+  `Web.AbortSignal`, a `Web.AbortController`, a `Web.Request`, and a
+  `Web.Response` cannot be cloned. A detached `Web.ArrayBuffer` raises
+  `DataCloneError`, not `Web.TypeError`, and options that are not correct
+  raise `Web.TypeError`, not `ArgumentError`.
+- `Web.structured_clone/2` reads the value one time, and the clone of data
+  with no `Web.ArrayBuffer` or `Web.Blob` is the same term. Before, the
+  function made a binary of each part of the value: its time increased
+  with the square of the depth.
+- **Breaking:** a function on a `Web.MessagePort` that is closed or
+  detached has no effect and gives no error, as in a browser. Before, each
+  function waited 100 ms and raised `DataCloneError`. Only the transfer of
+  such a port raises `DataCloneError`.
+- **Breaking:** `Web.MessagePort.add_event_listener/4` does not start the
+  port, as in a browser. Call `Web.MessagePort.start/1`.
+- **Breaking:** `Web.MessagePort.post_message/3` with the port itself in
+  the transfer list raises `DataCloneError`.
+- **Breaking:** `Web.BroadcastChannel.post_message/2` on a closed channel
+  raises `InvalidStateError`, as the HTML Standard specifies. Each other
+  function on a closed channel has no effect.
+- **Breaking:** the structs `Web.MessagePort` and `Web.BroadcastChannel`
+  have no field `onmessage`, and their field `address` is a pid. The field
+  `origin` of a `Web.MessageEvent` is `""` when there is no origin.
+- **Breaking:** the modules `Web.BroadcastChannel.Dispatcher` and
+  `Web.BroadcastChannel.DispatcherSupervisor` are removed. An adapter of
+  `Web.BroadcastChannel` gets the pid of each channel, not the pid of a
+  dispatcher, and the message is `{:broadcast_channel_message, payload}`.
+- The setting `:broadcast_governor` limits `post_message/2` in the process
+  that sends the message.
+- **Breaking:** `Web.using/2` follows the rules of ECMAScript. A value that
+  is not disposable, and not `nil`, raises `Web.TypeError` before the
+  block. When the block and the disposal fail, the macro raises
+  `Web.SuppressedError`.
+- **Breaking:** `Web.Console.time/1` does not start a timer that runs: it
+  writes a warning. `Web.Console.assert/2` starts its message with
+  `Assertion failed`. `Web.Console.table/2` has the column `(index)`, a
+  map gives one row for each pair, and each line of a message in a group
+  has the indent.
+- **Breaking:** `Web.Performance.time_origin/0` is the time origin in
+  milliseconds of Unix time. Before, it was a value of the monotonic
+  clock, usually below zero. A mark that does not exist raises
+  `Web.DOMException` with the name `SyntaxError`, not `ArgumentError`. The
+  entries are in the sequence of their start times.
 - The packages `mint` (1.11.0), `hpax` (1.1.0), and `idna` (8.0.0) are
   updated, because `mix hex.audit` reported security advisories for the
   versions before. `idna` 8.0.0 has the tables of Unicode 18.0.
@@ -591,6 +667,31 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A message to a `Web.MessagePort` that has no listener at that time is not
+  lost: it stays in the port message queue.
+- A listener of a `Web.MessagePort` or a `Web.BroadcastChannel` can call
+  each function of its port or channel. Before, a listener that sent a
+  message on its port stopped the port.
+- A listener that raises does not stop its port, its channel, or its event
+  target. The error goes to the log.
+- A slow listener of a `Web.BroadcastChannel` delays only its channel.
+  Before, one process for each channel name, with a name in `:global`,
+  delivered each message to one channel at a time and waited for it. A
+  listener that did not return stopped all the channels of that name in
+  the cluster, and the queue of that process had no limit.
+- The application starts when an application of the user has started the
+  default scope of `:pg`. The broadcast channels now have their own scope.
+- `Web.structured_clone/2` accepts an improper list. Before, it raised
+  `FunctionClauseError`.
+- Two listeners from the same code with different values of their
+  variables are two listeners of an event target. Before, the second one
+  was ignored, and the removal of one removed the two.
+- `Web.Console.assert/2` writes nothing for a value that is not `false` and
+  not `nil`. Before, it wrote an error for a value such as `1`.
+- `Web.Console.table/2` accepts a list of values that are not maps.
+  Before, it raised `FunctionClauseError`.
+- `Web.Performance.measure/2` finds a mark when a measure has the same
+  name.
 - The parser of `multipart/form-data` keeps each backslash of a field name
   and of a file name. Before, it removed them: the file name
   `C:\dir\file.txt` became `C:dirfile.txt`. Only a backslash before a

@@ -42,19 +42,17 @@ defmodule SecureWorkerExample do
     await_handover()
     direct_pid_result = direct_pid_attack_result(worker_pid)
 
+    # A handle with a token that is not correct is a detached handle. As in
+    # a browser, a message on such a handle gives no error and has no
+    # effect: the worker gets nothing, thus no answer comes.
     forged_port = %{client_port | token: make_ref()}
+    :ok = MessagePort.post_message(forged_port, %{"op" => "read", "key" => "db_password"})
 
     forged_result =
-      try do
-        MessagePort.post_message(forged_port, %{"op" => "read", "key" => "db_password"})
-        :unexpected_success
-      rescue
-        exception in [DOMException] ->
-          if exception.name == "DataCloneError" do
-            :data_clone_error
-          else
-            reraise(exception, __STACKTRACE__)
-          end
+      receive do
+        {:client_reply, _reply} -> :unexpected_reply
+      after
+        200 -> :no_effect
       end
 
     :ok = MessagePort.post_message(client_port, %{"op" => "read", "key" => "db_password"})

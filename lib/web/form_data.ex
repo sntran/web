@@ -5,6 +5,24 @@ defmodule Web.FormData do
   Programmatically constructed instances store entries eagerly. Multipart-parsed
   instances are live-backed by a coordinator process that discovers entries lazily.
 
+  ## A form as a body
+
+  A form is a body of a `Web.Request` or a `Web.Response`. The body is
+  encoded as `multipart/form-data`, as the HTML Standard specifies, and the
+  header `content-type` gets the boundary of the form:
+
+      iex> form = Web.FormData.new(boundary: "example") |> Web.FormData.append("name", "value")
+      iex> response = Web.Response.new(body: form)
+      iex> Web.Headers.get(response.headers, "content-type", nil)
+      "multipart/form-data; boundary=example"
+      iex> text = Web.await(Web.Response.text(response))
+      iex> String.split(text, "\\r\\n")
+      ["--example", ~s(Content-Disposition: form-data; name="name"), "", "value", "--example--", ""]
+
+  The bytes of a file are read from its stream chunk by chunk. A form with
+  all its data in memory has a content length, and `Web.fetch/2` can send it
+  again after a redirect.
+
   ## Social Contract
 
   - Live iteration: `Web.FormData` is an `Enumerable` collection of
@@ -193,6 +211,21 @@ defmodule Web.FormData do
 
   def cancel(%__MODULE__{}, _reason), do: :ok
 
+  @doc false
+  # Returns `true` if the form can be encoded more than one time: its
+  # entries are in memory, and no file has a stream that can be read only
+  # one time. A request with such a body can follow a redirect that sends
+  # the body again.
+  @spec static?(t()) :: boolean()
+  def static?(%__MODULE__{coordinator: nil, entries: entries}) do
+    Enum.all?(entries, fn
+      {_name, %File{stream: stream}} -> is_nil(stream)
+      {_name, _value} -> true
+    end)
+  end
+
+  def static?(%__MODULE__{}), do: false
+
   @doc """
   Returns the multipart Content-Type header value for this form.
   """
@@ -246,6 +279,7 @@ defmodule Web.FormData do
     alias Web.AbortSignal
     alias Web.AsyncContext.Snapshot
     alias Web.File
+    alias Web.FormData.Encoder
     alias Web.Internal.Bytes
     alias Web.ReadableStream
     alias Web.TypeError
@@ -938,8 +972,16 @@ defmodule Web.FormData do
       end
     end
 
+    # The value of a parameter is a token, or text in quotation marks.
+    #
+    # A browser does not escape a backslash in such text: the HTML Standard
+    # escapes only a line feed, a carriage return, and a quotation mark, with
+    # a percent sign. Thus a backslash stays as it is, and a file name such
+    # as `C:\dir\file.txt` is not changed. Some other clients escape a
+    # quotation mark with a backslash. Thus a quotation mark after a
+    # backslash is part of the text, unless the parameter ends there.
     defp parse_disposition_params(value) do
-      ~r/;\s*([!#$%&'*+\-.^_`|~0-9A-Za-z]+\*?)\s*=\s*("(?:\\.|[^"])*"|[^;]*)/u
+      ~r/;\s*([!#$%&'*+\-.^_`|~0-9A-Za-z]+\*?)\s*=\s*("(?:[^"]|(?<=\\)"(?!\s*(?:;|\z)))*"|[^;]*)/u
       |> Regex.scan(value, capture: :all_but_first)
       |> Enum.reduce(%{}, fn [name, raw_value], acc ->
         decoded_value =
@@ -960,7 +1002,7 @@ defmodule Web.FormData do
            byte_size(value) >= 2 do
         value
         |> binary_part(1, byte_size(value) - 2)
-        |> String.replace(~r/\\(.)/u, "\\1")
+        |> String.replace("\\\"", "\"")
       else
         value
       end
@@ -1410,10 +1452,13 @@ defmodule Web.FormData do
       {:file, %{name: name, filename: filename, type: content_type}}
     end
 
+    # A name in quotation marks has escapes for a line feed, a carriage
+    # return, and a quotation mark, as the HTML Standard specifies for the
+    # encoding of a form. The parameter `filename*` has its own encoding.
     defp parse_form_data_disposition(value) do
       params = parse_disposition_params(value)
-      name = Map.get(params, "name")
-      filename = Map.get(params, "filename*") || Map.get(params, "filename")
+      name = unescape(Map.get(params, "name"))
+      filename = Map.get(params, "filename*") || unescape(Map.get(params, "filename"))
 
       case name do
         nil ->
@@ -1426,6 +1471,9 @@ defmodule Web.FormData do
           {:ok, %{name: name, filename: filename}}
       end
     end
+
+    defp unescape(nil), do: nil
+    defp unescape(text), do: Encoder.unescape(text)
 
     defp unwrap!(:await_ready, {:ok, :ok}), do: :ok
     defp unwrap!(:value, {:ok, value}), do: value

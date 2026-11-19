@@ -476,13 +476,13 @@ URLPattern.match_context(pattern, "https://example.com/users/42", fn ->
 end)
 ```
 
-Standard containers that handle MIME-aware sniffing and live multipart iteration.
+Standard containers for blobs, files, and forms.
 
 ```elixir
-# MIME-aware blobs sniff generic binaries
+# The type of a blob comes from the header `content-type`
 html = Response.new(
   body: "<!doctype html><html>...",
-  headers: [{"content-type", "application/octet-stream"}]
+  headers: [{"content-type", "text/html"}]
 )
 
 await(Response.blob(html)).type # => "text/html"
@@ -490,7 +490,20 @@ await(Response.blob(html)).type # => "text/html"
 # Live FormData iteration with O(1) memory usage
 form = await(Response.form_data(response))
 Enum.to_list(form)
+
+# A form as the body of a request: `multipart/form-data`
+form =
+  FormData.new()
+  |> FormData.append("title", "Report")
+  |> FormData.append("file", File.new(["bytes"], filename: "report.txt", type: "text/plain"))
+
+await(fetch("https://example.com/upload", method: "POST", body: form))
 ```
+
+A `FormData` body is encoded as the HTML Standard specifies, and the header
+`content-type` gets the boundary. The bytes of a file are read from its
+stream chunk by chunk. A form with all its data in memory has a content
+length, and it can be sent again after a redirect.
 
 * * * * *
 

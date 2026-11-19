@@ -28,6 +28,16 @@ All notable changes to this project are documented in this file.
   response that can come from HTTP/2, as the Fetch Standard specifies:
   HTTP/2 has no reason phrase. For HTTP/1.1, the text stays the usual
   reason phrase of the status.
+- A `Web.FormData` is a body of a request or a response. It is encoded as
+  `multipart/form-data`, with the encoding algorithm of the HTML Standard:
+  the line ends of a name and of a string become CR LF, and a line feed, a
+  carriage return, and a quotation mark in a name or a file name become
+  `%0A`, `%0D`, and `%22`. A file with no type has the type
+  `application/octet-stream`. The bytes of a file are read from its stream
+  chunk by chunk. A form with all its data in memory has a content length
+  and can be sent again after a redirect. Before, the header `content-type`
+  was set, but the body had the entries of the form, not bytes, and the
+  request failed.
 - The setting `config :web, tls_options: [...]` gives TLS options to
   `Web.fetch/2` and to the TLS sockets of `Web.connect/2`: a keyword list of
   options of the Erlang application `:ssl`. For example, `cacertfile`
@@ -581,6 +591,11 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- The parser of `multipart/form-data` keeps each backslash of a field name
+  and of a file name. Before, it removed them: the file name
+  `C:\dir\file.txt` became `C:dirfile.txt`. Only a backslash before a
+  quotation mark inside the text is an escape. The parser also reads the
+  escapes `%0A`, `%0D`, and `%22` of a name, which a browser writes.
 - A write to a `Web.Socket` of a chunk that is not bytes rejects with the
   `Web.TypeError`, and the writable side has that error. Before, the error
   had the form `{:transport_error, error}`, but the transport did not fail.

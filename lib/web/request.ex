@@ -228,6 +228,9 @@ defmodule Web.Request do
        when module in [Web.URLSearchParams, Web.Blob, Web.ArrayBuffer, Web.Uint8Array],
        do: body
 
+  # A form with all its data in memory can be encoded again.
+  defp body_source(%Web.FormData{} = form), do: if(Web.FormData.static?(form), do: form)
+
   defp body_source(_body), do: nil
 
   defp build_request(url, init) do

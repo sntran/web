@@ -47,6 +47,7 @@ defmodule Web.Body do
       "hello"
   """
 
+  alias Web.FormData.Encoder
   alias Web.Internal.Bytes
 
   @callback text(struct()) :: Web.Promise.t()
@@ -147,6 +148,11 @@ defmodule Web.Body do
       when struct in [Web.Blob, Web.ArrayBuffer, Web.Uint8Array, Web.URLSearchParams] do
     Web.ReadableStream.from(body)
   end
+
+  # A form is encoded as `multipart/form-data`, as the Fetch Standard
+  # specifies. The header `content-type` has the boundary of the form: see
+  # `put_inferred_content_type/2`.
+  def stream(%Web.FormData{} = form), do: form |> Encoder.encode() |> stream()
 
   # Each binary that an enumerable gives becomes a `Web.Uint8Array`.
   def stream(body) do

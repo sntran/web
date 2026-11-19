@@ -13,6 +13,7 @@ defmodule Web.Request do
     :url,
     :method,
     :body,
+    :body_source,
     :dispatcher,
     :redirect,
     :signal,
@@ -26,6 +27,7 @@ defmodule Web.Request do
           method: String.t(),
           headers: Web.Headers.t(),
           body: any(),
+          body_source: term(),
           dispatcher: module() | nil,
           redirect: String.t(),
           signal: Web.AbortSignal.t() | pid() | reference() | nil,
@@ -101,6 +103,17 @@ defmodule Web.Request do
     end
   end
 
+  # The source of a body is its data, when the data is in memory. A request
+  # with such a body can be sent again after a redirect. A body from a stream
+  # has no source.
+  defp body_source(body) when is_binary(body) or is_list(body), do: body
+
+  defp body_source(%module{} = body)
+       when module in [Web.URLSearchParams, Web.Blob, Web.ArrayBuffer, Web.Uint8Array],
+       do: body
+
+  defp body_source(_body), do: nil
+
   defp build_request(url, init) do
     method = Keyword.get(init, :method, "GET") |> to_string() |> String.upcase()
     raw_body = Keyword.get(init, :body)
@@ -110,7 +123,9 @@ defmodule Web.Request do
       |> Web.Headers.new()
       |> Web.Body.put_inferred_content_type(raw_body)
 
-    body = Web.ReadableStream.from(raw_body)
+    # A request with no body has the body `nil`, as the Fetch Standard
+    # specifies, and starts no stream.
+    body = if is_nil(raw_body), do: nil, else: Web.ReadableStream.from(raw_body)
     dispatcher = Keyword.get(init, :dispatcher)
     redirect = Keyword.get(init, :redirect, "follow") |> to_string()
 
@@ -128,6 +143,7 @@ defmodule Web.Request do
       method: method,
       headers: headers,
       body: body,
+      body_source: body_source(raw_body),
       dispatcher: dispatcher,
       redirect: redirect,
       signal: signal,

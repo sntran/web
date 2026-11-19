@@ -256,7 +256,7 @@ defmodule Web.FetchRedirectTest do
     assert Enum.to_list(resp.body) == ["POST:payload"]
   end
 
-  test "307 preserves a streaming request body through redirect follow", %{port: port} do
+  test "307 rejects a request body from a stream", %{port: port} do
     body =
       Web.ReadableStream.new(%{
         start: fn controller ->
@@ -266,17 +266,15 @@ defmodule Web.FetchRedirectTest do
         end
       })
 
-    resp =
-      await(
-        Web.fetch("http://localhost:#{port}/redir-relative",
-          method: "POST",
-          headers: %{"content-length" => "7"},
-          body: body
-        )
+    promise =
+      Web.fetch("http://localhost:#{port}/redir-relative",
+        method: "POST",
+        headers: %{"content-length" => "7"},
+        body: body
       )
 
-    assert resp.status == 200
-    assert Enum.to_list(resp.body) == ["POST:payload"]
+    # A stream cannot be sent a second time.
+    assert catch_exit(await(promise)) == :redirect_stream_body
   end
 
   test "follow closes the previous response body before opening the next request", %{port: port} do
@@ -285,24 +283,9 @@ defmodule Web.FetchRedirectTest do
     assert Enum.to_list(resp.body) == ["success"]
   end
 
-  test "308 preserves a streaming request body through redirect follow", %{port: port} do
-    body =
-      Web.ReadableStream.new(%{
-        start: fn controller ->
-          Web.ReadableStreamDefaultController.enqueue(controller, "pay")
-          Web.ReadableStreamDefaultController.enqueue(controller, "load")
-          Web.ReadableStreamDefaultController.close(controller)
-        end
-      })
-
+  test "308 sends a request body from memory again", %{port: port} do
     resp =
-      await(
-        Web.fetch("http://localhost:#{port}/redir-308",
-          method: "POST",
-          headers: %{"content-length" => "7"},
-          body: body
-        )
-      )
+      await(Web.fetch("http://localhost:#{port}/redir-308", method: "POST", body: "payload"))
 
     assert resp.status == 200
     assert_receive {:stream_target_body, "payload"}

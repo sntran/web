@@ -5,6 +5,14 @@ defmodule Web.Dispatcher.HTTP do
 
   @max_redirects 20
   @redirect_statuses [301, 302, 303, 307, 308]
+  @credential_headers ["authorization", "cookie", "proxy-authorization"]
+  @request_body_headers [
+    "content-encoding",
+    "content-language",
+    "content-length",
+    "content-location",
+    "content-type"
+  ]
   @status_texts %{
     100 => "Continue",
     101 => "Switching Protocols",
@@ -76,181 +84,216 @@ defmodule Web.Dispatcher.HTTP do
     do_fetch(request, 0)
   end
 
-  defp do_fetch(_request, redirect_count) when redirect_count > @max_redirects do
-    {:error, :too_many_redirects}
-  end
-
-  # credo:disable-for-next-line
   defp do_fetch(%Web.Request{} = request, redirect_count) do
-    {request, request_body_for_fetch} = prepare_request_body(request)
-
     case Web.AbortSignal.subscribe(request.signal) do
       {:ok, signal_subscription} ->
-        case build_finch_request(request, request_body_for_fetch) do
-          {:ok, finch_request} ->
-            {bridge_pid, bridge_ref, bridge_monitor} = start_stream_bridge(finch_request)
-
-            case await_response_head(bridge_pid, bridge_ref, bridge_monitor, signal_subscription) do
-              {:ok, status, headers} ->
-                Web.AbortSignal.unsubscribe(signal_subscription)
-                Process.demonitor(bridge_monitor, [:flush])
-
-                stream =
-                  Stream.resource(
-                    fn -> build_stream_state(bridge_pid, bridge_ref, request.signal) end,
-                    &receive_body_chunk/1,
-                    &cleanup_stream/1
-                  )
-
-                {:ok,
-                 Web.Response.new(
-                   status: status,
-                   status_text: Map.get(@status_texts, status, ""),
-                   headers: headers,
-                   body: stream,
-                   url: Web.URL.href(request.url)
-                 )}
-                |> handle_redirect(request, redirect_count)
-
-              {:error, reason} ->
-                Web.AbortSignal.unsubscribe(signal_subscription)
-                Process.demonitor(bridge_monitor, [:flush])
-                cancel_bridge(bridge_pid, bridge_ref)
-                {:error, reason}
-            end
-
-          {:error, reason} ->
-            Web.AbortSignal.unsubscribe(signal_subscription)
-            {:error, reason}
-        end
+        result = send_request(request, signal_subscription, redirect_count)
+        Web.AbortSignal.unsubscribe(signal_subscription)
+        release_request_body(request)
+        handle_redirect(result, request, redirect_count)
 
       {:error, :aborted} ->
         {:error, :aborted}
     end
   end
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
-  defp handle_redirect({:ok, response} = result, request, redirect_count) do
-    redirect_mode = request.options[:redirect] || request.redirect || "follow"
-    is_redirect = response.status in @redirect_statuses
+  defp send_request(request, signal_subscription, redirect_count) do
+    with {:ok, finch_request} <- build_finch_request(request) do
+      {bridge_pid, bridge_ref, bridge_monitor} = start_stream_bridge(finch_request)
+      head = await_response_head(bridge_pid, bridge_ref, bridge_monitor, signal_subscription)
+      Process.demonitor(bridge_monitor, [:flush])
 
-    cond do
-      is_redirect and redirect_mode == "error" ->
-        close_body(response.body)
-        {:error, :redirect_error}
+      case head do
+        {:ok, status, headers} ->
+          stream =
+            Stream.resource(
+              fn -> build_stream_state(bridge_pid, bridge_ref, request.signal) end,
+              &receive_body_chunk/1,
+              &cleanup_stream/1
+            )
 
-      is_redirect and redirect_mode == "manual" ->
-        result
+          {:ok,
+           with_request_signal(request.signal, fn ->
+             Web.Response.new(
+               status: status,
+               status_text: Map.get(@status_texts, status, ""),
+               headers: headers,
+               body: stream,
+               url: Web.URL.href(request.url),
+               redirected: redirect_count > 0
+             )
+           end)}
 
-      is_redirect and redirect_mode == "follow" ->
-        case Web.Headers.get(response.headers, "location") do
-          nil ->
-            result
-
-          location ->
-            close_body(response.body)
-
-            next_url =
-              request.url
-              |> Web.URL.href()
-              |> URI.parse()
-              |> URI.merge(location)
-              |> URI.to_string()
-
-            next_request = next_redirect_request(request, response.status, next_url)
-
-            do_fetch(next_request, redirect_count + 1)
-        end
-
-      true ->
-        result
+        {:error, reason} ->
+          cancel_bridge(bridge_pid, bridge_ref)
+          {:error, reason}
+      end
     end
   end
 
-  defp next_redirect_request(request, 303, next_url) do
+  # The body stream of the response subscribes to the signal of the request.
+  # Thus an abort puts the body in the errored state immediately.
+  defp with_request_signal(%Web.AbortSignal{} = signal, fun) do
+    Web.AsyncContext.with_signal(signal, fun)
+  end
+
+  defp with_request_signal(_signal, fun), do: fun.()
+
+  # ---------------------------------------------------------------------------
+  # Redirects: the "HTTP-redirect fetch" procedure of the Fetch Standard
+  # ---------------------------------------------------------------------------
+
+  defp handle_redirect({:error, _reason} = error, _request, _redirect_count), do: error
+
+  defp handle_redirect({:ok, response} = result, request, redirect_count) do
+    location = Web.Headers.get(response.headers, "location")
+
+    cond do
+      response.status not in @redirect_statuses or is_nil(location) ->
+        result
+
+      redirect_mode(request) == "manual" ->
+        result
+
+      redirect_mode(request) == "error" ->
+        close_body(response.body)
+        {:error, :redirect_error}
+
+      true ->
+        close_body(response.body)
+        follow_redirect(request, response.status, location, redirect_count)
+    end
+  end
+
+  defp redirect_mode(request), do: request.options[:redirect] || request.redirect || "follow"
+
+  defp follow_redirect(_request, _status, _location, redirect_count)
+       when redirect_count >= @max_redirects do
+    {:error, :too_many_redirects}
+  end
+
+  defp follow_redirect(request, status, location, redirect_count) do
+    with {:ok, next_url} <- redirect_url(request.url, location),
+         {:ok, next_request} <- redirect_request(request, status, next_url) do
+      do_fetch(next_request, redirect_count + 1)
+    end
+  end
+
+  # The location is relative to the URL of the request. A location with no
+  # fragment gets the fragment of the request.
+  defp redirect_url(request_url, location) do
+    next_url = Web.URL.new(location, Web.URL.href(request_url))
+
+    cond do
+      Web.URL.protocol(next_url) not in ["http:", "https:"] ->
+        {:error, :redirect_unsupported_scheme}
+
+      Web.URL.hash(next_url) == "" ->
+        {:ok, Web.URL.hash(next_url, Web.URL.hash(request_url))}
+
+      true ->
+        {:ok, next_url}
+    end
+  rescue
+    ArgumentError -> {:error, :redirect_invalid_location}
+  end
+
+  defp redirect_request(request, status, next_url) do
+    headers = redirect_headers(request, next_url)
+
+    cond do
+      method_becomes_get?(status, request.method) ->
+        {:ok, next_request(request, next_url, "GET", drop_body_headers(headers), nil)}
+
+      is_nil(request.body) ->
+        {:ok, next_request(request, next_url, request.method, headers, nil)}
+
+      # A body from a stream cannot be sent a second time.
+      is_nil(request.body_source) ->
+        {:error, :redirect_stream_body}
+
+      true ->
+        {:ok, next_request(request, next_url, request.method, headers, request.body_source)}
+    end
+  end
+
+  defp method_becomes_get?(status, "POST") when status in [301, 302], do: true
+  defp method_becomes_get?(303, method), do: method not in ["GET", "HEAD"]
+  defp method_becomes_get?(_status, _method), do: false
+
+  # A redirect to a different origin must not get the credentials of the
+  # first origin.
+  defp redirect_headers(request, next_url) do
+    if Web.URL.origin(request.url) == Web.URL.origin(next_url) do
+      request.headers
+    else
+      Enum.reduce(@credential_headers, request.headers, &Web.Headers.delete(&2, &1))
+    end
+  end
+
+  defp drop_body_headers(headers) do
+    Enum.reduce(@request_body_headers, headers, &Web.Headers.delete(&2, &1))
+  end
+
+  defp next_request(request, next_url, method, headers, body) do
     Web.Request.new(
       next_url,
       request.options
-      |> Keyword.put(:method, "GET")
-      |> Keyword.put(:headers, Web.Headers.delete(request.headers, "content-length"))
-      |> Keyword.put(:body, nil)
+      |> Keyword.put(:method, method)
+      |> Keyword.put(:headers, headers)
+      |> Keyword.put(:body, body)
       |> Keyword.put(:dispatcher, request.dispatcher)
     )
   end
 
-  defp next_redirect_request(request, status, next_url) when status in [307, 308] do
-    Web.Request.new(
-      next_url,
-      request.options
-      |> Keyword.put(:method, request.method)
-      |> Keyword.put(:headers, request.headers)
-      |> Keyword.put(:body, request.body)
-      |> Keyword.put(:dispatcher, request.dispatcher)
-    )
-  end
-
-  defp next_redirect_request(request, _status, next_url) do
-    Web.Request.new(
-      next_url,
-      request.options
-      |> Keyword.put(:method, request.method)
-      |> Keyword.put(:headers, request.headers)
-      |> Keyword.put(:body, request.body)
-      |> Keyword.put(:dispatcher, request.dispatcher)
-    )
-  end
+  defp close_body(nil), do: :ok
 
   defp close_body(body_stream) do
     _ = Enum.reduce_while(body_stream, :ok, fn _, acc -> {:halt, acc} end)
     :ok
   end
 
-  defp build_finch_request(request, body) do
-    normalized_body =
-      case normalize_body(body || request.body) do
-        {:ok, value} -> value
-        value -> value
-      end
+  # ---------------------------------------------------------------------------
+  # Request body
+  # ---------------------------------------------------------------------------
 
+  defp build_finch_request(request) do
     {:ok,
      Finch.build(
        request.method,
        Web.URL.href(request.url),
        Web.Headers.to_list(request.headers),
-       normalized_body
+       request_body(request)
      )}
   rescue
     error -> {:error, error}
   end
 
-  defp prepare_request_body(
-         %Web.Request{body: %Web.ReadableStream{} = body, redirect: "follow"} = request
-       ) do
-    if not Web.ReadableStream.disturbed?(body) and not Web.ReadableStream.locked?(body) do
-      binary = body |> Enum.to_list() |> IO.iodata_to_binary()
-      {%{request | body: binary}, binary}
-    else
-      {request, body}
-    end
+  # The request is complete or it failed. Cancel a body stream that the
+  # request did not read to its end, thus the stream stops.
+  defp release_request_body(%Web.Request{body: %Web.ReadableStream{controller_pid: pid}}) do
+    Web.Stream.terminate_and_wait(pid, :cancel, :request_complete)
   end
 
-  defp prepare_request_body(%Web.Request{} = request) do
-    {request, request.body}
+  defp release_request_body(_request), do: :ok
+
+  defp request_body(%Web.Request{body: nil}), do: nil
+
+  # The data of the body is in memory. Send it as one block, thus the request
+  # has a content length.
+  defp request_body(%Web.Request{body: %Web.ReadableStream{} = body, body_source: source})
+       when not is_nil(source) do
+    body |> Enum.to_list() |> IO.iodata_to_binary()
   end
 
-  defp normalize_body(nil), do: nil
-  defp normalize_body(body) when is_binary(body) or is_list(body), do: body
+  # The body is a stream. Finch reads it chunk by chunk when it sends the
+  # request.
+  defp request_body(%Web.Request{body: %Web.ReadableStream{} = body}), do: {:stream, body}
 
-  defp normalize_body(%Web.ReadableStream{} = body) do
-    {:ok, body |> Enum.to_list() |> IO.iodata_to_binary()}
-  end
+  defp request_body(%Web.Request{body: body}) when is_binary(body) or is_list(body), do: body
 
-  defp normalize_body(body) do
-    if Enumerable.impl_for(body) do
-      {:stream, body}
-    else
-      body
-    end
+  defp request_body(%Web.Request{body: body}) do
+    if Enumerable.impl_for(body), do: {:stream, body}, else: body
   end
 
   defp start_stream_bridge(finch_request) do
@@ -272,6 +315,7 @@ defmodule Web.Dispatcher.HTTP do
           headers_received?: false,
           ready_sent?: false,
           waiting_consumer: nil,
+          consumer_monitor: nil,
           pending_chunk: nil,
           terminal: nil
         })
@@ -327,56 +371,90 @@ defmodule Web.Dispatcher.HTTP do
       {:bridge_error, ref, reason} when ref == state.ref ->
         state = %{state | terminal: {:error, reason}}
 
-        if state.waiting_consumer do
-          send(state.waiting_consumer, {:bridge_error, ref, reason})
-        else
-          send(state.owner, {:bridge_failed, ref, reason})
+        cond do
+          state.waiting_consumer ->
+            send(state.waiting_consumer, {:bridge_error, ref, reason})
+
+          not state.ready_sent? ->
+            send(state.owner, {:bridge_failed, ref, reason})
+
+          # The reader gets the error with its subsequent request.
+          true ->
+            :ok
         end
 
         bridge_loop(%{state | waiting_consumer: nil})
 
-      {:bridge_next, ref, consumer} when ref == state.ref and not is_nil(state.pending_chunk) ->
-        {worker_pid, chunk} = state.pending_chunk
-        send(consumer, {:bridge_chunk, ref, chunk})
-        send(worker_pid, {:bridge_ack, ref})
-        bridge_loop(%{state | pending_chunk: nil})
-
-      # coveralls-ignore-start
-      {:bridge_next, ref, consumer} when ref == state.ref and state.terminal == :done ->
-        send(consumer, {:bridge_done, ref})
-        bridge_loop(state)
-
-      # coveralls-ignore-stop
-
       {:bridge_next, ref, consumer} when ref == state.ref ->
-        case state.terminal do
-          # coveralls-ignore-start
-          {:error, reason} ->
-            send(consumer, {:bridge_error, ref, reason})
-            bridge_loop(state)
-
-          # coveralls-ignore-stop
-
-          _ ->
-            bridge_loop(%{state | waiting_consumer: consumer})
-        end
+        state |> monitor_consumer(consumer) |> answer_consumer(consumer) |> bridge_loop()
 
       {:bridge_cancel, ref} when ref == state.ref ->
-        if state.worker_pid && Process.alive?(state.worker_pid) do
-          Process.exit(state.worker_pid, :kill)
-        end
+        stop_worker(state)
 
-        :ok
+      # The process that reads the body stopped and did not cancel.
+      {:DOWN, monitor_ref, :process, _consumer, _reason}
+      when monitor_ref == state.consumer_monitor ->
+        stop_worker(state)
 
+      # The worker stopped. The bridge stays, because the reader must get the
+      # result of the request: the end of the body, or the error.
       {:DOWN, monitor_ref, :process, worker_pid, reason}
       when monitor_ref == state.worker_monitor and worker_pid == state.worker_pid ->
-        unless reason in [:normal, :killed] or match?({:shutdown, _}, reason) do
-          send(state.owner, {:bridge_failed, state.ref, reason})
-        end
-
-        :ok
+        state |> worker_stopped(reason) |> bridge_loop()
     end
   end
+
+  defp monitor_consumer(%{consumer_monitor: nil} = state, consumer) do
+    %{state | consumer_monitor: Process.monitor(consumer)}
+  end
+
+  defp monitor_consumer(state, _consumer), do: state
+
+  defp answer_consumer(%{pending_chunk: {worker_pid, chunk}} = state, consumer) do
+    send(consumer, {:bridge_chunk, state.ref, chunk})
+    send(worker_pid, {:bridge_ack, state.ref})
+    %{state | pending_chunk: nil}
+  end
+
+  defp answer_consumer(%{terminal: :done} = state, consumer) do
+    send(consumer, {:bridge_done, state.ref})
+    state
+  end
+
+  defp answer_consumer(%{terminal: {:error, reason}} = state, consumer) do
+    send(consumer, {:bridge_error, state.ref, reason})
+    state
+  end
+
+  defp answer_consumer(state, consumer), do: %{state | waiting_consumer: consumer}
+
+  defp stop_worker(state) do
+    if state.worker_pid && Process.alive?(state.worker_pid) do
+      Process.exit(state.worker_pid, :kill)
+    end
+
+    :ok
+  end
+
+  # A worker that stopped before it gave the end of the body is an error.
+  defp worker_stopped(%{terminal: nil} = state, reason) do
+    error = {:connection_process_stopped, reason}
+
+    cond do
+      state.waiting_consumer ->
+        send(state.waiting_consumer, {:bridge_error, state.ref, error})
+
+      not state.ready_sent? ->
+        send(state.owner, {:bridge_failed, state.ref, reason})
+
+      true ->
+        :ok
+    end
+
+    %{state | terminal: {:error, error}, waiting_consumer: nil}
+  end
+
+  defp worker_stopped(state, _reason), do: state
 
   defp bridge_worker(bridge_pid, ref, finch_request) do
     result =
@@ -459,85 +537,87 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp build_stream_state(bridge_pid, bridge_ref, signal) do
-    case Web.AbortSignal.subscribe(signal) do
-      {:ok, signal_subscription} ->
-        %{
-          bridge_pid: bridge_pid,
-          bridge_ref: bridge_ref,
-          bridge_monitor: Process.monitor(bridge_pid),
-          signal_subscription: signal_subscription
-        }
+    signal_subscription =
+      case Web.AbortSignal.subscribe(signal) do
+        {:ok, subscription} -> subscription
+        {:error, :aborted} -> :aborted
+      end
 
-      {:error, :aborted} ->
-        cancel_bridge(bridge_pid, bridge_ref)
-
-        %{
-          bridge_pid: bridge_pid,
-          bridge_ref: bridge_ref,
-          bridge_monitor: Process.monitor(bridge_pid),
-          signal_subscription: nil,
-          aborted?: true
-        }
-    end
+    %{
+      bridge_pid: bridge_pid,
+      bridge_ref: bridge_ref,
+      bridge_monitor: Process.monitor(bridge_pid),
+      signal: signal,
+      signal_subscription: signal_subscription
+    }
   end
 
+  # A body that does not arrive completely is an error. The function raises,
+  # and the body stream goes to the errored state. Thus a reader cannot use a
+  # part of a body as the full body.
   defp receive_body_chunk(state) do
-    if Map.get(state, :aborted?, false) do
-      {:halt, state}
-    else
-      case Web.AbortSignal.receive_abort(state.signal_subscription, 0) do
-        {:error, :aborted} ->
-          # coveralls-ignore-next-line
-          abort_and_halt(state)
-
-        :ok ->
-          send(state.bridge_pid, {:bridge_next, state.bridge_ref, self()})
-          await_body_chunk(state)
-      end
-    end
+    check_abort!(state)
+    send(state.bridge_pid, {:bridge_next, state.bridge_ref, self()})
+    await_body_chunk(state)
   end
 
   defp await_body_chunk(state) do
     receive do
       {:bridge_chunk, ref, chunk} when ref == state.bridge_ref ->
-        case Web.AbortSignal.receive_abort(state.signal_subscription, 0) do
-          {:error, :aborted} ->
-            # coveralls-ignore-next-line
-            abort_and_halt(state)
-
-          :ok ->
-            {[chunk], state}
-        end
+        check_abort!(state)
+        {[chunk], state}
 
       {:bridge_done, ref} when ref == state.bridge_ref ->
         {:halt, state}
 
-      {:bridge_error, ref, _reason} when ref == state.bridge_ref ->
-        {:halt, state}
+      {:bridge_error, ref, reason} when ref == state.bridge_ref ->
+        raise_body_error(reason)
 
-      {:DOWN, monitor_ref, :process, pid, _reason}
+      {:DOWN, monitor_ref, :process, pid, reason}
       when monitor_ref == state.bridge_monitor and pid == state.bridge_pid ->
-        {:halt, state}
+        raise_body_error({:connection_process_stopped, reason})
     after
       50 ->
-        case Web.AbortSignal.receive_abort(state.signal_subscription, 0) do
-          {:error, :aborted} ->
-            abort_and_halt(state)
-
-          :ok ->
-            # coveralls-ignore-next-line
-            await_body_chunk(state)
-        end
+        check_abort!(state)
+        await_body_chunk(state)
     end
   end
 
-  defp abort_and_halt(state) do
+  defp check_abort!(%{signal_subscription: :aborted} = state), do: raise_abort(state, :aborted)
+
+  defp check_abort!(state) do
+    case Web.AbortSignal.receive_abort(state.signal_subscription, 0, true) do
+      {:error, :aborted, reason} -> raise_abort(state, reason)
+      :ok -> :ok
+    end
+  end
+
+  defp raise_abort(state, reason) do
     cancel_bridge(state.bridge_pid, state.bridge_ref)
-    {:halt, Map.put(state, :aborted?, true)}
+
+    reason =
+      case reason do
+        :aborted -> abort_reason(state.signal)
+        other -> other
+      end
+
+    raise Web.DOMException, name: "AbortError", message: inspect(reason)
+  end
+
+  defp abort_reason(%Web.AbortSignal{} = signal), do: Web.AbortSignal.reason(signal) || :aborted
+  defp abort_reason(_signal), do: :aborted
+
+  defp raise_body_error(reason) when is_exception(reason), do: raise(reason)
+
+  defp raise_body_error(reason) do
+    raise Web.TypeError, "The response body is not complete: #{inspect(reason)}"
   end
 
   defp cleanup_stream(state) do
-    Web.AbortSignal.unsubscribe(state.signal_subscription)
+    if is_map(state.signal_subscription) do
+      Web.AbortSignal.unsubscribe(state.signal_subscription)
+    end
+
     Process.demonitor(state.bridge_monitor, [:flush])
     cancel_bridge(state.bridge_pid, state.bridge_ref)
   end

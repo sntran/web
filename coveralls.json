@@ -1,5 +1,6 @@
 {
   "skip_files": [
-    "test/support/wpt.ex"
+    "test/support/wpt.ex",
+    "test/support/echo_server.ex"
   ]
 }

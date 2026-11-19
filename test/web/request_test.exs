@@ -12,8 +12,7 @@ defmodule Web.RequestTest do
       assert match?(%Web.URL{}, req.url)
       assert req.method == "GET"
       assert req.headers == Web.Headers.new()
-      assert match?(%Web.ReadableStream{}, req.body)
-      assert "" == Enum.join(req.body, "")
+      assert req.body == nil
       assert req.dispatcher == nil
       assert req.redirect == "follow"
       assert req.signal == nil

@@ -227,8 +227,9 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}")
     {:ok, resp} = HTTP.fetch(req)
 
-    chunks = resp.body |> Enum.to_list()
-    assert Enum.join(chunks) == "he"
+    # The body is shorter than its content length. The reader gets an error,
+    # not a part of the body.
+    assert is_exception(body_error(resp))
   end
 
   test "fetch/1 handles query variables in path explicitly correctly" do
@@ -339,14 +340,14 @@ defmodule Web.Dispatcher.HTTPTest do
     task =
       Task.async(fn ->
         send(parent, :http_body_started)
-        Enum.to_list(resp.body)
+        body_error(resp)
       end)
 
     assert_receive :http_body_started
     Process.sleep(20)
     assert :ok = Web.AbortController.abort(controller, :timeout)
 
-    assert {:ok, []} = Task.yield(task, 1000)
+    assert {:ok, %Web.TypeError{message: "The stream is errored."}} = Task.yield(task, 1000)
     assert_receive :http_client_closed, 1000
   end
 
@@ -368,7 +369,10 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert :ok = Web.AbortController.abort(controller, :timeout)
-    assert Enum.to_list(resp.body) == []
+    assert %Web.TypeError{message: "The stream is errored."} = body_error(resp)
+
+    reader = Web.ReadableStream.get_reader(resp.body)
+    assert catch_exit(Web.Promise.await(Web.ReadableStreamDefaultReader.read(reader))) == :timeout
   end
 
   test "fetch/1 halts before the first body recv when aborted after headers" do
@@ -385,7 +389,7 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert :ok = Web.AbortController.abort(controller, :timeout)
-    assert Enum.to_list(resp.body) == []
+    assert %Web.TypeError{message: "The stream is errored."} = body_error(resp)
   end
 
   test "fetch/1 keeps waiting for delayed body chunks while the signal stays alive" do
@@ -404,7 +408,7 @@ defmodule Web.Dispatcher.HTTPTest do
     assert Enum.to_list(resp.body) == ["data"]
   end
 
-  test "fetch/1 normalizes transport closure to aborted when abort arrives during recv" do
+  test "fetch/1 gives an error when the transport closes before the body is complete" do
     parent = self()
 
     port =
@@ -423,14 +427,13 @@ defmodule Web.Dispatcher.HTTPTest do
     task =
       Task.async(fn ->
         send(parent, :http_recv_started)
-        Enum.to_list(resp.body)
+        body_error(resp)
       end)
 
     assert_receive :http_recv_started, 100
-    Process.sleep(1)
-    send(task.pid, {:abort, :queued_abort})
 
-    assert {:ok, []} = Task.yield(task, 1000)
+    assert {:ok, error} = Task.yield(task, 1000)
+    assert is_exception(error)
   end
 
   test "fetch/1 returns error when bridge process dies before response head" do
@@ -490,17 +493,18 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/abort-next-pull", signal: controller.signal)
     {:ok, resp} = HTTP.fetch(req)
 
-    chunks =
-      Enum.reduce(resp.body, [], fn chunk, acc ->
-        if acc == [] do
-          :ok = Web.AbortController.abort(controller, :timeout)
-        end
+    parent = self()
 
-        [chunk | acc]
+    # An abort after the first chunk stops the body with an error.
+    assert_raise Web.TypeError, "The stream is errored.", fn ->
+      Enum.each(resp.body, fn chunk ->
+        send(parent, {:chunk, chunk})
+        :ok = Web.AbortController.abort(controller, :timeout)
       end)
+    end
 
-    # Aborting after the first delivered chunk should stop subsequent pulls.
-    assert Enum.reverse(chunks) == ["data"]
+    assert_received {:chunk, "data"}
+    refute_received {:chunk, "more"}
   end
 
   test "fetch/1 populates status_text from HTTP status code map" do
@@ -523,5 +527,14 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/500", method: :get)
     {:ok, resp} = HTTP.fetch(req)
     assert resp.status_text == "Internal Server Error"
+  end
+
+  # Reads the body and returns the exception that the read raises.
+  defp body_error(resp) do
+    _chunks = Enum.to_list(resp.body)
+    flunk("the body read did not raise")
+  rescue
+    error in [ExUnit.AssertionError] -> reraise error, __STACKTRACE__
+    error -> error
   end
 end

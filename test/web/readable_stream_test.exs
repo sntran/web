@@ -159,6 +159,11 @@ defmodule Web.ReadableStreamTest do
 
       source_strategy = Web.ByteLengthQueuingStrategy.new(7)
 
+      # A source with no pull function does not change the queue. Thus the
+      # size is stable.
+      idle_stream = ReadableStream.new(%{high_water_mark: 7, strategy: source_strategy})
+      assert ReadableStream.get_desired_size(idle_stream.controller_pid) == 7
+
       source_stream =
         ReadableStream.new(%{
           high_water_mark: 7,
@@ -169,7 +174,6 @@ defmodule Web.ReadableStreamTest do
           end
         })
 
-      assert ReadableStream.get_desired_size(source_stream.controller_pid) == 7
       assert Enum.join(source_stream, "") == "abc"
     end
 
@@ -730,9 +734,9 @@ defmodule Web.ReadableStreamTest do
           end
         })
 
-      # The controller should catch the error and become errored
-      # Enum.to_list calls get_reader then read.
-      assert_raise TypeError, ~r/errored/, fn ->
+      # The stream goes to the errored state, and the enumeration raises the
+      # error of the source.
+      assert_raise RuntimeError, "Ouch!", fn ->
         Enum.to_list(stream)
       end
     end

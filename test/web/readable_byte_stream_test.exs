@@ -536,18 +536,17 @@ defmodule Web.ReadableByteStreamTest do
     spawn(fn ->
       reader = ReadableStream.get_reader(stream, mode: "byob")
 
-      send(
-        parent,
-        {:aborting_read,
-         await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))}
-      )
+      read = ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2)))
+      send(parent, {:aborting_read, catch_exit(await(read))})
     end)
 
     request = await_byob_request(stream.controller_pid)
     address = request.address
 
+    # The read rejects with the abort reason. It does not look like the end
+    # of the stream.
     assert :ok = AbortController.abort(controller, :byob_abort)
-    assert_receive {:aborting_read, %{done: true}}, 1_000
+    assert_receive {:aborting_read, :byob_abort}, 1_000
     assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request == nil
 
     send(address, {:web_stream_byob_response, address, {:chunk, "zz"}})

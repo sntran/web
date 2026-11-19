@@ -93,6 +93,29 @@ All notable changes to this project are documented in this file.
     for the linger time. An `await` after that time rejects with
     `Web.TypeError`. The `opened`, `closed`, and `upgraded` promises of
     `Web.Socket` do not expire.
+- **Breaking:** `Web.fetch/2` follows the redirect rules of the Fetch
+  Standard.
+  - `301` and `302` change `POST` to `GET`. `303` changes each method to
+    `GET`, but not `GET` and `HEAD`. The body and the headers that describe
+    it are removed.
+  - A redirect to a different origin does not get the headers
+    `authorization`, `cookie`, and `proxy-authorization`.
+  - The location is relative to the URL of the request, and `Web.URL` reads
+    it. A location with no fragment gets the fragment of the request.
+  - A redirect that must send a stream body again rejects with
+    `:redirect_stream_body`. A body from memory is sent again.
+  - `Web.Response` has the field `redirected`.
+- **Breaking:** `Web.fetch/2` sends a `Web.ReadableStream` body chunk by
+  chunk. Before, it read the full stream into memory. A body from memory is
+  sent as one block with a content length.
+- **Breaking:** a `Web.Request` with no body has the body `nil` and starts
+  no stream. `Web.Request` has the field `body_source`.
+- **Breaking:** a response body that is not complete is an error. Before, a
+  connection that closed too early, and an abort, gave a body that looked
+  complete. The read now rejects with the error or the abort reason.
+- **Breaking:** a stream goes to the errored state when its ambient
+  `Web.AbortSignal` aborts. Before, it closed. An enumeration of an errored
+  stream raises the error of the stream when that error is an exception.
 - **Breaking:** each stream has an owner, which is the process that made it,
   and each stream stops. Before, no stream process stopped, also after the
   stream was read to its end.
@@ -181,6 +204,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.URL` does not keep each host in a table. The table had no limit, and
+  it was necessary only for the Node.js call that is now removed.
+- A stream subscribes to its ambient `Web.AbortSignal` in its own process.
+  Before, each such stream started one more process that did not stop.
+- A read from an errored stream gives the error of the stream. Before, a
+  reader could get "This reader is no longer locked."
 - `Web.ReadableStream.from/1` accepts an enumerable that halts itself, such
   as `Stream.take/2`. Before, the stream raised `CaseClauseError`. The
   chunks `nil` and `:done` are usual chunks.

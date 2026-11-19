@@ -98,7 +98,7 @@ defmodule Web.ReadableStream do
   end
 
   @impl Web.Stream
-  def terminate({:cancel, reason}, %{source: source}) do
+  def terminate({type, reason}, %{source: source}) when type in [:cancel, :abort] do
     do_terminate(reason, source)
   end
 
@@ -355,6 +355,14 @@ defmodule Web.ReadableStream do
     end
   end
 
+  # An error of the enumerable goes to the process that asked for the chunk.
+  # That process raises it again, and the stream goes to the errored state.
+  defp safe_enumerator_next(state) do
+    enumerator_next(state)
+  catch
+    kind, reason -> {:raised, kind, reason, __STACKTRACE__}
+  end
+
   # The accumulator of the reduction holds the chunk. The value `:none` shows
   # that the enumerable gave no chunk.
   defp enumerator_next(:done), do: :done
@@ -384,13 +392,14 @@ defmodule Web.ReadableStream do
   defp enumerator_loop(state) do
     receive do
       {:next, from, ref} ->
-        case enumerator_next(state) do
+        case safe_enumerator_next(state) do
           {:chunk, chunk, next_state} ->
             send(from, {ref, {:chunk, chunk}})
             enumerator_loop(next_state)
 
-          :done ->
-            send(from, {ref, :done})
+          # The enumerable is complete, or it failed. The enumerator stops.
+          last_reply ->
+            send(from, {ref, last_reply})
         end
 
       :stop ->
@@ -409,24 +418,21 @@ defmodule Web.ReadableStream do
 
   defp halt_enumerator(_initial_or_done), do: :ok
 
-  # If the enumerable raises, the enumerator process stops. Then this
-  # function exits with the same reason, and the stream goes to the errored
-  # state.
   defp ask_enumerator(pid) do
     ref = Process.monitor(pid)
     send(pid, {:next, self(), ref})
 
     receive do
+      {^ref, {:raised, kind, reason, stacktrace}} ->
+        Process.demonitor(ref, [:flush])
+        :erlang.raise(kind, reason, stacktrace)
+
       {^ref, reply} ->
         Process.demonitor(ref, [:flush])
         reply
 
       {:DOWN, ^ref, :process, ^pid, reason} when reason in [:normal, :noproc] ->
         :done
-
-      {:DOWN, ^ref, :process, ^pid, {%{__exception__: true} = exception, stacktrace}}
-      when is_list(stacktrace) ->
-        reraise exception, stacktrace
 
       {:DOWN, ^ref, :process, ^pid, reason} ->
         exit(reason)
@@ -1007,7 +1013,7 @@ defimpl Enumerable, for: Web.ReadableStream do
 
   defp do_reduce(reader, {:cont, acc}, fun) do
     case Web.Promise.wait(ReadableStreamDefaultReader.read(reader)) do
-      {:rejected, _reason} ->
+      {:rejected, reason} ->
         try do
           ReadableStreamDefaultReader.release_lock(reader)
         rescue
@@ -1015,7 +1021,7 @@ defimpl Enumerable, for: Web.ReadableStream do
           _ -> :ok
         end
 
-        raise Web.TypeError, "The stream is errored."
+        raise_stream_error(reason)
 
       {:fulfilled, %{done: true}} ->
         try do
@@ -1043,6 +1049,10 @@ defimpl Enumerable, for: Web.ReadableStream do
         end
     end
   end
+
+  # Gives the error of the stream, when it is an exception.
+  defp raise_stream_error(reason) when is_exception(reason), do: raise(reason)
+  defp raise_stream_error(_reason), do: raise(Web.TypeError, "The stream is errored.")
 
   def count(_stream), do: {:error, __MODULE__}
   def member?(_stream, _element), do: {:error, __MODULE__}

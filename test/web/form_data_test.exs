@@ -1109,6 +1109,7 @@ defmodule Web.FormDataTest do
       |> Task.await()
 
     assert match?({:error, %Web.TypeError{message: "The stream is errored."}}, result) or
+             match?({:error, %Web.TypeError{message: "file read failed"}}, result) or
              match?(
                {:exit, {{:shutdown, %Web.TypeError{message: "file read failed"}}, _}},
                result

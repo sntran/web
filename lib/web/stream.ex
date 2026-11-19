@@ -121,6 +121,7 @@ defmodule Web.Stream do
     error_reason: nil,
     cancel_on_reader_exit: false,
     # Lifetime
+    signal_subscription: nil,
     owner_ref: nil,
     owner_down_reason: nil,
     linger: 5_000,
@@ -249,9 +250,9 @@ defmodule Web.Stream do
         data
       end
 
-    # Bind ambient AbortSignal — if one was captured in the snapshot, subscribe
-    # so the stream auto-cancels when the signal fires.
-    maybe_bind_ambient_signal(snapshot)
+    # If the snapshot has an ambient AbortSignal, the stream goes to the
+    # errored state when the signal aborts.
+    data = %{data | signal_subscription: bind_ambient_signal(snapshot)}
 
     {:ok, initial_state, data, all_actions}
   end
@@ -830,6 +831,22 @@ defmodule Web.Stream do
   end
 
   # Task DOWN monitoring
+  # The process of the ambient AbortSignal stopped.
+  defp handle_common(
+         :info,
+         {:DOWN, monitor_ref, :process, _pid, down_reason},
+         state,
+         %{signal_subscription: %{monitor_ref: monitor_ref}} = data
+       ) do
+    reason =
+      case down_reason do
+        {:shutdown, {:aborted, reason}} -> reason
+        _other -> :aborted
+      end
+
+    handle_ambient_abort(reason, state, data)
+  end
+
   defp handle_common(
          :info,
          {:DOWN, ref, :process, _pid, reason},
@@ -862,13 +879,19 @@ defmodule Web.Stream do
     end
   end
 
-  # Ambient AbortSignal fired
+  # The ambient AbortSignal aborted. The stream goes to the errored state,
+  # thus a reader gets the abort reason and not a body that looks complete.
+  defp handle_common(
+         :info,
+         {:abort, ref, reason},
+         state,
+         %{signal_subscription: %{ref: ref}} = data
+       ) do
+    handle_ambient_abort(reason, state, data)
+  end
+
   defp handle_common(:info, {:ambient_signal_abort, reason}, state, data) do
-    if state in [:closed, :errored] do
-      :keep_state_and_data
-    else
-      handle_termination(:cancel, reason, data)
-    end
+    handle_ambient_abort(reason, state, data)
   end
 
   # The lifetime timer: see `with_lifetime/3`.
@@ -886,6 +909,16 @@ defmodule Web.Stream do
   end
 
   defp handle_common(_type, _content, _state, _data), do: :not_handled
+
+  defp handle_ambient_abort(reason, state, data) do
+    data = %{data | signal_subscription: nil}
+
+    if state in [:closed, :errored] do
+      {:keep_state, data}
+    else
+      handle_termination(:abort, reason, data)
+    end
+  end
 
   defp handle_closed_event(:cast, {:enqueue, _chunk}, _data), do: :keep_state_and_data
   defp handle_closed_event(:internal, :flush_requests, data), do: flush_read_requests(data)
@@ -914,6 +947,13 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
   end
 
+  # A read from an errored stream gives the error. The error releases the
+  # lock, thus this clause must come before the lock checks.
+  defp handle_read_request(from, _pid, :errored, data) do
+    disturbed_data = %{data | disturbed: true}
+    {:keep_state, disturbed_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
+  end
+
   defp handle_read_request(from, pid, _state, data) when pid != data.reader_pid do
     {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
   end
@@ -921,11 +961,6 @@ defmodule Web.Stream do
   defp handle_read_request(from, pid, _state, %{reader_mode: :byob} = data)
        when pid == data.reader_pid do
     {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
-  end
-
-  defp handle_read_request(from, _pid, :errored, data) do
-    disturbed_data = %{data | disturbed: true}
-    {:keep_state, disturbed_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
   end
 
   defp handle_read_request(from, _pid, state, data) do
@@ -962,6 +997,11 @@ defmodule Web.Stream do
     {:keep_state, new_data, maybe_request_pull(new_data, actions)}
   end
 
+  defp handle_byob_read_request(from, _pid, _view, :errored, data) do
+    disturbed_data = %{data | disturbed: true}
+    {:keep_state, disturbed_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
+  end
+
   defp handle_byob_read_request(from, pid, _view, _state, data)
        when pid != data.reader_pid or data.reader_mode != :byob do
     {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
@@ -970,11 +1010,6 @@ defmodule Web.Stream do
   defp handle_byob_read_request(from, _pid, _view, _state, %{stream_type: stream_type})
        when stream_type != :bytes do
     {:keep_state_and_data, [{:reply, from, {:error, :not_byte_stream}}]}
-  end
-
-  defp handle_byob_read_request(from, _pid, _view, :errored, data) do
-    disturbed_data = %{data | disturbed: true}
-    {:keep_state, disturbed_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
   end
 
   defp handle_byob_read_request(from, _pid, %Web.Uint8Array{} = view, state, data) do
@@ -2078,41 +2113,23 @@ defmodule Web.Stream do
   # Ambient AbortSignal binding
   # ---------------------------------------------------------------------------
 
-  defp maybe_bind_ambient_signal(%{ambient_signal: signal}), do: bind_ambient_signal(signal)
-  defp maybe_bind_ambient_signal(_), do: :ok
-
-  defp bind_ambient_signal(nil), do: :ok
-
-  defp bind_ambient_signal(%AbortSignal{aborted: true, reason: reason}) do
+  # The stream process subscribes to the signal. Thus no other process is
+  # necessary, and the signal drops the subscription when the stream stops.
+  defp bind_ambient_signal(%{ambient_signal: %AbortSignal{aborted: true, reason: reason}}) do
     send(self(), {:ambient_signal_abort, reason})
-    :ok
+    nil
   end
 
-  defp bind_ambient_signal(%AbortSignal{} = signal) do
-    stream_pid = self()
-
-    spawn_link(fn -> forward_ambient_signal_abort(signal, stream_pid) end)
-
-    :ok
-  end
-
-  defp bind_ambient_signal(_), do: :ok
-
-  defp forward_ambient_signal_abort(signal, stream_pid) do
+  defp bind_ambient_signal(%{ambient_signal: %AbortSignal{} = signal}) do
     case AbortSignal.subscribe(signal) do
       {:ok, subscription} ->
-        await_ambient_signal_abort(subscription, stream_pid)
+        subscription
 
       {:error, :aborted} ->
-        send(stream_pid, {:ambient_signal_abort, signal.reason || :aborted})
+        send(self(), {:ambient_signal_abort, AbortSignal.reason(signal) || :aborted})
+        nil
     end
   end
 
-  defp await_ambient_signal_abort(subscription, stream_pid) do
-    with {:error, :aborted, reason} <- AbortSignal.receive_abort(subscription, :infinity, true) do
-      send(stream_pid, {:ambient_signal_abort, reason})
-    end
-
-    :ok
-  end
+  defp bind_ambient_signal(_snapshot), do: nil
 end

@@ -18,6 +18,7 @@ defmodule Web.Response do
     :url,
     :type,
     :snapshot,
+    redirected: false,
     headers: Web.Headers.new()
   ]
 
@@ -29,6 +30,7 @@ defmodule Web.Response do
           status_text: String.t(),
           url: String.t(),
           type: String.t(),
+          redirected: boolean(),
           snapshot: AsyncContext.Snapshot.t() | nil
         }
 
@@ -74,6 +76,7 @@ defmodule Web.Response do
       status_text: status_text,
       url: Keyword.get(opts, :url),
       type: Keyword.get(opts, :type, "default"),
+      redirected: Keyword.get(opts, :redirected, false),
       snapshot: AsyncContext.Snapshot.take()
     }
   end

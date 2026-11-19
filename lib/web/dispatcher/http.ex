@@ -1,9 +1,32 @@
-# credo:disable-for-this-file Credo.Check.Refactor.Nesting
 defmodule Web.Dispatcher.HTTP do
   @moduledoc "HTTP dispatcher using Finch with zero-buffer streaming."
   @behaviour Web.Dispatcher
 
+  # ## The processes of a request
+  #
+  # The worker runs the request of the HTTP client. It gives the status and
+  # the headers of the response to the process that called `fetch/1`. That
+  # process makes the body stream, and gives it to the worker. Then the
+  # worker enqueues each chunk of the body directly into the stream:
+  #
+  #   * while the stream wants chunks (its desired size is above 0), the
+  #     worker enqueues with no wait. Thus one pull can get many chunks;
+  #   * when the stream has enough chunks, the worker waits for the next
+  #     pull. The pull callback of the stream only sends a message to the
+  #     worker. This is the backpressure: the worker does not read the
+  #     connection while it waits;
+  #   * at the end of the body, the worker closes the stream. When the
+  #     connection fails, the worker puts the stream in the errored state
+  #     with a `Web.TypeError`.
+  #
+  # The watcher monitors the worker. A worker that stops with no message,
+  # for example a worker that a different process kills, puts the stream in
+  # the errored state: a body that is not complete never looks complete. The
+  # cancel callback of the stream tells the watcher, and the watcher stops
+  # the worker. See `tla/ResponseBody.tla`.
+
   alias Web.Internal.Bytes
+  alias Web.ReadableStream
 
   @max_redirects 20
   @default_receive_timeout 300_000
@@ -102,33 +125,27 @@ defmodule Web.Dispatcher.HTTP do
 
   defp send_request(request, signal_subscription, redirect_count) do
     with {:ok, finch_request} <- build_finch_request(request) do
-      {bridge_pid, bridge_ref, bridge_monitor} = start_stream_bridge(finch_request)
-      head = await_response_head(bridge_pid, bridge_ref, bridge_monitor, signal_subscription)
-      Process.demonitor(bridge_monitor, [:flush])
+      ref = make_ref()
+      owner = self()
+      {worker, monitor} = spawn_monitor(fn -> run_worker(owner, ref, finch_request) end)
 
-      case head do
+      case await_response_head(worker, ref, monitor, signal_subscription) do
         {:ok, status, headers} ->
-          stream =
-            Stream.resource(
-              fn -> build_stream_state(bridge_pid, bridge_ref, request.signal) end,
-              &receive_body_chunk/1,
-              &cleanup_stream/1
-            )
-
           {:ok,
            with_request_signal(request.signal, fn ->
              Web.Response.__network__(
                status: status,
                status_text: status_text(status, request.url),
                headers: headers,
-               body: response_body(stream, request.method, status),
+               body: response_body({worker, ref, monitor}, signal_subscription, request, status),
                url: Web.URL.href(request.url),
                redirected: redirect_count > 0
              )
            end)}
 
         {:error, reason} ->
-          cancel_bridge(bridge_pid, bridge_ref)
+          Process.demonitor(monitor, [:flush])
+          Process.exit(worker, :kill)
           {:error, reason}
       end
     end
@@ -150,25 +167,60 @@ defmodule Web.Dispatcher.HTTP do
 
   defp cleartext?(url), do: Web.URL.protocol(url) == "http:"
 
-  # A body that no process reads holds its connection. Thus the body stream
-  # has a time limit for the start of the read.
   @null_body_statuses [101, 103, 204, 205, 304]
 
   # The response of a HEAD request, and a response with a status that permits
-  # no body, have the body `nil`, as the Fetch Standard specifies. The
-  # function reads the response to its end, thus the connection is released.
-  defp response_body(stream, method, status)
-       when method == "HEAD" or status in @null_body_statuses do
-    Stream.run(stream)
-    nil
+  # no body, have the body `nil`, as the Fetch Standard specifies. The worker
+  # reads the response to its end, thus the connection is released, and this
+  # process waits for it.
+  defp response_body({worker, ref, monitor}, signal_subscription, request, status)
+       when request.method == "HEAD" or status in @null_body_statuses do
+    check_abort!(signal_subscription, worker)
+    send(worker, {:http_body, ref, :discard})
+
+    receive do
+      {:http_done, ^ref} ->
+        Process.demonitor(monitor, [:flush])
+        nil
+
+      {:http_failed, ^ref, reason} ->
+        Process.demonitor(monitor, [:flush])
+        raise_body_error(reason)
+
+      {:DOWN, ^monitor, :process, ^worker, reason} ->
+        raise_body_error({:connection_process_stopped, reason})
+    end
   end
 
-  defp response_body(stream, _method, _status) do
-    # Each chunk of the body is a `Web.Uint8Array`, as the Fetch Standard
-    # specifies.
+  # The body stream keeps this number of bytes before the worker waits. Thus
+  # the full body of a small response arrives also when no process reads it,
+  # and its connection goes back to the pool.
+  @body_high_water_mark 65_536
+
+  # A body that no process reads, and that is larger than the queue of the
+  # stream, holds its connection. Thus the body stream has a time limit for
+  # the start of the read. A reader that stops cancels the body. The stream
+  # is made in this process, thus its owner is the process that called
+  # `fetch/1`, and it gets the signal of the request.
+  defp response_body({worker, ref, monitor}, _signal_subscription, _request, _status) do
+    watcher = spawn(fn -> watch(worker, ref) end)
+
+    stream =
+      ReadableStream.new(
+        %{
+          pull: fn _controller -> send(worker, {:http_pull, ref}) end,
+          cancel: fn _reason -> send(watcher, {:http_cancel, ref}) end
+        },
+        high_water_mark: @body_high_water_mark,
+        strategy: Web.ByteLengthQueuingStrategy.new(@body_high_water_mark),
+        unread_timeout: Web.Application.unread_body_timeout(),
+        cancel_on_reader_exit: true
+      )
+
+    send(watcher, {:http_stream, ref, stream.controller_pid})
+    send(worker, {:http_body, ref, stream.controller_pid})
+    Process.demonitor(monitor, [:flush])
     stream
-    |> Stream.map(&Web.Uint8Array.from/1)
-    |> Web.ReadableStream.from_enumerable(unread_timeout: Web.Application.unread_body_timeout())
   end
 
   defp receive_timeout do
@@ -350,326 +402,253 @@ defmodule Web.Dispatcher.HTTP do
   # specifies.
   defp request_chunk(chunk), do: Bytes.to_binary!(chunk, "The request body")
 
-  defp start_stream_bridge(finch_request) do
-    bridge_ref = make_ref()
-    owner = self()
+  # ---------------------------------------------------------------------------
+  # The head of the response
+  # ---------------------------------------------------------------------------
 
-    bridge_pid =
-      spawn(fn ->
-        Process.flag(:trap_exit, true)
-
-        bridge_loop(%{
-          owner: owner,
-          ref: bridge_ref,
-          request: finch_request,
-          worker_pid: nil,
-          worker_monitor: nil,
-          status: nil,
-          headers: [],
-          headers_received?: false,
-          ready_sent?: false,
-          waiting_consumer: nil,
-          consumer_monitor: nil,
-          pending_chunk: nil,
-          terminal: nil
-        })
-      end)
-
-    {bridge_pid, bridge_ref, Process.monitor(bridge_pid)}
-  end
-
-  defp bridge_loop(%{worker_pid: nil, request: request} = state) do
-    bridge_pid = self()
-    worker_pid = spawn(fn -> bridge_worker(bridge_pid, state.ref, request) end)
-    bridge_loop(%{state | worker_pid: worker_pid, worker_monitor: Process.monitor(worker_pid)})
-  end
-
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
-  defp bridge_loop(state) do
+  # The signal of the request stops the wait for the head of the response.
+  defp await_response_head(worker, ref, monitor, signal_subscription) do
     receive do
-      {:bridge_status, ref, status} when ref == state.ref ->
-        state
-        |> Map.put(:status, status)
-        |> maybe_send_ready()
-        |> bridge_loop()
-
-      {:bridge_headers, ref, headers} when ref == state.ref ->
-        state
-        |> put_headers(headers)
-        |> maybe_send_ready()
-        |> bridge_loop()
-
-      {:bridge_data, ref, chunk, worker_pid}
-      when ref == state.ref and is_nil(state.waiting_consumer) ->
-        bridge_loop(%{state | pending_chunk: {worker_pid, chunk}})
-
-      {:bridge_data, ref, chunk, worker_pid} when ref == state.ref ->
-        send(state.waiting_consumer, {:bridge_chunk, ref, chunk})
-        send(worker_pid, {:bridge_ack, ref})
-        bridge_loop(%{state | waiting_consumer: nil})
-
-      {:bridge_done, ref} when ref == state.ref ->
-        state = %{state | terminal: :done}
-
-        if state.waiting_consumer do
-          send(state.waiting_consumer, {:bridge_done, ref})
-        end
-
-        bridge_loop(%{state | waiting_consumer: nil})
-
-      {:bridge_error, ref, reason} when ref == state.ref ->
-        state |> fail(reason, reason) |> bridge_loop()
-
-      {:bridge_next, ref, consumer} when ref == state.ref ->
-        state |> monitor_consumer(consumer) |> answer_consumer(consumer) |> bridge_loop()
-
-      {:bridge_cancel, ref} when ref == state.ref ->
-        stop_worker(state)
-
-      # The process that reads the body stopped and did not cancel.
-      {:DOWN, monitor_ref, :process, _consumer, _reason}
-      when monitor_ref == state.consumer_monitor ->
-        stop_worker(state)
-
-      # The worker stopped. The bridge stays, because the reader must get the
-      # result of the request: the end of the body, or the error.
-      {:DOWN, monitor_ref, :process, worker_pid, reason}
-      when monitor_ref == state.worker_monitor and worker_pid == state.worker_pid ->
-        state |> worker_stopped(reason) |> bridge_loop()
-    end
-  end
-
-  defp monitor_consumer(%{consumer_monitor: nil} = state, consumer) do
-    %{state | consumer_monitor: Process.monitor(consumer)}
-  end
-
-  defp monitor_consumer(state, _consumer), do: state
-
-  defp answer_consumer(%{pending_chunk: {worker_pid, chunk}} = state, consumer) do
-    send(consumer, {:bridge_chunk, state.ref, chunk})
-    send(worker_pid, {:bridge_ack, state.ref})
-    %{state | pending_chunk: nil}
-  end
-
-  defp answer_consumer(%{terminal: :done} = state, consumer) do
-    send(consumer, {:bridge_done, state.ref})
-    state
-  end
-
-  defp answer_consumer(%{terminal: {:error, reason}} = state, consumer) do
-    send(consumer, {:bridge_error, state.ref, reason})
-    state
-  end
-
-  defp answer_consumer(state, consumer), do: %{state | waiting_consumer: consumer}
-
-  defp stop_worker(state) do
-    if state.worker_pid && Process.alive?(state.worker_pid) do
-      Process.exit(state.worker_pid, :kill)
-    end
-
-    :ok
-  end
-
-  # A worker that stopped before it gave the end of the body is an error.
-  defp worker_stopped(%{terminal: nil} = state, reason) do
-    fail(state, {:connection_process_stopped, reason}, reason)
-  end
-
-  defp worker_stopped(state, _reason), do: state
-
-  # The request failed. The process that waits gets the error: the reader of
-  # the body, or the process that waits for the head of the response. A
-  # reader that does not wait gets the error with its subsequent request.
-  defp fail(state, body_error, head_error) do
-    cond do
-      state.waiting_consumer ->
-        send(state.waiting_consumer, {:bridge_error, state.ref, body_error})
-
-      not state.ready_sent? ->
-        send(state.owner, {:bridge_failed, state.ref, head_error})
-
-      true ->
-        :ok
-    end
-
-    %{state | terminal: {:error, body_error}, waiting_consumer: nil}
-  end
-
-  # An informational response (a status from 100 to 199, but not 101) comes
-  # before the response. The Fetch Standard ignores it: the bridge waits for
-  # the subsequent status and headers.
-  defp put_headers(%{status: status} = state, _headers)
-       when status in 100..199 and status != 101 do
-    %{state | status: nil}
-  end
-
-  defp put_headers(state, headers), do: %{state | headers: headers, headers_received?: true}
-
-  defp bridge_worker(bridge_pid, ref, finch_request) do
-    result =
-      Finch.stream(
-        finch_request,
-        Web.Application.finch_name(finch_request.scheme),
-        :ok,
-        fn
-          {:status, status}, acc ->
-            send(bridge_pid, {:bridge_status, ref, status})
-            acc
-
-          {:headers, headers}, acc ->
-            send(bridge_pid, {:bridge_headers, ref, headers})
-            acc
-
-          {:data, chunk}, acc ->
-            send(bridge_pid, {:bridge_data, ref, chunk, self()})
-
-            # The bridge stops this process when the reader cancels.
-            receive do
-              {:bridge_ack, ^ref} -> acc
-            end
-
-          # The Fetch Standard does not give the trailers to the caller.
-          {:trailers, _trailers}, acc ->
-            acc
-        end,
-        # The time to wait for the response headers, and for each subsequent
-        # part of the body. It does not include the time that the reader of
-        # the body uses, nor the time to send the request body.
-        receive_timeout: receive_timeout(),
-        # A request waits for a free connection with no limit, as in a
-        # browser. The signal of the request stops the wait.
-        pool_timeout: :infinity,
-        request_timeout: :infinity
-      )
-
-    case result do
-      {:ok, _acc} ->
-        send(bridge_pid, {:bridge_done, ref})
-
-      {:error, reason, _acc} ->
-        send(bridge_pid, {:bridge_error, ref, reason})
-    end
-  end
-
-  defp maybe_send_ready(%{status: status, headers_received?: true} = state)
-       when not is_nil(status) do
-    send(state.owner, {:bridge_ready, state.ref, status, state.headers})
-    %{state | ready_sent?: true}
-  end
-
-  defp maybe_send_ready(state), do: state
-
-  defp await_response_head(bridge_pid, bridge_ref, bridge_monitor, signal_subscription) do
-    receive do
-      {:bridge_ready, ^bridge_ref, status, headers} ->
+      {:http_head, ^ref, status, headers} ->
         {:ok, status, headers}
 
-      {:bridge_failed, ^bridge_ref, reason} ->
+      {:http_failed, ^ref, reason} ->
         {:error, reason}
 
-      {:DOWN, ^bridge_monitor, :process, ^bridge_pid, reason} ->
+      {:DOWN, ^monitor, :process, ^worker, reason} ->
         {:error, reason}
     after
       50 ->
         case Web.AbortSignal.receive_abort(signal_subscription, 0) do
-          {:error, :aborted} ->
-            cancel_bridge(bridge_pid, bridge_ref)
-            {:error, :aborted}
-
-          :ok ->
-            await_response_head(bridge_pid, bridge_ref, bridge_monitor, signal_subscription)
+          {:error, :aborted} -> {:error, :aborted}
+          :ok -> await_response_head(worker, ref, monitor, signal_subscription)
         end
     end
   end
 
-  defp build_stream_state(bridge_pid, bridge_ref, signal) do
-    signal_subscription =
-      case Web.AbortSignal.subscribe(signal) do
-        {:ok, subscription} -> subscription
-        {:error, :aborted} -> :aborted
-      end
+  # A signal that aborted before the end of the request stops it.
+  defp check_abort!(signal_subscription, worker) do
+    case Web.AbortSignal.receive_abort(signal_subscription, 0, true) do
+      {:error, :aborted, reason} ->
+        Process.exit(worker, :kill)
+        raise_abort(reason)
 
-    %{
-      bridge_pid: bridge_pid,
-      bridge_ref: bridge_ref,
-      bridge_monitor: Process.monitor(bridge_pid),
-      signal: signal,
-      signal_subscription: signal_subscription
-    }
-  end
-
-  # A body that does not arrive completely is an error. The function raises,
-  # and the body stream goes to the errored state. Thus a reader cannot use a
-  # part of a body as the full body.
-  defp receive_body_chunk(state) do
-    check_abort!(state)
-    send(state.bridge_pid, {:bridge_next, state.bridge_ref, self()})
-    await_body_chunk(state)
-  end
-
-  defp await_body_chunk(state) do
-    receive do
-      {:bridge_chunk, ref, chunk} when ref == state.bridge_ref ->
-        check_abort!(state)
-        {[chunk], state}
-
-      {:bridge_done, ref} when ref == state.bridge_ref ->
-        {:halt, state}
-
-      {:bridge_error, ref, reason} when ref == state.bridge_ref ->
-        raise_body_error(reason)
-
-      {:DOWN, monitor_ref, :process, pid, reason}
-      when monitor_ref == state.bridge_monitor and pid == state.bridge_pid ->
-        raise_body_error({:connection_process_stopped, reason})
-    after
-      50 ->
-        check_abort!(state)
-        await_body_chunk(state)
+      :ok ->
+        :ok
     end
   end
 
-  defp check_abort!(%{signal_subscription: :aborted} = state), do: raise_abort(state, :aborted)
+  defp raise_abort(reason) when is_exception(reason), do: raise(reason)
 
-  defp check_abort!(state) do
-    case Web.AbortSignal.receive_abort(state.signal_subscription, 0, true) do
-      {:error, :aborted, reason} -> raise_abort(state, reason)
-      :ok -> :ok
-    end
-  end
-
-  defp raise_abort(state, reason) do
-    cancel_bridge(state.bridge_pid, state.bridge_ref)
-
-    case reason do
-      # The signal aborted before the read of the body started.
-      :aborted -> raise Web.AbortSignal.reason(state.signal) || Web.AbortSignal.default_reason()
-      reason when is_exception(reason) -> raise reason
-      reason -> raise Web.DOMException, name: "AbortError", message: inspect(reason)
-    end
-  end
+  defp raise_abort(reason),
+    do: raise(Web.DOMException, name: "AbortError", message: inspect(reason))
 
   # A network error in the body is a `TypeError`, as the Fetch Standard
   # specifies.
-  defp raise_body_error(reason) do
-    raise Web.TypeError, message: "The response body is not complete.", cause: reason
+  defp raise_body_error(reason), do: raise(body_error(reason))
+
+  defp body_error(reason) do
+    %Web.TypeError{message: "The response body is not complete.", cause: reason}
   end
 
-  defp cleanup_stream(state) do
-    if is_map(state.signal_subscription) do
-      Web.AbortSignal.unsubscribe(state.signal_subscription)
-    end
+  # ---------------------------------------------------------------------------
+  # The watcher
+  # ---------------------------------------------------------------------------
 
-    Process.demonitor(state.bridge_monitor, [:flush])
-    cancel_bridge(state.bridge_pid, state.bridge_ref)
+  # The watcher gets the stream from the process that made it. A worker that
+  # stops before the end of the body puts the stream in the errored state.
+  defp watch(worker, ref) do
+    monitor = Process.monitor(worker)
+
+    stream =
+      receive do
+        {:http_stream, ^ref, stream} -> stream
+      end
+
+    receive do
+      {:http_cancel, ^ref} ->
+        Process.exit(worker, :kill)
+
+      {:DOWN, ^monitor, :process, ^worker, :normal} ->
+        :ok
+
+      {:DOWN, ^monitor, :process, ^worker, reason} ->
+        ReadableStream.error(stream, body_error({:connection_process_stopped, reason}))
+    end
   end
 
-  defp cancel_bridge(bridge_pid, bridge_ref) do
-    if Process.alive?(bridge_pid) do
-      send(bridge_pid, {:bridge_cancel, bridge_ref})
-    end
+  # ---------------------------------------------------------------------------
+  # The worker
+  # ---------------------------------------------------------------------------
 
-    :ok
+  defp run_worker(owner, ref, finch_request) do
+    acc = %{
+      owner: owner,
+      owner_monitor: Process.monitor(owner),
+      ref: ref,
+      status: nil,
+      phase: :head,
+      stream: nil,
+      stream_monitor: nil
+    }
+
+    result =
+      try do
+        Finch.stream_while(
+          finch_request,
+          Web.Application.finch_name(finch_request.scheme),
+          acc,
+          &handle_event/2,
+          # The time to wait for the response headers, and for each
+          # subsequent part of the body. It does not include the time that
+          # the reader of the body uses, nor the time to send the request
+          # body.
+          receive_timeout: receive_timeout(),
+          # A request waits for a free connection with no limit, as in a
+          # browser. The signal of the request stops the wait.
+          pool_timeout: :infinity,
+          request_timeout: :infinity
+        )
+      catch
+        # The callback failed, and the HTTP client closed the connection.
+        # The last state of the request is in the process dictionary.
+        :error, reason -> {:error, reason, Process.get(__MODULE__, acc)}
+      end
+
+    report(result)
+  end
+
+  defp handle_event({:status, status}, acc), do: {:cont, %{acc | status: status}}
+
+  # An informational response (a status from 100 to 199, but not 101) comes
+  # before the response. The Fetch Standard ignores it: the worker waits for
+  # the subsequent status and headers.
+  defp handle_event({:headers, _headers}, %{phase: :head, status: status} = acc)
+       when status in 100..199 and status != 101 do
+    {:cont, %{acc | status: nil}}
+  end
+
+  defp handle_event({:headers, headers}, %{phase: :head} = acc) do
+    send(acc.owner, {:http_head, acc.ref, acc.status, headers})
+    receive_body_target(acc)
+  end
+
+  # The trailers of a response. The Fetch Standard does not give them to the
+  # caller.
+  defp handle_event({:headers, _trailers}, acc), do: {:cont, acc}
+  defp handle_event({:trailers, _trailers}, acc), do: {:cont, acc}
+  defp handle_event({:data, _chunk}, %{phase: :discard} = acc), do: {:cont, acc}
+  defp handle_event({:data, chunk}, acc), do: {deliver(acc, chunk), acc}
+
+  # The process that called `fetch/1` gives the body stream, or tells that
+  # the response has no body. A process that stopped needs no response.
+  defp receive_body_target(acc) do
+    owner_monitor = acc.owner_monitor
+
+    receive do
+      {:http_body, ref, :discard} when ref == acc.ref ->
+        {:cont, remember(%{acc | phase: :discard})}
+
+      {:http_body, ref, stream} when ref == acc.ref ->
+        Process.demonitor(owner_monitor, [:flush])
+
+        acc = %{
+          acc
+          | phase: :body,
+            stream: stream,
+            stream_monitor: Process.monitor(stream)
+        }
+
+        {:cont, remember(acc)}
+
+      {:DOWN, ^owner_monitor, :process, _owner, _reason} ->
+        {:halt, %{acc | phase: :abandoned}}
+    end
+  end
+
+  defp remember(acc) do
+    Process.put(__MODULE__, acc)
+    acc
+  end
+
+  # Enqueues one chunk, then waits while the stream has enough chunks.
+  defp deliver(acc, chunk) do
+    ReadableStream.enqueue(acc.stream, Web.Uint8Array.from(chunk))
+    await_demand(acc, true)
+  end
+
+  # A stream that has enough chunks has chunks in its queue: a read that
+  # waits takes a chunk at once. Thus a read makes the desired size larger,
+  # and the stream calls pull again when it is above 0. The pull messages
+  # that came before the check are of no use, and the worker drops them. A
+  # pull that comes after the drop is new: the worker examines the desired
+  # size again before it waits.
+  defp await_demand(acc, drop?) do
+    case ReadableStream.get_desired_size(acc.stream) do
+      size when is_number(size) and size > 0 ->
+        drop_pulls(acc.ref)
+        :cont
+
+      nil ->
+        :halt
+
+      _full when drop? ->
+        drop_pulls(acc.ref)
+        await_demand(acc, false)
+
+      _full ->
+        stream_monitor = acc.stream_monitor
+
+        receive do
+          {:http_pull, ref} when ref == acc.ref -> :cont
+          {:DOWN, ^stream_monitor, :process, _stream, _reason} -> :halt
+        end
+    end
+  end
+
+  defp drop_pulls(ref) do
+    receive do
+      {:http_pull, ^ref} -> drop_pulls(ref)
+    after
+      0 -> :ok
+    end
+  end
+
+  # The end of the request. The worker tells the process that waits: the
+  # process that called `fetch/1` before the body, and the body stream after.
+  defp report({:ok, %{phase: :body} = acc}) do
+    if await_drain(acc) == :cont, do: ReadableStream.close(acc.stream)
+  end
+
+  defp report({:ok, %{phase: :discard} = acc}), do: send(acc.owner, {:http_done, acc.ref})
+  defp report({:ok, %{phase: :abandoned}}), do: :ok
+
+  defp report({:error, reason, %{phase: :body} = acc}) do
+    ReadableStream.error(acc.stream, body_error(reason))
+  end
+
+  defp report({:error, reason, acc}), do: send(acc.owner, {:http_failed, acc.ref, reason})
+
+  # The worker closes the stream when its queue is empty. Until then the
+  # body is readable: an abort of the request signal puts it in the errored
+  # state, as the Fetch Standard specifies for a body that is not read. The
+  # connection is free already, because the HTTP client has the full
+  # response.
+  defp await_drain(acc) do
+    case ReadableStream.get_desired_size(acc.stream) do
+      nil ->
+        :halt
+
+      @body_high_water_mark ->
+        :cont
+
+      _size ->
+        stream_monitor = acc.stream_monitor
+
+        receive do
+          {:http_pull, ref} when ref == acc.ref -> await_drain(acc)
+          {:DOWN, ^stream_monitor, :process, _stream, _reason} -> :halt
+        end
+    end
   end
 end

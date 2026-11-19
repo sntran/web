@@ -262,11 +262,27 @@ defmodule Web.TLA.ModelCheckTest do
       assert_holds(SpecModel.check("ResponseBody"))
     end
 
+    test "the design has all its properties with a larger queue" do
+      assert_holds(SpecModel.check("ResponseBody", {"Limit = 1", "Limit = 2"}))
+    end
+
     test "a body that is not complete, but looks complete, is found" do
       assert_violates(
-        SpecModel.check("ResponseBody", bug("exit_on_worker_stop")),
+        SpecModel.check("ResponseBody", bug("close_on_failure")),
         "FullBodyOrError"
       )
+    end
+
+    test "a reader that waits with no end when the worker stops is found" do
+      assert_violates(SpecModel.check("ResponseBody", bug("no_watcher")), "ReaderGetsAnEnd")
+    end
+
+    test "a worker that reads with no backpressure is found" do
+      assert_violates(SpecModel.check("ResponseBody", bug("no_backpressure")), "QueueBounded")
+    end
+
+    test "a connection that stays after a cancel is found" do
+      assert_violates(SpecModel.check("ResponseBody", bug("cancel_ignored")), "CancelStopsWorker")
     end
   end
 end

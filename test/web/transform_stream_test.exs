@@ -81,6 +81,49 @@ defmodule Web.TransformStreamTest do
       assert log == ""
     end
 
+    test "does not wait for a promise that the function start returns" do
+      test = self()
+      {started, resolve, _reject} = Promise.with_resolvers()
+
+      transform =
+        TransformStream.new(%{
+          start: fn _controller -> started end,
+          transform: fn chunk, controller ->
+            send(test, {:transform, chunk})
+            Controller.enqueue(controller, chunk)
+          end
+        })
+
+      # The constructor returned, and the promise is pending. The write and
+      # the read wait for it.
+      writer = WritableStream.get_writer(transform.writable)
+      reader = ReadableStream.get_reader(transform.readable)
+      write = Writer.write(writer, :chunk)
+      read = Reader.read(reader)
+      refute_receive {:transform, _chunk}, 50
+      assert Promise.peek(write) == :pending
+
+      resolve.(:ok)
+      assert await(read) == %{value: :chunk, done: false}
+      assert await(write) == :ok
+      assert_received {:transform, :chunk}
+    end
+
+    test "goes to the errored state when the promise of the function start rejects" do
+      {started, _resolve, reject} = Promise.with_resolvers()
+      transform = TransformStream.new(%{start: fn _controller -> started end})
+
+      writer = WritableStream.get_writer(transform.writable)
+      reader = ReadableStream.get_reader(transform.readable)
+      write = Writer.write(writer, :chunk)
+      read = Reader.read(reader)
+
+      reject.(:start_failed)
+      assert rejection(write) == :start_failed
+      assert rejection(read) == :start_failed
+      assert rejection(Writer.closed(writer)) == :start_failed
+    end
+
     test "lets the function start put chunks in the queue" do
       transform =
         TransformStream.new(%{
@@ -257,6 +300,97 @@ defmodule Web.TransformStreamTest do
       assert [:ok, :ok] = Enum.map(Enum.take(writes, 2), &await/1)
       assert %TypeError{} = rejection(Enum.at(writes, 2))
       assert %TypeError{} = rejection(Writer.write(writer, :later))
+    end
+
+    test "terminate puts the writable side in the errored state with a TypeError" do
+      transform =
+        TransformStream.new(%{
+          transform: fn _chunk, controller -> Controller.terminate(controller) end
+        })
+
+      writer = WritableStream.get_writer(transform.writable)
+      closed = Writer.closed(writer)
+      write = Writer.write(writer, :chunk)
+      late = Writer.write(writer, :late)
+      close = Writer.close(writer)
+
+      assert Enum.to_list(transform.readable) == []
+      assert await(write) == :ok
+
+      # The write that waited, the close that waited, and the promises of
+      # the writer reject with the same error.
+      error = rejection(late)
+      assert %TypeError{message: "The transform stream was terminated."} = error
+      assert rejection(close) == error
+      assert rejection(closed) == error
+      assert rejection(Writer.closed(writer)) == error
+      assert rejection(Writer.ready(writer)) == error
+      assert Writer.desired_size(writer) == nil
+
+      # The readable side is closed, not errored.
+      reader = ReadableStream.get_reader(transform.readable)
+      assert await(Reader.closed(reader)) == :ok
+      assert await(Reader.read(reader)) == %{value: nil, done: true}
+    end
+
+    test "terminate in the function flush does not prevent the close" do
+      transform =
+        TransformStream.new(%{flush: fn controller -> Controller.terminate(controller) end})
+
+      {writer, [write], close} = write_all(transform, [:chunk])
+
+      assert Enum.to_list(transform.readable) == [:chunk]
+      assert await(write) == :ok
+      assert await(close) == :ok
+      assert await(Writer.closed(writer)) == :ok
+    end
+
+    test "enqueue raises a TypeError after terminate, and the write rejects with it" do
+      transform =
+        TransformStream.new(%{
+          transform: fn chunk, controller ->
+            Controller.enqueue(controller, chunk)
+            Controller.terminate(controller)
+            Controller.enqueue(controller, :late)
+          end
+        })
+
+      writer = WritableStream.get_writer(transform.writable)
+      write = Writer.write(writer, :chunk)
+
+      # The readable side is closed with the chunk that came before the
+      # terminate. It is not errored.
+      assert Enum.to_list(transform.readable) == [:chunk]
+
+      assert %TypeError{message: "Cannot enqueue a chunk: the stream is closed."} =
+               rejection(write)
+
+      assert %TypeError{message: "The transform stream was terminated."} =
+               rejection(Writer.closed(writer))
+    end
+
+    test "enqueue raises a TypeError after a cancel of the readable side" do
+      test = self()
+
+      transform =
+        TransformStream.new(%{start: fn controller -> send(test, {:controller, controller}) end})
+
+      assert_receive {:controller, controller}
+      assert await(ReadableStream.cancel(transform.readable, :stop)) == :ok
+      assert_raise TypeError, fn -> Controller.enqueue(controller, :late) end
+    end
+
+    test "enqueue raises a TypeError in the function start after terminate or error" do
+      for ended <- [&Controller.terminate/1, &Controller.error(&1, :failed)] do
+        assert_raise TypeError, fn ->
+          TransformStream.new(%{
+            start: fn controller ->
+              ended.(controller)
+              Controller.enqueue(controller, :late)
+            end
+          })
+        end
+      end
     end
 
     test "terminate in the function start gives a stream with no chunks" do

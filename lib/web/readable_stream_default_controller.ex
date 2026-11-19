@@ -21,24 +21,29 @@ defmodule Web.ReadableStreamDefaultController do
       iex> stream = Web.ReadableStream.new(source)
       iex> Enum.to_list(stream)
       ["data"]
+
+  Raises `Web.TypeError` when the stream is closed or errored, as the
+  Streams Standard specifies.
   """
   def enqueue(%_{pid: pid}, chunk) do
-    ReadableStream.enqueue(pid, chunk)
+    ReadableStream.controller_enqueue(pid, chunk)
   end
 
   @doc """
   Closes the stream.
 
-  Once closed, no more data can be enqueued.
+  Once closed, no more data can be enqueued. Raises `Web.TypeError` when the
+  stream is closed or errored, as the Streams Standard specifies.
   """
   def close(%_{pid: pid}) do
-    ReadableStream.close(pid)
+    ReadableStream.controller_close(pid)
   end
 
   @doc """
   Errors the stream with a reason.
   """
   def error(%_{pid: pid}, reason) do
+    ReadableStream.start_ended(pid, :errored)
     ReadableStream.error(pid, reason)
   end
 

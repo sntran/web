@@ -357,6 +357,75 @@ defmodule Web.StreamStandardTest do
     end
   end
 
+  describe "a close of the stream object" do
+    test "completes the writes that wait, and awaits the promise of the sink" do
+      test = self()
+      {closed, resolve, _reject} = Promise.with_resolvers()
+
+      stream =
+        WritableStream.new(%{
+          write: fn chunk, _controller ->
+            Process.sleep(20)
+            send(test, {:written, chunk})
+          end,
+          close: fn _controller ->
+            send(test, :close_called)
+            closed
+          end
+        })
+
+      writer = WritableStream.get_writer(stream)
+      writes = Enum.map([1, 2], &Writer.write(writer, &1))
+      Writer.release_lock(writer)
+
+      close = WritableStream.close(stream)
+
+      # The close callback runs after the two writes.
+      assert_receive :close_called
+      assert_received {:written, 1}
+      assert_received {:written, 2}
+      assert Enum.map(writes, &await/1) == [:ok, :ok]
+
+      # The close waits for the promise of the sink.
+      Process.sleep(30)
+      assert Promise.peek(close) == :pending
+      resolve.(:ok)
+      assert await(close) == :ok
+    end
+
+    test "rejects when the promise of the sink rejects, and errors the stream" do
+      stream = WritableStream.new(%{close: fn _controller -> Promise.reject(:close_failed) end})
+
+      assert rejection(WritableStream.close(stream)) == :close_failed
+      assert WritableStream.__get_slots__(stream.controller_pid).state == :errored
+    end
+
+    test "rejects with a TypeError for a stream that closes, is closed, or is errored" do
+      slow = WritableStream.new(%{close: fn _controller -> Process.sleep(50) end})
+      first = WritableStream.close(slow)
+      assert %TypeError{} = rejection(WritableStream.close(slow))
+      assert await(first) == :ok
+      assert %TypeError{} = rejection(WritableStream.close(slow))
+
+      errored = WritableStream.new()
+      assert await(WritableStream.abort(errored, :stop)) == :ok
+      assert %TypeError{} = rejection(WritableStream.close(errored))
+    end
+
+    test "of the writable side of a transform stream runs the function flush" do
+      transform =
+        TransformStream.new(%{
+          flush: fn controller ->
+            Web.TransformStreamDefaultController.enqueue(controller, :last)
+          end
+        })
+
+      close = WritableStream.close(transform.writable)
+      assert Enum.to_list(transform.readable) == [:last]
+      assert await(close) == :ok
+    end
+  end
+
   describe "the checks of the constructors" do
     test "refuse an underlying source that is not valid" do
       for source <- [:nope, 123, "text", [1, 2]] do
@@ -696,6 +765,86 @@ defmodule Web.StreamStandardTest do
   end
 
   describe "a readable stream controller" do
+    defp controller_of(source \\ %{}, opts \\ []) do
+      test = self()
+      start = fn controller -> send(test, {:controller, controller}) end
+      stream = ReadableStream.new(Map.put(source, :start, start), opts)
+      assert_receive {:controller, controller}
+      {stream, controller}
+    end
+
+    test "raises a TypeError for an enqueue or a close after a close" do
+      {stream, controller} = controller_of()
+      assert ReadableStreamDefaultController.enqueue(controller, :chunk) == :ok
+      assert ReadableStreamDefaultController.close(controller) == :ok
+
+      assert_raise TypeError, "Cannot enqueue a chunk: the stream is closed.", fn ->
+        ReadableStreamDefaultController.enqueue(controller, :late)
+      end
+
+      assert_raise TypeError, "Cannot close: the stream is closed.", fn ->
+        ReadableStreamDefaultController.close(controller)
+      end
+
+      # An error after a close has no effect, and does not raise.
+      assert ReadableStreamDefaultController.error(controller, :failed) == :ok
+      assert Enum.to_list(stream) == [:chunk]
+    end
+
+    test "raises a TypeError for an enqueue or a close after an error" do
+      {_stream, controller} = controller_of()
+      assert ReadableStreamDefaultController.error(controller, :failed) == :ok
+
+      assert_raise TypeError, "Cannot enqueue a chunk: the stream is errored.", fn ->
+        ReadableStreamDefaultController.enqueue(controller, :late)
+      end
+
+      assert_raise TypeError, "Cannot close: the stream is errored.", fn ->
+        ReadableStreamDefaultController.close(controller)
+      end
+    end
+
+    test "raises a TypeError for an enqueue after a cancel, and after the stream stopped" do
+      {stream, controller} = controller_of()
+      assert await(ReadableStream.cancel(stream, :stop)) == :ok
+
+      assert_raise TypeError, fn ->
+        ReadableStreamDefaultController.enqueue(controller, :late)
+      end
+
+      monitor = Process.monitor(stream.controller_pid)
+      Process.exit(stream.controller_pid, :kill)
+      assert_receive {:DOWN, ^monitor, :process, _pid, :killed}
+
+      assert_raise TypeError, fn ->
+        ReadableStreamDefaultController.enqueue(controller, :late)
+      end
+    end
+
+    test "raises the same errors for a byte stream" do
+      {stream, controller} = controller_of(%{type: "bytes"})
+      assert ReadableByteStreamController.enqueue(controller, "bytes") == :ok
+      assert ReadableByteStreamController.close(controller) == :ok
+
+      assert_raise TypeError, fn -> ReadableByteStreamController.enqueue(controller, "late") end
+      assert_raise TypeError, fn -> ReadableByteStreamController.close(controller) end
+      assert Enum.join(stream) == "bytes"
+    end
+
+    test "keeps a closed stream closed when its pull fails after the close" do
+      stream =
+        ReadableStream.new(%{
+          pull: fn controller ->
+            ReadableStreamDefaultController.enqueue(controller, :chunk)
+            ReadableStreamDefaultController.close(controller)
+            ReadableStreamDefaultController.enqueue(controller, :late)
+          end
+        })
+
+      assert Enum.to_list(stream) == [:chunk]
+      assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
+    end
+
     test "gives the desired size 0 after a close, and nil after an error" do
       closed = ReadableStream.new(%{})
       ReadableStream.close(closed.controller_pid)

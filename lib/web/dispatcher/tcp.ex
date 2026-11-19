@@ -204,8 +204,9 @@ defmodule Web.Dispatcher.TCP do
       monitor_ref = Process.monitor(bridge_pid)
 
       receive do
+        # The stream can be closed already, thus this close has no check.
         {:DOWN, ^monitor_ref, :process, ^bridge_pid, _reason} ->
-          ReadableStreamDefaultController.close(controller)
+          Web.ReadableStream.close(controller.pid)
       end
     end)
 
@@ -280,13 +281,15 @@ defmodule Web.Dispatcher.TCP do
 
   defp fulfill_pull(%{controller: controller} = state, reply_to) do
     case await_socket_chunk(state.socket_reader) do
+      # The bridge runs at the same time as a cancel of the stream, thus
+      # these calls have no check.
       {:chunk, chunk} ->
-        ReadableStreamDefaultController.enqueue(controller, chunk)
+        Web.ReadableStream.enqueue(controller.pid, chunk)
         reply_pull(reply_to)
         process_pending_pulls(state)
 
       {:done, reason} ->
-        ReadableStreamDefaultController.close(controller)
+        Web.ReadableStream.close(controller.pid)
         reply_pull(reply_to)
         reply_pending_pulls(state.pending_pulls)
         shutdown_bridge(state, reason)

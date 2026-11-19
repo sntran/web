@@ -58,18 +58,17 @@ defmodule Web.TransformStream do
     # The function `start` runs in the process of the stream. Thus a process
     # that it starts with a link follows the life of the stream. A value that
     # it throws stops the start of the stream, and `new/2` throws that value.
-    case Map.get(transformer, :start) do
-      start_fn when is_function(start_fn, 1) ->
-        case start_fn.(%Controller{pid: pid}) do
-          %Web.Promise{} = promise -> Web.Promise.await(promise)
-          _ -> :ok
-        end
-
-      _ ->
-        :ok
+    #
+    # As in the Streams Standard, `new/2` does not wait for a promise that
+    # `start` returns. The stream waits for it in a task, and the writes wait
+    # until it fulfils. A rejection puts the two sides in the errored state.
+    with start_fn when is_function(start_fn, 1) <- Map.get(transformer, :start),
+         %Web.Promise{} = promise <- start_fn.(%Controller{pid: pid}) do
+      wait = fn -> Web.Promise.await(promise) end
+      {:producer_consumer, state, [{:next_event, :internal, {:start_task, wait}}]}
+    else
+      _no_promise -> {:producer_consumer, state}
     end
-
-    {:producer_consumer, state}
   end
 
   @impl Web.Stream

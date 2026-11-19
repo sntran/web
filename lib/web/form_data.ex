@@ -247,7 +247,6 @@ defmodule Web.FormData do
     alias Web.AsyncContext.Snapshot
     alias Web.File
     alias Web.ReadableStream
-    alias Web.ReadableStreamDefaultController
     alias Web.TypeError
 
     @header_separator "\r\n\r\n"
@@ -753,17 +752,17 @@ defmodule Web.FormData do
     defp produce_file_chunk(data, controller) do
       case scan_body(data.buffer, data.delimiter_prefix, data.retain_bytes) do
         {:data, emit, rest} ->
-          ReadableStreamDefaultController.enqueue(controller, emit)
+          ReadableStream.enqueue(controller.pid, emit)
           {:ok, bump_file_size(%{data | buffer: rest}, byte_size(emit))}
 
         {:boundary, emit, rest, transition} ->
           next_data = bump_file_size(data, byte_size(emit))
 
           if emit != "" do
-            ReadableStreamDefaultController.enqueue(controller, emit)
+            ReadableStream.enqueue(controller.pid, emit)
           end
 
-          ReadableStreamDefaultController.close(controller)
+          ReadableStream.close(controller.pid)
           {:ok, finalize_file_part(next_data, rest, transition)}
 
         :need_more ->
@@ -1043,8 +1042,11 @@ defmodule Web.FormData do
       end
     end
 
+    # The parser is a process that runs at the same time as a cancel of the
+    # file stream. Thus it uses the functions with no check: a chunk or a
+    # close for a stream that is closed has no effect.
     defp close_pull_controller(controller) do
-      ReadableStreamDefaultController.close(controller)
+      ReadableStream.close(controller.pid)
     end
 
     defp freeze_entries(entries, materialized?) do

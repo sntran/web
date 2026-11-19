@@ -251,7 +251,11 @@ defmodule Web.WritableStream do
   defp terminate_unlocked(pid, type, reason) do
     Web.Stream.promise_call(pid, {:terminate_unlocked, type, reason}, :ok, fn
       :ok -> {:ok, :ok}
-      {:error, :locked} -> {:error, %Web.TypeError{message: "Cannot #{type} a locked stream."}}
+      {:error, :locked} -> {:error, TypeError.exception("Cannot #{type} a locked stream.")}
+      {:error, :closing} -> {:error, TypeError.exception("The stream is closing.")}
+      {:error, :closed} -> {:error, TypeError.exception("The stream is closed.")}
+      {:error, :errored} -> {:error, TypeError.exception("The stream is errored.")}
+      {:error, {:errored, reason}} -> {:error, reason}
       {:error, thrown} -> {:error, thrown}
     end)
   end

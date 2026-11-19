@@ -29,6 +29,9 @@ defmodule Web.ReadableStream do
 
   @released_message "The stream is not available. It ended, or its owner stopped."
 
+  # A key in the dictionary of the stream process: see `start_ended/2`.
+  @start_ended {__MODULE__, :start_ended}
+
   alias Web.AbortSignal
   alias Web.ArrayBuffer
   alias Web.AsyncContext.Snapshot
@@ -615,12 +618,67 @@ defmodule Web.ReadableStream do
     Web.Stream.call(pid, :get_desired_size, nil)
   end
 
+  @doc false
+  # `enqueue` with no check, for a source that is a process of this library.
+  # Such a source can run at the same time as a cancel, thus a chunk for a
+  # stream that is closed or errored is discarded.
   def enqueue(pid, chunk) do
     :gen_statem.cast(pid, {:enqueue, chunk})
   end
 
+  @doc false
+  # `close` with no check: see `enqueue/2`.
   def close(pid) do
     Web.Stream.control_cast(pid, :close)
+  end
+
+  @doc false
+  # `enqueue` of a controller, as in the Streams Standard: raises
+  # `Web.TypeError` when the stream is closed or errored.
+  def controller_enqueue(pid, chunk) do
+    if pid == self() do
+      # The function `start` of a transform stream runs in the stream
+      # process, where a call to the stream is not possible.
+      start_refusal() |> controller_result("enqueue a chunk")
+      enqueue(pid, chunk)
+    else
+      pid
+      |> Web.Stream.call({:enqueue, chunk}, {:error, :closed})
+      |> controller_result("enqueue a chunk")
+    end
+  end
+
+  @doc false
+  # `close` of a controller: see `controller_enqueue/2`.
+  def controller_close(pid) do
+    if pid == self() do
+      start_refusal() |> controller_result("close")
+      Process.put(@start_ended, :closed)
+      close(pid)
+    else
+      pid |> Web.Stream.call(:close, {:error, :closed}) |> controller_result("close")
+    end
+  end
+
+  @doc false
+  # Records that the function `start` of a transform stream ended the
+  # readable side. A subsequent `enqueue` in that function raises.
+  def start_ended(pid, state) when state in [:closed, :errored] do
+    if pid == self(), do: Process.put(@start_ended, state)
+    :ok
+  end
+
+  defp start_refusal do
+    case Process.get(@start_ended) do
+      nil -> :ok
+      state -> {:error, state}
+    end
+  end
+
+  defp controller_result(:ok, _action), do: :ok
+
+  defp controller_result({:error, state}, action) do
+    raise TypeError, "Cannot #{action}: the stream is #{state}."
   end
 
   @impl Web.Stream

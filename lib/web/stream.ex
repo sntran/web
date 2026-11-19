@@ -109,9 +109,10 @@ defmodule Web.Stream do
     # The transformer called `terminate`: the stream closes after the write
     # that is in progress.
     terminated: false,
-    # The reason of a cancel of the readable side of a transform stream. The
-    # writable side is then errored with this reason.
-    cancel_reason: nil,
+    # `{:errored, reason}` when the writable side of a closed transform
+    # stream is in the errored state: the readable side was cancelled (the
+    # reason of the cancel), or the transformer called `terminate`.
+    writable_error: nil,
     read_requests: :queue.new(),
     disturbed: false,
     # Consumer (writable) side
@@ -671,7 +672,7 @@ defmodule Web.Stream do
   defp handle_common({:call, from}, {:wait_closed, side, pid}, state, data) do
     cond do
       state == :closed ->
-        {:keep_state_and_data, [{:reply, from, :ok}]}
+        {:keep_state_and_data, [{:reply, from, closed_reply(data, side)}]}
 
       state == :errored ->
         {:keep_state_and_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
@@ -690,10 +691,18 @@ defmodule Web.Stream do
        when type in [:cancel, :close, :abort] do
     side = if type == :cancel, do: :reader, else: :writer
 
-    if is_pid(lock_holder(data, side)) do
-      {:keep_state_and_data, [{:reply, from, {:error, :locked}}]}
-    else
-      handle_common({:call, from}, {:terminate, type, reason}, state, data)
+    cond do
+      is_pid(lock_holder(data, side)) ->
+        {:keep_state_and_data, [{:reply, from, {:error, :locked}}]}
+
+      # A close of a writable stream is the close of a writer: the writes
+      # that wait complete, and then the close callback of the sink runs.
+      # The stream has no writer, thus the writer of this request is `nil`.
+      type == :close and data.type in [:consumer, :producer_consumer] ->
+        {:keep_state_and_data, [{:next_event, {:call, from}, {:close, nil}}]}
+
+      true ->
+        handle_common({:call, from}, {:terminate, type, reason}, state, data)
     end
   end
 
@@ -727,7 +736,7 @@ defmodule Web.Stream do
         {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
 
       state == :closed ->
-        {:keep_state_and_data, [{:reply, from, :ok}]}
+        {:keep_state_and_data, [{:reply, from, closed_reply(data, :writer)}]}
 
       writable_ready?(data) ->
         {:keep_state_and_data, [{:reply, from, :ok}]}
@@ -749,6 +758,37 @@ defmodule Web.Stream do
 
       true ->
         {:keep_state, %{data | enqueue_waiters: :queue.in(from, data.enqueue_waiters)}}
+    end
+  end
+
+  # `enqueue` and `close` of a controller. The Streams Standard specifies
+  # that they throw a `TypeError` when the readable side cannot accept the
+  # request: it is closed, a close was requested, or it is errored. Thus
+  # they are calls, and the caller gets the refusal.
+  defp handle_common({:call, from}, {:enqueue, chunk}, state, data) do
+    case controller_refusal(state, data) do
+      nil ->
+        {:keep_state, new_data, actions} = handle_producer_enqueue(chunk, state, data)
+        {:keep_state, new_data, [{:reply, from, :ok} | actions]}
+
+      refusal ->
+        {:keep_state_and_data, [{:reply, from, {:error, refusal}}]}
+    end
+  end
+
+  defp handle_common({:call, from}, :close, state, data) do
+    case controller_refusal(state, data) do
+      nil ->
+        result =
+          if data.type == :producer,
+            do: handle_producer_close(data),
+            else: handle_common(:cast, :terminate_transform, state, data)
+
+        {next_state, new_data, actions} = transition(result, state, data)
+        {:next_state, next_state, new_data, [{:reply, from, :ok} | actions]}
+
+      refusal ->
+        {:keep_state_and_data, [{:reply, from, {:error, refusal}}]}
     end
   end
 
@@ -803,6 +843,7 @@ defmodule Web.Stream do
     desired =
       case state do
         :errored -> nil
+        :closed when is_tuple(data.writable_error) -> nil
         :closed -> 0
         _ -> internal_desired_size(data)
       end
@@ -936,6 +977,11 @@ defmodule Web.Stream do
         send(waiter_pid, {:stream_error, ref, :not_locked_by_writer})
         :keep_state_and_data
 
+      state == :closed and match?({:errored, _reason}, data.writable_error) ->
+        {:errored, reason} = data.writable_error
+        send(waiter_pid, {:stream_error, ref, {:errored, reason}})
+        :keep_state_and_data
+
       state == :closed ->
         send(waiter_pid, {:ready, ref})
         :keep_state_and_data
@@ -1009,16 +1055,21 @@ defmodule Web.Stream do
 
   # Task result (info message: {ref, result})
   defp handle_common(:info, {ref, result}, state, data) when is_reference(ref) do
-    if ref == data.task_ref do
-      case data.active_operation do
-        :abort ->
-          handle_abort_task_result(result, data)
+    cond do
+      ref != data.task_ref ->
+        :keep_state_and_data
 
-        _ ->
-          handle_task_result(result, state, data)
-      end
-    else
-      :keep_state_and_data
+      data.active_operation == :abort ->
+        handle_abort_task_result(result, data)
+
+      # A callback that continued after it closed the stream. Its result,
+      # also a failure, has no effect on a closed or errored stream, as in
+      # the Streams Standard.
+      state in [:closed, :errored] ->
+        {:keep_state, data |> clear_active_operation() |> Map.put(:pulling, false)}
+
+      true ->
+        handle_task_result(result, state, data)
     end
   end
 
@@ -1138,6 +1189,13 @@ defmodule Web.Stream do
 
   defp handle_common(_type, _content, _state, _data), do: :not_handled
 
+  # Why the readable side cannot accept an `enqueue` or a `close`, or `nil`.
+  defp controller_refusal(_state, %{type: :consumer}), do: :closed
+  defp controller_refusal(:errored, _data), do: :errored
+  defp controller_refusal(:closed, _data), do: :closed
+  defp controller_refusal(_state, %{terminated: true}), do: :closed
+  defp controller_refusal(_state, _data), do: nil
+
   defp task_timeout_error(operation, data) do
     Web.TypeError.exception(
       message: "The #{operation} callback did not return in #{data.timeout_ms} ms.",
@@ -1158,15 +1216,16 @@ defmodule Web.Stream do
   defp handle_closed_event(:cast, {:enqueue, _chunk}, _data), do: :keep_state_and_data
   defp handle_closed_event(:internal, :flush_requests, data), do: flush_read_requests(data)
 
-  # The readable side of a transform stream was cancelled. The writable side
-  # is errored with the reason of the cancel, as in the Streams Standard.
+  # The readable side of a transform stream was cancelled, or the
+  # transformer called `terminate`. The writable side is in the errored
+  # state, as in the Streams Standard: see the field `writable_error`.
   defp handle_closed_event({:call, from}, {:write, _pid, _chunk}, %{
-         cancel_reason: {:cancelled, reason}
+         writable_error: {:errored, reason}
        }) do
     {:keep_state_and_data, [{:reply, from, {:error, {:errored, reason}}}]}
   end
 
-  defp handle_closed_event({:call, from}, {:close, _pid}, %{cancel_reason: {:cancelled, _reason}}) do
+  defp handle_closed_event({:call, from}, {:close, _pid}, %{writable_error: {:errored, _reason}}) do
     {:keep_state_and_data, [{:reply, from, {:error, :errored}}]}
   end
 
@@ -1568,7 +1627,7 @@ defmodule Web.Stream do
         {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
 
       data.terminated ->
-        {:keep_state_and_data, [{:reply, from, {:error, :closed}}]}
+        {:keep_state_and_data, [{:reply, from, {:error, {:errored, terminated_error()}}}]}
 
       active_consumer_operation?(data) or not transform_ready?(data) ->
         new_data =
@@ -1767,6 +1826,20 @@ defmodule Web.Stream do
   # Task result handling
   # ---------------------------------------------------------------------------
 
+  # The transformer called `terminate`, and then its write failed. The
+  # write rejects with the failure. The readable side stays closed, and the
+  # writable side has the error of the terminate.
+  defp handle_task_result(
+         {:error, reason},
+         _state,
+         %{terminated: true, active_operation: {:write, from}} = data
+       ) do
+    data
+    |> clear_active_operation()
+    |> Map.put(:pending_write_request, nil)
+    |> terminate_transform([{:reply, from, {:error, {:errored, reason}}}])
+  end
+
   defp handle_task_result({:error, reason}, _state, data) do
     fail_stream(reason, data)
   end
@@ -1901,21 +1974,31 @@ defmodule Web.Stream do
     end
   end
 
-  # `terminate` of the controller of a transform stream: the readable side
-  # closes after its chunks are read, and the writable side accepts no more
-  # chunks. The writes that wait reject.
+  # `terminate` of the controller of a transform stream, as in the Streams
+  # Standard: the readable side closes after its chunks are read, and the
+  # writable side goes to the errored state with a `TypeError`. The writes
+  # that wait, a close that waits, and the promises `ready` and `closed` of
+  # the writer reject with that error.
   defp terminate_transform(data, actions) do
-    rejected =
-      data.queued_write_requests
-      |> :queue.to_list()
-      |> Enum.map(fn {from, _pid, _chunk} -> {:reply, from, {:error, :closed}} end)
+    error = terminated_error()
 
-    close_actions =
-      if data.pending_close_request, do: [{:reply, data.pending_close_request, :ok}], else: []
+    rejected =
+      queued_write_error_actions(data, error) ++
+        close_error_actions(data, error) ++
+        ready_error_actions(data, error)
 
     data
-    |> Map.merge(%{queued_write_requests: :queue.new(), pending_close_request: nil})
-    |> close_consumer_stream(actions ++ rejected ++ close_actions)
+    |> Map.merge(%{
+      queued_write_requests: :queue.new(),
+      pending_close_request: nil,
+      ready_waiters: :queue.new(),
+      writable_error: {:errored, error}
+    })
+    |> close_consumer_stream(actions ++ rejected)
+  end
+
+  defp terminated_error do
+    Web.TypeError.exception("The transform stream was terminated.")
   end
 
   defp close_consumer_stream(data, actions) do
@@ -2066,13 +2149,27 @@ defmodule Web.Stream do
   # stream.
   defp closed_waiter_actions(state, %{closed_waiters: [_ | _] = waiters} = data)
        when state in [:closed, :errored] do
-    reply = if state == :closed, do: :ok, else: {:error, {:errored, data.error_reason}}
+    actions =
+      Enum.map(waiters, fn {from, side, _pid} ->
+        if state == :closed do
+          {:reply, from, closed_reply(data, side)}
+        else
+          {:reply, from, {:error, {:errored, data.error_reason}}}
+        end
+      end)
 
-    {%{data | closed_waiters: []},
-     Enum.map(waiters, fn {from, _, _} -> {:reply, from, reply} end)}
+    {%{data | closed_waiters: []}, actions}
   end
 
   defp closed_waiter_actions(_state, data), do: {data, []}
+
+  # The reply for the promise `closed` of one side of a closed stream. The
+  # writable side of a transform stream can be in the errored state while
+  # the readable side is closed.
+  defp closed_reply(%{writable_error: {:errored, reason}}, :writer),
+    do: {:error, {:errored, reason}}
+
+  defp closed_reply(_data, _side), do: :ok
 
   # A release of the lock rejects the promise `closed` of that reader or writer.
   defp release_closed_waiters(data, side, pid) do
@@ -2221,8 +2318,8 @@ defmodule Web.Stream do
     new_data = %{
       data
       | disturbed: type == :cancel or data.disturbed,
-        cancel_reason:
-          if(type == :cancel and data.type == :producer_consumer, do: {:cancelled, reason}),
+        writable_error:
+          if(type == :cancel and data.type == :producer_consumer, do: {:errored, reason}),
         queue: if(type == :cancel, do: :queue.new(), else: data.queue),
         pulling: false,
         pending_write_request: nil,

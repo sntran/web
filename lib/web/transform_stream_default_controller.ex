@@ -20,10 +20,14 @@ defmodule Web.TransformStreamDefaultController do
 
   @doc """
   Puts a chunk in the queue of the readable side.
+
+  Raises `Web.TypeError` when the readable side is closed or errored, as the
+  Streams Standard specifies. For example, after a reader cancelled the
+  stream, or after `terminate/1`.
   """
   @spec enqueue(t(), term()) :: :ok
   def enqueue(%__MODULE__{pid: pid}, chunk) do
-    Web.ReadableStream.enqueue(pid, chunk)
+    Web.ReadableStream.controller_enqueue(pid, chunk)
   end
 
   @doc """
@@ -31,6 +35,7 @@ defmodule Web.TransformStreamDefaultController do
   """
   @spec error(t(), term()) :: :ok
   def error(%__MODULE__{pid: pid}, reason) do
+    Web.ReadableStream.start_ended(pid, :errored)
     Web.ReadableStream.error(pid, reason)
   end
 
@@ -42,6 +47,7 @@ defmodule Web.TransformStreamDefaultController do
   """
   @spec terminate(t()) :: :ok
   def terminate(%__MODULE__{pid: pid}) do
+    Web.ReadableStream.start_ended(pid, :closed)
     Web.Stream.control_cast(pid, :terminate_transform)
   end
 

@@ -217,6 +217,29 @@ All notable changes to this project are documented in this file.
   - `new/2` throws the value that the function `start` throws, raises
     `Web.TypeError` for a callback that is not a function, and raises
     `Web.RangeError` for the keys `:readable_type` and `:writable_type`.
+  - `terminate/1` of the controller closes the readable side and puts the
+    writable side in the errored state with a `Web.TypeError`. The writes
+    that wait, a close that waits, and the promises `ready` and `closed` of
+    the writer reject with that error. A `terminate/1` in the function
+    `flush` does not prevent the close.
+  - `new/2` does not wait for a promise that the function `start` returns.
+    The writes wait until that promise fulfils. A rejection puts the two
+    sides in the errored state.
+- **Breaking:** `enqueue/2` and `close/1` of a controller raise
+  `Web.TypeError` when the readable side is closed or errored, as the
+  Streams Standard specifies. This applies to
+  `Web.ReadableStreamDefaultController`, `Web.ReadableByteStreamController`,
+  and `Web.TransformStreamDefaultController`. Before, the chunk was
+  discarded with no message. A source that is a process, and that sends
+  chunks to the stream process, is not changed.
+- **Breaking:** `Web.WritableStream.close/1` of the stream object does the
+  steps of the close of a writer: the writes that wait complete, the close
+  callback of the sink runs, and the stream awaits a promise that the
+  callback returns. A close of a stream that closes, is closed, or is
+  errored rejects with a `Web.TypeError`. Before, the close stopped the
+  write that was in progress, and did not await the promise.
+- A callback that fails after it closed its stream has no effect on the
+  stream. Before, the closed stream went to the errored state.
 - **Breaking:** `Web.CountQueuingStrategy.new/1` and
   `Web.ByteLengthQueuingStrategy.new/1` raise `Web.RangeError` for a limit
   that is not a number or that is below zero.

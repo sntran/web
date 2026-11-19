@@ -11,12 +11,12 @@ defmodule Web.ReadableByteStreamController do
 
   @spec enqueue(t(), binary()) :: :ok
   def enqueue(%__MODULE__{pid: pid}, chunk) when is_binary(chunk) do
-    ReadableStream.enqueue(pid, chunk)
+    ReadableStream.controller_enqueue(pid, chunk)
   end
 
   @spec close(t()) :: :ok
   def close(%__MODULE__{pid: pid}) do
-    ReadableStream.close(pid)
+    ReadableStream.controller_close(pid)
   end
 
   @spec error(t(), term()) :: :ok

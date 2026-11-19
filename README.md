@@ -97,6 +97,10 @@ responses = await(Promise.all(requests))
 
 ```
 
+A token belongs to the process that acquired it. When that process stops,
+also with a failure, the governor takes the token back. Thus the capacity
+cannot decrease.
+
 Async APIs return `%Web.Promise{}` values. Promise executors capture the current `Web.AsyncContext`, so logger metadata and signals flow into spawned tasks automatically.
 
 ```elixir

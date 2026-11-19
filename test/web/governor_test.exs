@@ -80,73 +80,64 @@ defmodule Web.GovernorTest do
     eventually(fn -> governor_state(governor).in_use == 0 end)
   end
 
+  # A process that acquires one token, gives it to the test, and stays alive.
+  # The token belongs to this process, thus the process must not stop before
+  # the release.
+  defp start_holder(governor, label) do
+    parent = self()
+
+    spawn_link(fn ->
+      token = await(Governor.acquire(governor))
+      send(parent, {:acquired, label, token})
+
+      receive do
+        :stop -> :ok
+      end
+    end)
+  end
+
   test "queued acquisitions are granted in FIFO order" do
     governor = CountingGovernor.new(1)
     token = await(Governor.acquire(governor))
-    parent = self()
 
-    second =
-      Task.async(fn ->
-        second_token = await(Governor.acquire(governor))
-        send(parent, {:acquired, :second})
-        second_token
-      end)
-
+    _second = start_holder(governor, :second)
     eventually(fn -> queue_length(governor) == 1 end)
+    _third = start_holder(governor, :third)
+    eventually(fn -> queue_length(governor) == 2 end)
 
-    third =
-      Task.async(fn ->
-        third_token = await(Governor.acquire(governor))
-        send(parent, {:acquired, :third})
-        third_token
-      end)
-
-    Process.sleep(20)
     assert governor_state(governor).in_use == 1
-
     assert :ok = Token.release(token)
 
-    assert_receive {:acquired, :second}, 500
-    refute_receive {:acquired, :third}, 50
+    assert_receive {:acquired, :second, second_token}, 500
+    refute_receive {:acquired, :third, _token}, 50
 
-    second_token = Task.await(second, 500)
     assert :ok = Token.release(second_token)
-
-    assert_receive {:acquired, :third}, 500
-    third_token = Task.await(third, 500)
+    assert_receive {:acquired, :third, third_token}, 500
     assert :ok = Token.release(third_token)
   end
 
   test "release/1 is idempotent and wakes exactly one waiter" do
     governor = CountingGovernor.new(1)
     token = await(Governor.acquire(governor))
-    parent = self()
 
-    queued =
-      Enum.map(1..2, fn index ->
-        Task.async(fn ->
-          acquired = await(Governor.acquire(governor))
-          send(parent, {:queued_token, index, acquired})
-          acquired
-        end)
-      end)
+    for index <- 1..2, do: start_holder(governor, index)
+    eventually(fn -> queue_length(governor) == 2 end)
 
-    Process.sleep(20)
     assert :ok = Token.release(token)
     assert :ok = Token.release(token)
 
-    assert_receive {:queued_token, first_index, first}, 500
+    assert_receive {:acquired, first_index, first}, 500
     assert first_index in [1, 2]
-    Process.sleep(20)
+    refute_receive {:acquired, _index, _token}, 50
     assert governor_state(governor).in_use == 1
 
     assert :ok = Token.release(first)
-    assert_receive {:queued_token, second_index, second}, 500
+    assert_receive {:acquired, second_index, second}, 500
     assert second_index in [1, 2]
     assert second_index != first_index
 
     assert :ok = Token.release(second)
-    Enum.each(queued, &Task.await(&1, 500))
+    eventually(fn -> governor_state(governor).in_use == 0 end)
   end
 
   test "Governor.with/2 releases the token on success" do
@@ -254,7 +245,9 @@ defmodule Web.GovernorTest do
 
     acquisition = AbortableGovernor.acquire_abortable(governor)
     assert :ok = acquisition.abort.()
-    assert :aborted == catch_exit(await(acquisition.promise))
+
+    assert %Web.DOMException{name: "AbortError"} =
+             catch_exit(await(acquisition.promise))
 
     assert map_size(governor_state(governor).waiting) == 0
     assert :queue.is_empty(governor_state(governor).queue)
@@ -268,7 +261,10 @@ defmodule Web.GovernorTest do
     Process.exit(governor.pid, :kill)
     Process.sleep(10)
 
-    assert :closed == catch_exit(await(Governor.with(governor, fn -> :ok end)))
+    assert %Web.TypeError{message: message} =
+             catch_exit(await(Governor.with(governor, fn -> :ok end)))
+
+    assert message =~ "The governor is not available"
   end
 
   test "Governor.with/2 gives the rejection of a promise that the callback returns" do
@@ -344,21 +340,38 @@ defmodule Web.GovernorTest do
     assert Task.await(task, 500) == "req-42"
   end
 
+  # The message that the process of an acquisition sends to the governor.
+  defp acquire_message(waiter_ref, flag \\ :atomics.new(1, signed: false)) do
+    {:acquire, self(), waiter_ref, self(), flag}
+  end
+
+  defp empty_state do
+    %{
+      capacity: 1,
+      in_use: 0,
+      queue: :queue.new(),
+      active_tokens: %{},
+      holder_monitors: %{},
+      waiting: %{},
+      waiter_monitors: %{}
+    }
+  end
+
   test "dead waiting processes are cleaned up before the next grant" do
     governor = CountingGovernor.new(1)
     token = await(Governor.acquire(governor))
 
     waiter =
       spawn(fn ->
-        :ok = GenServer.call(governor.pid, {:acquire, self(), make_ref()}, :infinity)
+        GenServer.cast(governor.pid, acquire_message(make_ref()))
         Process.sleep(:infinity)
       end)
 
-    Process.sleep(20)
-    assert map_size(governor_state(governor).waiting) == 1
+    eventually(fn -> map_size(governor_state(governor).waiting) == 1 end)
 
     Process.exit(waiter, :kill)
     eventually(fn -> map_size(governor_state(governor).waiting) == 0 end)
+    assert queue_length(governor) == 0
 
     assert :ok = Token.release(token)
     eventually(fn -> governor_state(governor).in_use == 0 end)
@@ -369,7 +382,7 @@ defmodule Web.GovernorTest do
     token = await(Governor.acquire(governor))
     stale_waiter_ref = make_ref()
 
-    :ok = GenServer.call(governor.pid, {:acquire, self(), stale_waiter_ref}, :infinity)
+    GenServer.cast(governor.pid, acquire_message(stale_waiter_ref))
 
     eventually(fn -> queue_length(governor) == 1 end)
     send(governor.pid, {:DOWN, make_ref(), :process, self(), :normal})
@@ -385,77 +398,47 @@ defmodule Web.GovernorTest do
     assert queue_length(governor) == 0
   end
 
-  test "callback branches handle pre-canceled waiters directly" do
+  test "an acquisition that was aborted before it came to the governor is rejected" do
     waiter_ref = make_ref()
+    flag = :atomics.new(1, signed: false)
+    :atomics.put(flag, 1, 1)
 
-    state = %{
-      capacity: 1,
-      in_use: 0,
-      queue: :queue.new(),
-      active_tokens: %{},
-      waiting: %{},
-      canceled_waiters: MapSet.new([waiter_ref]),
-      waiter_monitors: %{}
-    }
+    assert {:noreply, next_state} =
+             CountingGovernor.handle_cast(acquire_message(waiter_ref, flag), empty_state())
 
-    assert {:reply, :ok, next_state} =
-             CountingGovernor.handle_call({:acquire, self(), waiter_ref}, self(), state)
-
-    assert_receive {:governor_rejected, ^waiter_ref, :aborted}
-    refute MapSet.member?(next_state.canceled_waiters, waiter_ref)
+    assert_receive {:governor_rejected, ^waiter_ref, %Web.DOMException{name: "AbortError"}}
+    assert next_state == empty_state()
   end
 
-  test "callback branches keep state stable for unknown abort/release/down signals" do
-    state = %{
-      capacity: 1,
-      in_use: 0,
-      queue: :queue.new(),
-      active_tokens: %{},
-      waiting: %{},
-      canceled_waiters: MapSet.new(),
-      waiter_monitors: %{}
-    }
+  test "an abort, a release, and a DOWN message that are not known do not change the state" do
+    state = empty_state()
 
-    unknown_waiter_ref = make_ref()
-    unknown_token_ref = make_ref()
-    unknown_monitor_ref = make_ref()
+    assert {:noreply, ^state} = CountingGovernor.handle_cast({:abort_waiter, make_ref()}, state)
+    assert {:noreply, ^state} = CountingGovernor.handle_cast({:release, make_ref()}, state)
 
-    assert {:noreply, abort_state} =
-             CountingGovernor.handle_cast({:abort_waiter, unknown_waiter_ref}, state)
-
-    assert MapSet.member?(abort_state.canceled_waiters, unknown_waiter_ref)
-
-    assert {:noreply, ^abort_state} =
-             CountingGovernor.handle_cast({:release, unknown_token_ref}, abort_state)
-
-    assert {:noreply, down_state} =
-             CountingGovernor.handle_info(
-               {:DOWN, unknown_monitor_ref, :process, self(), :normal},
-               abort_state
-             )
-
-    assert down_state.waiter_monitors == %{}
+    assert {:noreply, ^state} =
+             CountingGovernor.handle_info({:DOWN, make_ref(), :process, self(), :normal}, state)
   end
 
-  test "callback branches abort registered waiters directly" do
+  test "an abort of a registered waiter removes it and rejects its acquisition" do
     waiter_ref = make_ref()
     monitor_ref = Process.monitor(self())
 
     try do
+      waiter = %{waiter_ref: waiter_ref, pid: self(), holder: self(), monitor_ref: monitor_ref}
+
       state = %{
-        capacity: 1,
-        in_use: 1,
-        queue: :queue.from_list([waiter_ref]),
-        active_tokens: %{},
-        waiting: %{waiter_ref => %{waiter_ref: waiter_ref, pid: self(), monitor_ref: monitor_ref}},
-        canceled_waiters: MapSet.new(),
-        waiter_monitors: %{monitor_ref => waiter_ref}
+        empty_state()
+        | in_use: 1,
+          queue: :queue.from_list([waiter_ref]),
+          waiting: %{waiter_ref => waiter},
+          waiter_monitors: %{monitor_ref => waiter_ref}
       }
 
       assert {:noreply, next_state} =
                CountingGovernor.handle_cast({:abort_waiter, waiter_ref}, state)
 
-      assert_receive {:governor_rejected, ^waiter_ref, :aborted}
+      assert_receive {:governor_rejected, ^waiter_ref, %Web.DOMException{name: "AbortError"}}
       refute Map.has_key?(next_state.waiting, waiter_ref)
       refute Map.has_key?(next_state.waiter_monitors, monitor_ref)
       assert :queue.is_empty(next_state.queue)
@@ -464,23 +447,24 @@ defmodule Web.GovernorTest do
     end
   end
 
-  test "pre-aborted waiter refs are rejected on acquisition" do
+  test "an abort after the grant keeps no data in the governor" do
     governor = CountingGovernor.new(1)
-    waiter_ref = make_ref()
+    before = governor_state(governor)
 
-    GenServer.cast(governor.pid, {:abort_waiter, waiter_ref})
-    eventually(fn -> MapSet.member?(governor_state(governor).canceled_waiters, waiter_ref) end)
-    :ok = GenServer.call(governor.pid, {:acquire, self(), waiter_ref}, :infinity)
+    for _ <- 1..50 do
+      acquisition = AbortableGovernor.acquire_abortable(governor)
+      token = await(acquisition.promise)
+      assert :ok = acquisition.abort.()
+      assert :ok = Token.release(token)
+    end
 
-    assert_receive {:governor_rejected, ^waiter_ref, :aborted}, 200
-    assert map_size(governor_state(governor).waiting) == 0
+    eventually(fn -> governor_state(governor) == before end)
   end
 
   test "release and abort are harmless after the governor process stops" do
     governor = CountingGovernor.new(1)
     token = await(Governor.acquire(governor))
 
-    Process.unlink(governor.pid)
     Process.exit(governor.pid, :kill)
     Process.sleep(10)
 
@@ -488,16 +472,143 @@ defmodule Web.GovernorTest do
 
     assert :ok = Token.release(token)
     assert :ok = acquisition.abort.()
-    assert :closed == catch_exit(await(acquisition.promise))
+    assert %Web.TypeError{} = catch_exit(await(acquisition.promise))
   end
 
   test "acquire/1 rejects when the governor process is gone" do
     governor = CountingGovernor.new(1)
-    Process.unlink(governor.pid)
     Process.exit(governor.pid, :kill)
     Process.sleep(10)
 
-    assert :closed == catch_exit(await(Governor.acquire(governor)))
+    assert %Web.TypeError{message: message} = catch_exit(await(Governor.acquire(governor)))
+    assert message =~ "The governor is not available"
+  end
+
+  test "acquire/1 rejects when the governor process stops during the wait" do
+    governor = CountingGovernor.new(1)
+    _token = await(Governor.acquire(governor))
+
+    waiting = Governor.acquire(governor)
+    eventually(fn -> queue_length(governor) == 1 end)
+    Process.exit(governor.pid, :kill)
+
+    assert %Web.TypeError{} = catch_exit(await(waiting))
+  end
+
+  describe "the holder of a token" do
+    # Runs `fun` in a process, and returns after that process stopped.
+    defp in_stopped_process(fun, exit_reason \\ :normal) do
+      {pid, monitor} =
+        spawn_monitor(fn ->
+          fun.()
+          if exit_reason != :normal, do: exit(exit_reason)
+        end)
+
+      assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}, 1_000
+    end
+
+    test "is the process that acquired it: the token comes back when the process stops" do
+      for exit_reason <- [:normal, :failure, :kill] do
+        governor = CountingGovernor.new(1)
+        in_stopped_process(fn -> await(Governor.acquire(governor)) end, exit_reason)
+
+        eventually(fn -> governor_state(governor).in_use == 0 end)
+        assert governor_state(governor).active_tokens == %{}
+        assert governor_state(governor).holder_monitors == %{}
+
+        # The capacity is not lost.
+        assert %Token{} = token = await(Governor.acquire(governor))
+        assert :ok = Token.release(token)
+      end
+    end
+
+    test "gives its token to the next waiter when it stops" do
+      governor = CountingGovernor.new(1)
+      first = start_holder(governor, :first)
+      assert_receive {:acquired, :first, _token}, 500
+
+      _second = start_holder(governor, :second)
+      eventually(fn -> queue_length(governor) == 1 end)
+
+      Process.unlink(first)
+      Process.exit(first, :kill)
+      assert_receive {:acquired, :second, token}, 500
+      assert governor_state(governor).in_use == 1
+      assert :ok = Token.release(token)
+    end
+
+    test "is not the process of a promise: the token stays after that process stopped" do
+      governor = CountingGovernor.new(1)
+
+      # The acquisition runs in the process of the promise. The owner of that
+      # process is the test process.
+      promise =
+        Promise.new(fn resolve, _reject -> resolve.(await(Governor.acquire(governor))) end)
+
+      token = await(promise)
+      Process.sleep(50)
+      assert governor_state(governor).in_use == 1
+
+      assert :ok = Token.release(token)
+      eventually(fn -> governor_state(governor).in_use == 0 end)
+    end
+
+    test "can release a token after the governor took it back, with no effect" do
+      governor = CountingGovernor.new(2)
+      parent = self()
+
+      in_stopped_process(fn -> send(parent, {:token, await(Governor.acquire(governor))}) end)
+      assert_receive {:token, stale}
+      eventually(fn -> governor_state(governor).in_use == 0 end)
+
+      current = await(Governor.acquire(governor))
+      assert :ok = Token.release(stale)
+      Process.sleep(20)
+      assert governor_state(governor).in_use == 1
+      assert :ok = Token.release(current)
+    end
+
+    test "of Governor.with/2 is the owner: the token comes back when the owner stops" do
+      governor = CountingGovernor.new(1)
+      parent = self()
+
+      in_stopped_process(fn ->
+        Governor.with(governor, fn ->
+          send(parent, {:work, self()})
+          Promise.new(fn _resolve, _reject -> Process.sleep(:infinity) end)
+        end)
+
+        receive do
+          :never -> :ok
+        after
+          50 -> :ok
+        end
+      end)
+
+      # The work stopped with its owner, and the governor has its capacity.
+      assert_receive {:work, work}
+      eventually(fn -> not Process.alive?(work) end)
+      eventually(fn -> governor_state(governor).in_use == 0 end)
+      assert await(Governor.with(governor, fn -> :next end)) == :next
+    end
+
+    test "of Governor.with/2 keeps the token for the full time of the work" do
+      governor = CountingGovernor.new(1)
+
+      slow =
+        Governor.with(governor, fn ->
+          Promise.new(fn resolve, _reject ->
+            Process.sleep(100)
+            resolve.(:slow)
+          end)
+        end)
+
+      eventually(fn -> governor_state(governor).in_use == 1 end)
+      Process.sleep(50)
+      assert governor_state(governor).in_use == 1
+      assert await(slow) == :slow
+      eventually(fn -> governor_state(governor).in_use == 0 end)
+    end
   end
 
   test "governor-limited fetch usage caps concurrent dispatcher work" do

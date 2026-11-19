@@ -26,6 +26,8 @@ All notable changes to this project are documented in this file.
   compare the two states after each step.
 - Property tests for `Web.Promise`, `Web.ReadableStream`, `Web.URL`, and
   the redirect table of `Web.fetch/2`.
+- A property test that compares `Web.CountingGovernor` with a model: a
+  counter with a first-in, first-out queue.
 - The application setting `config :web, unread_body_timeout: ms` for the
   body of a `Web.fetch/2` response. A body that no process starts to read in
   that time releases its connection, and a later read rejects. The default
@@ -121,6 +123,14 @@ All notable changes to this project are documented in this file.
   `Web.Request.new/2` refuses, and a request whose body is already read or
   locked, give a rejection with `Web.TypeError`, and `fetch` makes no
   connection. `fetch` with a request as its input applies `init`.
+- **Breaking:** a token of `Web.CountingGovernor` belongs to the owner of the
+  process that acquired it. When that owner stops, the governor takes the
+  token back. If you give a token to a different process, keep the owner
+  alive until the release.
+- **Breaking:** an aborted acquisition of `Web.AbortableGovernor` rejects
+  with `Web.DOMException` (`AbortError`), and an acquisition from a governor
+  that stopped rejects with `Web.TypeError`. Before, the reasons were the
+  atoms `:aborted` and `:closed`.
 - **Breaking:** `Web.ReadableStream.tee/1` follows the algorithm of the
   Streams Standard.
   - When the two branches are cancelled, the stream is cancelled, and the
@@ -341,6 +351,15 @@ All notable changes to this project are documented in this file.
   field `:task` of the old promise.
 - `Web.fetch/2` rejects when the body of the request is already read.
   Before, it sent the request with an empty body and gave no error.
+- `Web.CountingGovernor` does not lose capacity when a process stops with
+  a token. Before, the token of a process that stopped was never released.
+  With the new promise engine, this also occurred when the owner of
+  `Web.Governor.with/2` stopped during the work, and each subsequent
+  acquisition then waited without end.
+- An acquisition waits no longer when the governor stops during the wait.
+  It rejects.
+- An abort after the grant keeps no data in the governor. Before, each such
+  abort left one reference in the governor.
 - An ended stream with the linger time `:infinity` stops after its owner
   stopped. Before, a lock on such a stream kept it without end.
 - A pipe with a source that has no end stops after the processes that use

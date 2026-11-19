@@ -24,6 +24,8 @@ All notable changes to this project are documented in this file.
 - Conformance tests in `test/tla/`. They do random operations on the real
   promise, stream, and signal, do the same steps on the specification, and
   compare the two states after each step.
+- Property tests for `Web.Promise`, `Web.ReadableStream`, `Web.URL`, and
+  the redirect table of `Web.fetch/2`.
 - The application setting `config :web, unread_body_timeout: ms` for the
   body of a `Web.fetch/2` response. A body that no process starts to read in
   that time releases its connection, and a later read rejects. The default

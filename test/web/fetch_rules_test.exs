@@ -2,6 +2,7 @@ defmodule Web.FetchRulesTest do
   # These tests set the linger time for the application. Thus they cannot run
   # at the same time as other tests.
   use ExUnit.Case, async: false
+  use ExUnitProperties
 
   use Web
 
@@ -105,6 +106,49 @@ defmodule Web.FetchRulesTest do
         assert %{method: "POST", body: "payload", headers: headers} = echo(response)
         assert headers["content-type"] == "text/x-test"
         assert headers["content-length"] == "7"
+      end
+    end
+  end
+
+  describe "each redirect" do
+    # The expected result comes from the table of the Fetch Standard, not
+    # from the code.
+    property "follows the table of the Fetch Standard", %{port: port} do
+      check all(
+              status <- member_of([301, 302, 303, 307, 308]),
+              method <- member_of(~w(GET POST PUT DELETE PATCH)),
+              text <- one_of([constant(nil), string(:alphanumeric, min_length: 1, max_length: 8)]),
+              other_origin? <- boolean(),
+              max_runs: 60
+            ) do
+        body = if method == "GET", do: nil, else: text
+        location = if other_origin?, do: url(port, "/echo", "127.0.0.1"), else: "/echo"
+
+        response =
+          await(
+            fetch(redirect(port, status, location),
+              method: method,
+              body: body,
+              headers: %{"authorization" => "secret", "x-keep" => "yes"}
+            )
+          )
+
+        expected_method =
+          cond do
+            status in [301, 302] and method == "POST" -> "GET"
+            status == 303 and method != "GET" -> "GET"
+            true -> method
+          end
+
+        expected_body = if expected_method == method, do: body || "", else: ""
+
+        assert response.redirected
+
+        assert %{method: ^expected_method, body: ^expected_body, headers: headers} =
+                 echo(response)
+
+        assert headers["x-keep"] == "yes"
+        assert Map.has_key?(headers, "authorization") == not other_origin?
       end
     end
   end

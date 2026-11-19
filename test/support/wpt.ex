@@ -8,6 +8,11 @@ defmodule Web.Platform.Test do
   alias Web.Platform.Test, as: PlatformTest
   alias Web.Platform.Test.JSHarvester
 
+  # The commit of web-platform-tests/wpt that the test suite uses. The URLs in
+  # the test modules refer to `master`. The loader replaces `master` with this
+  # commit, thus a change upstream cannot change the test results. To update
+  # the fixtures, change this value and correct the new failures.
+  @wpt_revision "468b711b4ffae476c26266ad83966626599c839b"
   @cache_dir Path.expand("tmp/wpt_cache", Elixir.File.cwd!())
   # The infrastructure uses an AsyncContext.Variable (referenced via
   # @context_key) to store the URL of the remote spec being processed.
@@ -99,15 +104,23 @@ defmodule Web.Platform.Test do
     Elixir.File.mkdir_p!(@cache_dir)
 
     {cache_path, meta_path} = cache_paths(url)
-    meta = read_meta(meta_path)
     fetch_url = normalize_fetch_url(url)
+    meta = meta_path |> read_meta() |> discard_other_revision(fetch_url, cache_path, meta_path)
     started_at = System.monotonic_time(:millisecond)
 
-    Variable.run(fetch_context_variable(), url, fn ->
-      fetch_governor()
-      |> Governor.with(fn ->
+    if cached_revision?(meta, fetch_url, cache_path) do
+      read_cached_json!(cache_path, url)
+    else
+      governed_fetch(url, fn ->
         fetch_json_with_cache(fetch_url, cache_path, meta_path, meta, started_at)
       end)
+    end
+  end
+
+  defp governed_fetch(url, fetch) do
+    Variable.run(fetch_context_variable(), url, fn ->
+      fetch_governor()
+      |> Governor.with(fetch)
       |> Web.await()
     end)
   end
@@ -123,17 +136,42 @@ defmodule Web.Platform.Test do
     Elixir.File.mkdir_p!(@cache_dir)
 
     {cache_path, meta_path} = cache_paths(url)
-    meta = read_meta(meta_path)
     fetch_url = normalize_fetch_url(url)
+    meta = meta_path |> read_meta() |> discard_other_revision(fetch_url, cache_path, meta_path)
     started_at = System.monotonic_time(:millisecond)
 
-    Variable.run(fetch_context_variable(), url, fn ->
-      fetch_governor()
-      |> Governor.with(fn ->
+    if cached_revision?(meta, fetch_url, cache_path) do
+      read_cached_source!(cache_path, url)
+    else
+      governed_fetch(url, fn ->
         fetch_source_with_cache(fetch_url, cache_path, meta_path, meta, started_at)
       end)
-      |> Web.await()
-    end)
+    end
+  end
+
+  # A fixture at a pinned commit does not change. Thus a cache entry for the
+  # same URL is correct, and no request is necessary.
+  defp cached_revision?(meta, fetch_url, cache_path) do
+    pinned?(fetch_url) and meta["url"] == fetch_url and Elixir.File.exists?(cache_path)
+  end
+
+  # A cache entry of a pinned fixture is correct only for the same commit.
+  # An entry for a different commit must not be used as a fallback.
+  defp discard_other_revision(meta, fetch_url, cache_path, meta_path) do
+    if pinned?(fetch_url) and meta["url"] != fetch_url do
+      _ = Elixir.File.rm(cache_path)
+      _ = Elixir.File.rm(meta_path)
+      %{}
+    else
+      meta
+    end
+  end
+
+  defp pinned?(fetch_url) do
+    String.starts_with?(
+      fetch_url,
+      "https://raw.githubusercontent.com/web-platform-tests/wpt/" <> @wpt_revision <> "/"
+    )
   end
 
   defp fetch_source_with_cache(url, cache_path, meta_path, meta, started_at) do
@@ -222,7 +260,7 @@ defmodule Web.Platform.Test do
   defp handle_fetch_source_response(response, url, cache_path, meta_path) do
     case response.status do
       200 ->
-        persist_fresh_source(response, cache_path, meta_path)
+        persist_fresh_source(response, url, cache_path, meta_path)
 
       304 ->
         read_cached_source!(cache_path, url)
@@ -253,7 +291,7 @@ defmodule Web.Platform.Test do
   defp handle_fetch_json_response(response, url, cache_path, meta_path) do
     case response.status do
       200 ->
-        persist_fresh_json(response, cache_path, meta_path)
+        persist_fresh_json(response, url, cache_path, meta_path)
 
       304 ->
         read_cached_json!(cache_path, url)
@@ -414,21 +452,23 @@ defmodule Web.Platform.Test do
       :ok
   end
 
-  defp persist_fresh_source(response, cache_path, meta_path) do
+  defp persist_fresh_source(response, url, cache_path, meta_path) do
     raw = Web.await(Web.Response.text(response))
 
     Elixir.File.write!(cache_path, raw)
 
     meta = %{
+      url: url,
       etag: Web.Headers.get(response.headers, "etag"),
       last_modified: Web.Headers.get(response.headers, "last-modified")
     }
 
     Elixir.File.write!(meta_path, Jason.encode!(meta))
+    reset_idna_lookup()
     raw
   end
 
-  defp persist_fresh_json(response, cache_path, meta_path) do
+  defp persist_fresh_json(response, url, cache_path, meta_path) do
     {json_response, text_response} = Web.Response.clone(response)
     raw = Web.await(Web.Response.text(text_response))
     decoded = decode_payload(json_response, raw)
@@ -436,12 +476,23 @@ defmodule Web.Platform.Test do
     Elixir.File.write!(cache_path, raw)
 
     meta = %{
+      url: url,
       etag: Web.Headers.get(response.headers, "etag"),
       last_modified: Web.Headers.get(response.headers, "last-modified")
     }
 
     Elixir.File.write!(meta_path, Jason.encode!(meta))
+    reset_idna_lookup()
     decoded
+  end
+
+  # `Web.URL.Idna` reads the cached fixtures one time and keeps the result.
+  # It can read them before this module downloads them. Then the test results
+  # change with the state of the cache. To prevent this, discard the result
+  # each time a fixture changes.
+  defp reset_idna_lookup do
+    _ = :persistent_term.erase({Web.URL.Idna, :lookup})
+    :ok
   end
 
   defp decode_payload(json_response, raw) do
@@ -581,12 +632,18 @@ defmodule Web.Platform.Test do
         host: "github.com",
         path: "/web-platform-tests/wpt/raw/refs/heads/" <> rest
       } ->
-        "https://raw.githubusercontent.com/web-platform-tests/wpt/" <> rest
+        pin_revision("https://raw.githubusercontent.com/web-platform-tests/wpt/" <> rest)
 
       _ ->
-        url
+        pin_revision(url)
     end
   end
+
+  defp pin_revision("https://raw.githubusercontent.com/web-platform-tests/wpt/master/" <> rest) do
+    "https://raw.githubusercontent.com/web-platform-tests/wpt/" <> @wpt_revision <> "/" <> rest
+  end
+
+  defp pin_revision(url), do: url
 
   defp runtime_option(key, default) do
     :web

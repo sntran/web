@@ -43,7 +43,6 @@ defmodule Web.ReadableStreamDefaultController do
   Errors the stream with a reason.
   """
   def error(%_{pid: pid}, reason) do
-    ReadableStream.start_ended(pid, :errored)
     ReadableStream.error(pid, reason)
   end
 

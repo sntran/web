@@ -366,6 +366,20 @@ defmodule Web.Promise do
   end
 
   @doc false
+  # Runs `fun` with `owner` as the owner of the promises and the streams
+  # that it makes, and then restores the owner of the calling process.
+  @spec with_owner(pid(), (-> result)) :: result when result: term()
+  def with_owner(owner, fun) when is_pid(owner) and is_function(fun, 0) do
+    previous = Process.put(@owner_key, owner)
+
+    try do
+      fun.()
+    after
+      if previous, do: Process.put(@owner_key, previous), else: Process.delete(@owner_key)
+    end
+  end
+
+  @doc false
   # The default time that a settled promise or an ended stream stays
   # available.
   @spec default_linger() :: non_neg_integer() | :infinity

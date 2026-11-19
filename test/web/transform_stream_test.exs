@@ -124,6 +124,21 @@ defmodule Web.TransformStreamTest do
       assert rejection(Writer.closed(writer)) == :start_failed
     end
 
+    test "runs the function start in the process that makes the stream" do
+      test = self()
+
+      transform =
+        TransformStream.new(%{
+          start: fn controller ->
+            send(test, {:start, self(), Controller.desired_size(controller)})
+          end
+        })
+
+      # The controller is usable in `start`: the readable side has the limit 0.
+      assert_received {:start, ^test, 0}
+      assert %TransformStream{} = transform
+    end
+
     test "lets the function start put chunks in the queue" do
       transform =
         TransformStream.new(%{
@@ -491,6 +506,14 @@ defmodule Web.TransformStreamTest do
       assert rejection(held) == :no_interest
       assert rejection(Writer.write(writer, :late)) == :no_interest
       assert %TypeError{} = rejection(Writer.close(writer))
+
+      # The promises of the writer reject with the reason also. A pipe reads
+      # `ready` before each write, and gives this reason to its source.
+      assert rejection(Writer.ready(writer)) == :no_interest
+      assert rejection(Writer.closed(writer)) == :no_interest
+
+      assert WritableStream.ready(writer.controller_pid, writer.owner_pid) ==
+               {:error, {:errored, :no_interest}}
     end
 
     test "stops a pipe, and cancels the source of the pipe with the reason" do

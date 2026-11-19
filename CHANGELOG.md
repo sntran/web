@@ -278,6 +278,15 @@ All notable changes to this project are documented in this file.
   `Web.Blob`, and a chunk for `Web.ReadableByteStreamController.enqueue/2`.
   The stream takes the buffer of a view that a byte source enqueues: that
   buffer becomes detached.
+- **Breaking:** the function `start` of a source, a sink, or a transformer
+  runs in the process that makes the stream, before the constructor
+  returns, as in the Streams Standard. A value that it throws is thrown by
+  `new`, and the stream process stops. The stream waits for a promise that
+  it returns: until then the stream does not pull, and the writes wait.
+  Before, the `start` of `Web.ReadableStream` and `Web.WritableStream` ran
+  in a task: `new` returned before it, and a value that it threw put the
+  stream in the errored state. A `start` that does not return stops its
+  caller now.
 - **Breaking:** `enqueue/2` and `close/1` of a controller raise
   `Web.TypeError` when the readable side is closed or errored, as the
   Streams Standard specifies. This applies to

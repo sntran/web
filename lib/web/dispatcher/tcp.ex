@@ -12,7 +12,6 @@ defmodule Web.Dispatcher.TCP do
 
   alias Web.Internal.Bytes
   alias Web.ReadableStream
-  alias Web.ReadableStreamDefaultController
   alias Web.ReadableStreamDefaultReader
   alias Web.Request
   alias Web.Response
@@ -83,12 +82,15 @@ defmodule Web.Dispatcher.TCP do
 
   defp body_source(bridge_pid, socket, signal) do
     %{
+      # The monitor of the bridge closes the stream when the bridge stops.
+      # Thus the close in these two functions has no check: the stream can
+      # be closed already.
       start: fn controller ->
         monitor_bridge(bridge_pid, controller)
 
         if signal_aborted?(signal) do
           cancel_bridge(bridge_pid, socket, signal_reason(signal))
-          ReadableStreamDefaultController.close(controller)
+          ReadableStream.close(controller.pid)
         else
           register_controller(bridge_pid, controller)
         end
@@ -96,7 +98,7 @@ defmodule Web.Dispatcher.TCP do
       pull: fn controller ->
         if signal_aborted?(signal) do
           cancel_bridge(bridge_pid, socket, signal_reason(signal))
-          ReadableStreamDefaultController.close(controller)
+          ReadableStream.close(controller.pid)
         else
           request_bridge_pull(bridge_pid)
         end
@@ -207,7 +209,7 @@ defmodule Web.Dispatcher.TCP do
       receive do
         # The stream can be closed already, thus this close has no check.
         {:DOWN, ^monitor_ref, :process, ^bridge_pid, _reason} ->
-          Web.ReadableStream.close(controller.pid)
+          ReadableStream.close(controller.pid)
       end
     end)
 
@@ -285,12 +287,12 @@ defmodule Web.Dispatcher.TCP do
       # The bridge runs at the same time as a cancel of the stream, thus
       # these calls have no check.
       {:chunk, chunk} ->
-        Web.ReadableStream.enqueue(controller.pid, Bytes.chunk(chunk))
+        ReadableStream.enqueue(controller.pid, Bytes.chunk(chunk))
         reply_pull(reply_to)
         process_pending_pulls(state)
 
       {:done, reason} ->
-        Web.ReadableStream.close(controller.pid)
+        ReadableStream.close(controller.pid)
         reply_pull(reply_to)
         reply_pending_pulls(state.pending_pulls)
         shutdown_bridge(state, reason)

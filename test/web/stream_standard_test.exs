@@ -357,6 +357,59 @@ defmodule Web.StreamStandardTest do
     end
   end
 
+  describe "the function start of a sink" do
+    test "runs in the process that makes the stream, with a controller that is usable" do
+      test = self()
+
+      stream =
+        WritableStream.new(%{
+          start: fn controller ->
+            send(test, {:start, self(), WritableStreamDefaultController.signal(controller)})
+          end
+        })
+
+      assert_received {:start, ^test, %AbortSignal{} = signal}
+      refute AbortSignal.aborted?(signal)
+      assert await(WritableStream.abort(stream, :stop)) == :ok
+      assert AbortSignal.aborted?(signal)
+    end
+
+    test "holds the writes until its promise fulfils" do
+      test = self()
+      {started, resolve, _reject} = Promise.with_resolvers()
+
+      stream =
+        WritableStream.new(%{
+          start: fn _controller -> started end,
+          write: fn chunk, _controller -> send(test, {:written, chunk}) end
+        })
+
+      writer = WritableStream.get_writer(stream)
+      write = Writer.write(writer, :chunk)
+      refute_receive {:written, _chunk}, 50
+
+      resolve.(:ok)
+      assert await(write) == :ok
+      assert_received {:written, :chunk}
+    end
+
+    test "that throws stops the stream process, and the constructor throws the value" do
+      test = self()
+
+      assert catch_throw(
+               WritableStream.new(%{
+                 start: fn controller ->
+                   send(test, {:controller, controller})
+                   throw(:failed)
+                 end
+               })
+             ) == :failed
+
+      assert_received {:controller, controller}
+      refute Process.alive?(controller.pid)
+    end
+  end
+
   describe "a close of the stream object" do
     test "completes the writes that wait, and awaits the promise of the sink" do
       test = self()

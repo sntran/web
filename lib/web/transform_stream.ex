@@ -55,20 +55,10 @@ defmodule Web.TransformStream do
     transformer = Keyword.get(opts, :transformer, %{})
     state = %{transformer: transformer, pid: pid}
 
-    # The function `start` runs in the process of the stream. Thus a process
-    # that it starts with a link follows the life of the stream. A value that
-    # it throws stops the start of the stream, and `new/2` throws that value.
-    #
-    # As in the Streams Standard, `new/2` does not wait for a promise that
-    # `start` returns. The stream waits for it in a task, and the writes wait
-    # until it fulfils. A rejection puts the two sides in the errored state.
-    with start_fn when is_function(start_fn, 1) <- Map.get(transformer, :start),
-         %Web.Promise{} = promise <- start_fn.(%Controller{pid: pid}) do
-      wait = fn -> Web.Promise.await(promise) end
-      {:producer_consumer, state, [{:next_event, :internal, {:start_task, wait}}]}
-    else
-      _no_promise -> {:producer_consumer, state}
-    end
+    # The function `start` of the transformer runs in the process that makes
+    # the stream: see `Web.Stream.run_start/3`. This process waits for it,
+    # and the writes wait until it is complete.
+    {:producer_consumer, state, Web.Stream.start_actions(opts)}
   end
 
   @impl Web.Stream
@@ -187,18 +177,17 @@ defmodule Web.TransformStream do
       |> Keyword.put(:high_water_mark, writable_hwm)
       |> Keyword.put(:strategy, readable_strategy)
 
-    case start_link(opts) do
-      {:ok, pid} ->
-        %__MODULE__{
-          readable: %Web.ReadableStream{controller_pid: pid},
-          writable: %Web.WritableStream{controller_pid: pid}
-        }
+    start_fn = Map.get(transformer, :start)
+    {:ok, pid} = start_link(Keyword.put(opts, :has_start, is_function(start_fn)))
 
-      # The function `start` of the transformer threw a value. This process
-      # throws the same value.
-      {:error, {:shutdown, {:start_failed, {kind, value, stacktrace}}}} ->
-        :erlang.raise(kind, value, stacktrace)
+    if start_fn do
+      Web.Stream.run_start(pid, start_fn, %Controller{pid: pid})
     end
+
+    %__MODULE__{
+      readable: %Web.ReadableStream{controller_pid: pid},
+      writable: %Web.WritableStream{controller_pid: pid}
+    }
   end
 
   @callbacks [start: 1, transform: 2, flush: 1, cancel: 1]

@@ -35,7 +35,6 @@ defmodule Web.TransformStreamDefaultController do
   """
   @spec error(t(), term()) :: :ok
   def error(%__MODULE__{pid: pid}, reason) do
-    Web.ReadableStream.start_ended(pid, :errored)
     Web.ReadableStream.error(pid, reason)
   end
 
@@ -47,7 +46,6 @@ defmodule Web.TransformStreamDefaultController do
   """
   @spec terminate(t()) :: :ok
   def terminate(%__MODULE__{pid: pid}) do
-    Web.ReadableStream.start_ended(pid, :closed)
     Web.Stream.control_cast(pid, :terminate_transform)
   end
 

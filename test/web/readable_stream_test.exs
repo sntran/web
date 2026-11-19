@@ -552,18 +552,68 @@ defmodule Web.ReadableStreamTest do
       wait_for_stream_state(error_pid, :errored)
     end
 
-    test "start callbacks that throw transition the stream to errored" do
-      {:ok, pid} =
-        ReadableStream.start_link(
-          source: %{
-            start: fn _controller ->
+    test "start callbacks that throw make the constructor throw, and start no stream" do
+      test = self()
+
+      thrown =
+        catch_throw(
+          ReadableStream.new(%{
+            start: fn controller ->
+              send(test, {:controller, controller})
               throw(:start_thrown)
             end
-          }
+          })
         )
 
-      Process.sleep(50)
-      assert ReadableStream.__get_slots__(pid).state == :errored
+      assert thrown == :start_thrown
+      assert_receive {:controller, controller}
+      refute Process.alive?(controller.pid)
+    end
+
+    test "start callbacks run in the process that makes the stream, before new returns" do
+      test = self()
+
+      stream =
+        ReadableStream.new(%{
+          start: fn controller ->
+            send(test, {:start, self()})
+            # The controller is usable: the desired size is the limit.
+            send(test, {:size, ReadableStreamDefaultController.desired_size(controller)})
+            ReadableStreamDefaultController.enqueue(controller, :first)
+          end,
+          pull: fn controller -> ReadableStreamDefaultController.close(controller) end
+        })
+
+      assert_received {:start, ^test}
+      assert_received {:size, 1}
+      assert Enum.to_list(stream) == [:first]
+    end
+
+    test "start callbacks that return a promise hold the first pull until it fulfils" do
+      test = self()
+      {started, resolve, _reject} = Web.Promise.with_resolvers()
+
+      stream =
+        ReadableStream.new(%{
+          start: fn _controller -> started end,
+          pull: fn controller ->
+            send(test, :pulled)
+            ReadableStreamDefaultController.enqueue(controller, :chunk)
+            ReadableStreamDefaultController.close(controller)
+          end
+        })
+
+      refute_receive :pulled, 50
+      resolve.(:ok)
+      assert Enum.to_list(stream) == [:chunk]
+      assert_received :pulled
+    end
+
+    test "start callbacks that return a promise that rejects put the stream in the errored state" do
+      stream = ReadableStream.new(%{start: fn _controller -> Web.Promise.reject(:failed) end})
+      reader = ReadableStream.get_reader(stream)
+
+      assert catch_exit(await(ReadableStreamDefaultReader.read(reader))) == :failed
     end
 
     test "task down paths handle normal and abnormal exits" do

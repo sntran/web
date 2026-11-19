@@ -842,12 +842,10 @@ defmodule Web.StreamTest do
   end
 
   describe "Web.Stream callback rescue/catch paths" do
-    test "source start callback exception transitions stream to errored state" do
-      {:ok, pid} =
-        ReadableStream.start_link(source: %{start: fn _ctrl -> raise "source start failed" end})
-
-      Process.sleep(50)
-      assert ReadableStream.__get_slots__(pid).state == :errored
+    test "source start callback exception is raised by the constructor" do
+      assert_raise RuntimeError, "source start failed", fn ->
+        ReadableStream.new(%{start: fn _ctrl -> raise "source start failed" end})
+      end
     end
 
     test "pull throw transitions stream to errored (catch clause)" do

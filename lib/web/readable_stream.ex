@@ -29,9 +29,6 @@ defmodule Web.ReadableStream do
 
   @released_message "The stream is not available. It ended, or its owner stopped."
 
-  # A key in the dictionary of the stream process: see `start_ended/2`.
-  @start_ended {__MODULE__, :start_ended}
-
   alias Web.AbortSignal
   alias Web.ArrayBuffer
   alias Web.AsyncContext.Snapshot
@@ -55,16 +52,9 @@ defmodule Web.ReadableStream do
     stream_type = Keyword.get(opts, :stream_type, :default)
     state = %{source: source, pid: pid, started: false, stream_type: stream_type}
 
-    if is_map(source) and is_function(source[:start], 1) do
-      ctrl = controller_for(stream_type, pid)
-      fun = source.start
-
-      # The stream waits for a promise that the `start` callback returns.
-      start = fn -> ctrl |> fun.() |> await_pull_result() end
-      {:producer, state, [{:next_event, :internal, {:start_task, start}}]}
-    else
-      {:producer, state}
-    end
+    # The function `start` of the source runs in the process that makes the
+    # stream: see `Web.Stream.run_start/3`. This process waits for it.
+    {:producer, state, Web.Stream.start_actions(opts)}
   end
 
   @impl Web.Stream
@@ -175,11 +165,18 @@ defmodule Web.ReadableStream do
         source_auto_allocate_chunk_size(underlying_source)
       )
 
-    {:ok, pid} =
-      start_link(stream_opts)
+    start_fn = source_start(underlying_source)
+    {:ok, pid} = start_link(Keyword.put(stream_opts, :has_start, is_function(start_fn)))
+
+    if start_fn do
+      Web.Stream.run_start(pid, start_fn, controller_for(stream_type, pid))
+    end
 
     %__MODULE__{controller_pid: pid}
   end
+
+  defp source_start(%{start: start}) when is_function(start, 1), do: start
+  defp source_start(_source), do: nil
 
   @doc """
   Makes a `ReadableStream` from an enumerable, or from a value of bytes.
@@ -652,43 +649,15 @@ defmodule Web.ReadableStream do
   # `enqueue` of a controller, as in the Streams Standard: raises
   # `Web.TypeError` when the stream is closed or errored.
   def controller_enqueue(pid, chunk) do
-    if pid == self() do
-      # The function `start` of a transform stream runs in the stream
-      # process, where a call to the stream is not possible.
-      start_refusal() |> controller_result("enqueue a chunk")
-      enqueue(pid, chunk)
-    else
-      pid
-      |> Web.Stream.call({:enqueue, chunk}, {:error, :closed})
-      |> controller_result("enqueue a chunk")
-    end
+    pid
+    |> Web.Stream.call({:enqueue, chunk}, {:error, :closed})
+    |> controller_result("enqueue a chunk")
   end
 
   @doc false
   # `close` of a controller: see `controller_enqueue/2`.
   def controller_close(pid) do
-    if pid == self() do
-      start_refusal() |> controller_result("close")
-      Process.put(@start_ended, :closed)
-      close(pid)
-    else
-      pid |> Web.Stream.call(:close, {:error, :closed}) |> controller_result("close")
-    end
-  end
-
-  @doc false
-  # Records that the function `start` of a transform stream ended the
-  # readable side. A subsequent `enqueue` in that function raises.
-  def start_ended(pid, state) when state in [:closed, :errored] do
-    if pid == self(), do: Process.put(@start_ended, state)
-    :ok
-  end
-
-  defp start_refusal do
-    case Process.get(@start_ended) do
-      nil -> :ok
-      state -> {:error, state}
-    end
+    pid |> Web.Stream.call(:close, {:error, :closed}) |> controller_result("close")
   end
 
   defp controller_result(:ok, _action), do: :ok

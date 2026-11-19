@@ -415,26 +415,21 @@ defmodule Web.WritableStreamTest do
   end
 
   test "start and write callback failures move the stream into errored" do
-    raised_start_stream =
-      WritableStream.new(%{
-        start: fn _controller ->
-          raise "start failed"
-        end
-      })
+    # A value that the function `start` throws is thrown by the constructor,
+    # as in the Streams Standard.
+    assert_raise RuntimeError, "start failed", fn ->
+      WritableStream.new(%{start: fn _controller -> raise "start failed" end})
+    end
 
-    thrown_start_stream =
-      WritableStream.new(%{
-        start: fn _controller ->
-          throw(:start_thrown)
-        end
-      })
+    assert catch_throw(WritableStream.new(%{start: fn _controller -> throw(:start_thrown) end})) ==
+             :start_thrown
 
-    assert_wait(fn ->
-      WritableStream.__get_slots__(raised_start_stream.controller_pid).state == :errored
-    end)
+    # A promise from `start` that rejects puts the stream in the errored state.
+    rejected_start_stream =
+      WritableStream.new(%{start: fn _controller -> Web.Promise.reject(:start_rejected) end})
 
     assert_wait(fn ->
-      WritableStream.__get_slots__(thrown_start_stream.controller_pid).state == :errored
+      WritableStream.__get_slots__(rejected_start_stream.controller_pid).state == :errored
     end)
 
     raised_write_stream =

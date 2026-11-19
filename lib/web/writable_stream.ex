@@ -24,15 +24,9 @@ defmodule Web.WritableStream do
     sink = Keyword.get(opts, :underlying_sink, %{})
     state = %{sink: sink, pid: pid}
 
-    if is_map(sink) and is_function(sink[:start], 1) do
-      ctrl = %WritableStreamDefaultController{pid: pid}
-      fun = sink.start
-
-      {:consumer, state,
-       [{:next_event, :internal, {:start_task, fn -> run_start(fun, ctrl) end}}]}
-    else
-      {:consumer, state}
-    end
+    # The function `start` of the sink runs in the process that makes the
+    # stream: see `Web.Stream.run_start/3`. This process waits for it.
+    {:consumer, state, Web.Stream.start_actions(opts)}
   end
 
   @impl Web.Stream
@@ -102,12 +96,19 @@ defmodule Web.WritableStream do
       raise Web.RangeError, "Invalid high water mark: #{inspect(hwm)}"
     end
 
+    start_fn = Map.get(underlying_sink, :start)
+
     {:ok, pid} =
       start_link(
         underlying_sink: underlying_sink,
         high_water_mark: hwm,
-        strategy: Web.CountQueuingStrategy.new(hwm)
+        strategy: Web.CountQueuingStrategy.new(hwm),
+        has_start: is_function(start_fn)
       )
+
+    if start_fn do
+      Web.Stream.run_start(pid, start_fn, %WritableStreamDefaultController{pid: pid})
+    end
 
     %__MODULE__{controller_pid: pid}
   end
@@ -268,15 +269,6 @@ defmodule Web.WritableStream do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
-
-  # The stream waits for a promise that the `start` callback returns. A
-  # rejection puts the stream in the errored state.
-  defp run_start(fun, ctrl) do
-    case fun.(ctrl) do
-      %Web.Promise{} = promise -> Web.Promise.await(promise)
-      other -> other
-    end
-  end
 
   defp invoke_sink_callback(sink, name, args) do
     case Map.get(sink, name) do

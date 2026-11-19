@@ -247,8 +247,10 @@ defmodule Web.ReadableStreamPropertyTest do
           high_water_mark: limit
         )
 
+      # The stream pulls until its queue has `limit` chunks, and not more.
+      for _ <- 1..limit, do: assert_receive({:pulled, ^ref}, 1_000)
       Process.sleep(30)
-      assert count_pulls(ref) == limit
+      assert count_pulls(ref) == 0
 
       # Each read lets the stream pull one more chunk.
       reader = ReadableStream.get_reader(stream)

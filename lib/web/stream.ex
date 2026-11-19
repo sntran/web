@@ -230,6 +230,62 @@ defmodule Web.Stream do
       :ok
   end
 
+  # ---------------------------------------------------------------------------
+  # The function `start`
+  #
+  # As in the Streams Standard, the function `start` of a source, a sink, or
+  # a transformer runs in the process that makes the stream, before the
+  # constructor returns:
+  #
+  #   * A value that it throws is thrown by the constructor, and the stream
+  #     process stops.
+  #   * The stream waits for a promise that it returns. Until that promise
+  #     fulfils, the stream does not pull, and the writes wait. A rejection
+  #     puts the stream in the errored state.
+  #
+  # The stream process makes a promise, the gate, and has a task that awaits
+  # it: see `start_actions/1`. The constructor calls `run_start/3`, which
+  # runs `start` and settles the gate with its result. The stream process
+  # owns the gate and the promises that `start` makes, as it owns the
+  # promises of its other callbacks.
+  # ---------------------------------------------------------------------------
+
+  @start_resolver {__MODULE__, :start_resolver}
+
+  @doc false
+  # The actions for the callback `start/2` of a stream module. The option
+  # `:has_start` tells that the constructor will call `run_start/3`.
+  def start_actions(opts) do
+    if Keyword.get(opts, :has_start, false) do
+      {gate, resolve, _reject} = Web.Promise.with_resolvers()
+      Process.put(@start_resolver, resolve)
+      [{:next_event, :internal, {:start_task, fn -> Web.Promise.await(gate) end}}]
+    else
+      []
+    end
+  end
+
+  @doc false
+  def run_start(pid, start_fn, controller) do
+    resolve = call(pid, :take_start_resolver, nil)
+    # A promise from `start` becomes the result of the gate.
+    resolve.(Web.Promise.with_owner(pid, fn -> start_fn.(controller) end))
+    :ok
+  catch
+    kind, value ->
+      stacktrace = __STACKTRACE__
+      stop(pid)
+      :erlang.raise(kind, value, stacktrace)
+  end
+
+  @doc false
+  # Stops a stream process, with no call to a callback.
+  def stop(pid) when is_pid(pid) do
+    :gen_statem.stop(pid, :normal, 5_000)
+  catch
+    :exit, _reason -> :ok
+  end
+
   @doc false
   # A control message is a usual message. Thus the stream handles a `close`
   # after the chunks that the same process enqueued before it.
@@ -275,25 +331,13 @@ defmodule Web.Stream do
     strategy = normalize_strategy(Keyword.get(opts, :strategy, %Web.CountQueuingStrategy{}))
     timeout_ms = Keyword.get(opts, :timeout_ms, 30_000)
 
-    case start_module(module, opts) do
-      {:ok, started} ->
-        init_data(started, module, opts, snapshot, owner, hwm, strategy, timeout_ms)
+    started =
+      case module.start(self(), opts) do
+        {type, state} -> {type, state, []}
+        {type, state, actions} -> {type, state, actions}
+      end
 
-      {:error, failure} ->
-        {:stop, {:shutdown, {:start_failed, failure}}}
-    end
-  end
-
-  # A start function that throws stops the start of the stream. The reason is
-  # a shutdown reason, thus the VM writes no crash report: the process that
-  # makes the stream throws the value again.
-  defp start_module(module, opts) do
-    case module.start(self(), opts) do
-      {t, s} -> {:ok, {t, s, []}}
-      {t, s, a} -> {:ok, {t, s, a}}
-    end
-  catch
-    kind, value -> {:error, {kind, value, __STACKTRACE__}}
+    init_data(started, module, opts, snapshot, owner, hwm, strategy, timeout_ms)
   end
 
   defp init_data(
@@ -732,11 +776,16 @@ defmodule Web.Stream do
       state == :errored ->
         {:keep_state_and_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
 
+      # The writable side of a transform stream is in the errored state. An
+      # error releases the lock, thus this check comes before the lock check.
+      state == :closed and is_tuple(data.writable_error) ->
+        {:keep_state_and_data, [{:reply, from, closed_reply(data, :writer)}]}
+
       pid != data.writer_pid ->
         {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
 
       state == :closed ->
-        {:keep_state_and_data, [{:reply, from, closed_reply(data, :writer)}]}
+        {:keep_state_and_data, [{:reply, from, :ok}]}
 
       writable_ready?(data) ->
         {:keep_state_and_data, [{:reply, from, :ok}]}
@@ -790,6 +839,11 @@ defmodule Web.Stream do
       refusal ->
         {:keep_state_and_data, [{:reply, from, {:error, refusal}}]}
     end
+  end
+
+  # The constructor takes the function that settles the gate of `start`.
+  defp handle_common({:call, from}, :take_start_resolver, _state, _data) do
+    {:keep_state_and_data, [{:reply, from, Process.delete(@start_resolver)}]}
   end
 
   # Query helpers
@@ -973,13 +1027,13 @@ defmodule Web.Stream do
        )
        when data.type in [:consumer, :producer_consumer] do
     cond do
-      owner_pid != data.writer_pid ->
-        send(waiter_pid, {:stream_error, ref, :not_locked_by_writer})
-        :keep_state_and_data
-
       state == :closed and match?({:errored, _reason}, data.writable_error) ->
         {:errored, reason} = data.writable_error
         send(waiter_pid, {:stream_error, ref, {:errored, reason}})
+        :keep_state_and_data
+
+      owner_pid != data.writer_pid ->
+        send(waiter_pid, {:stream_error, ref, :not_locked_by_writer})
         :keep_state_and_data
 
       state == :closed ->

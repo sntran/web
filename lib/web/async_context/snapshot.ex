@@ -28,7 +28,7 @@ defmodule Web.AsyncContext.Snapshot do
 
       snapshot = Web.AsyncContext.Snapshot.take()
 
-      Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
+      spawn(fn ->
         Web.AsyncContext.Snapshot.run(snapshot, fn ->
           # Logger metadata, $callers, and all Variables are now available.
         end)

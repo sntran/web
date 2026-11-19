@@ -19,7 +19,6 @@ defmodule Web.Application do
       # The servers of the message ports, the broadcast channels, and the
       # sockets.
       {DynamicSupervisor, name: Web.HandleSupervisor, strategy: :one_for_one},
-      {Task.Supervisor, name: Web.TaskSupervisor},
       Web.AbortSignal.Reasons,
       Web.URLPattern.Cache,
       # The function reads the settings each time the pools start.

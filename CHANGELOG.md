@@ -90,6 +90,15 @@ All notable changes to this project are documented in this file.
     for the linger time. An `await` after that time rejects with
     `Web.TypeError`. The `opened`, `closed`, and `upgraded` promises of
     `Web.Socket` do not expire.
+- **Breaking:** `Web.URL` does the "domain to ASCII" operation in Elixir
+  only. It follows Unicode Technical Standard #46 with the settings of the
+  URL Standard. Before, the library read the expected results from the
+  cached WPT fixture files in `tmp/wpt_cache`, and then called a Node.js
+  process if `node` was installed. Both are removed, and the module
+  `Web.URL.Idna` is removed. A host can give a different result now:
+  - an empty label is permitted (`bücher..example`);
+  - the IDNA2008 rules for U+00B7 and other CONTEXTO characters do not apply;
+  - a label with the prefix `xn--` must decode to a valid label.
 - The WPT fixtures are pinned to one commit of `web-platform-tests/wpt`
   (`@wpt_revision` in `test/support/wpt.ex`). A change upstream cannot change
   the test results.
@@ -144,6 +153,13 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.URLPattern` uses the Unicode properties `ID_Start` and `ID_Continue`
+  for the name of a group. Before, it accepted each character below U+1F000.
+  A name with a variation selector after its first letter does not raise
+  `MatchError`.
+- The WPT fixture loader keeps each surrogate pair. Before, it removed a
+  combining mark above U+FFFF that came first in a string, and the tests
+  did not get the real input.
 - `Web.Promise` inspect coverage no longer relies on a sleep-driven race for
   the in-progress pending-state assertion in `test/web/promise_test.exs`.
 - `Web.Dispatcher.TCP` now seals end-to-end TCP backpressure by reading from

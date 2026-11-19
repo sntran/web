@@ -464,7 +464,6 @@ defmodule Web.Platform.Test do
     }
 
     Elixir.File.write!(meta_path, Jason.encode!(meta))
-    reset_idna_lookup()
     raw
   end
 
@@ -482,17 +481,7 @@ defmodule Web.Platform.Test do
     }
 
     Elixir.File.write!(meta_path, Jason.encode!(meta))
-    reset_idna_lookup()
     decoded
-  end
-
-  # `Web.URL.Idna` reads the cached fixtures one time and keeps the result.
-  # It can read them before this module downloads them. Then the test results
-  # change with the state of the cache. To prevent this, discard the result
-  # each time a fixture changes.
-  defp reset_idna_lookup do
-    _ = :persistent_term.erase({Web.URL.Idna, :lookup})
-    :ok
   end
 
   defp decode_payload(json_response, raw) do
@@ -694,19 +683,16 @@ defmodule Web.Platform.Test do
 
   defp normalize_cases(url, payload) when is_binary(url) and is_map(payload), do: [payload]
 
+  # Jason decodes a correct surrogate pair, but fails on a surrogate that is
+  # alone. A browser changes such a surrogate to U+FFFD when it reads the
+  # string, thus do the same here. Do not change a correct pair.
   defp repair_surrogates(text) do
     Regex.replace(
       ~r/\\u([Dd][89AaBb][0-9A-Fa-f]{2})\\u([Dd][C-Fc-f][0-9A-Fa-f]{2})|\\u([Dd][89A-Fa-f][0-9A-Fa-f]{2})/,
       text,
       fn
-        _, high, low, "" ->
-          h = String.to_integer(high, 16)
-          l = String.to_integer(low, 16)
-          cp = 0x10000 + (h - 0xD800) * 0x400 + (l - 0xDC00)
-          cp |> List.wrap() |> List.to_string() |> Jason.encode!() |> String.slice(1..-2//1)
-
-        _, "", "", _lone ->
-          "\\uFFFD"
+        _match, "", "", _lone -> "\\uFFFD"
+        pair, _high, _low, "" -> pair
       end
     )
   end

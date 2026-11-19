@@ -35,14 +35,12 @@ defmodule SecureByobStreamExample do
 
       reader = ReadableStream.get_reader(stream, mode: "byob")
       scratch = Uint8Array.new(ArrayBuffer.new(@view_bytes))
-      buffer_id = ArrayBuffer.identity(scratch.buffer)
 
-      IO.puts("consumer buffer=#{inspect(buffer_id)} bytes=#{scratch.byte_length}")
+      IO.puts("consumer buffer bytes=#{scratch.byte_length}")
 
       stats =
         drain(reader, scratch, %{
-          buffer_id: buffer_id,
-          buffer_reused?: true,
+          buffer_length_kept?: true,
           bytes: 0,
           reads: 0
         })
@@ -53,7 +51,7 @@ defmodule SecureByobStreamExample do
       :ok = AbortController.abort(controller, :demo_complete)
 
       IO.puts("completed reads=#{stats.reads} bytes=#{stats.bytes}")
-      IO.puts("buffer reused on every read=#{stats.buffer_reused?}")
+      IO.puts("buffer length kept on every read=#{stats.buffer_length_kept?}")
 
       IO.puts(
         "sample capabilities=#{Enum.map_join(source_stats.capability_sample, ", ", &inspect/1)}"
@@ -130,30 +128,27 @@ defmodule SecureByobStreamExample do
       %{value: %Uint8Array{} = view, done: false} ->
         read_number = stats.reads + 1
 
-        buffer_reused? =
-          stats.buffer_reused? and ArrayBuffer.identity(view.buffer) == stats.buffer_id
+        # A BYOB read moves the buffer into the stream. The buffer that the
+        # reader gave is now detached. The result has a buffer of the same
+        # length, which the reader uses for the subsequent read.
+        buffer_length_kept? =
+          stats.buffer_length_kept? and ArrayBuffer.detached?(scratch.buffer) and
+            ArrayBuffer.byte_length(view.buffer) == @view_bytes
 
         if read_number <= 3 or rem(read_number, 16) == 0 do
-          IO.puts(
-            "read=#{read_number} bytes=#{view.byte_length} consumer_buffer=#{inspect(ArrayBuffer.identity(view.buffer))}"
-          )
+          IO.puts("read=#{read_number} bytes=#{view.byte_length}")
         end
 
-        drain(reader, scratch, %{
+        drain(reader, Uint8Array.new(view.buffer), %{
           stats
           | reads: read_number,
             bytes: stats.bytes + view.byte_length,
-            buffer_reused?: buffer_reused?
+            buffer_length_kept?: buffer_length_kept?
         })
     end
   end
 
-  defp await_promise(%Web.Promise{task: task}) do
-    Task.await(task, :infinity)
-  catch
-    :exit, {{:shutdown, reason}, {Task, :await, _details}} -> exit(reason)
-    :exit, reason -> exit(reason)
-  end
+  defp await_promise(%Web.Promise{} = promise), do: Web.Promise.await(promise)
 end
 
 SecureByobStreamExample.run()

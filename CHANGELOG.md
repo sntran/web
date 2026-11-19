@@ -111,7 +111,25 @@ All notable changes to this project are documented in this file.
   `Web.Request.new/2` refuses, and a request whose body is already read or
   locked, give a rejection with `Web.TypeError`, and `fetch` makes no
   connection. `fetch` with a request as its input applies `init`.
-
+- **Breaking:** `Web.ArrayBuffer` is a struct around a binary. It uses no
+  table and no process, and the VM collects a buffer as each other term.
+  - The detached state is one flag in an `:atomics` array. `detach/1`, a
+    transfer, and `detached?/1` operate as before for all the copies of
+    the struct on one node.
+  - `Web.ArrayBuffer.transfer/2` is new. It moves the bytes to a new
+    buffer and detaches the first buffer, as `ArrayBuffer.prototype.transfer()`
+    of ECMAScript.
+  - `write_at/3` is removed. No function changes the bytes of a buffer.
+  - `new/1` raises `Web.TypeError` for input that is not a binary or a byte
+    length.
+- **Breaking:** a read with `Web.ReadableStreamBYOBReader` moves the buffer
+  of the view into the stream, as the Streams Standard specifies. The
+  buffer that you gave becomes detached. The result has a new view in a
+  buffer of the same length: use `value.buffer` for the subsequent read.
+  - At the end of the stream, `value` is a view of zero bytes in that
+    buffer. Before, it was the view that you gave.
+  - A view of zero bytes, or a view of a detached buffer, gives a rejection
+    with `Web.TypeError`.
 - **Breaking:** `Web.Promise` has a new engine. A pending promise is a small
   process, not a `Task`. The struct has the fields `:pid` and `:state`, and
   the field `:task` is removed.
@@ -288,6 +306,14 @@ All notable changes to this project are documented in this file.
   stops.
 - An errored stream stops after the linger time, also with chunks in its
   queue. No process can read those chunks.
+- `Web.ArrayBuffer.new/1` does not leave data behind. Before, each buffer
+  left one row with all its bytes in a table, and nothing removed the row.
+  Thus each `array_buffer/1` of a body kept its bytes until the VM stopped.
+  Each read of a buffer also called one process.
+- A BYOB read with a view of a detached buffer gives a rejection. Before,
+  it raised in the stream process.
+- The example `examples/secure_byob_stream.exs` operates again. It used the
+  field `:task` of the old promise.
 - `Web.fetch/2` rejects when the body of the request is already read.
   Before, it sent the request with an empty body and gave no error.
 - A pipe with a source that has no end stops after the processes that use

@@ -1053,14 +1053,35 @@ defmodule Web.Stream do
   end
 
   defp handle_byob_read_request(from, _pid, %Web.Uint8Array{} = view, state, data) do
-    data = %{data | disturbed: true}
+    case take_byob_view(view) do
+      {:ok, view} -> accept_byob_read(from, view, state, %{data | disturbed: true})
+      {:error, error} -> {:keep_state_and_data, [{:reply, from, {:error, error}}]}
+    end
+  end
 
+  # A BYOB read moves the buffer of the reader into the stream, as the
+  # Streams Standard specifies. The buffer of the reader becomes detached,
+  # and the result of the read has a new buffer with the same bytes and the
+  # bytes of the chunk. Thus no process can change the buffer during the read.
+  defp take_byob_view(%Web.Uint8Array{byte_length: 0}) do
+    {:error, Web.TypeError.exception("A BYOB read needs a view with a byte length above zero.")}
+  end
+
+  defp take_byob_view(%Web.Uint8Array{} = view) do
+    {:ok, Web.Uint8Array.transfer(view)}
+  rescue
+    Web.TypeError ->
+      {:error,
+       Web.TypeError.exception("A BYOB read needs a view of a buffer that is not detached.")}
+  end
+
+  defp accept_byob_read(from, view, state, data) do
     cond do
       not :queue.is_empty(data.queue) ->
         pop_queued_bytes(from, view, data)
 
       state == :closed ->
-        {:keep_state, data, [{:reply, from, :done}]}
+        {:keep_state, data, [{:reply, from, {:done, Web.Uint8Array.empty(view)}}]}
 
       true ->
         pending_byob_request = new_pending_byob_request(from, view)
@@ -1074,8 +1095,7 @@ defmodule Web.Stream do
     {chunk, new_queue, new_total_queued_size} =
       take_bytes_from_queue(data.queue, data.total_queued_size, data.strategy, view.byte_length)
 
-    :ok = Web.ArrayBuffer.write_at(view.buffer, view.byte_offset, chunk)
-    chunk_view = Web.Uint8Array.new(view.buffer, view.byte_offset, byte_size(chunk))
+    chunk_view = Web.Uint8Array.fill(view, chunk)
 
     new_data = %{
       data
@@ -1214,8 +1234,7 @@ defmodule Web.Stream do
     written_size = min(byte_size(chunk), view.byte_length)
     written = binary_part(chunk, 0, written_size)
 
-    :ok = Web.ArrayBuffer.write_at(view.buffer, view.byte_offset, written)
-    chunk_view = Web.Uint8Array.new(view.buffer, view.byte_offset, written_size)
+    chunk_view = Web.Uint8Array.fill(view, written)
 
     new_data =
       if written_size < byte_size(chunk) do
@@ -2094,6 +2113,10 @@ defmodule Web.Stream do
     case take_pending_byob_request(data) do
       {nil, new_data} ->
         {new_data, []}
+
+      # The reader gets its buffer back, in a view of zero bytes.
+      {%{from: from, view: view}, new_data} when reply == :done ->
+        {new_data, [{:reply, from, {:done, Web.Uint8Array.empty(view)}}]}
 
       {%{from: from}, new_data} ->
         {new_data, [{:reply, from, reply}]}

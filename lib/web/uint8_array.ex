@@ -1,6 +1,9 @@
 defmodule Web.Uint8Array do
   @moduledoc """
-  WHATWG-style immutable Uint8Array view over an ArrayBuffer.
+  An immutable `Uint8Array` view of a part of a `Web.ArrayBuffer`.
+
+  A view does not copy the bytes of its buffer. `to_binary/1` raises
+  `Web.TypeError` when the buffer is detached.
 
   ## Examples
 
@@ -68,6 +71,29 @@ defmodule Web.Uint8Array do
   @doc false
   @spec identity(t()) :: reference() | nil
   def identity(%__MODULE__{} = uint8_array), do: uint8_array.id
+
+  @doc false
+  # Moves the buffer of the view to a new buffer, and returns the same view
+  # of the new buffer. The first buffer becomes detached. Raises
+  # `Web.TypeError` when the buffer is detached.
+  @spec transfer(t()) :: t()
+  def transfer(%__MODULE__{buffer: buffer, byte_offset: offset, byte_length: length}) do
+    build_view(ArrayBuffer.transfer(buffer), offset, length)
+  end
+
+  @doc false
+  # Puts `chunk` at the start of the view, and returns a view of only those
+  # bytes. Only the one holder of the buffer can use this function.
+  @spec fill(t(), binary()) :: t()
+  def fill(%__MODULE__{buffer: buffer, byte_offset: offset, byte_length: length}, chunk)
+      when is_binary(chunk) and byte_size(chunk) <= length do
+    build_view(ArrayBuffer.replace(buffer, offset, chunk), offset, byte_size(chunk))
+  end
+
+  @doc false
+  # Returns a view of zero bytes at the same offset of the same buffer.
+  @spec empty(t()) :: t()
+  def empty(%__MODULE__{buffer: buffer, byte_offset: offset}), do: build_view(buffer, offset, 0)
 
   @doc """
   Returns the binary represented by this Uint8Array view.

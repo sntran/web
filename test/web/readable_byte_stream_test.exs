@@ -14,6 +14,114 @@ defmodule Web.ReadableByteStreamTest do
   alias Web.TextDecoderStream
   alias Web.Uint8Array
 
+  describe "the buffer of a BYOB read" do
+    test "moves into the stream: the buffer of the reader becomes detached" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ReadableStream.enqueue(stream.controller_pid, "hello")
+
+      view = Uint8Array.new(ArrayBuffer.new(8))
+      assert %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
+
+      assert ArrayBuffer.detached?(view.buffer)
+      refute ArrayBuffer.detached?(value.buffer)
+      assert Uint8Array.to_binary(value) == "hello"
+
+      # The new buffer has the length of the first buffer.
+      assert ArrayBuffer.byte_length(value.buffer) == 8
+      assert ArrayBuffer.data(value.buffer) == <<"hello", 0, 0, 0>>
+    end
+
+    test "can be used again for the subsequent read" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ReadableStream.enqueue(stream.controller_pid, "abcdefgh")
+      ReadableStream.close(stream.controller_pid)
+
+      read_all = fn read_all, view, acc ->
+        case await(ReadableStreamBYOBReader.read(reader, view)) do
+          %{value: value, done: false} ->
+            read_all.(read_all, Uint8Array.new(value.buffer), [Uint8Array.to_binary(value) | acc])
+
+          %{value: value, done: true} ->
+            assert value.byte_length == 0
+            assert ArrayBuffer.byte_length(value.buffer) == 3
+            acc |> Enum.reverse()
+        end
+      end
+
+      assert read_all.(read_all, Uint8Array.new(ArrayBuffer.new(3)), []) == ["abc", "def", "gh"]
+    end
+
+    test "keeps the bytes that are not in the view" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ReadableStream.enqueue(stream.controller_pid, "XYZ")
+
+      view = Uint8Array.new(ArrayBuffer.new("0123456789"), 4, 4)
+      assert %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
+
+      assert {value.byte_offset, value.byte_length} == {4, 3}
+      assert Uint8Array.to_binary(value) == "XYZ"
+      assert ArrayBuffer.data(value.buffer) == "0123XYZ789"
+    end
+
+    test "limits each read to the length of the view" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ReadableStream.enqueue(stream.controller_pid, String.duplicate("x", 100))
+
+      view = Uint8Array.new(ArrayBuffer.new(16), 0, 7)
+      assert %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
+      assert value.byte_length == 7
+    end
+
+    test "is refused when it is detached, and the stream continues" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ReadableStream.enqueue(stream.controller_pid, "hello")
+
+      view = Uint8Array.new(ArrayBuffer.new(8))
+      assert %{done: false} = await(ReadableStreamBYOBReader.read(reader, view))
+
+      # The first view has a detached buffer after the read.
+      assert %Web.TypeError{message: message} =
+               catch_exit(await(ReadableStreamBYOBReader.read(reader, view)))
+
+      assert message =~ "a buffer that is not detached"
+
+      ReadableStream.enqueue(stream.controller_pid, "again")
+      fresh = Uint8Array.new(ArrayBuffer.new(8))
+      assert %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, fresh))
+      assert Uint8Array.to_binary(value) == "again"
+    end
+
+    test "is refused when the view has zero bytes, and stays attached" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ReadableStream.enqueue(stream.controller_pid, "hello")
+
+      view = Uint8Array.new(ArrayBuffer.new(8), 0, 0)
+
+      assert %Web.TypeError{message: message} =
+               catch_exit(await(ReadableStreamBYOBReader.read(reader, view)))
+
+      assert message =~ "byte length above zero"
+      refute ArrayBuffer.detached?(view.buffer)
+      refute ReadableStream.disturbed?(stream)
+    end
+
+    test "stays attached when the stream refuses the read" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ReadableStreamBYOBReader.release_lock(reader)
+
+      view = Uint8Array.new(ArrayBuffer.new(8))
+      assert %Web.TypeError{} = catch_exit(await(ReadableStreamBYOBReader.read(reader, view)))
+      refute ArrayBuffer.detached?(view.buffer)
+    end
+  end
+
   test "BYOB readers consume queued bytes and preserve queued remainders" do
     stream = ReadableStream.new(%{type: "bytes"})
     reader = ReadableStream.get_reader(stream, mode: "byob")
@@ -190,8 +298,12 @@ defmodule Web.ReadableByteStreamTest do
     closed_reader = ReadableStream.get_reader(closed_stream, mode: "byob")
     closed_view = Uint8Array.new(ArrayBuffer.new(2))
 
-    assert await(ReadableStreamBYOBReader.read(closed_reader, closed_view)) ==
-             %{value: closed_view, done: true}
+    # The result has the buffer of the reader, in a view of zero bytes.
+    assert %{value: %Uint8Array{byte_length: 0, byte_offset: 0} = empty_view, done: true} =
+             await(ReadableStreamBYOBReader.read(closed_reader, closed_view))
+
+    assert ArrayBuffer.byte_length(empty_view.buffer) == 2
+    assert ArrayBuffer.detached?(closed_view.buffer)
 
     errored_stream =
       ReadableStream.new(%{
@@ -357,7 +469,7 @@ defmodule Web.ReadableByteStreamTest do
 
     ReadableStream.close(stream.controller_pid)
 
-    assert :done =
+    assert {:done, %Uint8Array{byte_length: 0}} =
              ReadableStream.byob_read(stream.controller_pid, Uint8Array.new(ArrayBuffer.new(1)))
 
     pending_stream = ReadableStream.new(%{type: "bytes"})

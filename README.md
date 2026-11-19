@@ -204,11 +204,15 @@ await(Response.text(Response.new(body: encoded)))
 # => "Hello, 🌍"
 ```
 
-Byte-oriented streams also support WHATWG-style BYOB reads. Consumers can
-reuse their own `Uint8Array` buffers while producers fill them through a
-capability-scoped `ReadableStreamBYOBRequest`, with
-`ReadableByteStreamController` exposing the active BYOB request and
-byte-oriented desired-size flow control.
+Byte-oriented streams also support WHATWG-style BYOB reads. The reader
+gives a `Uint8Array` view, and each read gives not more bytes than the view
+can hold. The producer fills the view through a capability-scoped
+`ReadableStreamBYOBRequest`, and `ReadableByteStreamController` gives the
+active BYOB request and the desired size in bytes.
+
+As in the Streams Standard, a BYOB read moves the buffer into the stream:
+the buffer that you gave becomes detached, and the result has a new view in
+a buffer of the same length. Use `value.buffer` for the subsequent read.
 
 ```elixir
 use Web
@@ -230,8 +234,14 @@ stream =
 reader = ReadableStream.get_reader(stream, mode: "byob")
 view = Uint8Array.new(ArrayBuffer.new(5))
 
-await(ReadableStreamBYOBReader.read(reader, view))
-# => %{value: %Web.Uint8Array<...>, done: false}
+%{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
+Uint8Array.to_binary(value)
+# => "hello"
+
+# The first buffer is detached. Use the buffer of the result again.
+ArrayBuffer.detached?(view.buffer)
+# => true
+view = Uint8Array.new(value.buffer)
 ```
 
 For a full buffer-reuse example, run:

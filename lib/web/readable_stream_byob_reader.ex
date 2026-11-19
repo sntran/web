@@ -1,6 +1,21 @@
 defmodule Web.ReadableStreamBYOBReader do
   @moduledoc """
-  A BYOB reader for byte-oriented readable streams.
+  A BYOB ("bring your own buffer") reader for a readable byte stream.
+
+  `read/2` moves the buffer of the view into the stream, as the Streams
+  Standard specifies. The buffer that you gave becomes detached. The result
+  has a new view, in a new buffer that has the same length:
+
+      {:ok, view} = ...
+      %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
+      bytes = Web.Uint8Array.to_binary(value)
+
+      # Use the buffer of the result for the subsequent read.
+      view = Web.Uint8Array.new(value.buffer)
+
+  A binary of the BEAM is immutable. Thus a BYOB read does not decrease the
+  number of copies, as it does in a browser. Its function here is to limit
+  the number of bytes of each read to the length of the view.
   """
 
   defstruct [:controller_pid]
@@ -18,8 +33,8 @@ defmodule Web.ReadableStreamBYOBReader do
       {:ok, %Uint8Array{} = chunk_view} ->
         Promise.resolve(%{value: chunk_view, done: false})
 
-      :done ->
-        Promise.resolve(%{value: view, done: true})
+      {:done, %Uint8Array{} = empty_view} ->
+        Promise.resolve(%{value: empty_view, done: true})
 
       {:error, :not_locked_by_reader} ->
         Promise.reject(%TypeError{message: "This BYOB reader is no longer locked."})

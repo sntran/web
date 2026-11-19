@@ -190,6 +190,61 @@ defmodule Web.StreamLifetimeTest do
     end
   end
 
+  describe "a stream with the option :unread_timeout" do
+    defp counting_source(parent) do
+      %{
+        pull: fn controller -> ReadableStreamDefaultController.enqueue(controller, "x") end,
+        cancel: fn reason -> send(parent, {:cancelled, reason}) end
+      }
+    end
+
+    test "goes to the errored state and stops when no process reads it" do
+      stream = ReadableStream.new(counting_source(self()), unread_timeout: 50)
+
+      assert_receive {:cancelled, %TypeError{message: message}}, 2_000
+      assert message =~ "The stream was not read in 50 ms"
+      assert_down(stream.controller_pid)
+
+      assert_raise TypeError, ~r/The stream is not available/, fn -> Enum.take(stream, 1) end
+    end
+
+    test "discards its chunks and stops when it is closed and no process reads it" do
+      stream = ReadableStream.from_enumerable(["a", "b"], unread_timeout: 50, high_water_mark: 5)
+      assert_down(stream.controller_pid)
+    end
+
+    test "continues when a process started to read it" do
+      stream = ReadableStream.new(counting_source(self()), unread_timeout: 50)
+      reader = ReadableStream.get_reader(stream)
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "x", done: false}
+
+      refute_receive {:cancelled, _reason}, 200
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "x", done: false}
+    end
+
+    test "continues while a process holds its lock" do
+      stream = ReadableStream.new(counting_source(self()), unread_timeout: 50)
+      _reader = ReadableStream.get_reader(stream)
+
+      refute_receive {:cancelled, _reason}, 200
+      assert Process.alive?(stream.controller_pid)
+    end
+  end
+
+  describe "an errored stream" do
+    test "stops after the linger time, also with chunks in its queue" do
+      stream =
+        ReadableStream.new(%{
+          start: fn controller ->
+            ReadableStreamDefaultController.enqueue(controller, "not read")
+            ReadableStreamDefaultController.error(controller, :source_failure)
+          end
+        })
+
+      assert_down(stream.controller_pid)
+    end
+  end
+
   describe "from/1" do
     test "accepts an enumerable that halts itself" do
       assert Enum.to_list(ReadableStream.from(Stream.take([1, 2, 3], 2))) == [1, 2]

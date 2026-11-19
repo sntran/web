@@ -4,6 +4,7 @@ defmodule Web.Dispatcher.HTTP do
   @behaviour Web.Dispatcher
 
   @max_redirects 20
+  @default_unread_body_timeout 300_000
   @redirect_statuses [301, 302, 303, 307, 308]
   @credential_headers ["authorization", "cookie", "proxy-authorization"]
   @request_body_headers [
@@ -118,7 +119,7 @@ defmodule Web.Dispatcher.HTTP do
                status: status,
                status_text: Map.get(@status_texts, status, ""),
                headers: headers,
-               body: stream,
+               body: response_body(stream),
                url: Web.URL.href(request.url),
                redirected: redirect_count > 0
              )
@@ -129,6 +130,16 @@ defmodule Web.Dispatcher.HTTP do
           {:error, reason}
       end
     end
+  end
+
+  # A body that no process reads holds its connection. Thus the body stream
+  # has a time limit for the start of the read.
+  defp response_body(stream) do
+    Web.ReadableStream.from_enumerable(stream, unread_timeout: unread_body_timeout())
+  end
+
+  defp unread_body_timeout do
+    Application.get_env(:web, :unread_body_timeout, @default_unread_body_timeout)
   end
 
   # The body stream of the response subscribes to the signal of the request.

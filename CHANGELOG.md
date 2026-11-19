@@ -15,6 +15,11 @@ All notable changes to this project are documented in this file.
   settled promise or an ended stream stays available. The default is 5000 ms.
 - Tests that count the processes of the VM, to find streams that stay after
   their work is complete.
+- The application setting `config :web, unread_body_timeout: ms` for the
+  body of a `Web.fetch/2` response. A body that no process starts to read in
+  that time releases its connection, and a later read rejects. The default
+  is 300000 ms. The value `:infinity` removes the limit.
+- The option `:unread_timeout` for a stream that holds a resource.
 - `use Web` aliases `Web.ReadableStreamDefaultReader`.
 - Tests that count the processes of the VM, to find promises that a
   long-lived process keeps.
@@ -216,6 +221,8 @@ All notable changes to this project are documented in this file.
   stopped.
 - The helper processes of `Web.AbortSignal.any/1` stop when the new signal
   stops.
+- An errored stream stops after the linger time, also with chunks in its
+  queue. No process can read those chunks.
 - `Web.URL` does not keep each host in a table. The table had no limit, and
   it was necessary only for the Node.js call that is now removed.
 - A stream subscribes to its ambient `Web.AbortSignal` in its own process.

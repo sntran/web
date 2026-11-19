@@ -163,9 +163,12 @@ Managed processes that provide data with spec-compliant backpressure.
 
 A stream is a process, and it has an owner: the process that made it. A
 stream stops after it is ended and all its chunks are read. It also stops
-when its owner stops and no process has locked it. Thus read or cancel each
-response body in a process that stays alive. A halt, such as `Enum.take/2`,
-cancels the stream.
+when its owner stops and no process has locked it. A halt, such as
+`Enum.take/2`, cancels the stream.
+
+Read or cancel each response body. A body that no process starts to read
+releases its connection after 300 seconds
+(`config :web, unread_body_timeout: ms`), and a later read rejects.
 
 ```elixir
 # Create a stream from any enumerable

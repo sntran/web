@@ -7,6 +7,9 @@ defmodule Web.Test.EchoServer do
   #     the body, each on its own line.
   #   * `/redirect/<status>?to=<location>` gives a redirect to the location.
   #   * `/truncated` gives a body that is shorter than its content length.
+  #   * `/hold` gives the start of a body and keeps the connection open. It
+  #     sends `:server_connection_closed` to the test process when the client
+  #     closes the connection.
   #
   # The server sends `{:server_chunk, data}` to the test process for each
   # chunk of a chunked request body.
@@ -39,6 +42,7 @@ defmodule Web.Test.EchoServer do
          {method, target, headers} = parse_head(head),
          {:ok, body} <- read_body(socket, headers, rest, parent) do
       respond(socket, method, target, headers, body)
+      if target == "/hold", do: wait_for_close(socket, parent)
     end
 
     :gen_tcp.close(socket)
@@ -124,8 +128,19 @@ defmodule Web.Test.EchoServer do
     :gen_tcp.send(socket, "HTTP/1.1 200 OK\r\ncontent-length: 50\r\n\r\npartial")
   end
 
+  defp respond(socket, _method, "/hold", _headers, _body) do
+    :gen_tcp.send(socket, "HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nstart")
+  end
+
   defp respond(socket, _method, _target, _headers, _body) do
     send_response(socket, 404, [], "not found")
+  end
+
+  defp wait_for_close(socket, parent) do
+    case :gen_tcp.recv(socket, 0, 10_000) do
+      {:error, :closed} -> send(parent, :server_connection_closed)
+      _other -> :ok
+    end
   end
 
   defp send_response(socket, status, headers, body) do

@@ -122,6 +122,7 @@ defmodule Web.Stream do
     cancel_on_reader_exit: false,
     # Lifetime
     signal_subscription: nil,
+    unread_timeout: nil,
     owner_ref: nil,
     owner_down_reason: nil,
     linger: 5_000,
@@ -224,7 +225,8 @@ defmodule Web.Stream do
       timeout_ms: timeout_ms,
       async_context: snapshot,
       owner_ref: Process.monitor(owner),
-      linger: Keyword.get_lazy(opts, :linger, &Web.Promise.default_linger/0)
+      linger: Keyword.get_lazy(opts, :linger, &Web.Promise.default_linger/0),
+      unread_timeout: Keyword.get(opts, :unread_timeout)
     }
 
     {initial_state, default_actions} =
@@ -241,7 +243,7 @@ defmodule Web.Stream do
           {:writable, []}
       end
 
-    all_actions = extra_actions ++ default_actions
+    all_actions = extra_actions ++ default_actions ++ unread_timeout_actions(data)
 
     data =
       if type in [:consumer, :producer_consumer] do
@@ -892,6 +894,24 @@ defmodule Web.Stream do
 
   defp handle_common(:info, {:ambient_signal_abort, reason}, state, data) do
     handle_ambient_abort(reason, state, data)
+  end
+
+  # The option `:unread_timeout`: the stream holds a resource, for example a
+  # network connection, and no process started to read it in the given time.
+  # A stream that has work goes to the errored state, thus its source
+  # releases the resource. A closed stream discards its chunks. Then the
+  # lifetime rules stop the stream.
+  defp handle_common({:timeout, :unread}, :expired, state, data) do
+    cond do
+      data.disturbed or locked?(data) or state == :errored ->
+        :keep_state_and_data
+
+      state == :closed ->
+        {:keep_state, %{data | queue: :queue.new(), total_queued_size: 0, disturbed: true}}
+
+      true ->
+        handle_termination(:abort, unread_error(data), data)
+    end
   end
 
   # The lifetime timer: see `with_lifetime/3`.
@@ -1680,7 +1700,8 @@ defmodule Web.Stream do
   defp lifetime_timeout(state, data) when state in [:closed, :errored] do
     cond do
       not is_nil(data.active_task) -> nil
-      drained?(data) -> complete_linger(data)
+      # No process can read the chunks of an errored stream.
+      state == :errored or drained?(data) -> complete_linger(data)
       true -> unread_linger(data)
     end
   end
@@ -1710,6 +1731,19 @@ defmodule Web.Stream do
   defp drained?(data) do
     :queue.is_empty(data.queue) and :queue.is_empty(data.read_requests) and
       is_nil(data.pending_byob_request)
+  end
+
+  defp unread_timeout_actions(%{unread_timeout: timeout}) when is_integer(timeout) do
+    [{{:timeout, :unread}, timeout, :expired}]
+  end
+
+  defp unread_timeout_actions(_data), do: []
+
+  defp unread_error(data) do
+    Web.TypeError.exception(
+      "The stream was not read in #{data.unread_timeout} ms. " <>
+        "Read or cancel each response body."
+    )
   end
 
   defp owner_down_type(%{type: :producer}), do: :cancel

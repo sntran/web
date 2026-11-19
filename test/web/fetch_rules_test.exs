@@ -43,6 +43,17 @@ defmodule Web.FetchRulesTest do
     %{method: method, headers: headers, body: body}
   end
 
+  defp settle(baseline, attempts \\ 150) do
+    difference = :erlang.system_info(:process_count) - baseline
+
+    if difference <= 10 or attempts == 0 do
+      difference
+    else
+      Process.sleep(20)
+      settle(baseline, attempts - 1)
+    end
+  end
+
   defp assert_down(pid) do
     ref = Process.monitor(pid)
     assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 2_000
@@ -217,6 +228,43 @@ defmodule Web.FetchRulesTest do
 
       Process.exit(controller.signal.pid, :kill)
       assert catch_exit(await(Response.text(response))) == {:errored, :aborted}
+    end
+  end
+
+  describe "a response body that no process reads" do
+    setup do
+      Application.put_env(:web, :unread_body_timeout, 150)
+      on_exit(fn -> Application.delete_env(:web, :unread_body_timeout) end)
+    end
+
+    test "releases its connection after the time limit", %{port: port} do
+      response = await(fetch(url(port, "/hold")))
+      assert response.status == 200
+
+      assert_receive :server_connection_closed, 2_000
+      assert_down(response.body.controller_pid)
+
+      assert %TypeError{} = catch_exit(await(Response.text(response)))
+    end
+
+    test "does not leave processes in a process that stays alive", %{port: port} do
+      baseline = :erlang.system_info(:process_count)
+
+      for _ <- 1..20 do
+        assert %Response{status: 200} = await(fetch(url(port, "/echo")))
+        assert %Response{status: 200} = await(fetch(url(port, "/hold")))
+      end
+
+      assert settle(baseline) <= 10
+    end
+
+    test "is not changed by the time limit when a process reads it", %{port: port} do
+      response = await(fetch(url(port, "/echo"), method: "POST", body: "kept"))
+      reader = ReadableStream.get_reader(response.body)
+      Process.sleep(300)
+
+      assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
+      assert value =~ "kept"
     end
   end
 

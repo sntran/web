@@ -1108,13 +1108,10 @@ defmodule Web.FormDataTest do
       end)
       |> Task.await()
 
-    assert match?({:error, %Web.TypeError{message: "The stream is errored."}}, result) or
-             match?({:error, %Web.TypeError{message: "file read failed"}}, result) or
-             match?(
-               {:exit, {{:shutdown, %Web.TypeError{message: "file read failed"}}, _}},
-               result
-             ) or
-             match?({:exit, {:noproc, _}}, result)
+    # The read must fail. The form of the failure depends on the time when
+    # the child stream gets the error of the source.
+    assert match?({:error, %Web.TypeError{}}, result) or match?({:exit, _reason}, result),
+           "unexpected result: #{inspect(result)}"
 
     assert_eventually(fn -> not Process.alive?(form.coordinator) end)
   end

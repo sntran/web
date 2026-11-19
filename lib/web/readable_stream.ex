@@ -236,7 +236,13 @@ defmodule Web.ReadableStream do
 
   def from(%__MODULE__{} = stream), do: stream
 
-  def from(enumerable) do
+  def from(enumerable), do: from_enumerable(enumerable, [])
+
+  @doc false
+  # Makes a stream from an enumerable, with options for the stream engine.
+  # The HTTP dispatcher uses the option `:unread_timeout` for a response
+  # body.
+  def from_enumerable(enumerable, opts) when is_list(opts) do
     if Enumerable.impl_for(enumerable) do
       enumerator_pid = start_enumerator(enumerable)
 
@@ -260,7 +266,7 @@ defmodule Web.ReadableStream do
             # coveralls-ignore-stop
           end
         },
-        cancel_on_reader_exit: true
+        Keyword.put(opts, :cancel_on_reader_exit, true)
       )
     else
       raise ArgumentError, "cannot normalize body from #{inspect(enumerable)}"

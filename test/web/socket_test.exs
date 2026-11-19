@@ -49,7 +49,7 @@ defmodule Web.SocketTest do
     rest = read_bytes!(reader, 8 - first.value.byte_length)
     assert Web.Uint8Array.to_binary(first.value) <> rest == "abcdefgh"
 
-    assert {:transport_error, %TypeError{message: message}} =
+    assert %TypeError{message: message} =
              catch_exit(await(WritableStreamDefaultWriter.write(writer, :not_bytes)))
 
     assert message == "Socket writes must be a binary, a Uint8Array, or an ArrayBuffer"
@@ -242,9 +242,12 @@ defmodule Web.SocketTest do
     assert_opened_remote(socket, "localhost:#{port}")
     writer = Web.WritableStream.get_writer(socket.writable)
 
+    # The chunk is an error of the caller, not of the transport. The write
+    # rejects with the TypeError, and the writable side has that error.
     reason = catch_exit(await(WritableStreamDefaultWriter.write(writer, %{bad: :payload})))
-    assert match?({:transport_error, %TypeError{}}, reason)
-    assert match?({:transport_error, %TypeError{}}, await(socket.closed))
+    assert %TypeError{} = reason
+    assert await(socket.closed) == reason
+    assert catch_exit(await(WritableStreamDefaultWriter.write(writer, "late"))) == reason
   end
 
   test "server closes the transport when the holder process crashes" do
@@ -274,8 +277,8 @@ defmodule Web.SocketTest do
 
   test "start_tls resolves upgraded with a new secure socket" do
     parent = self()
-    certfile = fixture_path("socket_test_cert.pem")
-    keyfile = fixture_path("socket_test_key.pem")
+    certfile = fixture_path("test_server_cert.pem")
+    keyfile = fixture_path("test_server_key.pem")
 
     {port, _task} =
       start_tcp_server(fn socket ->
@@ -290,8 +293,8 @@ defmodule Web.SocketTest do
         :ssl.close(ssl_socket)
       end)
 
-    socket = Web.connect(%{hostname: "127.0.0.1", port: port}, secureTransport: "starttls")
-    assert_opened_remote(socket, "127.0.0.1:#{port}")
+    socket = Web.connect(%{hostname: "localhost", port: port}, secureTransport: "starttls")
+    assert_opened_remote(socket, "localhost:#{port}")
 
     reader = ReadableStream.get_reader(socket.readable)
     writer = Web.WritableStream.get_writer(socket.writable)
@@ -301,7 +304,9 @@ defmodule Web.SocketTest do
     assert_receive :saw_starttls, 1_000
     assert read_chunk!(reader) == "220 Ready to start TLS\r\n"
 
-    upgraded = await(Socket.start_tls(socket))
+    # The socket verifies the certificate of the server with this
+    # certificate authority, and it verifies the host name.
+    upgraded = await(Socket.start_tls(socket, cacertfile: fixture_path("test_ca.pem")))
     assert %Socket{} = upgraded
     assert upgraded.address != socket.address
     assert upgraded.token != socket.token
@@ -358,6 +363,104 @@ defmodule Web.SocketTest do
 
     assert await(socket.closed) == :closed
     assert_alias_revoked(socket.address, Envelope.new(socket.token, :debug))
+  end
+
+  describe "the verification of the server certificate" do
+    # Starts a TLS server that sends one message, and returns its port. The
+    # server stays in operation when the client refuses the handshake.
+    defp start_verified_server(parent) do
+      options =
+        server_ssl_options(
+          fixture_path("test_server_cert.pem"),
+          fixture_path("test_server_key.pem")
+        )
+
+      {:ok, _task} =
+        Task.start_link(fn ->
+          {:ok, listen_socket} = :ssl.listen(0, options)
+          {:ok, {_address, port}} = :ssl.sockname(listen_socket)
+          send(parent, {:verified_server_port, port})
+
+          with {:ok, transport_socket} <- :ssl.transport_accept(listen_socket, 5_000),
+               {:ok, socket} <- :ssl.handshake(transport_socket, 5_000) do
+            :ssl.send(socket, "verified")
+            :ssl.close(socket)
+          end
+
+          :ssl.close(listen_socket)
+        end)
+
+      assert_receive {:verified_server_port, port}, 1_000
+      port
+    end
+
+    defp tls_alert(socket) do
+      assert {:tls_alert, {alert, _text}} = catch_exit(await(socket.opened))
+      alert
+    end
+
+    test "accepts a certificate from a certificate authority that the caller gives" do
+      port = start_verified_server(self())
+
+      socket =
+        Web.connect("localhost:#{port}",
+          secureTransport: "on",
+          ssl_options: [cacertfile: fixture_path("test_ca.pem")]
+        )
+
+      assert_opened_remote(socket, "localhost:#{port}")
+      assert read_chunk!(ReadableStream.get_reader(socket.readable)) == "verified"
+    end
+
+    @tag :capture_log
+    test "refuses a certificate from a certificate authority that is not known" do
+      port = start_verified_server(self())
+      socket = Web.connect("localhost:#{port}", secureTransport: "on")
+
+      assert tls_alert(socket) == :unknown_ca
+    end
+
+    @tag :capture_log
+    test "refuses a certificate for a different host name" do
+      port = start_verified_server(self())
+
+      # The certificate is for the name `localhost`.
+      socket =
+        Web.connect(%{hostname: "127.0.0.1", port: port},
+          secureTransport: "on",
+          ssl_options: [cacertfile: fixture_path("test_ca.pem")]
+        )
+
+      assert tls_alert(socket) == :bad_certificate
+    end
+
+    test "does no verification only when the caller asks for that" do
+      port = start_verified_server(self())
+
+      socket =
+        Web.connect(%{hostname: "127.0.0.1", port: port},
+          secureTransport: "on",
+          ssl_options: [verify: :verify_none]
+        )
+
+      assert_opened_remote(socket, "127.0.0.1:#{port}")
+    end
+
+    test "uses the setting :tls_options of the application" do
+      previous = Application.get_env(:web, :tls_options)
+      Application.put_env(:web, :tls_options, cacertfile: fixture_path("test_ca.pem"))
+
+      on_exit(fn ->
+        if previous == nil,
+          do: Application.delete_env(:web, :tls_options),
+          else: Application.put_env(:web, :tls_options, previous)
+      end)
+
+      port = start_verified_server(self())
+      socket = Web.connect("localhost:#{port}", secureTransport: "on")
+
+      assert_opened_remote(socket, "localhost:#{port}")
+    end
   end
 
   test "connect/2 supports initial tls sockets" do

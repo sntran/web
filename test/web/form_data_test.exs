@@ -572,6 +572,10 @@ defmodule Web.FormDataTest do
   test "pre-aborted signals exit immediately without locking or reading the source" do
     {stream, tracker} = tracked_source(byte_chunks("ignored"))
     signal = Web.AbortSignal.abort(:already_aborted)
+
+    # A new stream pulls its source one time, to fill its queue. The test
+    # waits for that pull, thus it is not counted as a read of the parser.
+    assert_eventually(fn -> source_pulls(tracker) == 1 end)
     pulls_before = stable_source_pulls(tracker)
 
     assert :already_aborted = catch_exit(Web.FormData.parse(stream, "x", signal: signal))

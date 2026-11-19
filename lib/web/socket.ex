@@ -314,6 +314,14 @@ defmodule Web.Socket do
          :ok <- transport_send(state.transport, state.socket, payload) do
       {:reply, :ok, state}
     else
+      # A chunk that is not bytes is an error of the caller, not of the
+      # transport. The write rejects with the `TypeError`, and the writable
+      # side has that error, as the Streams Standard specifies for a sink
+      # that fails.
+      {:error, %TypeError{} = error} ->
+        next_state = shutdown_state(state, error, :write_error)
+        {:stop, :normal, {:error, error}, next_state}
+
       {:error, reason} ->
         next_state = shutdown_state(state, {:transport_error, reason}, :write_error)
         {:stop, :normal, {:error, reason}, next_state}
@@ -633,13 +641,48 @@ defmodule Web.Socket do
     |> merge_ssl_options(host)
   end
 
+  # The options of a TLS connection. The socket verifies the certificate of
+  # the server and its host name, unless the caller gives the option
+  # `verify: :verify_none`. The options of the caller come before the
+  # setting `:tls_options` of the application.
   defp merge_ssl_options(options, host) do
-    options
+    Web.Application.tls_options()
+    |> Keyword.merge(options)
     |> Keyword.put_new(:active, false)
     |> Keyword.put_new(:mode, :binary)
     |> Keyword.put_new(:packet, :raw)
-    |> Keyword.put_new(:verify, :verify_none)
+    |> Keyword.put_new(:verify, :verify_peer)
     |> Keyword.put_new(:server_name_indication, String.to_charlist(host))
+    |> add_trust_options()
+  end
+
+  defp add_trust_options(options) do
+    if options[:verify] == :verify_peer do
+      options
+      |> add_trust_store()
+      |> Keyword.put_new(:depth, 4)
+      |> Keyword.put_new(:customize_hostname_check,
+        match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+      )
+    else
+      options
+    end
+  end
+
+  # The trust store: the option of the caller or of the application, then
+  # the store of the operating system, then the store of the package
+  # `castore`.
+  defp add_trust_store(options) do
+    if Keyword.has_key?(options, :cacertfile) or Keyword.has_key?(options, :cacerts) do
+      options
+    else
+      try do
+        Keyword.put(options, :cacerts, :public_key.cacerts_get())
+      rescue
+        # coveralls-ignore-next-line
+        _error -> Keyword.put(options, :cacertfile, CAStore.file_path())
+      end
+    end
   end
 
   defp transport_send(:tcp, socket, payload), do: :gen_tcp.send(socket, payload)

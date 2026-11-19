@@ -28,6 +28,10 @@ All notable changes to this project are documented in this file.
   response that can come from HTTP/2, as the Fetch Standard specifies:
   HTTP/2 has no reason phrase. For HTTP/1.1, the text stays the usual
   reason phrase of the status.
+- The setting `config :web, tls_options: [...]` gives TLS options to
+  `Web.fetch/2` and to the TLS sockets of `Web.connect/2`: a keyword list of
+  options of the Erlang application `:ssl`. For example, `cacertfile`
+  names a file of private certificate authorities.
 - `Web.Uint8Array.from/1`, which makes a view with a new buffer from a
   binary, iodata, a `Web.ArrayBuffer`, or a `Web.Uint8Array`.
 - A short form for `inspect/1` of a `Web.Uint8Array`:
@@ -555,8 +559,21 @@ All notable changes to this project are documented in this file.
   JS sources, and derives case names from richer fixture metadata such as
   `description`.
 
+### Security
+
+- **Breaking:** a TLS socket from `Web.connect/2` or
+  `Web.Socket.start_tls/2` verifies the certificate of the server and its
+  host name. Before, the default was `verify: :verify_none`: the socket
+  accepted each certificate, and a process in the network path could read
+  and change the data. The trust store is the store of the operating
+  system, or the option `cacertfile` or `cacerts` of the caller. A caller
+  that needs no verification must give `verify: :verify_none`.
+
 ### Fixed
 
+- A write to a `Web.Socket` of a chunk that is not bytes rejects with the
+  `Web.TypeError`, and the writable side has that error. Before, the error
+  had the form `{:transport_error, error}`, but the transport did not fail.
 - `Web.AbortSignal.unsubscribe/1` removes the subscription from the signal.
   Before, the signal kept each subscribed process until that process
   stopped.

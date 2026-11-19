@@ -33,10 +33,49 @@ defmodule Web.Application do
   @doc false
   # Starts the pools of the HTTP connections with the settings of the
   # application.
+  #
+  # There are two groups of pools: one for connections with no TLS, and one
+  # for TLS connections. The HTTP client gives the transport options of a
+  # pool to each connection of that pool, and a connection with no TLS
+  # refuses the options of TLS. Thus the setting `:tls_options` needs its
+  # own group.
   def start_finch do
     protocols = configured_http_protocols()
+    tls_options = configured_tls_options()
     :persistent_term.put(@http_protocols_key, protocols)
-    Finch.start_link(name: Web.Finch, pools: finch_pools(protocols))
+
+    children = [
+      {Finch, name: Web.Finch, pools: finch_pools(protocols)},
+      {Finch, name: Web.Finch.TLS, pools: finch_pools(protocols, tls_options)}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end
+
+  @doc false
+  # The name of the group of pools for a URL scheme.
+  @spec finch_name(:http | :https) :: atom()
+  def finch_name(:https), do: Web.Finch.TLS
+  def finch_name(:http), do: Web.Finch
+
+  @doc false
+  # The TLS options of `Web.fetch/2` and `Web.connect/2`, from the setting
+  # `:tls_options`: a keyword list of options of the application `:ssl` of
+  # Erlang. For example, `cacertfile: path` names a file of certificate
+  # authorities. Without the setting, the trust store of the operating
+  # system is used.
+  @spec tls_options() :: keyword()
+  def tls_options, do: configured_tls_options()
+
+  defp configured_tls_options do
+    options = Application.get_env(:web, :tls_options, [])
+
+    if Keyword.keyword?(options) do
+      options
+    else
+      raise ArgumentError,
+            "The setting :tls_options of :web must be a keyword list, got: #{inspect(options)}"
+    end
   end
 
   @doc false
@@ -78,13 +117,13 @@ defmodule Web.Application do
   @doc false
   # The pools of the HTTP connections. Each origin has 25 connections. A
   # request waits for a connection when all of them are in use.
-  def finch_pools(protocols \\ @default_http_protocols) do
+  def finch_pools(protocols \\ @default_http_protocols, tls_options \\ []) do
     %{
       :default => [
         protocols: protocols,
         size: 25,
         count: 1,
-        conn_opts: [transport_opts: [timeout: connect_timeout()]]
+        conn_opts: [transport_opts: [timeout: connect_timeout()] ++ tls_options]
       ]
     }
   end

@@ -514,7 +514,7 @@ defmodule Web.Dispatcher.HTTP do
     result =
       Finch.stream(
         finch_request,
-        Web.Finch,
+        Web.Application.finch_name(finch_request.scheme),
         :ok,
         fn
           {:status, status}, acc ->

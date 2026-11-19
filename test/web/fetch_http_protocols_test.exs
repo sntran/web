@@ -24,10 +24,45 @@ defmodule Web.FetchHTTPProtocolsTest do
     end
   end
 
+  @ssl_directory Path.expand("../support/ssl", __DIR__)
+
   setup_all do
     {:ok, server} = Bandit.start_link(plug: Server, scheme: :http, port: 0, startup_log: false)
     {:ok, {_address, port}} = ThousandIsland.listener_info(server)
-    %{base: "http://localhost:#{port}"}
+
+    {:ok, tls_server} =
+      Bandit.start_link(
+        plug: Server,
+        scheme: :https,
+        port: 0,
+        certfile: Path.join(@ssl_directory, "test_server_cert.pem"),
+        keyfile: Path.join(@ssl_directory, "test_server_key.pem"),
+        startup_log: false
+      )
+
+    {:ok, {_address, tls_port}} = ThousandIsland.listener_info(tls_server)
+    %{base: "http://localhost:#{port}", tls_base: "https://localhost:#{tls_port}"}
+  end
+
+  defp set_env(key, value) do
+    previous = Application.get_env(:web, key)
+    Application.put_env(:web, key, value)
+
+    on_exit(fn ->
+      if previous == nil,
+        do: Application.delete_env(:web, key),
+        else: Application.put_env(:web, key, previous)
+    end)
+  end
+
+  # Trusts the certificate authority of the test server, and starts the
+  # pools again.
+  defp trust_test_authority(protocols) do
+    # The functions for the end of a test run in the opposite sequence.
+    # This one runs last: it starts the pools after the setting is restored.
+    on_exit(&restart_pools/0)
+    set_env(:tls_options, cacertfile: Path.join(@ssl_directory, "test_ca.pem"))
+    use_protocols(protocols)
   end
 
   # Sets the protocols and starts the pools again.
@@ -116,6 +151,51 @@ defmodule Web.FetchHTTPProtocolsTest do
     test "gives the empty status text for a TLS connection, which can use HTTP/2" do
       assert HTTP.status_text(200, URL.new("https://example.com/")) == ""
       assert HTTP.status_text(200, URL.new("http://example.com/")) == "OK"
+    end
+  end
+
+  describe "a TLS connection" do
+    @tag :capture_log
+    test "is refused when the certificate authority of the server is not known", context do
+      error = catch_exit(await(fetch(context.tls_base <> "/")))
+      assert %TypeError{message: "fetch failed", cause: cause} = error
+      assert inspect(cause) =~ "Unknown CA"
+    end
+
+    test "uses the certificate authority of the setting :tls_options", context do
+      trust_test_authority([:http1])
+
+      response = await(fetch(context.tls_base <> "/", method: "POST", body: "payload"))
+      assert {response.status, response.status_text, version(response)} == {200, "OK", "HTTP/1.1"}
+      assert await(Response.text(response)) == "POST:payload"
+
+      # A connection with no TLS does not get the TLS options.
+      assert await(fetch(context.base <> "/")).status == 200
+    end
+
+    test "uses HTTP/2 when the server selects it, with the empty status text", context do
+      trust_test_authority([:http1, :http2])
+
+      response = await(fetch(context.tls_base <> "/", method: "POST", body: "payload"))
+      assert {response.status, response.status_text, version(response)} == {200, "", "HTTP/2"}
+      assert await(Response.text(response)) == "POST:payload"
+    end
+
+    @tag :capture_log
+    test "verifies the host name of the certificate", context do
+      trust_test_authority([:http1])
+
+      # The certificate is for the name `localhost`.
+      url = String.replace(context.tls_base, "localhost", "127.0.0.1") <> "/"
+      assert %TypeError{message: "fetch failed"} = catch_exit(await(fetch(url)))
+    end
+
+    test "refuses a setting that is not a keyword list" do
+      set_env(:tls_options, :not_options)
+
+      assert_raise ArgumentError, ~r/The setting :tls_options of :web must be/, fn ->
+        Web.Application.tls_options()
+      end
     end
   end
 

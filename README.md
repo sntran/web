@@ -343,6 +343,21 @@ chunk = await(ReadableStreamDefaultReader.read(reader))
 Uint8Array.to_binary(chunk.value)
 ```
 
+A TLS socket verifies the certificate of the server and its host name,
+with the trust store of the operating system. `fetch` does the same. The
+setting `:tls_options` gives TLS options to the two functions: a keyword
+list of options of the Erlang application `:ssl`. For example, this setting
+names a file of private certificate authorities:
+
+```elixir
+config :web, tls_options: [cacertfile: "/etc/ssl/private-ca.pem"]
+```
+
+One socket can have its own options, which come before the setting:
+`Web.connect(address, secureTransport: "on", ssl_options: [cacertfile: path])`.
+The option `verify: :verify_none` stops the verification. Use it only for a
+test.
+
 Explicit `STARTTLS` upgrades are supported through `Socket.start_tls/2`. For a
 full SMTP handshake example, run:
 

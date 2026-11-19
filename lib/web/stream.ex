@@ -104,6 +104,14 @@ defmodule Web.Stream do
     reader_ref: nil,
     reader_mode: nil,
     pending_byob_request: nil,
+    # A pull was requested while a pull was in progress.
+    pull_again: false,
+    # The transformer called `terminate`: the stream closes after the write
+    # that is in progress.
+    terminated: false,
+    # The reason of a cancel of the readable side of a transform stream. The
+    # writable side is then errored with this reason.
+    cancel_reason: nil,
     read_requests: :queue.new(),
     disturbed: false,
     # Consumer (writable) side
@@ -260,12 +268,37 @@ defmodule Web.Stream do
     strategy = normalize_strategy(Keyword.get(opts, :strategy, %Web.CountQueuingStrategy{}))
     timeout_ms = Keyword.get(opts, :timeout_ms, 30_000)
 
-    {type, impl_state, extra_actions} =
-      case module.start(self(), opts) do
-        {t, s} -> {t, s, []}
-        {t, s, a} -> {t, s, a}
-      end
+    case start_module(module, opts) do
+      {:ok, started} ->
+        init_data(started, module, opts, snapshot, owner, hwm, strategy, timeout_ms)
 
+      {:error, failure} ->
+        {:stop, {:shutdown, {:start_failed, failure}}}
+    end
+  end
+
+  # A start function that throws stops the start of the stream. The reason is
+  # a shutdown reason, thus the VM writes no crash report: the process that
+  # makes the stream throws the value again.
+  defp start_module(module, opts) do
+    case module.start(self(), opts) do
+      {t, s} -> {:ok, {t, s, []}}
+      {t, s, a} -> {:ok, {t, s, a}}
+    end
+  catch
+    kind, value -> {:error, {kind, value, __STACKTRACE__}}
+  end
+
+  defp init_data(
+         {type, impl_state, extra_actions},
+         module,
+         opts,
+         snapshot,
+         owner,
+         hwm,
+         strategy,
+         timeout_ms
+       ) do
     {readable_hwm, writable_hwm} = init_capacities(type, hwm, strategy)
 
     data = %__MODULE__{
@@ -385,7 +418,10 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   def writable(type, content, data) do
-    type |> do_writable(content, data) |> with_lifetime(:writable, data)
+    type
+    |> do_writable(content, data)
+    |> start_held_write(:writable, data)
+    |> with_lifetime(:writable, data)
   end
 
   defp do_writable(type, content, data) do
@@ -433,7 +469,10 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   def closing(type, content, data) do
-    type |> do_closing(content, data) |> with_lifetime(:closing, data)
+    type
+    |> do_closing(content, data)
+    |> start_held_write(:closing, data)
+    |> with_lifetime(:closing, data)
   end
 
   defp do_closing(type, content, data) do
@@ -810,6 +849,17 @@ defmodule Web.Stream do
     end
   end
 
+  defp handle_common(:cast, :terminate_transform, state, %{type: :producer_consumer} = data)
+       when state in [:writable, :closing] do
+    if active_consumer_operation?(data) do
+      {:keep_state, %{data | terminated: true}}
+    else
+      terminate_transform(%{data | terminated: true}, [])
+    end
+  end
+
+  defp handle_common(:cast, :terminate_transform, _state, _data), do: :keep_state_and_data
+
   defp handle_common(:cast, {:error, reason}, state, data) do
     if state in [:closed, :errored] do
       :keep_state_and_data
@@ -1062,6 +1112,18 @@ defmodule Web.Stream do
   defp handle_closed_event(:cast, {:enqueue, _chunk}, _data), do: :keep_state_and_data
   defp handle_closed_event(:internal, :flush_requests, data), do: flush_read_requests(data)
 
+  # The readable side of a transform stream was cancelled. The writable side
+  # is errored with the reason of the cancel, as in the Streams Standard.
+  defp handle_closed_event({:call, from}, {:write, _pid, _chunk}, %{
+         cancel_reason: {:cancelled, reason}
+       }) do
+    {:keep_state_and_data, [{:reply, from, {:error, {:errored, reason}}}]}
+  end
+
+  defp handle_closed_event({:call, from}, {:close, _pid}, %{cancel_reason: {:cancelled, _reason}}) do
+    {:keep_state_and_data, [{:reply, from, {:error, :errored}}]}
+  end
+
   defp handle_closed_event({:call, from}, {:write, pid, _chunk}, data) do
     reply_to_writer(from, pid, data.writer_pid, {:error, :closed})
   end
@@ -1264,7 +1326,7 @@ defmodule Web.Stream do
   end
 
   defp maybe_request_pull(data, actions) do
-    if readable_desired_size(data) > 0 do
+    if readable_wants_chunk?(data) do
       [{:next_event, :internal, :maybe_pull} | actions]
     else
       actions
@@ -1281,6 +1343,10 @@ defmodule Web.Stream do
     case {type, content} do
       {:cast, {:enqueue, chunk}} ->
         handle_producer_enqueue(chunk, state, data)
+
+      # A close of the readable side of a transform stream is `terminate`.
+      {:cast, :close} ->
+        handle_common(:cast, :terminate_transform, state, data)
 
       _ ->
         :not_handled
@@ -1324,7 +1390,7 @@ defmodule Web.Stream do
 
       {:empty, _} ->
         new_data = refresh_backpressure(new_data)
-        {:keep_state, new_data}
+        {:keep_state, new_data, [{:next_event, :internal, :maybe_pull}]}
     end
   end
 
@@ -1393,15 +1459,26 @@ defmodule Web.Stream do
   # Maybe pull (producer backpressure)
   # ---------------------------------------------------------------------------
 
+  # The rule of the Streams Standard for a pull: the stream pulls when its
+  # queue is below its limit, or when a read waits. A request during a pull
+  # causes one more pull after it. Thus a source whose pull gives no chunk
+  # immediately is not pulled again and again.
   defp handle_maybe_pull(data) do
-    effective_ds = readable_desired_size(data)
-
-    if not data.pulling and effective_ds > 0 do
-      do_trigger_pull(data)
-    else
-      :keep_state_and_data
+    cond do
+      data.pulling -> {:keep_state, %{data | pull_again: true}}
+      readable_wants_chunk?(data) -> do_trigger_pull(data)
+      true -> :keep_state_and_data
     end
   end
+
+  defp readable_wants_chunk?(data) do
+    readable_capacity(data) > 0 or not :queue.is_empty(data.read_requests) or
+      not is_nil(data.pending_byob_request)
+  end
+
+  # The actions after a pull is complete.
+  defp after_pull_actions(%{pull_again: true}), do: [{:next_event, :internal, :maybe_pull}]
+  defp after_pull_actions(_data), do: []
 
   defp do_trigger_pull(%{module: module, impl_state: impl_state} = data) do
     if function_exported?(module, :pull, 2) do
@@ -1444,7 +1521,10 @@ defmodule Web.Stream do
       pid != data.writer_pid ->
         {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
 
-      active_consumer_operation?(data) ->
+      data.terminated ->
+        {:keep_state_and_data, [{:reply, from, {:error, :closed}}]}
+
+      active_consumer_operation?(data) or not transform_ready?(data) ->
         new_data =
           data
           |> enqueue_write_request({from, pid, chunk})
@@ -1458,6 +1538,43 @@ defmodule Web.Stream do
         |> reply_keep_state()
     end
   end
+
+  # The backpressure of a transform stream, as the Streams Standard
+  # specifies: the transform of a chunk starts only when the readable side
+  # wants a chunk. Until then the write waits, and the writer gets
+  # backpressure. Thus a reader that is slow does not fill the memory.
+  defp transform_ready?(%{type: :producer_consumer} = data), do: readable_wants_chunk?(data)
+  defp transform_ready?(_data), do: true
+
+  # Starts a write that waited for the readable side. Each result of the
+  # states `writable` and `closing` goes through this function.
+  defp start_held_write(result, state, data) do
+    case transition(result, state, data) do
+      {next_state, new_data, actions} when next_state in [:writable, :closing] ->
+        if held_write_can_start?(new_data) do
+          {{:value, request}, remaining} = :queue.out(new_data.queued_write_requests)
+
+          started =
+            new_data
+            |> Map.put(:queued_write_requests, remaining)
+            |> start_write_task(request)
+
+          {:next_state, next_state, started, actions}
+        else
+          result
+        end
+
+      _other ->
+        result
+    end
+  end
+
+  defp held_write_can_start?(%{type: :producer_consumer} = data) do
+    not active_consumer_operation?(data) and not :queue.is_empty(data.queued_write_requests) and
+      readable_wants_chunk?(data)
+  end
+
+  defp held_write_can_start?(_data), do: false
 
   defp handle_close(from, pid, _state, data) do
     cond do
@@ -1592,13 +1709,15 @@ defmodule Web.Stream do
          _state,
          %{active_operation: :pull} = data
        ) do
+    actions = after_pull_actions(data)
+
     new_data =
       data
       |> Map.put(:impl_state, new_impl_state)
       |> clear_active_operation()
-      |> Map.put(:pulling, false)
+      |> Map.merge(%{pulling: false, pull_again: false})
 
-    {:keep_state, new_data}
+    {:keep_state, new_data, actions}
   end
 
   defp handle_task_result(
@@ -1606,23 +1725,27 @@ defmodule Web.Stream do
          _state,
          %{active_operation: :pull} = data
        ) do
+    actions = after_pull_actions(data)
+
     new_data =
       data
       |> Map.put(:impl_state, new_impl_state)
       |> clear_active_operation()
-      |> Map.put(:pulling, false)
+      |> Map.merge(%{pulling: false, pull_again: false})
 
-    {:keep_state, new_data, [:hibernate]}
+    {:keep_state, new_data, actions ++ [:hibernate]}
   end
 
   defp handle_task_result({:ok, new_impl_state}, _state, %{active_operation: :pull} = data) do
+    actions = after_pull_actions(data)
+
     new_data =
       data
       |> Map.put(:impl_state, new_impl_state)
       |> clear_active_operation()
-      |> Map.put(:pulling, false)
+      |> Map.merge(%{pulling: false, pull_again: false})
 
-    {:keep_state, new_data, [{:next_event, :internal, :maybe_pull}]}
+    {:keep_state, new_data, actions}
   end
 
   # Producer init (start_task) completed
@@ -1680,6 +1803,14 @@ defmodule Web.Stream do
 
   defp continue_after_consumer_completion(data, state, actions) do
     cond do
+      # The transformer called `terminate` during this write.
+      data.terminated ->
+        terminate_transform(data, actions)
+
+      # The next write waits for the readable side of a transform stream.
+      not :queue.is_empty(data.queued_write_requests) and not transform_ready?(data) ->
+        {:keep_state, data, actions}
+
       not :queue.is_empty(data.queued_write_requests) ->
         {{:value, request}, remaining} = :queue.out(data.queued_write_requests)
 
@@ -1700,6 +1831,23 @@ defmodule Web.Stream do
         {new_data, ready_actions} = maybe_resolve_ready_waiters(data)
         {:keep_state, new_data, actions ++ ready_actions}
     end
+  end
+
+  # `terminate` of the controller of a transform stream: the readable side
+  # closes after its chunks are read, and the writable side accepts no more
+  # chunks. The writes that wait reject.
+  defp terminate_transform(data, actions) do
+    rejected =
+      data.queued_write_requests
+      |> :queue.to_list()
+      |> Enum.map(fn {from, _pid, _chunk} -> {:reply, from, {:error, :closed}} end)
+
+    close_actions =
+      if data.pending_close_request, do: [{:reply, data.pending_close_request, :ok}], else: []
+
+    data
+    |> Map.merge(%{queued_write_requests: :queue.new(), pending_close_request: nil})
+    |> close_consumer_stream(actions ++ rejected ++ close_actions)
   end
 
   defp close_consumer_stream(data, actions) do
@@ -1982,19 +2130,31 @@ defmodule Web.Stream do
     end
   end
 
-  defp finalize_termination(data, type, _reason) when type in [:cancel, :close] do
+  defp finalize_termination(data, type, reason) when type in [:cancel, :close] do
     {data, pending_byob_actions} = settle_pending_byob_request(data, :done)
 
     actions =
-      pending_write_closed_actions(data) ++
-        queued_write_closed_actions(data) ++
-        close_ok_actions(data) ++
-        ready_ok_actions(data) ++
-        pending_byob_actions
+      if type == :cancel and data.type == :producer_consumer do
+        # A cancel of the readable side of a transform stream: the writes
+        # that wait reject with the reason of the cancel.
+        pending_write_error_actions(data, reason) ++
+          queued_write_error_actions(data, reason) ++
+          close_error_actions(data, reason) ++
+          ready_error_actions(data, reason) ++
+          pending_byob_actions
+      else
+        pending_write_closed_actions(data) ++
+          queued_write_closed_actions(data) ++
+          close_ok_actions(data) ++
+          ready_ok_actions(data) ++
+          pending_byob_actions
+      end
 
     new_data = %{
       data
       | disturbed: type == :cancel or data.disturbed,
+        cancel_reason:
+          if(type == :cancel and data.type == :producer_consumer, do: {:cancelled, reason}),
         queue: if(type == :cancel, do: :queue.new(), else: data.queue),
         pulling: false,
         pending_write_request: nil,

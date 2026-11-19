@@ -396,9 +396,9 @@ defmodule Web.StreamTest do
       ts = TransformStream.new(%{})
 
       writer = WritableStream.get_writer(ts.writable)
-      await(WritableStreamDefaultWriter.write(writer, "hello"))
-      await(WritableStreamDefaultWriter.write(writer, " world"))
-      await(WritableStreamDefaultWriter.close(writer))
+      WritableStreamDefaultWriter.write(writer, "hello")
+      WritableStreamDefaultWriter.write(writer, " world")
+      WritableStreamDefaultWriter.close(writer)
 
       assert "hello world" == Enum.join(ts.readable, "")
     end
@@ -412,9 +412,9 @@ defmodule Web.StreamTest do
         })
 
       writer = WritableStream.get_writer(ts.writable)
-      await(WritableStreamDefaultWriter.write(writer, "hello"))
-      await(WritableStreamDefaultWriter.write(writer, " world"))
-      await(WritableStreamDefaultWriter.close(writer))
+      WritableStreamDefaultWriter.write(writer, "hello")
+      WritableStreamDefaultWriter.write(writer, " world")
+      WritableStreamDefaultWriter.close(writer)
 
       assert "HELLO WORLD" == Enum.join(ts.readable, "")
     end
@@ -428,8 +428,8 @@ defmodule Web.StreamTest do
         })
 
       writer = WritableStream.get_writer(ts.writable)
-      await(WritableStreamDefaultWriter.write(writer, "hi"))
-      await(WritableStreamDefaultWriter.close(writer))
+      WritableStreamDefaultWriter.write(writer, "hi")
+      WritableStreamDefaultWriter.close(writer)
 
       assert "hi!" == Enum.join(ts.readable, "")
     end
@@ -446,8 +446,8 @@ defmodule Web.StreamTest do
         })
 
       writer = WritableStream.get_writer(ts.writable)
-      await(WritableStreamDefaultWriter.write(writer, "A"))
-      await(WritableStreamDefaultWriter.close(writer))
+      WritableStreamDefaultWriter.write(writer, "A")
+      WritableStreamDefaultWriter.close(writer)
 
       assert "AEND" == Enum.join(ts.readable, "")
     end
@@ -493,18 +493,21 @@ defmodule Web.StreamTest do
       writer = WritableStream.get_writer(ts.writable)
 
       for n <- 1..3 do
-        await(WritableStreamDefaultWriter.write(writer, n))
+        WritableStreamDefaultWriter.write(writer, n)
       end
 
-      await(WritableStreamDefaultWriter.close(writer))
+      WritableStreamDefaultWriter.close(writer)
 
       assert Enum.to_list(ts.readable) == [2, 4, 6]
     end
 
     test "TransformStream with high_water_mark option" do
+      # The option is the limit of the writable side. The default limit of
+      # the readable side is 0, as in the Streams Standard.
       ts = TransformStream.new(%{}, high_water_mark: 5)
       slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
-      assert slots.desired_size == 5
+      assert slots.writable_desired_size == 5
+      assert slots.readable_desired_size == 0
     end
 
     test "TransformStream falls back to writable high water mark for invalid readable strategy hwm" do
@@ -550,10 +553,13 @@ defmodule Web.StreamTest do
 
       writer = WritableStream.get_writer(ts.writable)
 
+      # A read waits, thus the transform of the chunk starts.
+      read = Web.ReadableStreamDefaultReader.read(ReadableStream.get_reader(ts.readable))
+
       assert %RuntimeError{message: "transform failed"} =
                catch_exit(await(WritableStreamDefaultWriter.write(writer, "x")))
 
-      Process.sleep(50)
+      assert %RuntimeError{message: "transform failed"} = catch_exit(await(read))
       assert ReadableStream.__get_slots__(ts.readable.controller_pid).state == :errored
     end
 
@@ -575,8 +581,8 @@ defmodule Web.StreamTest do
         })
 
       writer = WritableStream.get_writer(ts.writable)
-      await(WritableStreamDefaultWriter.write(writer, "hello"))
-      await(WritableStreamDefaultWriter.close(writer))
+      WritableStreamDefaultWriter.write(writer, "hello")
+      WritableStreamDefaultWriter.close(writer)
       assert Enum.join(ts.readable, "") == "HELLO"
     end
   end
@@ -679,22 +685,30 @@ defmodule Web.StreamTest do
       assert result in [:abort_now, {:errored, "This writer is no longer locked."}]
     end
 
-    test "transform bridge check keeps writer readiness independent from readable saturation" do
+    test "a transform stream gives backpressure to its writer until a process reads" do
       ts = TransformStream.new(%{}, high_water_mark: 1)
       writer = WritableStream.get_writer(ts.writable)
 
-      assert :ok = await(WritableStreamDefaultWriter.write(writer, "a"))
-      assert ReadableStream.__get_slots__(ts.readable.controller_pid).desired_size == 0
+      first = WritableStreamDefaultWriter.write(writer, "a")
+      second = WritableStreamDefaultWriter.write(writer, "b")
+      ready = WritableStreamDefaultWriter.ready(writer)
+      Process.sleep(50)
 
-      ready_task = Task.async(fn -> await(WritableStreamDefaultWriter.ready(writer)) end)
-      assert {:ok, :ok} = Task.yield(ready_task, 1_000)
+      # No process reads. The writes wait, and no chunk is in the readable queue.
+      assert Enum.map([first, second, ready], &Web.Promise.peek/1) == [
+               :pending,
+               :pending,
+               :pending
+             ]
 
-      assert :ok = await(WritableStreamDefaultWriter.write(writer, "b"))
-      assert :queue.len(ReadableStream.__get_slots__(ts.readable.controller_pid).queue) == 2
+      assert :queue.len(ReadableStream.__get_slots__(ts.readable.controller_pid).queue) == 0
 
       reader = ReadableStream.get_reader(ts.readable)
       assert await(Web.ReadableStreamDefaultReader.read(reader)) == %{value: "a", done: false}
+      assert await(first) == :ok
       assert await(Web.ReadableStreamDefaultReader.read(reader)) == %{value: "b", done: false}
+      assert await(second) == :ok
+      assert await(ready) == :ok
       assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
       assert :ok = WritableStreamDefaultWriter.release_lock(writer)
     end
@@ -702,14 +716,15 @@ defmodule Web.StreamTest do
     test "transform desired size separates readable and writable accounting" do
       ts = TransformStream.new(%{}, high_water_mark: 2)
       writer = WritableStream.get_writer(ts.writable)
-      assert :ok = await(WritableStreamDefaultWriter.write(writer, "a"))
+      WritableStreamDefaultWriter.write(writer, "a")
 
+      # The write waits for a reader. It uses one place of the writable side.
+      Process.sleep(20)
       slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
-      assert slots.desired_size == 1
-      assert slots.readable_desired_size == 1
-      assert slots.writable_desired_size == 2
+      assert slots.readable_desired_size == 0
+      assert slots.writable_desired_size == 1
 
-      assert WritableStream.desired_size(ts.writable) == 2
+      assert WritableStream.desired_size(ts.writable) == 1
       assert :ok = WritableStreamDefaultWriter.release_lock(writer)
     end
 
@@ -770,10 +785,10 @@ defmodule Web.StreamTest do
         })
 
       writer = WritableStream.get_writer(ts.writable)
-      assert :ok = await(WritableStreamDefaultWriter.write(writer, "x"))
-      assert :ok = await(WritableStreamDefaultWriter.close(writer))
-      assert_receive {:transform_chunk, "x"}
+      WritableStreamDefaultWriter.write(writer, "x")
+      WritableStreamDefaultWriter.close(writer)
       assert "X" == Enum.join(ts.readable, "")
+      assert_receive {:transform_chunk, "x"}
     end
 
     test "timeout check transitions to errored with task timeout reason for flush" do
@@ -914,7 +929,7 @@ defmodule Web.StreamTest do
     test "transform callback with non-standard return preserves flow" do
       ts = TransformStream.new(%{transform: fn _chunk, _ctrl -> :not_an_ok_tuple end})
       writer = WritableStream.get_writer(ts.writable)
-      assert :ok = await(WritableStreamDefaultWriter.write(writer, "test"))
+      WritableStreamDefaultWriter.write(writer, "test")
     end
 
     test "write callback with non-standard return preserves flow" do
@@ -1010,8 +1025,8 @@ defmodule Web.StreamTest do
         })
 
       writer = WritableStream.get_writer(ts.writable)
-      assert :ok = await(WritableStreamDefaultWriter.write(writer, "hi"))
-      assert :ok = await(WritableStreamDefaultWriter.close(writer))
+      WritableStreamDefaultWriter.write(writer, "hi")
+      WritableStreamDefaultWriter.close(writer)
       assert "hi!" == Enum.join(ts.readable, "")
     end
 
@@ -1156,7 +1171,7 @@ defmodule Web.StreamTest do
     end
 
     test "legacy enqueue_ready call still supports immediate and parked backpressure checks" do
-      ts = TransformStream.new(%{}, high_water_mark: 1)
+      ts = TransformStream.new(%{}, readable_strategy: Web.CountQueuingStrategy.new(1))
       pid = ts.readable.controller_pid
 
       assert :ok = :gen_statem.call(pid, :enqueue_ready)

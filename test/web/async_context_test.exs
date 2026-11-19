@@ -423,8 +423,8 @@ defmodule Web.AsyncContextTest do
 
       # Write to the writable side
       writer = WritableStream.get_writer(transform.writable)
-      await(WritableStreamDefaultWriter.write(writer, "input"))
-      await(WritableStreamDefaultWriter.close(writer))
+      WritableStreamDefaultWriter.write(writer, "input")
+      WritableStreamDefaultWriter.close(writer)
 
       # Read from the readable side
       reader = ReadableStream.get_reader(transform.readable)
@@ -452,8 +452,8 @@ defmodule Web.AsyncContextTest do
           })
 
         writer = WritableStream.get_writer(transform.writable)
-        await(WritableStreamDefaultWriter.write(writer, "x"))
-        await(WritableStreamDefaultWriter.close(writer))
+        WritableStreamDefaultWriter.write(writer, "x")
+        WritableStreamDefaultWriter.close(writer)
 
         reader = ReadableStream.get_reader(transform.readable)
         assert %{value: "x"} = await(ReadableStreamDefaultReader.read(reader))
@@ -647,10 +647,10 @@ defmodule Web.AsyncContextTest do
           writer = WritableStream.get_writer(transform.writable)
 
           for chunk <- chunks do
-            await(WritableStreamDefaultWriter.write(writer, chunk))
+            WritableStreamDefaultWriter.write(writer, chunk)
           end
 
-          await(WritableStreamDefaultWriter.close(writer))
+          WritableStreamDefaultWriter.close(writer)
 
           reader = ReadableStream.get_reader(transform.readable)
 
@@ -830,11 +830,13 @@ defmodule Web.AsyncContextTest do
         ts = TransformStream.new(%{})
         writer = WritableStream.get_writer(ts.writable)
 
+        # The writes are not awaited: a write to a transform stream waits
+        # until a process reads the readable side.
         for chunk <- chunks do
-          await(Web.WritableStreamDefaultWriter.write(writer, chunk))
+          Web.WritableStreamDefaultWriter.write(writer, chunk)
         end
 
-        await(Web.WritableStreamDefaultWriter.close(writer))
+        Web.WritableStreamDefaultWriter.close(writer)
 
         reader = ReadableStream.get_reader(ts.readable)
 
@@ -881,7 +883,7 @@ defmodule Web.AsyncContextTest do
       await(Web.WritableStreamDefaultWriter.close(writer))
     end
 
-    test "writer readiness stays independent from readable_strategy saturation" do
+    test "the writer gets backpressure when the readable side is full" do
       pull_count = :counters.new(1, [])
 
       strategy = Web.CountQueuingStrategy.new(2)
@@ -904,15 +906,20 @@ defmodule Web.AsyncContextTest do
       await(Web.WritableStreamDefaultWriter.write(writer, "a"))
       await(Web.WritableStreamDefaultWriter.write(writer, "b"))
 
-      # Writer.ready should remain write-side only even when the readable side is saturated.
-      ready_task = Task.async(fn -> await(Web.WritableStreamDefaultWriter.ready(writer)) end)
-      assert {:ok, :ok} = Task.yield(ready_task, 2_000)
+      # The readable side is full. The third write waits, and the writer gets
+      # backpressure, as the Streams Standard specifies.
+      third = Web.WritableStreamDefaultWriter.write(writer, "c")
+      ready = Web.WritableStreamDefaultWriter.ready(writer)
+      Process.sleep(50)
+      assert Promise.peek(third) == :pending
+      assert Promise.peek(ready) == :pending
+      assert :counters.get(pull_count, 1) == 2
 
-      # A third write is accepted immediately even before the readable side drains.
-      await(Web.WritableStreamDefaultWriter.write(writer, "c"))
-
+      # A read lets the third write continue.
       reader = ReadableStream.get_reader(ts.readable)
       %{value: "a"} = await(ReadableStreamDefaultReader.read(reader))
+      assert await(third) == :ok
+      assert await(ready) == :ok
 
       %{value: "b"} = await(ReadableStreamDefaultReader.read(reader))
       %{value: "c"} = await(ReadableStreamDefaultReader.read(reader))

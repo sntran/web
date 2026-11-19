@@ -1,30 +1,48 @@
 defmodule Web.TransformStream do
   @moduledoc """
-  An Elixir implementation of the WHATWG TransformStream standard.
+  A transform stream, as `TransformStream` of the Streams Standard.
 
-  A TransformStream is a combined readable/writable stream where data written to
-  the writable side is transformed and made available on the readable side.
+  A transform stream has a writable side and a readable side. A chunk that
+  is written to the writable side goes through the function `transform`, and
+  the results are read from the readable side.
 
-  Internally it runs a single `Web.Stream` engine in `:producer_consumer` mode:
-  the same process PID serves both the writable and the readable faces.
+  ## Backpressure
+
+  The transform of a chunk starts only when the readable side wants a chunk:
+  a read waits, or the queue of the readable side is below its limit. The
+  default limit of the readable side is 0, as in the Streams Standard. Thus
+  a write to a transform stream that no process reads stays pending:
+
+      transform = Web.TransformStream.new()
+      writer = Web.WritableStream.get_writer(transform.writable)
+
+      # This promise fulfils when a process reads from `transform.readable`.
+      Web.WritableStreamDefaultWriter.write(writer, "chunk")
+
+  Do not await a write before a process reads the readable side. Write and
+  close with no await, or read in a different process, or use
+  `Web.ReadableStream.pipe_through/2`.
 
   ## Usage
 
-  Pass a transformer map with an optional `transform` key:
-
       iex> ts = Web.TransformStream.new(%{
       ...>   transform: fn chunk, controller ->
-      ...>     Web.ReadableStreamDefaultController.enqueue(controller, String.upcase(chunk))
+      ...>     Web.TransformStreamDefaultController.enqueue(controller, String.upcase(chunk))
       ...>   end
       ...> })
       iex> writer = Web.WritableStream.get_writer(ts.writable)
-      iex> Web.await(Web.WritableStreamDefaultWriter.write(writer, "hello"))
-      :ok
-      iex> Web.await(Web.WritableStreamDefaultWriter.close(writer))
-      :ok
+      iex> Web.WritableStreamDefaultWriter.write(writer, "hello")
+      iex> Web.WritableStreamDefaultWriter.close(writer)
       iex> Enum.join(ts.readable, "")
       "HELLO"
   """
+
+  alias Web.TransformStreamDefaultController, as: Controller
+
+  @enforce_keys [:readable, :writable]
+  defstruct [:readable, :writable]
+
+  @type t :: %__MODULE__{readable: %Web.ReadableStream{}, writable: %Web.WritableStream{}}
 
   use Web.Stream
 
@@ -37,15 +55,12 @@ defmodule Web.TransformStream do
     transformer = Keyword.get(opts, :transformer, %{})
     state = %{transformer: transformer, pid: pid}
 
-    # If the transformer provides a `start` callback, invoke it now (in the
-    # gen_statem's init process) so any resources it opens — e.g. Agent or
-    # GenServer — are linked to the stream process and follow its lifecycle.
-    # Per the WHATWG spec, start(controller) returns :ok or a Promise; no state.
+    # The function `start` runs in the process of the stream. Thus a process
+    # that it starts with a link follows the life of the stream. A value that
+    # it throws stops the start of the stream, and `new/2` throws that value.
     case Map.get(transformer, :start) do
       start_fn when is_function(start_fn, 1) ->
-        ctrl = %Web.ReadableStreamDefaultController{pid: pid}
-
-        case start_fn.(ctrl) do
+        case start_fn.(%Controller{pid: pid}) do
           %Web.Promise{} = promise -> Web.Promise.await(promise)
           _ -> :ok
         end
@@ -59,7 +74,7 @@ defmodule Web.TransformStream do
 
   @impl Web.Stream
   def write(chunk, _ctrl, %{transformer: transformer, pid: pid} = state) do
-    ctrl = %Web.ReadableStreamDefaultController{pid: pid}
+    ctrl = %Controller{pid: pid}
 
     result =
       case Map.get(transformer, :transform) do
@@ -67,8 +82,8 @@ defmodule Web.TransformStream do
           transform.(chunk, ctrl)
 
         _ ->
-          # Default passthrough: enqueue chunk as-is
-          Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
+          # The default transform gives the chunk with no change.
+          Controller.enqueue(ctrl, chunk)
           :ok
       end
 
@@ -82,7 +97,7 @@ defmodule Web.TransformStream do
 
   @impl Web.Stream
   def flush(_ctrl, %{transformer: transformer, pid: pid} = state) do
-    ctrl = %Web.ReadableStreamDefaultController{pid: pid}
+    ctrl = %Controller{pid: pid}
 
     result =
       case Map.get(transformer, :flush) do
@@ -102,23 +117,18 @@ defmodule Web.TransformStream do
   end
 
   @impl Web.Stream
-  def terminate({:cancel, reason}, %{transformer: transformer}) do
+  # A cancel of the readable side, and an abort of the writable side, call
+  # the function `cancel` of the transformer with the reason.
+  def terminate({type, reason}, %{transformer: transformer}) when type in [:cancel, :abort] do
     do_terminate(reason, transformer)
   end
 
-  def terminate(reason, %{transformer: transformer}) do
-    do_terminate(reason, transformer)
-  end
+  def terminate(_event, _state), do: :ok
 
   defp do_terminate(reason, transformer) do
     case Map.get(transformer, :cancel) do
-      # coveralls-ignore-start
-      cancel when is_function(cancel, 1) ->
-        cancel.(reason)
-
-      # coveralls-ignore-stop
-      _ ->
-        :ok
+      cancel when is_function(cancel, 1) -> cancel.(reason)
+      _ -> :ok
     end
   end
 
@@ -127,46 +137,92 @@ defmodule Web.TransformStream do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Creates a new TransformStream.
+  Makes a transform stream.
 
-  Returns a map with `:readable` (`%Web.ReadableStream{}`) and `:writable`
-  (`%Web.WritableStream{}`) keys, both backed by the same engine PID.
+  ## The transformer
+
+  A map with these optional functions. Each one returns `:ok` or a
+  `Web.Promise`. The controller is a `Web.TransformStreamDefaultController`.
+
+    * `start: fn controller -> ... end` - called when the stream is made;
+    * `transform: fn chunk, controller -> ... end` - called for each chunk
+      that is written. The default gives the chunk with no change;
+    * `flush: fn controller -> ... end` - called when the writable side
+      closes, before the readable side closes;
+    * `cancel: fn reason -> ... end` - called when the readable side is
+      cancelled, or the writable side is aborted.
+
+  A value that `transform` or `flush` throws puts the two sides in the
+  errored state. A value that `start` throws is thrown by this function.
 
   ## Options
 
-  - `:high_water_mark` — the writable-side high water mark (default: 1)
-  - `:readable_strategy` — a queuing strategy (e.g. `Web.CountQueuingStrategy.new(n)`)
-    for the readable side, allowing users to tune the high-water mark of the
-    transformed output queue. Defaults to `Web.CountQueuingStrategy.new(1)`.
-  - `:writable_strategy` — legacy alias for `:readable_strategy` (deprecated)
+    * `:writable_strategy` - the queuing strategy of the writable side. The
+      default is `Web.CountQueuingStrategy.new(1)`.
+    * `:readable_strategy` - the queuing strategy of the readable side. The
+      default is `Web.CountQueuingStrategy.new(0)`.
+    * `:high_water_mark` - the limit of the writable side, when
+      `:writable_strategy` is not given.
 
-  ## Transformer keys
-
-  - `transform: fn chunk, ctrl -> :ok end` — called for each written chunk; must return `:ok` or a `Web.Promise.t()`
-  - `flush: fn ctrl -> :ok end` — called before the stream closes; must return `:ok` or a `Web.Promise.t()`
-  - `start: fn ctrl -> :ok end` — called at stream creation; must return `:ok` or a `Web.Promise.t()`
-  - `cancel: fn reason -> :ok end` — called if the stream is cancelled
+  Raises `Web.TypeError` for a transformer that is not a map, or for a
+  callback that is not a function with the correct number of arguments.
+  Raises `Web.RangeError` for a transformer with the key `:readable_type` or
+  `:writable_type`, as the Streams Standard specifies.
   """
+  @spec new(map(), keyword()) :: t()
   def new(transformer \\ %{}, opts \\ []) do
-    hwm = Keyword.get(opts, :high_water_mark, 1)
+    :ok = validate_transformer!(transformer)
 
-    readable_strategy =
-      Keyword.get(
-        opts,
-        :readable_strategy,
-        Keyword.get(opts, :writable_strategy, Web.CountQueuingStrategy.new(hwm))
-      )
+    writable_hwm =
+      case Keyword.get(opts, :writable_strategy) do
+        %{high_water_mark: hwm} when is_number(hwm) -> hwm
+        _ -> Keyword.get(opts, :high_water_mark, 1)
+      end
+
+    readable_strategy = Keyword.get(opts, :readable_strategy, Web.CountQueuingStrategy.new(0))
 
     opts =
       opts
+      |> Keyword.drop([:writable_strategy, :readable_strategy])
       |> Keyword.put(:transformer, transformer)
-      |> Keyword.put_new(:strategy, readable_strategy)
+      |> Keyword.put(:high_water_mark, writable_hwm)
+      |> Keyword.put(:strategy, readable_strategy)
 
-    {:ok, pid} = start_link(opts)
+    case start_link(opts) do
+      {:ok, pid} ->
+        %__MODULE__{
+          readable: %Web.ReadableStream{controller_pid: pid},
+          writable: %Web.WritableStream{controller_pid: pid}
+        }
 
-    %{
-      readable: %Web.ReadableStream{controller_pid: pid},
-      writable: %Web.WritableStream{controller_pid: pid}
-    }
+      # The function `start` of the transformer threw a value. This process
+      # throws the same value.
+      {:error, {:shutdown, {:start_failed, {kind, value, stacktrace}}}} ->
+        :erlang.raise(kind, value, stacktrace)
+    end
+  end
+
+  @callbacks [start: 1, transform: 2, flush: 1, cancel: 1]
+
+  defp validate_transformer!(transformer) when is_map(transformer) do
+    for key <- [:readable_type, :writable_type], is_map_key(transformer, key) do
+      raise Web.RangeError, "The transformer key #{inspect(key)} is not permitted"
+    end
+
+    for {name, arity} <- @callbacks,
+        callback = Map.get(transformer, name),
+        not is_nil(callback) do
+      if not is_function(callback, arity) do
+        raise Web.TypeError,
+              "The transformer function #{inspect(name)} must be a function with " <>
+                "#{arity} argument(s), got: #{inspect(callback)}"
+      end
+    end
+
+    :ok
+  end
+
+  defp validate_transformer!(transformer) do
+    raise Web.TypeError, "The transformer must be a map, got: #{inspect(transformer)}"
   end
 end

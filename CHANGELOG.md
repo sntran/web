@@ -141,6 +141,29 @@ All notable changes to this project are documented in this file.
   could fail after 5000 ms.
 - The default connect time of `Web.connect/2` changes from 5000 ms to
   10000 ms, which is the new setting `connect_timeout`.
+- **Breaking:** `Web.TransformStream` follows the Streams Standard.
+  - The transform of a chunk starts only when the readable side wants a
+    chunk, and until then the write waits. Before, a transform stream gave
+    no backpressure: each write was transformed immediately, and the chunks
+    of a slow reader filled the memory.
+  - The default limit of the readable side is 0. Thus a write to a
+    transform stream that no process reads stays pending. Do not await a
+    write before a process reads the readable side.
+  - `new/2` gives a `%Web.TransformStream{}` struct. The option
+    `:writable_strategy` is the strategy of the writable side. Before, it
+    was a second name for `:readable_strategy`.
+  - The callbacks get a `Web.TransformStreamDefaultController`, which has
+    `enqueue/2`, `error/2`, `terminate/1`, and `desired_size/1`. The
+    functions of `Web.ReadableStreamDefaultController` accept it also.
+  - A cancel of the readable side errors the writable side with the reason
+    of the cancel. An abort of the stream object gives its reason to the
+    function `cancel` with no change.
+  - `new/2` throws the value that the function `start` throws, raises
+    `Web.TypeError` for a callback that is not a function, and raises
+    `Web.RangeError` for the keys `:readable_type` and `:writable_type`.
+- **Breaking:** `Web.CountQueuingStrategy.new/1` and
+  `Web.ByteLengthQueuingStrategy.new/1` raise `Web.RangeError` for a limit
+  that is not a number or that is below zero.
 - **Breaking:** the readers and writers of a stream follow the Streams
   Standard for these operations.
   - A stream gets the calls of one process in the sequence of the calls,
@@ -422,6 +445,12 @@ All notable changes to this project are documented in this file.
   it raised in the stream process.
 - The example `examples/secure_byob_stream.exs` operates again. It used the
   field `:task` of the old promise.
+- A readable stream does not call `pull` again and again when `pull` gives
+  no chunk immediately. Before, the stream called such a `pull` without a
+  pause: 36,725 calls in 300 ms in a measurement, each one in a new process.
+  A socket that waited for data used the processor continuously.
+- A readable stream with the limit 0 calls `pull` when a read waits, as the
+  Streams Standard specifies. Before, it did not pull.
 - `Web.Socket` settles its promises `opened` and `closed` when one of its
   streams stops with a failure. Before, a process that awaited `closed`
   waited without end.

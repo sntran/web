@@ -177,10 +177,10 @@ defmodule Web.TextEncodingTest do
       text
       |> split_binary_into_chunks(chunk_sizes)
       |> Enum.each(fn chunk ->
-        assert :ok = await(WritableStreamDefaultWriter.write(writer, chunk))
+        WritableStreamDefaultWriter.write(writer, chunk)
       end)
 
-      assert :ok = await(WritableStreamDefaultWriter.close(writer))
+      WritableStreamDefaultWriter.close(writer)
       assert Enum.join(stream.readable, "") == text
     end
   end
@@ -244,8 +244,8 @@ defmodule Web.TextEncodingTest do
     stream = TextDecoderStream.new()
     writer = WritableStream.get_writer(stream.writable)
 
-    assert :ok = await(WritableStreamDefaultWriter.write(writer, <<0xF0, 0x9F>>))
-    assert :ok = await(WritableStreamDefaultWriter.close(writer))
+    WritableStreamDefaultWriter.write(writer, <<0xF0, 0x9F>>)
+    WritableStreamDefaultWriter.close(writer)
     assert Enum.join(stream.readable, "") == <<0xEF, 0xBF, 0xBD>>
   end
 
@@ -253,19 +253,24 @@ defmodule Web.TextEncodingTest do
     stream = TextDecoderStream.new("utf-8", %{fatal: true})
     writer = WritableStream.get_writer(stream.writable)
 
-    assert :ok = await(WritableStreamDefaultWriter.write(writer, <<0xF0, 0x9F>>))
+    # A read waits, thus the write and the close can continue.
+    reader = Web.ReadableStream.get_reader(stream.readable)
+    read = Web.ReadableStreamDefaultReader.read(reader)
+    WritableStreamDefaultWriter.write(writer, <<0xF0, 0x9F>>)
 
     assert %Web.TypeError{} =
              catch_exit(await(WritableStreamDefaultWriter.close(writer)))
+
+    assert %Web.TypeError{} = catch_exit(await(read))
   end
 
   test "TextEncoderStream encodes written strings into Uint8Array chunks" do
     stream = TextEncoderStream.new()
     writer = WritableStream.get_writer(stream.writable)
 
-    assert :ok = await(WritableStreamDefaultWriter.write(writer, "Hi "))
-    assert :ok = await(WritableStreamDefaultWriter.write(writer, "🌍"))
-    assert :ok = await(WritableStreamDefaultWriter.close(writer))
+    WritableStreamDefaultWriter.write(writer, "Hi ")
+    WritableStreamDefaultWriter.write(writer, "🌍")
+    WritableStreamDefaultWriter.close(writer)
 
     assert Enum.map(stream.readable, &Uint8Array.to_binary/1) == ["Hi ", "🌍"]
   end
@@ -274,8 +279,14 @@ defmodule Web.TextEncodingTest do
     stream = TextEncoderStream.new()
     writer = WritableStream.get_writer(stream.writable)
 
+    # A read waits, thus the transform of the chunk starts.
+    reader = Web.ReadableStream.get_reader(stream.readable)
+    read = Web.ReadableStreamDefaultReader.read(reader)
+
     assert %Web.TypeError{} =
              catch_exit(await(WritableStreamDefaultWriter.write(writer, 123)))
+
+    assert %Web.TypeError{} = catch_exit(await(read))
   end
 
   defp split_binary_into_chunks(binary, sizes) do

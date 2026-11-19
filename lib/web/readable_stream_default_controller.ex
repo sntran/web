@@ -22,7 +22,7 @@ defmodule Web.ReadableStreamDefaultController do
       iex> Enum.to_list(stream)
       ["data"]
   """
-  def enqueue(%__MODULE__{pid: pid}, chunk) do
+  def enqueue(%_{pid: pid}, chunk) do
     ReadableStream.enqueue(pid, chunk)
   end
 
@@ -31,14 +31,14 @@ defmodule Web.ReadableStreamDefaultController do
 
   Once closed, no more data can be enqueued.
   """
-  def close(%__MODULE__{pid: pid}) do
+  def close(%_{pid: pid}) do
     ReadableStream.close(pid)
   end
 
   @doc """
   Errors the stream with a reason.
   """
-  def error(%__MODULE__{pid: pid}, reason) do
+  def error(%_{pid: pid}, reason) do
     ReadableStream.error(pid, reason)
   end
 
@@ -53,7 +53,7 @@ defmodule Web.ReadableStreamDefaultController do
   If the stream is closed or errored the call also returns `:ok` so the
   transform task can complete cleanly.
   """
-  def wait_for_capacity(%__MODULE__{pid: pid}) do
+  def wait_for_capacity(%_{pid: pid}) do
     ref = make_ref()
     Web.Stream.control_cast(pid, {:register_enqueue_waiter, self(), ref})
 
@@ -81,7 +81,7 @@ defmodule Web.ReadableStreamDefaultController do
       iex> :ok
       :ok
   """
-  def desired_size(%__MODULE__{pid: pid}) do
+  def desired_size(%_{pid: pid}) do
     ReadableStream.get_desired_size(pid)
   end
 end

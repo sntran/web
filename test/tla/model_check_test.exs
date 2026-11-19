@@ -198,6 +198,41 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "Console" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("Console"))
+    end
+
+    test "a message with no indent in a group is found" do
+      assert_violates(SpecModel.check("Console", bug("no_indent")), "IndentIsDepth")
+    end
+
+    test "a depth of the groups below zero is found" do
+      assert_violates(SpecModel.check("Console", bug("group_end_below_zero")), "TypeOK")
+    end
+
+    test "a timer that starts again is found" do
+      assert_violates(
+        SpecModel.check("Console", bug("time_starts_again")),
+        "TimerIsNotStartedAgain"
+      )
+    end
+
+    test "a timer that runs after its end is found" do
+      assert_violates(
+        SpecModel.check("Console", bug("time_end_keeps_timer")),
+        "EndedTimerDoesNotRun"
+      )
+    end
+
+    test "a counter that keeps its value after a reset is found" do
+      assert_violates(
+        SpecModel.check("Console", bug("count_reset_keeps_count")),
+        "ResetCounterIsZero"
+      )
+    end
+  end
+
   describe "ResponseBody" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("ResponseBody"))

@@ -358,13 +358,34 @@ defmodule Web.Dispatcher.HTTP do
     {:ok,
      Finch.build(
        request.method,
-       Web.URL.href(request.url),
+       request_uri(request.url),
        Web.Headers.to_list(request_headers(request.headers)),
        request_body(request)
      )}
   rescue
     error -> {:error, error}
   end
+
+  # The HTTP client parses a URL string with `URI.parse/1`, which runs
+  # regular expressions. The URL of the request is parsed already, thus the
+  # dispatcher gives its parts. The host has no brackets, and the path and
+  # the query are in their serialized form.
+  defp request_uri(url) do
+    %URI{
+      scheme: url.protocol |> String.trim_trailing(":"),
+      host: url.hostname,
+      port: request_port(url),
+      path: url.pathname,
+      query: request_query(Web.URL.search(url))
+    }
+  end
+
+  defp request_port(%Web.URL{port: "", protocol: "https:"}), do: 443
+  defp request_port(%Web.URL{port: ""}), do: 80
+  defp request_port(%Web.URL{port: port}), do: String.to_integer(port)
+
+  defp request_query(""), do: nil
+  defp request_query("?" <> query), do: query
 
   # The request is complete or it failed. Cancel a body stream that the
   # request did not read to its end, thus the stream stops.

@@ -5,6 +5,7 @@ defmodule Web.Test.EchoServer do
   #
   #   * `/echo` gives the request back as text: the method, the headers, and
   #     the body, each on its own line.
+  #   * `/target` gives the request target and the header `host`.
   #   * `/redirect/<status>?to=<location>` gives a redirect to the location.
   #   * `/truncated` gives a body that is shorter than its content length.
   #   * `/hold` gives the start of a body and keeps the connection open. It
@@ -116,6 +117,11 @@ defmodule Web.Test.EchoServer do
       |> Enum.map_join(";", fn {name, value} -> "#{name}=#{value}" end)
 
     send_response(socket, 200, [], Enum.join([method, header_text, body], "\n"))
+  end
+
+  # The request target and the header `host`, as the server got them.
+  defp respond(socket, _method, "/target" <> _rest = target, headers, _body) do
+    send_response(socket, 200, [], target <> "\n" <> Map.get(headers, "host", ""))
   end
 
   defp respond(socket, _method, "/redirect/" <> rest, _headers, _body) do

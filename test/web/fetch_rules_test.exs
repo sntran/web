@@ -60,6 +60,33 @@ defmodule Web.FetchRulesTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 2_000
   end
 
+  describe "the request target" do
+    defp target(url) do
+      [target, host] =
+        url |> Web.fetch() |> await() |> Response.text() |> await() |> String.split("\n")
+
+      {target, host}
+    end
+
+    test "has the path and the query of the URL", %{port: port} do
+      assert target(url(port, "/target/a%20b/c?x=1&y=%2F")) ==
+               {"/target/a%20b/c?x=1&y=%2F", "localhost:#{port}"}
+    end
+
+    test "has no fragment", %{port: port} do
+      assert target(url(port, "/target#part")) == {"/target", "localhost:#{port}"}
+    end
+
+    test "has the path in its serialized form", %{port: port} do
+      assert target(url(port, "/target/ä b/../c")) == {"/target/c", "localhost:#{port}"}
+      assert target(url(port, "/target/ä b")) == {"/target/%C3%A4%20b", "localhost:#{port}"}
+    end
+
+    test "goes to an IPv4 address", %{port: port} do
+      assert target(url(port, "/target", "127.0.0.1")) == {"/target", "127.0.0.1:#{port}"}
+    end
+  end
+
   describe "a redirect changes the method" do
     test "301 and 302 change POST to GET and remove the body", %{port: port} do
       for status <- [301, 302] do

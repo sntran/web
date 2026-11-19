@@ -598,6 +598,27 @@ defmodule Web.PromiseTest do
       resolve.(:correct)
       assert await(promise) == :correct
     end
+
+    test "a promise and its executor stop when the supervisor stops the promise" do
+      parent = self()
+
+      promise =
+        Promise.new(fn _resolve, _reject ->
+          send(parent, {:executor, self()})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:executor, executor}
+      monitors = Enum.map([promise.pid, executor], &Process.monitor/1)
+
+      # The supervisor of the application stops its processes with this
+      # signal.
+      Process.exit(promise.pid, :shutdown)
+
+      for monitor <- monitors do
+        assert_receive {:DOWN, ^monitor, :process, _pid, _reason}
+      end
+    end
   end
 
   describe "Inspect" do

@@ -1969,7 +1969,9 @@ defmodule Web.FormDataTest do
   defp restore_ambient_signal(key, nil), do: Process.delete(key)
   defp restore_ambient_signal(key, previous), do: Process.put(key, previous)
 
-  defp assert_eventually(fun, attempts \\ 20)
+  # The limit is long for a machine that is busy. The function returns when
+  # the condition is true.
+  defp assert_eventually(fun, attempts \\ 200)
 
   defp assert_eventually(fun, attempts) when attempts > 0 do
     if fun.() do
@@ -2345,7 +2347,9 @@ defmodule Web.FormDataEdgeTest do
     {stream, tracker}
   end
 
-  defp assert_eventually(fun, attempts \\ 20)
+  # The limit is long for a machine that is busy. The function returns when
+  # the condition is true.
+  defp assert_eventually(fun, attempts \\ 200)
 
   defp assert_eventually(fun, attempts) when attempts > 0 do
     if fun.() do

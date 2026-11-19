@@ -80,31 +80,6 @@ defmodule Web.Dispatcher.TCPTest do
     defp notify_chunk_sent(observer, chunk), do: send(observer, {:tcp_server_sent, chunk})
   end
 
-  defmodule ReaderReplyServer do
-    @behaviour :gen_statem
-
-    def start_link(reply) do
-      :gen_statem.start_link(__MODULE__, reply, [])
-    end
-
-    @impl true
-    def callback_mode, do: :handle_event_function
-
-    @impl true
-    def init(reply) do
-      {:ok, :ready, reply}
-    end
-
-    @impl true
-    def handle_event({:call, from}, {:read, _pid}, _state, reply) do
-      {:keep_state, reply, [{:reply, from, reply}]}
-    end
-
-    def handle_event(_type, _content, _state, reply) do
-      {:keep_state, reply}
-    end
-  end
-
   test "fetch/1 handles standard tcp scheme and yields chunks dynamically" do
     port = TCPServer.start_link("", true)
 
@@ -303,18 +278,6 @@ defmodule Web.Dispatcher.TCPTest do
     assert_receive :tcp_client_closed, 1_000
   end
 
-  test "bridge queues demand while no controller is registered yet" do
-    {bridge_pid, socket} = start_debug_bridge([{:sleep, 500}, "late"], nil)
-    reply_ref = make_ref()
-
-    send(bridge_pid, {:pull, {self(), reply_ref}})
-    refute_receive {^reply_ref, :ok}, 100
-
-    send(bridge_pid, {:cancel, :manual_cleanup})
-    assert_receive :tcp_client_closed, 1_000
-    _ = socket
-  end
-
   test "bridge treats readable cancellation as a clean end-of-stream" do
     {bridge_pid, socket} = start_debug_bridge([{:sleep, 500}, "late"], nil)
     source = TCP.__debug_body_source__(bridge_pid, socket, nil)
@@ -398,33 +361,7 @@ defmodule Web.Dispatcher.TCPTest do
     assert_receive :tcp_client_closed, 1_000
   end
 
-  test "__debug_await_socket_chunk__/1 maps socket readable cancellation to done" do
-    # The answer of a stream that has the error of the cancel.
-    reply = {:error, {:errored, {:readable_cancel, :bridge_cancelled}}}
-    {:ok, pid} = ReaderReplyServer.start_link(reply)
-    reader = %Web.ReadableStreamDefaultReader{controller_pid: pid}
-
-    assert {:done, :bridge_cancelled} = TCP.__debug_await_socket_chunk__(reader)
-  end
-
-  test "__debug_await_socket_chunk__/1 maps non-cancel reader failures to done" do
-    port = TCPServer.start_link([{:sleep, 500}, "late"], false, false, self())
-    socket = Web.connect("localhost:#{port}")
-    assert %{remoteAddress: _remote_address} = await(socket.opened)
-
-    reader = ReadableStream.get_reader(socket.readable)
-    read_task = Task.async(fn -> TCP.__debug_await_socket_chunk__(reader) end)
-
-    Process.sleep(50)
-    Process.exit(socket.readable.controller_pid, :kill)
-
-    assert {:ok, {:done, reason}} = Task.yield(read_task, 1_000)
-    assert reason != :bridge_cancelled
-    _ = Socket.close(socket)
-    assert_receive :tcp_client_closed, 1_000
-  end
-
-  test "bridge abort messages cancel the registered proxy controller" do
+  test "an abort message to the bridge ends the stream and closes the socket" do
     {bridge_pid, socket} = start_debug_bridge([{:sleep, 500}, "late"], nil)
     source = TCP.__debug_body_source__(bridge_pid, socket, nil)
     proxy = proxy_stream()
@@ -434,6 +371,60 @@ defmodule Web.Dispatcher.TCPTest do
 
     assert Enum.to_list(proxy) == []
     assert_receive :tcp_client_closed, 1_000
+  end
+
+  test "the bridge ignores a message that it does not know" do
+    port = TCPServer.start_link([{:sleep, 100}, "data"])
+    {:ok, resp} = TCP.fetch(Request.new("tcp://localhost:#{port}"))
+
+    send(dispatcher_source(resp.body).debug_bridge_pid, :not_a_bridge_message)
+
+    assert Web.TestBytes.binaries(resp.body) == ["data"]
+  end
+
+  test "the body ends, and the watcher of the signal stops, when the bridge stops" do
+    controller = Web.AbortController.new()
+    port = TCPServer.start_link([{:sleep, 500}, "late"], false, false, self())
+    {:ok, resp} = TCP.fetch(Request.new("tcp://localhost:#{port}", signal: controller.signal))
+
+    bridge = dispatcher_source(resp.body).debug_bridge_pid
+    read_task = Task.async(fn -> Enum.to_list(resp.body) end)
+    Process.sleep(50)
+
+    # The watcher is the process that subscribed to the signal.
+    assert [watcher] = Map.keys(:sys.get_state(controller.signal.pid).subscribers)
+    monitor = Process.monitor(watcher)
+    Process.exit(bridge, :kill)
+
+    assert {:ok, []} = Task.yield(read_task, 1_000)
+    assert_receive {:DOWN, ^monitor, :process, ^watcher, _reason}, 1_000
+    _ = Socket.close(dispatcher_socket(resp.body))
+  end
+
+  test "fetch/1 gives an error when the bridge stops before the connection is ready" do
+    port = TCPServer.start_link("data")
+    req = Request.new("tcp://localhost:#{port}")
+
+    task =
+      Task.async(fn ->
+        receive do
+          :go -> TCP.fetch(req)
+        end
+      end)
+
+    # The supervisor of the sockets does not answer for a short time, thus
+    # the bridge waits for its socket.
+    :ok = :sys.suspend(Web.HandleSupervisor)
+
+    try do
+      :erlang.trace(task.pid, true, [:procs])
+      send(task.pid, :go)
+      assert_receive {:trace, _fetcher, :spawn, bridge, _mfa}, 1_000
+      Process.exit(bridge, :kill)
+      assert Task.await(task) == {:error, :killed}
+    after
+      :ok = :sys.resume(Web.HandleSupervisor)
+    end
   end
 
   test "fetch/1 aborts an in-flight tcp stream and closes the socket" do
@@ -538,26 +529,6 @@ defmodule Web.Dispatcher.TCPTest do
     assert resp.status_text == "Connected"
   end
 
-  test "__debug_start_socket_bridge__/3 supports its default body and signal arguments" do
-    port = TCPServer.start_link("data", false, false, self())
-
-    assert {:ok, bridge_pid, socket} =
-             TCP.__debug_start_socket_bridge__(%{hostname: "localhost", port: port})
-
-    assert is_pid(bridge_pid)
-    _ = Socket.close(socket)
-    assert_receive :tcp_client_closed, 1_000
-
-    port = TCPServer.start_link("data", false, false, self())
-
-    assert {:ok, bridge_pid, socket} =
-             TCP.__debug_start_socket_bridge__(%{hostname: "localhost", port: port}, nil)
-
-    assert is_pid(bridge_pid)
-    _ = Socket.close(socket)
-    assert_receive :tcp_client_closed, 1_000
-  end
-
   defp raw_request(url, method, body) do
     %Request{
       url: Web.URL.new(url),
@@ -575,7 +546,7 @@ defmodule Web.Dispatcher.TCPTest do
     port = TCPServer.start_link(response_data, false, false, self())
 
     {:ok, bridge_pid, socket} =
-      TCP.__debug_start_socket_bridge__(%{hostname: "localhost", port: port}, nil, signal)
+      TCP.__debug_start_socket_bridge__(%{hostname: "localhost", port: port}, signal)
 
     {bridge_pid, socket}
   end

@@ -19,14 +19,6 @@ defmodule Web.Dispatcher.TCP do
   alias Web.TypeError
   alias Web.WritableStream
 
-  # The bridge has the connect time, and some more time to start.
-  defp bridge_boot_timeout do
-    case Web.Application.connect_timeout() do
-      :infinity -> :infinity
-      timeout -> timeout + 1_000
-    end
-  end
-
   @watcher_poll_interval 25
 
   @impl true
@@ -64,20 +56,22 @@ defmodule Web.Dispatcher.TCP do
     )
   end
 
+  # ---------------------------------------------------------------------------
+  # Test hooks
+  #
+  # The tests of this library use these two functions, and the keys
+  # `:debug_bridge_pid` and `:debug_socket` of the source, to stop the
+  # processes of a connection at a known time.
+  # ---------------------------------------------------------------------------
+
   @doc false
-  # coveralls-ignore-next-line
-  def __debug_start_socket_bridge__(address, body \\ nil, signal \\ nil) do
-    start_socket_bridge(address, body, signal)
+  def __debug_start_socket_bridge__(address, signal) do
+    start_socket_bridge(address, nil, signal)
   end
 
   @doc false
   def __debug_body_source__(bridge_pid, socket, signal) do
     body_source(bridge_pid, socket, signal)
-  end
-
-  @doc false
-  def __debug_await_socket_chunk__(socket_reader) do
-    await_socket_chunk(socket_reader)
   end
 
   defp body_source(bridge_pid, socket, signal) do
@@ -87,20 +81,14 @@ defmodule Web.Dispatcher.TCP do
       # be closed already.
       start: fn controller ->
         monitor_bridge(bridge_pid, controller)
-
-        if signal_aborted?(signal) do
-          cancel_bridge(bridge_pid, socket, signal_reason(signal))
-          ReadableStream.close(controller.pid)
-        else
-          register_controller(bridge_pid, controller)
-        end
+        if signal_aborted?(signal), do: abort_body(bridge_pid, socket, signal, controller)
+        :ok
       end,
       pull: fn controller ->
         if signal_aborted?(signal) do
-          cancel_bridge(bridge_pid, socket, signal_reason(signal))
-          ReadableStream.close(controller.pid)
+          abort_body(bridge_pid, socket, signal, controller)
         else
-          request_bridge_pull(bridge_pid)
+          request_bridge_pull(bridge_pid, controller)
         end
       end,
       cancel: fn reason ->
@@ -109,6 +97,11 @@ defmodule Web.Dispatcher.TCP do
       debug_bridge_pid: bridge_pid,
       debug_socket: socket
     }
+  end
+
+  defp abort_body(bridge_pid, socket, signal, controller) do
+    cancel_bridge(bridge_pid, socket, signal_reason(signal))
+    ReadableStream.close(controller.pid)
   end
 
   defp start_socket_bridge(address, body, signal) do
@@ -120,6 +113,8 @@ defmodule Web.Dispatcher.TCP do
         bridge_boot(caller, ref, address, body, signal)
       end)
 
+    # The socket has the time limit of the connection, thus this wait has
+    # an end: the promise `opened` of the socket settles.
     receive do
       {:bridge_ready, ^ref, socket} ->
         Process.demonitor(bridge_monitor, [:flush])
@@ -129,24 +124,9 @@ defmodule Web.Dispatcher.TCP do
         Process.demonitor(bridge_monitor, [:flush])
         {:error, reason}
 
-      # coveralls-ignore-start
+      # The bridge stopped before the connection was ready.
       {:DOWN, ^bridge_monitor, :process, ^bridge_pid, reason} ->
-        {:error, normalize_exit_reason(reason)}
-        # coveralls-ignore-stop
-    after
-      bridge_boot_timeout() ->
-        Process.exit(bridge_pid, :kill)
-
-        # coveralls-ignore-start
-        receive do
-          {:DOWN, ^bridge_monitor, :process, ^bridge_pid, _reason} -> :ok
-        after
-          0 -> :ok
-        end
-
-        # coveralls-ignore-stop
-
-        {:error, :timeout}
+        {:error, reason}
     end
   end
 
@@ -164,13 +144,11 @@ defmodule Web.Dispatcher.TCP do
 
           bridge_loop(%{
             abort_watcher: abort_watcher,
-            controller: nil,
-            pending_pulls: :queue.new(),
             socket: socket,
             socket_reader: socket_reader
           })
         after
-          release_reader_lock(socket_reader)
+          ReadableStream.release_lock(socket_reader.controller_pid)
         end
 
       {:error, reason} ->
@@ -187,15 +165,8 @@ defmodule Web.Dispatcher.TCP do
       {:abort, reason} ->
         shutdown_bridge(state, reason)
 
-      {:register_controller, controller} ->
-        state
-        |> Map.put(:controller, controller)
-        |> process_pending_pulls()
-
-      {:pull, reply_to} ->
-        state
-        |> enqueue_pull_request(reply_to)
-        |> process_pending_pulls()
+      {:pull, controller_pid, reply_to} ->
+        fulfill_pull(state, controller_pid, reply_to)
 
       _message ->
         bridge_loop(state)
@@ -218,11 +189,7 @@ defmodule Web.Dispatcher.TCP do
 
   defp cancel_bridge(bridge_pid, socket, reason) do
     _ = await_promise(ReadableStream.cancel(socket.readable.controller_pid, reason))
-
-    if Process.alive?(bridge_pid) do
-      send(bridge_pid, {:cancel, reason})
-    end
-
+    send(bridge_pid, {:cancel, reason})
     :ok
   end
 
@@ -233,68 +200,35 @@ defmodule Web.Dispatcher.TCP do
     Web.AbortSignal.reason(signal) || Web.AbortSignal.default_reason()
   end
 
-  defp register_controller(bridge_pid, controller) do
-    if Process.alive?(bridge_pid) do
-      send(bridge_pid, {:register_controller, controller})
-    end
-
-    :ok
-  end
-
-  defp request_bridge_pull(bridge_pid) do
+  # The promise fulfils when the bridge gave a chunk to the stream, or when
+  # the bridge stopped.
+  defp request_bridge_pull(bridge_pid, controller) do
     Web.Promise.new(fn resolve, _reject ->
-      if Process.alive?(bridge_pid) do
-        bridge_monitor = Process.monitor(bridge_pid)
-        reply_ref = make_ref()
-        send(bridge_pid, {:pull, {self(), reply_ref}})
+      bridge_monitor = Process.monitor(bridge_pid)
+      reply_ref = make_ref()
+      send(bridge_pid, {:pull, controller.pid, {self(), reply_ref}})
 
-        receive do
-          {^reply_ref, :ok} ->
-            Process.demonitor(bridge_monitor, [:flush])
-            resolve.(:ok)
-
-          {:DOWN, ^bridge_monitor, :process, ^bridge_pid, _reason} ->
-            resolve.(:ok)
-        end
-      else
-        resolve.(:ok)
+      receive do
+        {^reply_ref, :ok} -> Process.demonitor(bridge_monitor, [:flush])
+        {:DOWN, ^bridge_monitor, :process, ^bridge_pid, _reason} -> :ok
       end
+
+      resolve.(:ok)
     end)
   end
 
-  defp enqueue_pull_request(state, reply_to) do
-    %{state | pending_pulls: :queue.in(reply_to, state.pending_pulls)}
-  end
-
-  defp process_pending_pulls(%{controller: nil} = state) do
-    bridge_loop(state)
-  end
-
-  defp process_pending_pulls(%{pending_pulls: pending_pulls} = state) do
-    case :queue.out(pending_pulls) do
-      {{:value, reply_to}, rest} ->
-        state
-        |> Map.put(:pending_pulls, rest)
-        |> fulfill_pull(reply_to)
-
-      {:empty, _queue} ->
-        bridge_loop(state)
-    end
-  end
-
-  defp fulfill_pull(%{controller: controller} = state, reply_to) do
+  defp fulfill_pull(state, controller_pid, {reply_pid, reply_ref}) do
     case await_socket_chunk(state.socket_reader) do
       # The bridge runs at the same time as a cancel of the stream, thus
       # these calls have no check.
       {:chunk, chunk} ->
-        ReadableStream.enqueue(controller.pid, Bytes.chunk(chunk))
-        reply_pull(reply_to)
-        process_pending_pulls(state)
+        ReadableStream.enqueue(controller_pid, Bytes.chunk(chunk))
+        send(reply_pid, {reply_ref, :ok})
+        bridge_loop(state)
 
       {:done, reason} ->
-        ReadableStream.close(controller.pid)
-        reply_pull(reply_to)
-        reply_pending_pulls(state.pending_pulls)
+        ReadableStream.close(controller_pid)
+        send(reply_pid, {reply_ref, :ok})
         shutdown_bridge(state, reason)
     end
   end
@@ -307,23 +241,10 @@ defmodule Web.Dispatcher.TCP do
       {:ok, %{done: true}} ->
         {:done, :closed}
 
-      {:error, {:readable_cancel, reason}} ->
-        {:done, reason}
-
+      # The read failed, or a cancel stopped it. The body ends.
       {:error, reason} ->
         {:done, reason}
     end
-  end
-
-  defp reply_pull({pid, ref}) do
-    send(pid, {ref, :ok})
-    :ok
-  end
-
-  defp reply_pending_pulls(pending_pulls) do
-    pending_pulls
-    |> :queue.to_list()
-    |> Enum.each(&reply_pull/1)
   end
 
   defp write_request_body(_writable, nil), do: :ok
@@ -371,7 +292,6 @@ defmodule Web.Dispatcher.TCP do
       {:stop_abort_watcher, ^ref} ->
         :ok
 
-      # coveralls-ignore-next-line
       {:DOWN, ^bridge_monitor, :process, ^bridge_pid, _reason} ->
         :ok
     after
@@ -410,18 +330,6 @@ defmodule Web.Dispatcher.TCP do
     _ = await_promise(socket.closed)
     :ok
   end
-
-  defp release_reader_lock(%ReadableStreamDefaultReader{controller_pid: pid}) do
-    _ = ReadableStream.release_lock(pid)
-    :ok
-  catch
-    :exit, _reason -> :ok
-  end
-
-  # coveralls-ignore-start
-  defp normalize_exit_reason({:shutdown, reason}), do: reason
-  defp normalize_exit_reason(reason), do: reason
-  # coveralls-ignore-stop
 
   defp await_promise(%Web.Promise{} = promise) do
     case Web.Promise.wait(promise) do

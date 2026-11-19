@@ -6,8 +6,6 @@ defmodule Web.URL.IP do
   alias Web.URL.{Encoding, Punycode}
 
   @default_ports %{"ftp" => "21", "http" => "80", "https" => "443", "ws" => "80", "wss" => "443"}
-  @host_cache_table :web_url_host_cache
-  @host_cache_owner :web_url_host_cache_owner
 
   @spec split_host_and_port(String.t()) :: {String.t(), String.t()}
   def split_host_and_port(host_port) do
@@ -17,19 +15,7 @@ defmodule Web.URL.IP do
   end
 
   @spec normalize_host(String.t(), String.t()) :: String.t()
-  def normalize_host(hostname, protocol) do
-    cache_key = {protocol, hostname}
-
-    case host_cache_get(cache_key) do
-      {:ok, cached} ->
-        cached
-
-      :miss ->
-        normalized = do_normalize_host(hostname, protocol)
-        host_cache_put(cache_key, normalized)
-        normalized
-    end
-  end
+  def normalize_host(hostname, protocol), do: do_normalize_host(hostname, protocol)
 
   @spec valid_host?(String.t(), String.t()) :: boolean()
   def valid_host?(hostname, protocol) do
@@ -403,61 +389,6 @@ defmodule Web.URL.IP do
 
   defp special_protocol?(protocol) do
     protocol == "file:" or Map.has_key?(@default_ports, String.trim_trailing(protocol, ":"))
-  end
-
-  defp host_cache_get(key) do
-    table = ensure_host_cache_table!()
-
-    case :ets.lookup(table, key) do
-      [{^key, value}] -> {:ok, value}
-      [] -> :miss
-    end
-  end
-
-  defp host_cache_put(key, value) do
-    table = ensure_host_cache_table!()
-
-    true = :ets.insert(table, {key, value})
-
-    value
-  end
-
-  defp ensure_host_cache_table! do
-    case :ets.whereis(@host_cache_table) do
-      :undefined ->
-        :global.trans(
-          {__MODULE__, @host_cache_table},
-          &ensure_host_cache_table_inside_transaction/0
-        )
-
-      table ->
-        table
-    end
-  end
-
-  defp ensure_host_cache_table_inside_transaction do
-    case :ets.whereis(@host_cache_table) do
-      :undefined ->
-        start_host_cache_owner!()
-        @host_cache_table
-
-      table ->
-        table
-    end
-  end
-
-  defp start_host_cache_owner! do
-    if is_nil(Process.whereis(@host_cache_owner)) do
-      _ =
-        Agent.start(
-          fn ->
-            :ets.new(@host_cache_table, [:named_table, :set, :public, read_concurrency: true])
-          end,
-          name: @host_cache_owner
-        )
-    end
-
-    :ok
   end
 
   defp ipv6_address?(host) do

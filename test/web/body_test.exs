@@ -98,7 +98,9 @@ defmodule Web.BodyTest do
     # consume_body reject path: mapper returns {:error, reason} (source line 160)
     # json/1 returns {:error, reason} when JSON parsing fails
     response = Response.new(body: "invalid json {{")
-    assert %Jason.DecodeError{} = catch_exit(await(Response.json(response)))
+
+    assert %Web.SyntaxError{cause: %Jason.DecodeError{}} =
+             catch_exit(await(Response.json(response)))
   end
 
   test "Response.text/1 rejects when stream is already locked" do

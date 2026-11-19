@@ -119,6 +119,15 @@ defmodule Web.Body do
       def clone(%{body: _} = struct) do
         Web.Body.clone(struct)
       end
+
+      @doc """
+      Returns `true` if a process read from the body, as the attribute
+      `bodyUsed`. A request or a response with no body gives `false`.
+      """
+      @spec body_used?(struct()) :: boolean()
+      def body_used?(%{body: _} = struct) do
+        Web.Body.body_used?(struct)
+      end
     end
 
     # coveralls-ignore-stop
@@ -138,7 +147,22 @@ defmodule Web.Body do
 
   @doc false
   def json(%{body: body}) do
-    consume_body(body, &Jason.decode/1)
+    consume_body(body, &parse_json/1)
+  end
+
+  # Text that is not JSON gives `SyntaxError`, as `JSON.parse` of ECMAScript.
+  defp parse_json(binary) do
+    case Jason.decode(binary) do
+      {:ok, value} ->
+        {:ok, value}
+
+      {:error, error} ->
+        {:error,
+         Web.SyntaxError.exception(
+           message: "The body is not valid JSON: #{Exception.message(error)}",
+           cause: error
+         )}
+    end
   end
 
   @doc false
@@ -181,23 +205,23 @@ defmodule Web.Body do
   @doc false
   def blob(%{body: body} = struct) do
     consume_body(body, fn binary ->
-      type =
-        if Map.get(struct, :__struct__) == Web.Response do
-          Web.Response.resolved_content_type(struct, binary)
-        else
-          content_type(struct)
-        end
-
-      Web.Blob.new([binary], type: type)
+      Web.Blob.new([binary], type: content_type(struct))
     end)
   end
 
   @doc false
+  def clone(%{body: nil} = struct), do: {struct, struct}
+
   def clone(%{body: body} = struct) do
     ensure_usable!(body)
     [branch_a, branch_b] = Web.ReadableStream.tee(body)
     {%{struct | body: branch_a}, %{struct | body: branch_b}}
   end
+
+  @doc false
+  # The body is used when it is not `nil` and a process read from it.
+  def body_used?(%{body: nil}), do: false
+  def body_used?(%{body: body}), do: Web.ReadableStream.disturbed?(body)
 
   defp consume_body(body, mapper) do
     Web.Promise.new(fn resolve, reject ->
@@ -402,15 +426,13 @@ defmodule Web.Body do
     end
   end
 
-  defp content_type(%{headers: %Web.Headers{} = headers} = struct) do
-    if Map.get(struct, :__struct__) == Web.Response do
-      Web.Response.resolved_content_type(struct)
-    else
-      headers
-      |> Web.Headers.get("content-type", "")
-      |> Web.MIME.parse()
-      |> Kernel.||("")
-    end
+  # The MIME type comes only from the header `content-type`, as the Fetch
+  # Standard specifies. The content of the body has no effect.
+  defp content_type(%{headers: %Web.Headers{} = headers}) do
+    headers
+    |> Web.Headers.get("content-type", "")
+    |> Web.MIME.parse()
+    |> Kernel.||("")
   end
 
   defp content_type(_), do: ""

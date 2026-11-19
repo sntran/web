@@ -35,7 +35,7 @@ defmodule Web.Dispatcher.TCP do
     case start_socket_bridge(%{hostname: host, port: port}, body, request.signal) do
       {:ok, bridge_pid, socket} ->
         {:ok,
-         Response.new(
+         Response.__network__(
            status: 200,
            status_text: "Connected",
            body: build_body_stream(bridge_pid, socket, request.signal),

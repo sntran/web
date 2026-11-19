@@ -115,11 +115,11 @@ defmodule Web.Dispatcher.HTTP do
 
           {:ok,
            with_request_signal(request.signal, fn ->
-             Web.Response.new(
+             Web.Response.__network__(
                status: status,
                status_text: Map.get(@status_texts, status, ""),
                headers: headers,
-               body: response_body(stream),
+               body: response_body(stream, request.method, status),
                url: Web.URL.href(request.url),
                redirected: redirect_count > 0
              )
@@ -134,7 +134,18 @@ defmodule Web.Dispatcher.HTTP do
 
   # A body that no process reads holds its connection. Thus the body stream
   # has a time limit for the start of the read.
-  defp response_body(stream) do
+  @null_body_statuses [101, 103, 204, 205, 304]
+
+  # The response of a HEAD request, and a response with a status that permits
+  # no body, have the body `nil`, as the Fetch Standard specifies. The
+  # function reads the response to its end, thus the connection is released.
+  defp response_body(stream, method, status)
+       when method == "HEAD" or status in @null_body_statuses do
+    Stream.run(stream)
+    nil
+  end
+
+  defp response_body(stream, _method, _status) do
     Web.ReadableStream.from_enumerable(stream, unread_timeout: unread_body_timeout())
   end
 

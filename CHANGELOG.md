@@ -6,6 +6,9 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.RangeError` and `Web.SyntaxError`, as the errors of ECMAScript.
+- `body_used?/1` for `Web.Request` and `Web.Response`, as the attribute
+  `bodyUsed`.
 - `Web.CountingGovernor.start_link/1`, `start/1`, and `get/1` for a governor
   that has no owner. Use `{Web.CountingGovernor, capacity: 4, name: MyName}`
   in a supervision tree for a governor that all the processes of an
@@ -122,6 +125,27 @@ All notable changes to this project are documented in this file.
     that is not a list.
   - With a request as its input, `new/2` applies the members of `init`.
     Before, it ignored them.
+- **Breaking:** `Web.Response` follows the Fetch Standard.
+  - `new/1` raises `Web.RangeError` for a status that is not from 200 to
+    599, and `Web.TypeError` for a status text that is not a reason phrase,
+    or for a body with the status 101, 103, 204, 205, or 304.
+  - A response with no body has the body `nil`, and starts no stream. Before,
+    each response had a stream. `Web.fetch/2` gives the body `nil` for a HEAD
+    request and for a status that permits no body.
+  - The default of `url` is `""`. The response of `Web.fetch/2` has the type
+    `"basic"`.
+  - `json/2` has an empty status text, keeps a `content-type` that `init`
+    has, and raises `Web.TypeError` for a value that cannot be changed to
+    JSON.
+  - `redirect/2` has an empty status text, puts the serialized URL in the
+    header `location`, raises `Web.TypeError` for a URL that is not valid,
+    and raises `Web.RangeError` for a status that is not a redirect status.
+  - `json/1` of a request or a response rejects with `Web.SyntaxError` when
+    the body is not JSON. Before, the reason was `Jason.DecodeError`, which
+    is now in the field `cause`.
+  - `blob/1` gets its type only from the header `content-type`. Before, it
+    examined the bytes of the body when the header was absent or generic.
+    Use `Web.MIME.sniff/1` to examine the bytes.
 - **Breaking:** `Web.Headers` validates each name and each value, and
   raises `Web.TypeError` for a name that is not an HTTP token, or for a
   value that contains a NUL, CR, or LF character. It removes the HTTP

@@ -245,6 +245,40 @@ defmodule Web.Dispatcher.HTTPTest do
     assert {:error, _} = HTTP.fetch(req)
   end
 
+  test "fetch/1 gives the body nil for a status that permits no body" do
+    for status <- [204, 304] do
+      port = HTTPServer.start_link(["HTTP/1.1 #{status} Status\r\nx-test: 1\r\n\r\n"])
+
+      {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/none"))
+
+      assert resp.status == status
+      assert resp.body == nil
+      assert resp.type == "basic"
+      assert Web.Headers.get(resp.headers, "x-test") == "1"
+      assert Web.Promise.await(Web.Response.text(resp)) == ""
+    end
+  end
+
+  test "fetch/1 gives the body nil for a HEAD request" do
+    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n"])
+
+    {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/head", method: "HEAD"))
+
+    assert resp.status == 200
+    assert resp.body == nil
+    assert Web.Headers.get(resp.headers, "content-length") == "5"
+  end
+
+  test "fetch/1 gives a response for a status that the constructor refuses" do
+    port = HTTPServer.start_link(["HTTP/1.1 999 Unusual\r\ncontent-length: 2\r\n\r\nok"])
+
+    {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/unusual"))
+
+    assert resp.status == 999
+    assert resp.ok == false
+    assert Web.Promise.await(Web.Response.text(resp)) == "ok"
+  end
+
   test "fetch/1 handles a deferred chunked completion with an empty body" do
     port =
       HTTPServer.start_link([

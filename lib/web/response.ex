@@ -8,7 +8,6 @@ defmodule Web.Response do
   use Web.Body
 
   alias Web.AsyncContext
-  alias Web.MIME
 
   defstruct [
     :body,
@@ -23,7 +22,7 @@ defmodule Web.Response do
   ]
 
   @type t :: %__MODULE__{
-          body: Enumerable.t() | nil,
+          body: %Web.ReadableStream{} | nil,
           headers: Web.Headers.t(),
           status: non_neg_integer(),
           ok: boolean(),
@@ -35,16 +34,34 @@ defmodule Web.Response do
         }
 
   @redirect_statuses [301, 302, 303, 307, 308]
+  @null_body_statuses [101, 103, 204, 205, 304]
 
   @doc """
-  Constructs a new Response structure.
+  Makes a response, as the `Response` constructor of the Fetch Standard.
 
-  Automatically normalizes the `:ok` boolean based on standard 2xx range (success for both HTTP and NNTP).
+  ## Options
+
+    * `:body` - the body. A response with no body has the body `nil`.
+    * `:status` - an integer from 200 to 599. The default is 200.
+    * `:status_text` - the reason phrase. The default is `""`.
+    * `:headers` - a `Web.Headers` struct, a map, or a list of pairs.
+
+  These options are for a dispatcher, which makes the response of a
+  `Web.fetch/2`: `:url`, `:redirected`, and `:type`.
+
+  The function raises for input that the Fetch Standard refuses:
+
+    * `Web.RangeError` for a status that is not from 200 to 599;
+    * `Web.TypeError` for a status text that is not a reason phrase;
+    * `Web.TypeError` for a body together with a status that permits no body:
+      101, 103, 204, 205, or 304;
+    * `Web.TypeError` for a header name or a header value that is not valid.
 
   ## Examples
+
       iex> resp = Web.Response.new(status: 200)
-      iex> resp.ok
-      true
+      iex> {resp.ok, resp.body, resp.status_text, resp.url}
+      {true, nil, "", ""}
 
       iex> resp = Web.Response.new(status: 404)
       iex> resp.ok
@@ -56,35 +73,24 @@ defmodule Web.Response do
   """
   def new(opts) when is_list(opts) do
     status = Keyword.get(opts, :status, 200)
-    raw_body = Keyword.get(opts, :body)
-
-    headers =
-      Keyword.get(opts, :headers, %{})
-      |> Web.Headers.new()
-      |> Web.Body.put_inferred_content_type(raw_body)
-
-    # JS fetch normalizes 2xx as ok: true
-    # NNTP standard 2xx codes and HTTP 2xx codes both specify success.
-    ok = status >= 200 and status < 300
     status_text = Keyword.get(opts, :status_text, "")
+    body = Keyword.get(opts, :body)
 
-    %__MODULE__{
-      body: Web.ReadableStream.from(raw_body),
-      headers: headers,
-      status: status,
-      ok: ok,
-      status_text: status_text,
-      url: Keyword.get(opts, :url),
-      type: Keyword.get(opts, :type, "default"),
-      redirected: Keyword.get(opts, :redirected, false),
-      snapshot: AsyncContext.Snapshot.take()
-    }
+    :ok = validate_status!(status)
+    :ok = validate_status_text!(status_text)
+    :ok = validate_null_body!(status, body)
+
+    build(opts)
+  end
+
+  def new(other) do
+    raise Web.TypeError, "Response init must be a keyword list, got: #{inspect(other)}"
   end
 
   def new, do: new([])
 
   @doc """
-  Constructs a new Response using a body and init options.
+  Makes a response from a body and init options. See `new/1`.
   """
   def new(body, init) when is_list(init) do
     init
@@ -92,80 +98,142 @@ defmodule Web.Response do
     |> new()
   end
 
-  @doc """
-  Returns a network-error style response.
-  """
-  @spec error() :: t()
-  def error do
-    new(body: nil, status: 0, type: "error")
-  end
-
-  @doc """
-  Creates a JSON response and sets the content type.
-  """
-  @spec json(any(), keyword()) :: t()
-  def json(data, init \\ []) do
-    encoded = Jason.encode!(data)
-
-    headers =
-      init
-      |> Keyword.get(:headers, %{})
-      |> Web.Headers.new()
-      |> Web.Headers.set("content-type", "application/json")
-
-    init
-    |> Keyword.put(:headers, headers)
-    |> Keyword.put_new(:status_text, "OK")
-    |> then(&new(encoded, &1))
-  end
-
-  @doc """
-  Creates a redirect response with an empty body and Location header.
-  """
-  @spec redirect(String.t(), non_neg_integer()) :: t()
-  def redirect(url, status \\ 302) when is_integer(status) do
-    if status not in @redirect_statuses do
-      raise Web.TypeError, "Invalid redirect status #{status}"
-    end
-
-    status_text =
-      case status do
-        301 -> "Moved Permanently"
-        302 -> "Found"
-        303 -> "See Other"
-        307 -> "Temporary Redirect"
-        308 -> "Permanent Redirect"
-      end
-
-    new(
-      body: nil,
-      status: status,
-      status_text: status_text,
-      headers: %{"location" => to_string(url)}
-    )
+  def new(_body, init) do
+    raise Web.TypeError, "Response init must be a keyword list, got: #{inspect(init)}"
   end
 
   @doc false
-  @spec resolved_content_type(t(), binary() | nil) :: String.t()
-  def resolved_content_type(%__MODULE__{} = response, body_binary \\ nil) do
-    header_value = Web.Headers.get(response.headers, "content-type")
-    parsed_header = MIME.parse(header_value)
+  # Makes the response of a dispatcher from the data of the network. The
+  # checks of the constructor are not applicable: a server can give each
+  # status.
+  @spec __network__(keyword()) :: t()
+  def __network__(opts) when is_list(opts) do
+    opts
+    |> Keyword.put_new(:type, "basic")
+    |> build()
+  end
 
-    cond do
-      parsed_header != nil and not MIME.generic_binary?(parsed_header) ->
-        parsed_header
+  defp build(opts) do
+    status = Keyword.get(opts, :status, 200)
+    raw_body = Keyword.get(opts, :body)
 
-      is_binary(body_binary) ->
-        MIME.sniff(body_binary)
+    headers =
+      Keyword.get(opts, :headers, %{})
+      |> Web.Headers.new()
+      |> Web.Body.put_inferred_content_type(raw_body)
 
-      is_binary(response.body) ->
-        MIME.sniff(response.body)
+    %__MODULE__{
+      # A response with no body has the body `nil`, as the Fetch Standard
+      # specifies, and starts no stream.
+      body: if(is_nil(raw_body), do: nil, else: Web.ReadableStream.from(raw_body)),
+      headers: headers,
+      status: status,
+      ok: status in 200..299,
+      status_text: Keyword.get(opts, :status_text, ""),
+      url: Keyword.get(opts, :url) || "",
+      type: Keyword.get(opts, :type, "default"),
+      redirected: Keyword.get(opts, :redirected, false),
+      snapshot: AsyncContext.Snapshot.take()
+    }
+  end
 
-      is_list(response.body) ->
-        response.body |> IO.iodata_to_binary() |> MIME.sniff()
+  defp validate_status!(status) when is_integer(status) and status in 200..599, do: :ok
 
-      true ->
-        parsed_header || "application/octet-stream"
+  defp validate_status!(status) when is_integer(status) do
+    raise Web.RangeError, "The status must be from 200 to 599, got: #{status}"
+  end
+
+  defp validate_status!(status) do
+    raise Web.TypeError, "The status must be an integer, got: #{inspect(status)}"
+  end
+
+  # The reason phrase of HTTP: tab, space, and each visible byte.
+  defp validate_status_text!(text) when is_binary(text) do
+    if Regex.match?(~r/\A[\t \x21-\x7E\x80-\xFF]*\z/, text) do
+      :ok
+    else
+      raise Web.TypeError, "Invalid status text: #{inspect(text)}"
     end
+  end
+
+  defp validate_status_text!(text) do
+    raise Web.TypeError, "Invalid status text: #{inspect(text)}"
+  end
+
+  defp validate_null_body!(status, body)
+       when status in @null_body_statuses and not is_nil(body) do
+    raise Web.TypeError, "Response with null body status cannot have body"
+  end
+
+  defp validate_null_body!(_status, _body), do: :ok
+
+  @doc """
+  Returns a network error response, as `Response.error()`.
+  """
+  @spec error() :: t()
+  def error do
+    build(status: 0, type: "error")
+  end
+
+  @doc """
+  Makes a JSON response, as `Response.json()`.
+
+  The header `content-type` is `application/json`, unless `init` has that
+  header. Raises `Web.TypeError` if `data` cannot be changed to JSON.
+  """
+  @spec json(any(), keyword()) :: t()
+  def json(data, init \\ []) do
+    encoded = encode_json!(data)
+
+    headers = init |> Keyword.get(:headers, %{}) |> Web.Headers.new()
+
+    headers =
+      if Web.Headers.has(headers, "content-type") do
+        headers
+      else
+        Web.Headers.set(headers, "content-type", "application/json")
+      end
+
+    new(encoded, Keyword.put(init, :headers, headers))
+  end
+
+  defp encode_json!(data) do
+    Jason.encode!(data)
+  rescue
+    error ->
+      reraise Web.TypeError,
+              [message: "The value cannot be changed to JSON", cause: error],
+              __STACKTRACE__
+  end
+
+  @doc """
+  Makes a redirect response with no body, as `Response.redirect()`.
+
+  The URL must be an absolute URL. Raises `Web.TypeError` for a URL that is
+  not valid, and `Web.RangeError` for a status that is not 301, 302, 303,
+  307, or 308.
+  """
+  @spec redirect(String.t() | Web.URL.t(), non_neg_integer()) :: t()
+  def redirect(url, status \\ 302) do
+    location = redirect_location!(url)
+
+    if status not in @redirect_statuses do
+      raise Web.RangeError, "Invalid redirect status: #{inspect(status)}"
+    end
+
+    build(status: status, headers: %{"location" => location})
+  end
+
+  defp redirect_location!(%Web.URL{} = url), do: Web.URL.href(url)
+
+  defp redirect_location!(url) when is_binary(url) do
+    url |> Web.URL.new() |> Web.URL.href()
+  rescue
+    ArgumentError ->
+      reraise Web.TypeError, [message: "Invalid URL: #{inspect(url)}"], __STACKTRACE__
+  end
+
+  defp redirect_location!(url) do
+    raise Web.TypeError, "Invalid URL: #{inspect(url)}"
   end
 end

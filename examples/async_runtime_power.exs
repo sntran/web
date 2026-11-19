@@ -198,7 +198,7 @@ defmodule AsyncRuntimePowerExample do
 
   defp do_chunk_binary(binary, size, acc) do
     take = min(size, byte_size(binary))
-    <<chunk::binary-size(take), rest::binary>> = binary
+    <<chunk::binary-size(^take), rest::binary>> = binary
     do_chunk_binary(rest, size, [chunk | acc])
   end
 

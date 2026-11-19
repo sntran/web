@@ -1,78 +1,92 @@
-Mix.install([
-  {:web, "~> 0.2.0"}
-])
+# A short tour of `Web`: fetch, streams, abort signals, and a governor.
+#
+# The script starts a small HTTP server on this machine, thus it needs no
+# network.
+#
+# Usage: mix run examples/demo.exs
 
-# Import the "Web-First" DSL
 use Web
 
-IO.puts("--- Starting Web v0.2.0 Demo ---")
-
-# 1. Create a ReadableStream from a custom counter source
-# This source logs every time the controller asks for more data via pull().
-source = %{
-  pull: fn controller ->
-    # In some environments, we might need to initialize the count
-    count = (Process.get(:demo_count) || 0) + 1
-    Process.put(:demo_count, count)
-
-    # Check backpressure signal from the controller
-    ds = Web.ReadableStreamDefaultController.desired_size(controller)
-    IO.puts("[Source] Pulling item ##{count} (Desired size: #{ds})")
-
-    Web.ReadableStreamDefaultController.enqueue(controller, count)
-
-    if count >= 10 do
-      IO.puts("[Source] All items enqueued. Closing.")
-      Web.ReadableStreamDefaultController.close(controller)
-    end
+defmodule Demo.Server do
+  # An HTTP server with two paths. "/slow" sends one line each 100 ms, with
+  # no end. Each other path sends three lines.
+  def start do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+    spawn(fn -> accept(listen) end)
+    "http://127.0.0.1:#{port}"
   end
-}
 
-# High water mark of 1 means it will pull only when needed
-stream = Web.ReadableStream.new(source)
+  defp accept(listen) do
+    {:ok, socket} = :gen_tcp.accept(listen)
+    spawn(fn -> serve(socket) end)
+    accept(listen)
+  end
 
-# 2. tee() the stream into two independent branches
-IO.puts("[System] Teeing the stream into Branch A and Branch B")
-{branch_a, branch_b} = Web.ReadableStream.tee(stream)
+  defp serve(socket) do
+    with {:ok, request} <- :gen_tcp.recv(socket, 0, 5_000) do
+      :gen_tcp.send(socket, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n")
+      :gen_tcp.send(socket, "transfer-encoding: chunked\r\n\r\n")
 
-# 3. Consume Branch A (The "Fast" reader)
-# Branch A uses Elixir's Enumerable protocol (via Enum) to consume as fast as the source provides.
-task_a =
-  Task.async(fn ->
-    IO.puts("[Branch A] Fast reader starting...")
-
-    Enum.each(branch_a, fn val ->
-      IO.puts("[Branch A] Received: #{val}")
-    end)
-
-    IO.puts("[Branch A] Finished.")
-  end)
-
-# 4. Consume Branch B (The "Slow" reader)
-# Branch B uses a direct reader and introduces a delay, creating backpressure.
-task_b =
-  Task.async(fn ->
-    IO.puts("[Branch B] Slow reader starting...")
-    reader = Web.ReadableStream.get_reader(branch_b)
-
-    consume = fn recursive_fn ->
-      case Web.ReadableStreamDefaultReader.read(reader) do
-        :done ->
-          :ok
-
-        val ->
-          IO.puts("[Branch B] Received: #{val}. Processing for 1 second...")
-          # Processing delay
-          Process.sleep(1000)
-          recursive_fn.(recursive_fn)
+      if String.starts_with?(request, "GET /slow") do
+        send_lines(socket, Stream.iterate(1, &(&1 + 1)))
+      else
+        send_lines(socket, 1..3)
+        :gen_tcp.send(socket, "0\r\n\r\n")
+        serve(socket)
       end
     end
+  end
 
-    consume.(consume)
-    IO.puts("[Branch B] Finished.")
-  end)
+  defp send_lines(socket, numbers) do
+    Enum.reduce_while(numbers, :ok, fn number, :ok ->
+      line = "line #{number}\n"
+      chunk = [Integer.to_string(byte_size(line), 16), "\r\n", line, "\r\n"]
+      Process.sleep(100)
+      if :gen_tcp.send(socket, chunk) == :ok, do: {:cont, :ok}, else: {:halt, :closed}
+    end)
+  end
+end
 
-# 5. Wait for both tasks to finish via Promise.all/1
-_results = await(Promise.all([task_a, task_b]))
+base = Demo.Server.start()
 
-IO.puts("--- Demo Completed Successfully ---")
+IO.puts("1. fetch gives a response before the body is complete")
+response = await(fetch(base <> "/lines"))
+IO.puts("   status=#{response.status} type=#{Headers.get(response.headers, "content-type")}")
+
+IO.puts("2. the body is a stream: each chunk arrives when the server sends it")
+
+for chunk <- response.body do
+  IO.puts("   chunk of #{chunk.byte_length} bytes: #{inspect(Uint8Array.to_binary(chunk))}")
+end
+
+IO.puts("3. a pipeline: split the stream, decode one branch, count the other")
+[text_branch, count_branch] = ReadableStream.tee(await(fetch(base <> "/lines")).body)
+count = Task.async(fn -> Enum.reduce(count_branch, 0, &(&1.byte_length + &2)) end)
+text = text_branch |> ReadableStream.pipe_through(TextDecoderStream.new()) |> Enum.join()
+IO.puts("   text=#{inspect(text)} bytes=#{Task.await(count)}")
+
+IO.puts("4. an abort signal stops a response that has no end")
+response = await(fetch(base <> "/slow", signal: AbortSignal.timeout(350)))
+
+try do
+  for chunk <- response.body, do: IO.puts("   got #{inspect(Uint8Array.to_binary(chunk))}")
+rescue
+  error in DOMException -> IO.puts("   the body stopped: #{error.name}")
+end
+
+IO.puts("5. a governor: six requests, two at a time")
+governor = CountingGovernor.new(2)
+started = System.monotonic_time(:millisecond)
+
+statuses =
+  for index <- 1..6 do
+    Governor.with(governor, fn ->
+      fetch(base <> "/lines?#{index}") |> Promise.then(&Response.text/1)
+    end)
+  end
+  |> Promise.all()
+  |> await()
+  |> length()
+
+IO.puts("   #{statuses} responses in #{System.monotonic_time(:millisecond) - started} ms")

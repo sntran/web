@@ -25,6 +25,33 @@
 
 ---
 
+## 📦 Installation
+
+Add `web` to the dependencies in `mix.exs`:
+
+```elixir
+def deps do
+  [
+    {:web, "~> 0.5.0"}
+  ]
+end
+```
+
+The package needs Elixir 1.19 or later and Erlang/OTP 28 or later. The
+tests run on Elixir 1.19 with Erlang/OTP 28, and on Elixir 1.20 with
+Erlang/OTP 29.
+
+For a first look, run the tour in this repository:
+
+```shell
+mix run examples/demo.exs
+```
+
+The directory [`examples/`](examples/README.md) has an index of all the
+examples.
+
+---
+
 ## 🛠 The "Web-First" DSL
 If you’ve used the modern Web API in a browser, you already know how to use this library. We've mapped those standards to idiomatic Elixir.
 

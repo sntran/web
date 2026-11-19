@@ -3,147 +3,95 @@ Mix.Task.run("app.start")
 defmodule Web.Benchmarks.FormDataMemory do
   @moduledoc false
 
+  # A multipart form with one large file goes through the library in the
+  # two directions, and the memory of the VM stays flat:
+  #
+  #   * parse: `Web.FormData.parse/2` reads a `multipart/form-data` body
+  #     from a stream. The file of the form is a stream too;
+  #   * encode: a `Web.FormData` with a file that has a stream is the body
+  #     of a response. The body is a stream of `multipart/form-data` bytes.
+  #
+  # Usage: mix run bench/form_data_memory.exs
+
   alias Web.FormData
-  alias Web.ReadableStream
-  alias Web.ReadableStreamDefaultController
-  alias Web.ReadableStreamDefaultReader
 
   @boundary "memory-boundary"
   @chunk_size 64 * 1024
-  @file_chunks 16_384
-  @sample_interval 128
+  @chunks 16_384
+  @sample_interval 256
 
   def run do
-    {stream, tracker} = source_stream()
-    form_data = FormData.parse(stream, @boundary)
-    file = FormData.get(form_data, "upload")
-    file_stream = Web.File.stream(file)
-    reader = ReadableStream.get_reader(file_stream)
-
-    metrics = sample_read_loop(reader, form_data.coordinator, file_stream.controller_pid, tracker, 0, 0)
-
-    IO.puts("""
-    [Reader API] coordinator_pid=#{inspect(form_data.coordinator)}
-    child_pid=#{inspect(file_stream.controller_pid)}
-    source_pulls=#{metrics.source_pulls}
-    bytes_read=#{metrics.bytes_read}
-    max_coordinator_memory=#{metrics.max_coordinator_memory}
-    max_child_memory=#{metrics.max_child_memory}
-    """)
+    IO.puts("file_bytes=#{@chunks * @chunk_size}")
+    report("parse", fn -> parse() end)
+    report("encode", fn -> encode() end)
   end
 
-  # Enumerable streaming bench: verifies O(1) coordinator memory while
-  # iterating a 1 GB upload via `Enum.each` and reading the file stream inline.
-  def run_enumerable do
-    {stream, tracker} = source_stream()
-    form_data = FormData.parse(stream, @boundary)
+  defp report(label, fun) do
+    :erlang.garbage_collect()
+    start = :erlang.memory(:total)
+    {time, {bytes, peak}} = :timer.tc(fun)
 
-    max_coordinator_memory = :atomics.new(1, [])
-
-    Enum.each(form_data, fn [_name, file] ->
-      file
-      |> Web.File.stream()
-      |> Enum.each(fn chunk ->
-        # Sample coordinator memory every @sample_interval chunks
-        bytes = byte_size(chunk)
-        if rem(bytes, @chunk_size * @sample_interval) == 0 do
-          mem = process_memory(form_data.coordinator)
-          current = :atomics.get(max_coordinator_memory, 1)
-          if mem > current, do: :atomics.put(max_coordinator_memory, 1, mem)
-        end
-      end)
-    end)
-
-    FormData.cancel(form_data)
-
-    IO.puts("""
-    [Enumerable API] coordinator_pid=#{inspect(form_data.coordinator)}
-    source_pulls=#{Agent.get(tracker, & &1.pulls)}
-    max_coordinator_memory=#{:atomics.get(max_coordinator_memory, 1)}
-    """)
+    IO.puts(
+      "#{label}: bytes=#{bytes} seconds=#{Float.round(time / 1_000_000, 2)} " <>
+        "memory_at_start=#{start} largest_memory=#{peak} increase=#{peak - start}"
+    )
   end
 
-  defp source_stream do
-    {:ok, tracker} =
-      Agent.start_link(fn ->
-        %{
-          phase: :opening,
-          remaining_chunks: @file_chunks,
-          pulls: 0
-        }
-      end)
-
-    stream =
-      ReadableStream.new(%{
-        pull: fn controller ->
-          {event, _next_state} = Agent.get_and_update(tracker, fn state ->
-            {event, next_state} = next_chunk(state)
-            {{event, next_state}, %{next_state | pulls: state.pulls + 1}}
-          end)
-
-          case event do
-            {:chunk, chunk} -> ReadableStreamDefaultController.enqueue(controller, chunk)
-            :close -> ReadableStreamDefaultController.close(controller)
-          end
-        end
-      })
-
-    {stream, tracker}
-  end
-
-  defp next_chunk(%{phase: :opening, remaining_chunks: remaining} = state) do
+  # The body of an upload, as a stream: the headers of the part, the bytes
+  # of the file, and the last boundary.
+  defp parse do
     headers =
       "--#{@boundary}\r\n" <>
         "Content-Disposition: form-data; name=\"upload\"; filename=\"large.bin\"\r\n" <>
         "Content-Type: application/octet-stream\r\n\r\n"
 
-    {{:chunk, headers}, %{state | phase: :file, remaining_chunks: remaining}}
+    body = Stream.concat([[headers], file_chunks(), ["\r\n--#{@boundary}--\r\n"]])
+
+    body
+    |> Web.ReadableStream.from()
+    |> FormData.parse(@boundary)
+    |> FormData.get("upload")
+    |> Web.File.stream()
+    |> count_bytes()
   end
 
-  defp next_chunk(%{phase: :file, remaining_chunks: remaining} = state) when remaining > 1 do
-    {{:chunk, :binary.copy(<<0>>, @chunk_size)}, %{state | remaining_chunks: remaining - 1}}
+  defp encode do
+    file =
+      Web.File.new([],
+        name: "upload",
+        filename: "large.bin",
+        type: "application/octet-stream",
+        stream: Web.ReadableStream.from(file_chunks())
+      )
+
+    form = FormData.new(boundary: @boundary) |> FormData.append("upload", file)
+
+    Web.Response.new(body: form).body
+    |> count_bytes()
   end
 
-  defp next_chunk(%{phase: :file, remaining_chunks: 1} = state) do
-    closing = :binary.copy(<<0>>, @chunk_size) <> "\r\n--#{@boundary}--\r\n"
-    {{:chunk, closing}, %{state | phase: :done, remaining_chunks: 0}}
+  defp file_chunks do
+    chunk = :binary.copy(<<0>>, @chunk_size)
+    Stream.map(1..@chunks, fn _index -> chunk end)
   end
 
-  defp next_chunk(%{phase: :done} = state) do
-    {:close, state}
-  end
-
-  defp sample_read_loop(reader, coordinator_pid, child_pid, tracker, bytes_read, max_memory) do
-    case ReadableStreamDefaultReader.read(reader) do
-      :done ->
-        %{
-          bytes_read: bytes_read,
-          source_pulls: Agent.get(tracker, & &1.pulls),
-          max_coordinator_memory: max(max_memory, process_memory(coordinator_pid)),
-          max_child_memory: process_memory(child_pid)
-        }
-
-      chunk ->
-        next_bytes_read = bytes_read + byte_size(chunk)
-
-        next_max_memory =
-          if rem(div(next_bytes_read, @chunk_size), @sample_interval) == 0 do
-            max(max_memory, process_memory(coordinator_pid))
+  # Reads the stream to its end. Returns the number of bytes, and the
+  # largest memory of the VM during the read.
+  defp count_bytes(stream) do
+    {bytes, _count, peak} =
+      Enum.reduce(stream, {0, 0, 0}, fn chunk, {bytes, count, peak} ->
+        peak =
+          if rem(count, @sample_interval) == 0 do
+            max(peak, :erlang.memory(:total))
           else
-            max_memory
+            peak
           end
 
-        sample_read_loop(reader, coordinator_pid, child_pid, tracker, next_bytes_read, next_max_memory)
-    end
-  end
+        {bytes + chunk.byte_length, count + 1, peak}
+      end)
 
-  defp process_memory(pid) do
-    case Process.info(pid, :memory) do
-      {:memory, memory} -> memory
-      _ -> 0
-    end
+    {bytes, peak}
   end
 end
 
 Web.Benchmarks.FormDataMemory.run()
-Web.Benchmarks.FormDataMemory.run_enumerable()

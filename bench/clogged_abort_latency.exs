@@ -3,132 +3,89 @@ Mix.Task.run("app.start")
 defmodule Web.Benchmarks.CloggedAbortLatency do
   @moduledoc false
 
-  import Web, only: [await: 1]
+  # The time from the abort of a writable stream to the call of the function
+  # `abort` of its sink, when the mailbox of the stream is full.
+  #
+  # An abort is a priority message of Erlang/OTP: the stream gets it before
+  # the requests that wait in its mailbox.
+  #
+  # Usage: mix run bench/clogged_abort_latency.exs
 
   alias Web.WritableStream
   alias Web.WritableStreamDefaultWriter
 
-  @flood_size 50_000
-  @samples 15
+  @samples 9
 
   def run do
-    samples =
-      1..@samples
-      |> Enum.map(fn _ -> run_sample() end)
-      |> Enum.sort()
+    for requests <- [1_000, 50_000, 200_000] do
+      samples = Enum.sort(for _sample <- 1..@samples, do: run_sample(requests))
 
-    IO.puts("""
-    commit=#{git_short_rev("HEAD")}
-    samples=#{length(samples)}
-    p50_us=#{percentile(samples, 50)}
-    p95_us=#{percentile(samples, 95)}
-    p99_us=#{percentile(samples, 99)}
-    min_us=#{Enum.min(samples)}
-    max_us=#{Enum.max(samples)}
-    avg_us=#{Float.round(Enum.sum(samples) / length(samples), 2)}
-    """)
+      IO.puts(
+        "requests_in_mailbox=#{requests} median_us=#{Enum.at(samples, div(@samples, 2))} " <>
+          "min_us=#{hd(samples)} max_us=#{List.last(samples)}"
+      )
+    end
   end
 
-  defp run_sample do
+  defp run_sample(requests) do
     parent = self()
 
     stream =
       WritableStream.new(%{
-        write: fn chunk, _controller ->
-          send(parent, {:sink_write_started, self(), chunk})
+        write: fn _chunk, _controller ->
+          send(parent, {:write_started, self()})
 
           receive do
             :release -> :ok
           end
         end,
-        abort: fn reason ->
-          send(parent, {:sink_aborted, System.monotonic_time(:microsecond), reason})
+        abort: fn _reason ->
+          send(parent, {:sink_aborted, System.monotonic_time(:microsecond)})
           :ok
         end
       })
 
     writer = WritableStream.get_writer(stream)
-    owner_pid = writer.owner_pid
     pid = stream.controller_pid
 
-    write_task =
-      Task.async(fn ->
-        try do
-          await(WritableStreamDefaultWriter.write(writer, "chunk-0"))
-        catch
-          :exit, _ -> :ok
-        end
-      end)
+    # The first write stays in the sink.
+    spawn(fn -> Web.Promise.wait(WritableStreamDefaultWriter.write(writer, "first")) end)
 
-    {:sink_write_started, sink_pid, "chunk-0"} = wait_for_write_start()
-
-    flooder =
-      spawn(fn ->
-        Enum.each(1..@flood_size, fn index ->
-          ref = make_ref()
-          send(pid, {:"$gen_call", {self(), ref}, {:write, owner_pid, "chunk-#{index}"}})
-        end)
-
-        receive do
-          :stop -> :ok
-        end
-      end)
-
-    wait_for_queue_pressure(pid)
-
-    started_at = System.monotonic_time(:microsecond)
-    abort_task = WritableStream.abort(stream, :emergency_stop)
-
-    elapsed_us =
+    sink =
       receive do
-        {:sink_aborted, aborted_at, :emergency_stop} -> aborted_at - started_at
+        {:write_started, sink} -> sink
       end
 
-    _ = await(abort_task)
+    # The stream process stops while the requests and the abort go into its
+    # mailbox. Thus the abort is behind all the requests.
+    :erlang.suspend_process(pid)
 
-    send(sink_pid, :release)
-    send(flooder, :stop)
-    Task.shutdown(write_task, :brutal_kill)
+    for index <- 1..requests do
+      send(pid, {:"$gen_call", {self(), make_ref()}, {:write, writer.owner_pid, index}})
+    end
 
-    elapsed_us
+    abort = WritableStreamDefaultWriter.abort(writer, :emergency_stop)
+    Process.sleep(20)
+    resumed_at = System.monotonic_time(:microsecond)
+    :erlang.resume_process(pid)
+
+    elapsed =
+      receive do
+        {:sink_aborted, aborted_at} -> aborted_at - resumed_at
+      end
+
+    Web.Promise.wait(abort)
+    send(sink, :release)
+    flush()
+    elapsed
   end
 
-  defp wait_for_write_start do
+  # The answers of the requests that the abort rejected.
+  defp flush do
     receive do
-      {:sink_write_started, sink_pid, "chunk-0"} ->
-        {:sink_write_started, sink_pid, "chunk-0"}
-    end
-  end
-
-  defp wait_for_queue_pressure(pid, attempts \\ 1_000)
-
-  defp wait_for_queue_pressure(_pid, 0), do: raise("mailbox pressure did not build in time")
-
-  defp wait_for_queue_pressure(pid, attempts) do
-    if Process.info(pid, :message_queue_len) |> elem(1) > 10_000 do
-      :ok
-    else
-      Process.sleep(1)
-      wait_for_queue_pressure(pid, attempts - 1)
-    end
-  end
-
-  defp percentile(sorted, p) do
-    index =
-      sorted
-      |> length()
-      |> Kernel.*(p / 100)
-      |> Float.ceil()
-      |> trunc()
-      |> max(1)
-
-    Enum.at(sorted, index - 1)
-  end
-
-  defp git_short_rev(ref) do
-    case System.cmd("git", ["rev-parse", "--short", ref]) do
-      {output, 0} -> String.trim(output)
-      _ -> ref
+      _answer -> flush()
+    after
+      0 -> :ok
     end
   end
 end

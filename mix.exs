@@ -1,7 +1,7 @@
 defmodule Web.MixProject do
   use Mix.Project
 
-  @version "0.4.0"
+  @version "0.5.0"
   @repo_url "https://github.com/sntran/web"
   @description "A protocol-agnostic, zero-buffer suite of Web Standard APIs for Elixir."
 

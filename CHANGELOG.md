@@ -2,9 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased] - 2026-11-19
+## [0.5.0] - 2026-11-19
 
 ### Added
+
+- A cancel, an abort, and an error of a stream are priority messages of
+  Erlang/OTP 28: the stream gets them before the other messages of its
+  mailbox. With 5000 requests in the mailbox, an abort took 24.6 ms
+  before. It now takes 2 ms with 50000 requests. A close stays a usual
+  message, thus it comes after the chunks that the same process sent
+  before it.
+- The package is tested on Elixir 1.20 with Erlang/OTP 29, and on
+  Elixir 1.19 with Erlang/OTP 28. The code compiles with no warning on the
+  two versions.
+- `examples/README.md`, an index of the examples, and a new
+  `examples/demo.exs`: a short tour that needs no network.
 
 - Time limits for `Web.fetch/2`. `config :web, connect_timeout: ms` is the
   time to open a connection, also for `Web.connect/2`. The default is
@@ -174,6 +186,21 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Breaking:** the promise `closed` of a `Web.Socket` rejects when the
+  socket fails, as the Sockets API specifies. It fulfils for a close, for
+  a close of the peer, and for a cancel of the readable side. Before, it
+  always fulfilled.
+- **Breaking:** `Web.Socket.close/2` ends the two streams of the socket. A
+  function on a socket that is closed returns immediately. The field
+  `address` of the struct is a pid, and the option `:request_timeout` is
+  removed.
+- **Breaking:** `Web.await/1` is a function, not a macro, and it returns a
+  value that is not a promise with no change, as `await` of ECMAScript.
+  Before, a call needed `require Web`, and a value that was not a promise
+  raised.
+- The benchmark scripts in `bench/` use the functions of this version.
+  `bench/selective_receive.exs` is removed: it measured the VM, not the
+  library.
 - **Breaking:** `Web.structured_clone/2` accepts all data: atoms, tuples,
   bitstrings, improper lists, and structs that have only data. Before, a
   map with an atom key raised `DataCloneError`. A `Web.Promise`, a
@@ -667,6 +694,14 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A write to a `Web.Socket` that waits for a slow peer does not stop the
+  reads of the socket. Before, the process of the socket sent the bytes:
+  while a write waited, the socket did not read, and the two sides could
+  wait for each other with no end.
+- A write to a `Web.Socket` has no time limit. Before, a write that took
+  more than 5 seconds failed with `:closed`, while the socket was open.
+- The time of the write requests that wait in a writable stream does not
+  increase with the square of their number.
 - A message to a `Web.MessagePort` that has no listener at that time is not
   lost: it stays in the port message queue.
 - A listener of a `Web.MessagePort` or a `Web.BroadcastChannel` can call

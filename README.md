@@ -217,7 +217,10 @@ upper =
 
 ```
 
-Standard-compliant gzip/deflate and UTF-8 encoding that works across streamed chunk boundaries.
+Standard-compliant gzip/deflate and text encoding that works across streamed chunk boundaries.
+`TextDecoder` and `TextDecoderStream` decode UTF-8, UTF-16LE, UTF-16BE, and
+the single-byte encodings of the Encoding Standard, such as windows-1252
+(the label `latin1`), windows-1251, and KOI8-R.
 
 ```elixir
 source = ReadableStream.from(["Hello, ", "🌍"])

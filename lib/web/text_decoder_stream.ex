@@ -1,10 +1,11 @@
 defmodule Web.TextDecoderStream do
   @moduledoc """
-  A transform stream from UTF-8 bytes to text, as `TextDecoderStream` of the
-  Encoding Standard.
+  A transform stream from bytes to text, as `TextDecoderStream` of the
+  Encoding Standard. The default encoding is UTF-8. `Web.TextDecoder` lists
+  the encodings that the label can name.
 
   Each chunk that is written is a binary, a `Web.Uint8Array`, or a
-  `Web.ArrayBuffer`. Each chunk that is read is a string. A code point that
+  `Web.ArrayBuffer`. Each chunk that is read is a string. A character that
   is divided between two chunks is joined.
 
   The options are the options of `Web.TextDecoder.new/2`: `:fatal` and

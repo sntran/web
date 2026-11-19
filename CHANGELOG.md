@@ -12,6 +12,14 @@ All notable changes to this project are documented in this file.
   response headers or for the next part of a body. The default is
   300000 ms. A request that fails for one of these limits rejects with
   `Web.TypeError`.
+- `Web.TextDecoder` and `Web.TextDecoderStream` decode more encodings of
+  the Encoding Standard: UTF-16LE, UTF-16BE, x-user-defined, and the 28
+  single-byte encodings (IBM866, the ISO-8859 group, KOI8-R, KOI8-U,
+  macintosh, windows-874, windows-1250 to windows-1258, and
+  x-mac-cyrillic). Each label of the Standard for these encodings is
+  accepted: for example, `latin1` and `ascii` are labels of windows-1252.
+  The tables come from the index files of the Standard. The library has no
+  decoder for the multi-byte encodings of Chinese, Japanese, and Korean.
 - `Web.Uint8Array.from/1`, which makes a view with a new buffer from a
   binary, iodata, a `Web.ArrayBuffer`, or a `Web.Uint8Array`.
 - A short form for `inspect/1` of a `Web.Uint8Array`:
@@ -189,10 +197,16 @@ All notable changes to this project are documented in this file.
   priority messages, but that request had no effect, and it would put a
   `close` before the chunks that were enqueued before it.
 - **Breaking:** `Web.TextDecoder.new/2` and `Web.TextDecoderStream.new/2`
-  raise `Web.RangeError` for a label that is not a label of UTF-8, as the
-  Encoding Standard specifies. Before, they raised `Web.TypeError`. All the
-  six labels of UTF-8 are accepted. The option `:ignore_bom` has its Elixir
-  name; the name `:ignoreBOM` is accepted also.
+  raise `Web.RangeError` for a label that is not valid, as the Encoding
+  Standard specifies. Before, they raised `Web.TypeError`. A label can have
+  ASCII whitespace at its two ends, and its ASCII letters can be uppercase;
+  whitespace and letters that are not ASCII are not changed. The option
+  `:ignore_bom` has its Elixir name; the name `:ignoreBOM` is accepted
+  also.
+- `Web.TextDecoder` starts again after a `decode/3` call with no `stream`
+  option, as the Encoding Standard specifies. Thus it removes the byte
+  order mark of the subsequent data also. Before, only the first data of a
+  decoder lost its byte order mark.
 - `Web.TextDecoderStream` has the fields `:encoding`, `:fatal`, and
   `:ignore_bom`, and `Web.TextEncoderStream` has the field `:encoding`.
 - `Web.TextEncoderStream` gives no chunk for an empty string, joins a code

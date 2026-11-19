@@ -42,7 +42,7 @@ defmodule Web.TextEncodingTest do
   test "TextDecoder with fatal: true raises on invalid UTF-8" do
     decoder = TextDecoder.new("utf-8", %{fatal: true})
 
-    assert_raise Web.TypeError, "The encoded data was not valid UTF-8", fn ->
+    assert_raise Web.TypeError, "The encoded data was not valid utf-8", fn ->
       TextDecoder.decode(decoder, <<0xC3, 0x28>>)
     end
   end
@@ -53,12 +53,12 @@ defmodule Web.TextEncodingTest do
     assert TextDecoder.decode(decoder, <<0xF0, 0x9F>>) == <<0xEF, 0xBF, 0xBD>>
   end
 
-  test "TextDecoder handles valid complete input in fatal mode and leaves BOM state untouched on empty ignoreBOM stream chunks" do
+  test "TextDecoder handles valid complete input in fatal mode, and starts again after the end of the data" do
     decoder = TextDecoder.new("utf-8", %{fatal: true, ignoreBOM: true})
 
     assert TextDecoder.decode(decoder, "hello") == "hello"
     assert TextDecoder.decode(decoder, "", %{stream: true}) == ""
-    assert %{bom_seen: true, carry: ""} = :sys.get_state(decoder.state_pid)
+    assert %{bom_seen: false, carry: ""} = :sys.get_state(decoder.state_pid)
   end
 
   test "TextDecoder empty decodes exercise fresh BOM state branches" do
@@ -69,8 +69,10 @@ defmodule Web.TextEncodingTest do
     decoder = TextDecoder.new()
     assert TextDecoder.decode(decoder, "", %{stream: true}) == ""
     assert %{bom_seen: false, carry: ""} = :sys.get_state(decoder.state_pid)
+    # A call with no `stream` option is the end of the data: the decoder
+    # starts again.
     assert TextDecoder.decode(decoder, "", %{stream: false}) == ""
-    assert %{bom_seen: true, carry: ""} = :sys.get_state(decoder.state_pid)
+    assert %{bom_seen: false, carry: ""} = :sys.get_state(decoder.state_pid)
   end
 
   test "TextDecoder preserves split three-byte and four-byte prefixes across streamed chunks" do
@@ -190,7 +192,7 @@ defmodule Web.TextEncodingTest do
       fatal_decoder = TextDecoder.new("utf-8", %{fatal: true})
       forgiving_decoder = TextDecoder.new("utf-8", %{fatal: false})
 
-      assert_raise Web.TypeError, "The encoded data was not valid UTF-8", fn ->
+      assert_raise Web.TypeError, "The encoded data was not valid utf-8", fn ->
         TextDecoder.decode(fatal_decoder, binary)
       end
 
@@ -235,7 +237,7 @@ defmodule Web.TextEncodingTest do
       assert %TextDecoder{encoding: "utf-8"} = TextDecoder.new(valid_label)
 
       # The Encoding Standard gives RangeError for a label that is not known.
-      assert_raise Web.RangeError, ~r/supports only UTF-8/, fn ->
+      assert_raise Web.RangeError, ~r/is not valid/, fn ->
         TextDecoder.new(invalid_label)
       end
     end
@@ -389,12 +391,9 @@ defmodule Web.TextEncodingTest do
         assert TextDecoderStream.new(label).encoding == "utf-8"
       end
 
-      for label <- ["utf-16le", "latin1", "no-such-encoding", ""] do
-        assert_raise Web.RangeError, ~r/supports only UTF-8/, fn -> TextDecoder.new(label) end
-
-        assert_raise Web.RangeError, ~r/supports only UTF-8/, fn ->
-          TextDecoderStream.new(label)
-        end
+      for label <- ["no-such-encoding", "", "replacement", "gbk", "shift_jis"] do
+        assert_raise Web.RangeError, fn -> TextDecoder.new(label) end
+        assert_raise Web.RangeError, fn -> TextDecoderStream.new(label) end
       end
 
       assert_raise Web.TypeError, fn -> TextDecoder.new(:utf8) end
@@ -434,22 +433,8 @@ defmodule Web.TextEncodingTest do
     ])
   end
 
+  # A label that the Encoding Standard does not have.
   defp invalid_utf8_label do
-    string(:alphanumeric, min_length: 1)
-    |> filter(fn label ->
-      normalized =
-        label
-        |> String.trim()
-        |> String.downcase()
-
-      normalized not in [
-        "utf-8",
-        "utf8",
-        "unicode-1-1-utf-8",
-        "unicode11utf8",
-        "unicode20utf8",
-        "x-unicode20utf8"
-      ]
-    end)
+    filter(string(:alphanumeric, min_length: 1), &(Web.Encoding.get(&1) == :error))
   end
 end

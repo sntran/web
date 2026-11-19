@@ -79,7 +79,8 @@ payload_stream = Web.File.stream(payload)
 sink =
   WritableStream.new(%{
     write: fn chunk, _controller ->
-      size = byte_size(IO.iodata_to_binary(chunk))
+      # Each chunk of a file stream is a `Web.Uint8Array`.
+      size = chunk.byte_length
 
       Agent.get_and_update(sink_state, fn %{bytes: bytes, checkpoint: checkpoint} = state ->
         next = bytes + size

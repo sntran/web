@@ -27,12 +27,18 @@ defmodule ByteCounterStream do
   """
   @spec write(iodata(), term(), map()) :: {:ok, map()}
   def write(chunk, controller, state) do
-    binary = IO.iodata_to_binary(chunk)
+    ReadableStreamDefaultController.enqueue(controller, chunk)
 
-    ReadableStreamDefaultController.enqueue(controller, binary)
-
-    {:ok, %{state | total_bytes: state.total_bytes + byte_size(binary)}}
+    {:ok, %{state | total_bytes: state.total_bytes + chunk_size(chunk)}}
   end
+
+  @doc """
+  Returns the number of bytes of a chunk. A chunk of a response body is a
+  `Web.Uint8Array`. A chunk from a different source can be a binary.
+  """
+  @spec chunk_size(Web.Uint8Array.t() | iodata()) :: non_neg_integer()
+  def chunk_size(%Web.Uint8Array{byte_length: length}), do: length
+  def chunk_size(chunk), do: IO.iodata_length(chunk)
 
   @doc """
   Closes the stream and notifies the parent process of the total byte count.
@@ -104,11 +110,10 @@ defmodule StreamByteCounterDemo do
       transform_counter =
         TransformStream.new(%{
           transform: fn chunk, controller ->
-            binary = IO.iodata_to_binary(chunk)
-            ReadableStreamDefaultController.enqueue(controller, binary)
+            ReadableStreamDefaultController.enqueue(controller, chunk)
 
             Agent.update(transform_counter_pid, fn total ->
-              total + byte_size(binary)
+              total + ByteCounterStream.chunk_size(chunk)
             end)
 
             :ok

@@ -49,7 +49,8 @@ defmodule AsyncRuntimePowerExample do
                     |> File.stream()
                     |> ReadableStream.pipe_through(compression)
                     |> Enum.each(fn chunk ->
-                      send(parent, {:compressed_chunk, byte_size(chunk)})
+                      # Each chunk of a stream of bytes is a `Web.Uint8Array`.
+                      send(parent, {:compressed_chunk, chunk.byte_length})
                       Process.sleep(10)
                     end)
                 end)

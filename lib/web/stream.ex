@@ -131,6 +131,9 @@ defmodule Web.Stream do
     # The callers that wait for the end of the stream: {from, pid}.
     closed_waiters: [],
     queued_write_requests: :queue.new(),
+    # The number of requests in `queued_write_requests`. The stream needs it
+    # for each write, and the length of a queue costs a read of the queue.
+    queued_write_count: 0,
     ready_waiters: :queue.new(),
     # Transform-side readable backpressure (transform task parks here until readable has space)
     enqueue_waiters: :queue.new(),
@@ -213,7 +216,7 @@ defmodule Web.Stream do
     # The process of the promise is ready for the reply. The stream sends the
     # reply to that process.
     receive do
-      {^tag, replier} -> send(pid, {:"$gen_call", {replier, tag}, message})
+      {^tag, replier} -> deliver(pid, {:"$gen_call", {replier, tag}, message}, message)
     end
 
     promise
@@ -286,19 +289,63 @@ defmodule Web.Stream do
     :exit, _reason -> :ok
   end
 
-  @doc false
-  # A control message is a usual message. Thus the stream handles a `close`
+  # ---------------------------------------------------------------------------
+  # Priority messages
+  #
+  # A cancel, an abort, and an error discard the data that the stream has.
+  # Thus they do not wait for the messages before them: the stream gets them
+  # as priority messages of Erlang/OTP, before the other messages of its
+  # mailbox. A stream with a full mailbox stops immediately.
+  #
+  # Each other message is a usual message. Thus the stream handles a `close`
   # after the chunks that the same process enqueued before it.
-  def control_cast(pid, message) when is_pid(pid) do
-    send(pid, {:"$gen_cast", message})
+  #
+  # A priority message needs a priority alias of the stream process. The
+  # stream keeps its alias in its process dictionary, where a sender reads
+  # it with no message to the stream.
+  # ---------------------------------------------------------------------------
+
+  @priority_alias {__MODULE__, :priority_alias}
+
+  defp deliver(pid, envelope, message) do
+    if abortive?(message) do
+      send_with_priority(pid, envelope)
+    else
+      send(pid, envelope)
+    end
+
     :ok
+  end
+
+  defp abortive?({terminate, type, _reason})
+       when terminate in [:terminate, :terminate_unlocked] and type in [:cancel, :abort],
+       do: true
+
+  defp abortive?({:abort, _owner, _reason}), do: true
+  defp abortive?({:error, _reason}), do: true
+  defp abortive?(_message), do: false
+
+  defp send_with_priority(pid, envelope) do
+    case :erlang.process_info(pid, {:dictionary, @priority_alias}) do
+      {_item, alias} when is_reference(alias) -> :erlang.send(alias, envelope, [:priority])
+      # The process stopped, or it is not a stream of this version.
+      _other -> send(pid, envelope)
+    end
+  rescue
+    # The process is on a different node.
+    ArgumentError -> send(pid, envelope)
+  end
+
+  @doc false
+  def control_cast(pid, message) when is_pid(pid) do
+    deliver(pid, {:"$gen_cast", message}, message)
   end
 
   @doc false
   def control_call(pid, message, timeout \\ :infinity) when is_pid(pid) do
     monitor_ref = Process.monitor(pid)
     ref = make_ref()
-    send(pid, {:"$gen_call", {self(), ref}, message})
+    deliver(pid, {:"$gen_call", {self(), ref}, message}, message)
 
     receive do
       {^ref, reply} ->
@@ -324,6 +371,7 @@ defmodule Web.Stream do
   @impl true
   def init({module, opts, snapshot, owner}) do
     Process.flag(:message_queue_data, :off_heap)
+    Process.put(@priority_alias, :erlang.alias([:priority]))
     # The callbacks of this stream run in tasks. The promises and streams that
     # they make belong to this stream.
     Web.Promise.put_owner(self())
@@ -1726,12 +1774,8 @@ defmodule Web.Stream do
     case transition(result, state, data) do
       {next_state, new_data, actions} when next_state in [:writable, :closing] ->
         if held_write_can_start?(new_data) do
-          {{:value, request}, remaining} = :queue.out(new_data.queued_write_requests)
-
-          started =
-            new_data
-            |> Map.put(:queued_write_requests, remaining)
-            |> start_write_task(request)
+          {request, new_data} = dequeue_write_request(new_data)
+          started = start_write_task(new_data, request)
 
           {:next_state, next_state, started, actions}
         else
@@ -2022,11 +2066,10 @@ defmodule Web.Stream do
         {:keep_state, data, actions}
 
       not :queue.is_empty(data.queued_write_requests) ->
-        {{:value, request}, remaining} = :queue.out(data.queued_write_requests)
+        {request, data} = dequeue_write_request(data)
 
         new_data =
           data
-          |> Map.put(:queued_write_requests, remaining)
           |> start_write_task(request)
 
         {:keep_state, new_data, actions}
@@ -2059,6 +2102,7 @@ defmodule Web.Stream do
     data
     |> Map.merge(%{
       queued_write_requests: :queue.new(),
+      queued_write_count: 0,
       pending_close_request: nil,
       ready_waiters: :queue.new(),
       writable_error: {:errored, error}
@@ -2112,6 +2156,7 @@ defmodule Web.Stream do
       |> clear_writer_lock()
       |> Map.put(:pending_write_request, nil)
       |> Map.put(:queued_write_requests, :queue.new())
+      |> Map.put(:queued_write_count, 0)
       |> Map.put(:pending_close_request, nil)
       |> Map.put(:ready_waiters, :queue.new())
       |> Map.put(:enqueue_waiters, :queue.new())
@@ -2394,6 +2439,7 @@ defmodule Web.Stream do
         pending_write_request: nil,
         pending_close_request: nil,
         queued_write_requests: :queue.new(),
+        queued_write_count: 0,
         ready_waiters: :queue.new(),
         backpressure: false,
         error_reason: nil
@@ -2416,6 +2462,7 @@ defmodule Web.Stream do
       data
       | pending_write_request: nil,
         queued_write_requests: :queue.new(),
+        queued_write_count: 0,
         pending_close_request: nil,
         ready_waiters: :queue.new(),
         backpressure: false,
@@ -2514,11 +2561,22 @@ defmodule Web.Stream do
   end
 
   defp pending_write_count(data) do
-    :queue.len(data.queued_write_requests) + if(data.pending_write_request, do: 1, else: 0)
+    data.queued_write_count + if(data.pending_write_request, do: 1, else: 0)
   end
 
   defp enqueue_write_request(data, request) do
-    %{data | queued_write_requests: :queue.in(request, data.queued_write_requests)}
+    %{
+      data
+      | queued_write_requests: :queue.in(request, data.queued_write_requests),
+        queued_write_count: data.queued_write_count + 1
+    }
+  end
+
+  defp dequeue_write_request(data) do
+    {{:value, request}, remaining} = :queue.out(data.queued_write_requests)
+
+    {request,
+     %{data | queued_write_requests: remaining, queued_write_count: data.queued_write_count - 1}}
   end
 
   defp active_consumer_operation?(data) do

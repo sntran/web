@@ -228,6 +228,9 @@ defmodule Web.Body do
 
       {:error, :already_locked} ->
         {:error, Web.TypeError.exception("ReadableStream is already locked")}
+
+      {:error, :released} ->
+        {:error, Web.TypeError.exception("body already used")}
     end
   end
 
@@ -253,24 +256,26 @@ defmodule Web.Body do
   end
 
   defp read_body_to_text(%Web.ReadableStream{controller_pid: pid}) do
-    decoder = Web.TextDecoder.new()
-
     case Web.ReadableStream.get_reader(pid) do
       :ok ->
-        read_stream_text_chunks(pid, decoder, [])
+        read_stream_text_chunks(pid, Web.TextDecoder.initial_state(), [])
 
       {:error, :already_locked} ->
         {:error, Web.TypeError.exception("ReadableStream is already locked")}
+
+      {:error, :released} ->
+        {:error, Web.TypeError.exception("body already used")}
     end
   end
 
-  defp read_stream_text_chunks(pid, decoder, acc) do
+  defp read_stream_text_chunks(pid, decoder_state, acc) do
     case Web.ReadableStream.read(pid) do
       {:ok, chunk} ->
-        with {:ok, binary} <- normalize_text_chunk(chunk),
-             decoded <- Web.TextDecoder.decode(decoder, binary, %{stream: true}) do
-          read_stream_text_chunks(pid, decoder, [decoded | acc])
-        else
+        case normalize_text_chunk(chunk) do
+          {:ok, binary} ->
+            {decoded, decoder_state} = Web.TextDecoder.decode_step(decoder_state, binary, true)
+            read_stream_text_chunks(pid, decoder_state, [decoded | acc])
+
           {:error, reason} ->
             Web.ReadableStream.release_lock(pid)
             {:error, reason}
@@ -279,7 +284,7 @@ defmodule Web.Body do
       :done ->
         Web.ReadableStream.release_lock(pid)
 
-        final = Web.TextDecoder.decode(decoder, "", %{stream: false})
+        {final, _decoder_state} = Web.TextDecoder.decode_step(decoder_state, "", false)
         {:ok, acc |> Enum.reverse() |> Kernel.++([final]) |> IO.iodata_to_binary()}
 
       {:error, reason} ->
@@ -295,7 +300,10 @@ defmodule Web.Body do
         is_list(body) -> IO.iodata_to_binary(body)
       end
 
-    {:ok, Web.TextDecoder.decode(Web.TextDecoder.new(), binary)}
+    {text, _decoder_state} =
+      Web.TextDecoder.decode_step(Web.TextDecoder.initial_state(), binary, false)
+
+    {:ok, text}
   end
 
   defp normalize_text_chunk(chunk) when is_binary(chunk), do: {:ok, chunk}

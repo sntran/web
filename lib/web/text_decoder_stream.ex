@@ -29,11 +29,13 @@ defmodule Web.TextDecoderStream do
         end,
         flush: fn controller ->
           decoded = TextDecoder.decode(decoder, <<>>, %{stream: false})
+          TextDecoder.dispose(decoder)
 
           if decoded != "" do
             ReadableStreamDefaultController.enqueue(controller, decoded)
           end
-        end
+        end,
+        cancel: fn _reason -> TextDecoder.dispose(decoder) end
       })
 
     %__MODULE__{readable: stream.readable, writable: stream.writable}

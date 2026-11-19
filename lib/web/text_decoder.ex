@@ -1,10 +1,52 @@
+defmodule Web.TextDecoder.State do
+  @moduledoc false
+
+  # Holds the bytes that a decoder keeps between two calls with
+  # `stream: true`. The process stops when its owner stops.
+
+  use GenServer
+
+  @spec start(pid(), map()) :: {:ok, pid()}
+  def start(owner, state), do: GenServer.start(__MODULE__, {owner, state})
+
+  @spec update(pid(), (map() -> {term(), map()})) :: term()
+  def update(pid, fun), do: GenServer.call(pid, {:update, fun}, :infinity)
+
+  @spec stop(pid()) :: :ok
+  def stop(pid) do
+    GenServer.stop(pid, :normal)
+  catch
+    :exit, _reason -> :ok
+  end
+
+  @impl true
+  def init({owner, state}) do
+    Process.monitor(owner)
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call({:update, fun}, _from, state) do
+    {reply, new_state} = fun.(state)
+    {:reply, reply, new_state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, _ref, :process, _pid, _reason}, state), do: {:stop, :normal, state}
+end
+
 defmodule Web.TextDecoder do
   @moduledoc """
   WHATWG-style UTF-8 text decoder with streaming support.
 
   Supports `fatal` and `ignoreBOM` options and preserves trailing partial
   UTF-8 bytes across streamed `decode/3` calls.
+
+  A decoder keeps its state in a small process. The process stops when the
+  process that made the decoder stops.
   """
+
+  alias Web.TextDecoder.State
 
   import Bitwise
 
@@ -37,7 +79,7 @@ defmodule Web.TextDecoder do
       raise TypeError, "TextDecoder only supports UTF-8"
     end
 
-    {:ok, state_pid} = Agent.start_link(fn -> %{carry: "", bom_seen: false} end)
+    {:ok, state_pid} = State.start(Web.Promise.owner(), initial_state())
     %__MODULE__{encoding: "utf-8", state_pid: state_pid, fatal: fatal, ignore_bom: ignore_bom}
   end
 
@@ -46,10 +88,36 @@ defmodule Web.TextDecoder do
     stream = Map.get(options, :stream, false)
     chunk = normalize_input(input)
 
-    case Agent.get_and_update(decoder.state_pid, &decode_chunk(&1, chunk, decoder, stream)) do
+    case update_state(decoder, &decode_chunk(&1, chunk, decoder, stream)) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
+  end
+
+  defp update_state(decoder, fun) do
+    State.update(decoder.state_pid, fun)
+  catch
+    :exit, _reason ->
+      {:error, TypeError.exception("The TextDecoder is not available. Its owner stopped.")}
+  end
+
+  @doc false
+  # Stops the state process of a decoder that has no more use.
+  @spec dispose(t()) :: :ok
+  def dispose(%__MODULE__{state_pid: state_pid}), do: State.stop(state_pid)
+
+  @doc false
+  # The state of a decoder as data. `Web.Body` uses `initial_state/0` and
+  # `decode_step/3`, thus a body read starts no state process.
+  @spec initial_state() :: map()
+  def initial_state, do: %{carry: "", bom_seen: false}
+
+  @doc false
+  @spec decode_step(map(), binary(), boolean()) :: {String.t(), map()}
+  def decode_step(state, chunk, stream?) when is_binary(chunk) do
+    decoder = %__MODULE__{encoding: "utf-8", fatal: false, ignore_bom: false}
+    {{:ok, text}, new_state} = decode_chunk(state, chunk, decoder, stream?)
+    {text, new_state}
   end
 
   defp decode_chunk(%{carry: carry, bom_seen: bom_seen} = state, chunk, decoder, stream) do

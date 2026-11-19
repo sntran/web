@@ -10,7 +10,7 @@ defmodule Web.URL do
   defguardp digit?(char) when char in ?0..?9
 
   alias Web.Internal.Ascii
-  alias Web.URL.{Encoding, IP, Parser}
+  alias Web.URL.{Encoding, FastPath, IP, Parser}
 
   defstruct protocol: "",
             username: "",
@@ -64,12 +64,19 @@ defmodule Web.URL do
 
   def new(url, base) when is_binary(url) do
     # The parser checks that the text is valid UTF-8, and removes the C0
-    # characters again. This trim is only for the check of an rclone URL.
+    # characters again. This trim is for the short parse and for the check
+    # of an rclone URL.
     trimmed = Encoding.trim_c0(url)
 
-    if rclone_url?(trimmed),
-      do: trimmed |> Encoding.valid_utf8!() |> parse_rclone(),
-      else: parse_standard(trimmed, base)
+    case base == nil and FastPath.parse(trimmed) do
+      {:ok, fields} ->
+        Map.merge(%__MODULE__{}, fields)
+
+      _other ->
+        if rclone_url?(trimmed),
+          do: trimmed |> Encoding.valid_utf8!() |> parse_rclone(),
+          else: parse_standard(trimmed, base)
+    end
   end
 
   @doc """

@@ -145,6 +145,14 @@ defmodule Web.GovernorTest do
       assert Promise.peek(waiting) == :pending
     end
 
+    test "answers a request in the linger time, and then stops" do
+      governor = governor_of_stopped_owner(3)
+
+      assert GenServer.call(governor.pid, :capacity) == 3
+      assert Process.alive?(governor.pid)
+      assert_stops(governor)
+    end
+
     test "starts the linger time again for each message" do
       governor = governor_of_stopped_owner(1)
 
@@ -572,27 +580,6 @@ defmodule Web.GovernorTest do
 
     assert :ok = Token.release(token)
     eventually(fn -> governor_state(governor).in_use == 0 end)
-  end
-
-  test "internal no-op paths tolerate unrelated signals and stale queue entries" do
-    governor = CountingGovernor.new(1)
-    token = await(Governor.acquire(governor))
-    stale_waiter_ref = make_ref()
-
-    GenServer.cast(governor.pid, acquire_message(stale_waiter_ref))
-
-    eventually(fn -> queue_length(governor) == 1 end)
-    send(governor.pid, {:DOWN, make_ref(), :process, self(), :normal})
-    Process.sleep(10)
-
-    :sys.replace_state(governor.pid, fn state ->
-      %{state | waiting: Map.delete(state.waiting, stale_waiter_ref)}
-    end)
-
-    GenServer.cast(governor.pid, {:abort_waiter, make_ref()})
-    assert :ok = Token.release(token)
-    Process.sleep(10)
-    assert queue_length(governor) == 0
   end
 
   test "an acquisition that was aborted before it came to the governor is rejected" do

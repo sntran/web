@@ -606,15 +606,8 @@ defmodule Web.URLPattern do
     do_fold_compare_prefixes(rest, [token | acc])
   end
 
-  # Parser.parse/1 does not emit zero-length literal tokens for valid public
-  # patterns, so this fallback only guards malformed internal token streams.
-  # coveralls-ignore-start
-  defp extract_compare_prefix("") do
-    {"", ""}
-  end
-
-  # coveralls-ignore-stop
-
+  # The parser gives no fixed token with an empty value, thus the value has
+  # a last character.
   defp extract_compare_prefix(value) do
     last_char = String.last(value)
     last_codepoint = :binary.decode_unsigned(last_char)

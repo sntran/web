@@ -386,16 +386,10 @@ defmodule Web.FormData do
 
     defp owner_loop(pid, owner, owner_ref) do
       receive do
+        # The owner of the form stopped, thus the parser stops.
         {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
-          if Process.alive?(pid) do
-            Process.exit(pid, :shutdown)
-          end
-
-          receive do
-            {:EXIT, ^pid, _exit_reason} -> :ok
-          after
-            0 -> :ok
-          end
+          Process.exit(pid, :shutdown)
+          :ok
 
         {:EXIT, ^pid, _reason} ->
           :ok
@@ -1202,11 +1196,9 @@ defmodule Web.FormData do
 
     defp release_source_lock(%{source_lock_released?: true} = data), do: data
 
+    # The two functions below have no effect on a source that stopped.
     defp release_source_lock(%{source_pid: source_pid} = data) do
-      if Process.alive?(source_pid) do
-        _ = safe_call(fn -> ReadableStream.release_lock(source_pid) end)
-      end
-
+      _ = ReadableStream.release_lock(source_pid)
       %{data | source_lock_released?: true}
     end
 
@@ -1215,11 +1207,7 @@ defmodule Web.FormData do
     defp maybe_cancel_source(_data, nil), do: :ok
 
     defp maybe_cancel_source(%{source_pid: source_pid}, reason) do
-      if Process.alive?(source_pid) do
-        _ =
-          safe_call(fn -> Web.Stream.control_call(source_pid, {:terminate, :cancel, reason}) end)
-      end
-
+      _outcome = Web.Promise.wait(ReadableStream.cancel(source_pid, reason))
       :ok
     end
 
@@ -1481,12 +1469,6 @@ defmodule Web.FormData do
     defp unwrap!(:next_entry, {:ok, :done}), do: :done
     defp unwrap!(_kind, {:error, %TypeError{} = reason}), do: raise(reason)
     defp unwrap!(_kind, {:error, reason}), do: exit(reason)
-
-    defp safe_call(fun) do
-      fun.()
-    catch
-      :exit, _ -> :ok
-    end
 
     defp normalize_call_exit(reason) do
       if is_tuple(reason) and tuple_size(reason) == 2 and is_tuple(elem(reason, 0)) and

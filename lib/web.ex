@@ -325,7 +325,7 @@ defmodule Web do
           {:error, reason} -> reject.(fetch_error(reason, request))
         end
       catch
-        # coveralls-ignore-next-line
+        # A dispatcher throws this when the signal aborts the request.
         :throw, {:abort, reason} -> reject.(reason)
       end
     end)

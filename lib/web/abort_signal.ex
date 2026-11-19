@@ -196,17 +196,12 @@ defmodule Web.AbortSignal do
   def subscribe(%__MODULE__{aborted: true}), do: {:error, :aborted}
 
   def subscribe(%__MODULE__{pid: pid, ref: ref}) when is_pid(pid) and is_reference(ref) do
-    if Process.alive?(pid) do
-      :ok = GenServer.call(pid, {:subscribe, self()})
-      {:ok, %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: Process.monitor(pid)}}
-    else
-      {:error, :aborted}
-    end
+    :ok = GenServer.call(pid, {:subscribe, self()})
+    {:ok, %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: Process.monitor(pid)}}
   catch
-    # coveralls-ignore-start
-    :exit, _ ->
-      {:error, :aborted}
-      # coveralls-ignore-stop
+    # The process of the signal stopped: the signal aborted, or it had no
+    # more use.
+    :exit, _reason -> {:error, :aborted}
   end
 
   def subscribe(pid) when is_pid(pid) do

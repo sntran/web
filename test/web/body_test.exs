@@ -125,19 +125,19 @@ defmodule Web.BodyTest do
   end
 
   test "Response.text/1 returns empty string for nil body" do
-    # read_body_to_binary(nil) returns {:ok, ""} — covers body.ex line 169
+    # A body of nil is the empty string.
     response = %Response{Response.new() | body: nil}
     assert "" = await(Response.text(response))
   end
 
   test "Response.text/1 returns binary body directly" do
-    # read_body_to_binary(binary) branch — covers body.ex line 170
+    # A struct that has a binary in the place of a stream.
     response = %Response{Response.new() | body: "direct binary"}
     assert "direct binary" = await(Response.text(response))
   end
 
   test "Response.text/1 returns iolist body as binary" do
-    # read_body_to_binary(list) branch — covers body.ex line 171
+    # A struct that has iodata in the place of a stream.
     response = %Response{Response.new() | body: ["io", "list"]}
     assert "iolist" = await(Response.text(response))
   end
@@ -257,6 +257,42 @@ defmodule Web.BodyTest do
     assert {original, clone} = BodyHarness.clone(%BodyHarness{body: ReadableStream.from("hello")})
     assert "hello" == await(BodyHarness.text(original))
     assert "hello" == await(BodyHarness.text(clone))
+  end
+
+  test "a body whose stream stopped rejects with TypeError" do
+    stream = ReadableStream.from("hello")
+    Web.Stream.stop(stream.controller_pid)
+
+    for read <- [&BodyHarness.text/1, &BodyHarness.bytes/1] do
+      assert %Web.TypeError{message: "body already used"} =
+               catch_exit(await(read.(%BodyHarness{body: stream})))
+    end
+  end
+
+  test "a body whose stream stops in the middle of a read rejects with TypeError" do
+    test = self()
+
+    # With this limit, the stream pulls only when a read waits.
+    stream =
+      ReadableStream.new(
+        %{
+          start: fn controller -> send(test, {:stream, controller.pid}) end,
+          pull: fn controller -> Process.exit(controller.pid, :kill) end
+        },
+        high_water_mark: 0
+      )
+
+    assert_receive {:stream, pid}
+    monitor = Process.monitor(pid)
+
+    assert %Web.TypeError{message: "The body stream stopped."} =
+             catch_exit(await(BodyHarness.text(%BodyHarness{body: stream})))
+
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
+  end
+
+  test "an exception of the library accepts a message as a string" do
+    assert_raise Web.SyntaxError, "not valid", fn -> raise Web.SyntaxError, "not valid" end
   end
 
   test "Response.form_data/1 parses multipart text and file values" do

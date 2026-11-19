@@ -58,7 +58,6 @@ defmodule Web.Body do
   @callback blob(struct()) :: Web.Promise.t()
   @callback clone(struct()) :: {struct(), struct()}
   defmacro __using__(_opts) do
-    # coveralls-ignore-start
     quote do
       @behaviour Web.Body
 
@@ -132,8 +131,6 @@ defmodule Web.Body do
         Web.Body.body_used?(struct)
       end
     end
-
-    # coveralls-ignore-stop
   end
 
   @doc false
@@ -275,23 +272,29 @@ defmodule Web.Body do
   defp read_body_to_binary(body) when is_binary(body), do: {:ok, body}
   defp read_body_to_binary(body) when is_list(body), do: {:ok, IO.iodata_to_binary(body)}
 
+  # The messages for a stream that gives no reader: the stream has a
+  # reader, or it stopped after the check of `ensure_usable!/1`.
+  @reader_errors %{
+    already_locked: "ReadableStream is already locked",
+    released: "body already used"
+  }
+
   defp read_body_to_binary(%Web.ReadableStream{controller_pid: pid}) do
     case Web.ReadableStream.get_reader(pid) do
-      :ok ->
-        read_stream_chunks(pid, [])
-
-      {:error, :already_locked} ->
-        {:error, Web.TypeError.exception("ReadableStream is already locked")}
-
-      {:error, :released} ->
-        {:error, Web.TypeError.exception("body already used")}
+      :ok -> read_stream_chunks(pid, [])
+      {:error, reason} -> {:error, Web.TypeError.exception(Map.fetch!(@reader_errors, reason))}
     end
   end
 
   # A read from an errored stream rejects with the error of the stream, as
-  # the Streams Standard specifies.
+  # the Streams Standard specifies. A stream that stopped in the middle of a
+  # read gives a `TypeError`, as each failure of a body in the Fetch
+  # Standard.
   defp stream_error({:errored, reason}), do: reason
-  defp stream_error(reason), do: reason
+
+  defp stream_error(reason) do
+    Web.TypeError.exception(message: "The body stream stopped.", cause: reason)
+  end
 
   defp read_stream_chunks(pid, acc) do
     case Web.ReadableStream.read(pid) do
@@ -315,61 +318,15 @@ defmodule Web.Body do
     end
   end
 
-  defp read_body_to_text(nil), do: {:ok, ""}
+  # The text of a body is the UTF-8 decode of its bytes, with no byte order
+  # mark, as the Fetch Standard specifies.
+  defp read_body_to_text(body) do
+    with {:ok, binary} <- read_body_to_binary(body) do
+      {text, _decoder_state} =
+        Web.TextDecoder.decode_step(Web.TextDecoder.initial_state(), binary, false)
 
-  defp read_body_to_text(body) when is_binary(body) or is_list(body) do
-    decode_text_body(body)
-  end
-
-  defp read_body_to_text(%Web.ReadableStream{controller_pid: pid}) do
-    case Web.ReadableStream.get_reader(pid) do
-      :ok ->
-        read_stream_text_chunks(pid, Web.TextDecoder.initial_state(), [])
-
-      {:error, :already_locked} ->
-        {:error, Web.TypeError.exception("ReadableStream is already locked")}
-
-      {:error, :released} ->
-        {:error, Web.TypeError.exception("body already used")}
+      {:ok, text}
     end
-  end
-
-  defp read_stream_text_chunks(pid, decoder_state, acc) do
-    case Web.ReadableStream.read(pid) do
-      {:ok, chunk} ->
-        case Bytes.to_binary(chunk) do
-          {:ok, binary} ->
-            {decoded, decoder_state} = Web.TextDecoder.decode_step(decoder_state, binary, true)
-            read_stream_text_chunks(pid, decoder_state, [decoded | acc])
-
-          :error ->
-            Web.ReadableStream.release_lock(pid)
-            {:error, chunk_error()}
-        end
-
-      :done ->
-        Web.ReadableStream.release_lock(pid)
-
-        {final, _decoder_state} = Web.TextDecoder.decode_step(decoder_state, "", false)
-        {:ok, acc |> Enum.reverse() |> Kernel.++([final]) |> IO.iodata_to_binary()}
-
-      {:error, reason} ->
-        Web.ReadableStream.release_lock(pid)
-        {:error, stream_error(reason)}
-    end
-  end
-
-  defp decode_text_body(body) do
-    binary =
-      cond do
-        is_binary(body) -> body
-        is_list(body) -> IO.iodata_to_binary(body)
-      end
-
-    {text, _decoder_state} =
-      Web.TextDecoder.decode_step(Web.TextDecoder.initial_state(), binary, false)
-
-    {:ok, text}
   end
 
   defp chunk_error do

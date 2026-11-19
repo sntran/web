@@ -183,7 +183,6 @@ defmodule Web.CountingGovernor do
   def handle_call(:capacity, _from, state) do
     case with_lifetime({:noreply, state}) do
       {:noreply, state} -> {:reply, state.capacity, state}
-      # coveralls-ignore-next-line
       {:noreply, state, time} -> {:reply, state.capacity, state, time}
     end
   end
@@ -276,7 +275,8 @@ defmodule Web.CountingGovernor do
 
   defp do_cast({:release, token_ref}, state) do
     case Map.pop(state.active_tokens, token_ref) do
-      # coveralls-ignore-next-line
+      # The token went back already: its holder released it two times, or
+      # its holder stopped.
       {nil, _active_tokens} ->
         {:noreply, state}
 
@@ -395,17 +395,10 @@ defmodule Web.CountingGovernor do
         {:empty, state}
 
       {{:value, waiter_ref}, queue} ->
-        state = %{state | queue: queue}
-
-        case Map.pop(state.waiting, waiter_ref) do
-          {nil, waiting} ->
-            # coveralls-ignore-next-line
-            pop_next_waiter(%{state | waiting: waiting})
-
-          {waiter, waiting} ->
-            state = %{state | waiting: waiting}
-            {:waiter, waiter, state}
-        end
+        # Each waiter of the queue is in `waiting`: an abort and the stop of
+        # a waiter remove it from the two places.
+        {waiter, waiting} = Map.pop!(state.waiting, waiter_ref)
+        {:waiter, waiter, %{state | queue: queue, waiting: waiting}}
     end
   end
 

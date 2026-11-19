@@ -18,6 +18,8 @@ defmodule Web.EventTarget do
   @optional_callbacks handle_add_listener: 4, handle_dispatch: 2
 
   defmacro __using__(_opts) do
+    # The macro runs when a module compiles, before the coverage tool starts.
+    # coveralls-ignore-start
     quote do
       @behaviour Web.EventTarget
 
@@ -43,6 +45,8 @@ defmodule Web.EventTarget do
         end
       end
     end
+
+    # coveralls-ignore-stop
   end
 
   @spec add_event_listener(target, String.t() | atom(), callback(), keyword() | map()) :: target

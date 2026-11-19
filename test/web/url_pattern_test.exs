@@ -1055,11 +1055,6 @@ defmodule Web.URLPatternTest do
       assert URLPattern.test(p, url)
     end
 
-    test "params registry cache hit" do
-      # Already hit by other tests, but let's call it again
-      assert URLPattern.params() == URLPattern.params()
-    end
-
     test "normalize_component_input for search and hash with markers" do
       # These check markers handling in normalize_component_input
       # Search may start with ?

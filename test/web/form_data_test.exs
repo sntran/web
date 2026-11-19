@@ -1313,42 +1313,6 @@ defmodule Web.FormDataTest do
     assert :ok = ReadableStreamDefaultReader.release_lock(closed_reader)
   end
 
-  test "parser child_pull closes controllers when the coordinator is forced into discard mode" do
-    boundary = "forced-discard-branch-boundary"
-
-    payload =
-      multipart_payload(boundary, [
-        %{
-          name: "upload",
-          filename: "x.txt",
-          content_type: "text/plain",
-          value: String.duplicate("y", 64)
-        }
-      ])
-
-    {stream, _tracker} = tracked_source(byte_chunks(payload))
-    form = Web.FormData.parse(stream, boundary)
-
-    _file = Web.FormData.get(form, "upload")
-
-    :sys.replace_state(form.coordinator, fn {:running, data} ->
-      {:running, put_in(data.current_file.mode, :discard)}
-    end)
-
-    closed_stream = ReadableStream.new()
-    closed_reader = ReadableStream.get_reader(closed_stream)
-
-    assert :ok =
-             Web.FormData.Parser.child_pull(
-               form.coordinator,
-               1,
-               %Web.ReadableStreamDefaultController{pid: closed_stream.controller_pid}
-             )
-
-    assert :done = ReadableStream.read(closed_stream.controller_pid)
-    assert :ok = ReadableStreamDefaultReader.release_lock(closed_reader)
-  end
-
   test "parser helper calls exit on shutdown and generic call failures" do
     shutdown_pid = crash_on_call({:shutdown, :call_failed})
     generic_pid = crash_on_call(:call_failed)

@@ -32,6 +32,16 @@ defmodule WebTest do
 
         "mock://error/" ->
           {:error, :simulated_error}
+
+        "mock://type-error/" ->
+          {:error, Web.TypeError.exception("the dispatcher refused the request")}
+
+        "mock://dom-exception/" ->
+          {:error, Web.DOMException.exception(name: "NetworkError", message: "no network")}
+
+        # A dispatcher throws when it finds that the signal aborted.
+        "mock://abort/" ->
+          Web.AbortSignal.check!(Web.AbortSignal.abort(:stopped_by_the_caller))
       end
     end
   end
@@ -104,12 +114,25 @@ defmodule WebTest do
     assert {"aGVsbG8=", "hello"} = UsingWeb.base64_with_imports("hello")
   end
 
-  test "await macro returns value on {:ok, value}" do
+  test "fetch rejects with the error of a dispatcher that is a TypeError or a DOMException" do
+    assert %Web.TypeError{message: "the dispatcher refused the request", cause: nil} =
+             catch_exit(await(Web.fetch("mock://type-error/", dispatcher: MockDispatcher)))
+
+    assert %Web.DOMException{name: "NetworkError", message: "no network"} =
+             catch_exit(await(Web.fetch("mock://dom-exception/", dispatcher: MockDispatcher)))
+  end
+
+  test "fetch rejects with the abort reason that a dispatcher throws" do
+    assert catch_exit(await(Web.fetch("mock://abort/", dispatcher: MockDispatcher))) ==
+             :stopped_by_the_caller
+  end
+
+  test "await returns the value of a promise" do
     response = await(Web.fetch("mock://success/", dispatcher: MockDispatcher))
     assert %Web.Response{ok: true, url: "mock://success/"} = response
   end
 
-  test "await macro exits on promise rejection" do
+  test "await exits with the reason of a rejection" do
     assert %Web.TypeError{message: "fetch failed", cause: :simulated_error} =
              catch_exit(await(Web.fetch("mock://error/", dispatcher: MockDispatcher)))
   end
@@ -120,7 +143,7 @@ defmodule WebTest do
     assert Web.await(Web.Promise.resolve(1)) == 1
   end
 
-  test "use Web imports await macro" do
+  test "use Web imports await" do
     defmodule AwaitTest do
       use Web
 

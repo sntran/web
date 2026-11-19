@@ -5,6 +5,8 @@ defmodule Web.AbortSignalLifetimeTest do
 
   use Web
 
+  alias Web.AbortSignal.Reasons
+
   @linger 100
   @count 200
   @tolerance 20
@@ -150,6 +152,37 @@ defmodule Web.AbortSignalLifetimeTest do
 
       Process.sleep(1_300)
       assert AbortSignal.reason(controller.signal) == :kept_reason
+    end
+
+    test "a signal with no use stays for the handoff time when the linger time is :infinity" do
+      Application.put_env(:web, :linger, :infinity)
+
+      signal = in_short_process(fn -> AbortController.new().signal end)
+
+      # The owner stopped, and no process is subscribed. The signal waits
+      # for a process that got it in a message.
+      refute_down(signal.pid, 300)
+      assert {:ok, subscription} = AbortSignal.subscribe(signal)
+      assert AbortSignal.unsubscribe(subscription) == :ok
+      Process.exit(signal.pid, :kill)
+    end
+
+    test "is not kept, and gives no error, when the store of the reasons does not run" do
+      # The application stops the store before the other processes.
+      :ok = Supervisor.terminate_child(Web.Supervisor, Reasons)
+
+      try do
+        ref = make_ref()
+        assert Reasons.put(ref, :not_kept) == :ok
+        assert Reasons.get(ref) == nil
+      after
+        {:ok, _pid} = Supervisor.restart_child(Web.Supervisor, Reasons)
+      end
+
+      controller = AbortController.new()
+      assert AbortController.abort(controller, :kept_again) == :ok
+      assert_down(controller.signal.pid)
+      assert AbortSignal.reason(controller.signal) == :kept_again
     end
 
     test "does not stay in persistent_term" do

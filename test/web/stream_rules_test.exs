@@ -512,4 +512,45 @@ defmodule Web.StreamRulesTest do
       assert :erpc.call(node, ReadableStream, :__get_slots__, [pid]).state == :closed
     end
   end
+
+  describe "the abort of an ambient signal" do
+    defp ambient_stream(controller) do
+      test = self()
+
+      Web.AsyncContext.with_signal(controller.signal, fn ->
+        ReadableStream.new(%{
+          start: fn stream_controller -> send(test, {:controller, stream_controller}) end
+        })
+      end)
+    end
+
+    test "errors a closed stream that has chunks, and discards them" do
+      controller = AbortController.new()
+      stream = ambient_stream(controller)
+      assert_receive {:controller, stream_controller}
+
+      ReadableStreamDefaultController.enqueue(stream_controller, "kept")
+      ReadableStreamDefaultController.close(stream_controller)
+      AbortController.abort(controller, :stop)
+
+      reader = ReadableStream.get_reader(stream)
+      assert catch_exit(await(ReadableStreamDefaultReader.read(reader))) == :stop
+    end
+
+    test "has no effect on a stream that closed and gave its last chunk" do
+      controller = AbortController.new()
+      stream = ambient_stream(controller)
+      assert_receive {:controller, stream_controller}
+
+      ReadableStreamDefaultController.enqueue(stream_controller, "read")
+      ReadableStreamDefaultController.close(stream_controller)
+      reader = ReadableStream.get_reader(stream)
+      assert %{value: "read"} = await(ReadableStreamDefaultReader.read(reader))
+
+      AbortController.abort(controller, :late)
+
+      assert %{done: true} = await(ReadableStreamDefaultReader.read(reader))
+      assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
+    end
+  end
 end

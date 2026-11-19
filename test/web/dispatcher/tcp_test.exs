@@ -142,6 +142,33 @@ defmodule Web.Dispatcher.TCPTest do
     assert_receive :request_body_received, 1_000
   end
 
+  test "fetch/1 writes a request body that is iodata, or a list of chunks of bytes" do
+    for {body, expected} <- [
+          {["io", [?d, "ata"]], "iodata"},
+          {["ab", Web.Uint8Array.from("cd"), Web.ArrayBuffer.new("ef")], "abcdef"}
+        ] do
+      parent = self()
+
+      {:ok, listener} =
+        :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+
+      {:ok, port} = :inet.port(listener)
+
+      Task.start_link(fn ->
+        {:ok, socket} = :gen_tcp.accept(listener)
+        {:ok, received} = :gen_tcp.recv(socket, byte_size(expected), 1_000)
+        send(parent, {:request_body, received})
+        :ok = :gen_tcp.send(socket, "ok")
+        :gen_tcp.close(socket)
+        :gen_tcp.close(listener)
+      end)
+
+      {:ok, resp} = TCP.fetch(raw_request("tcp://localhost:#{port}", "POST", body))
+      assert Web.TestBytes.join(resp.body) == "ok"
+      assert_receive {:request_body, ^expected}, 1_000
+    end
+  end
+
   test "fetch/1 accepts empty binary request bodies for non-GET methods" do
     port = TCPServer.start_link("ok", false)
 

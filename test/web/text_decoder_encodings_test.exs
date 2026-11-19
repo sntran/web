@@ -311,6 +311,16 @@ defmodule Web.TextDecoderEncodingsTest do
       end
     end
 
+    test "gives TypeError with the option fatal for the two byte orders" do
+      assert_raise TypeError, "The encoded data was not valid utf-16be", fn ->
+        decode("utf-16be", <<0xDC, 0x00, 0x00, ?a>>, %{fatal: true})
+      end
+
+      assert_raise TypeError, "The encoded data was not valid utf-16le", fn ->
+        decode("utf-16le", <<0x00, 0xDC, ?a, 0x00>>, %{fatal: true})
+      end
+    end
+
     test "follows the test of the Standard for the option fatal with streams" do
       decoder = TextDecoder.new("utf-16le", %{fatal: true})
       odd = <<0x00>>

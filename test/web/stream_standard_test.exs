@@ -821,6 +821,17 @@ defmodule Web.StreamStandardTest do
       end
     end
 
+    test "raises a TypeError for an enqueue to a stream that has no readable side" do
+      stream = WritableStream.new()
+      controller = %WritableStreamDefaultController{pid: stream.controller_pid}
+
+      assert_raise TypeError, fn ->
+        ReadableStreamDefaultController.enqueue(controller, :chunk)
+      end
+
+      assert_raise TypeError, fn -> ReadableStreamDefaultController.close(controller) end
+    end
+
     test "raises the same errors for a byte stream" do
       {stream, controller} = controller_of(%{type: "bytes"})
       assert ReadableByteStreamController.enqueue(controller, "bytes") == :ok

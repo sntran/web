@@ -84,6 +84,10 @@ defmodule Web.ByteChunksTest do
       assert_bytes(chunks(Response.new(body: params).body), "a=1")
     end
 
+    test "raises a TypeError for a body that is not bytes and not a stream" do
+      assert_raise TypeError, ~r/Cannot make a ReadableStream/, fn -> Response.new(body: 123) end
+    end
+
     test "keeps the chunks of a stream from the caller, and reads each form of bytes" do
       mixed = ["ab", Uint8Array.from("cd"), ArrayBuffer.new("ef"), [?g, "h"]]
       stream = ReadableStream.from(mixed)

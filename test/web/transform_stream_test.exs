@@ -393,6 +393,35 @@ defmodule Web.TransformStreamTest do
       end
     end
 
+    test "a close of the readable side in the function start is a terminate" do
+      assert_raise TypeError, "Cannot enqueue a chunk: the stream is closed.", fn ->
+        TransformStream.new(%{
+          start: fn controller ->
+            ReadableStreamDefaultController.close(controller)
+            Controller.enqueue(controller, :late)
+          end
+        })
+      end
+
+      transform =
+        TransformStream.new(%{
+          start: fn controller -> ReadableStreamDefaultController.close(controller) end
+        })
+
+      assert Enum.to_list(transform.readable) == []
+    end
+
+    test "terminate rejects a process that waits for the writable side with a message" do
+      transform =
+        TransformStream.new(%{start: fn controller -> Controller.terminate(controller) end})
+
+      assert Enum.to_list(transform.readable) == []
+      writer = WritableStream.get_writer(transform.writable)
+
+      assert {:error, {:errored, %TypeError{message: "The transform stream was terminated."}}} =
+               WritableStream.ready(writer.controller_pid, writer.owner_pid)
+    end
+
     test "terminate in the function start gives a stream with no chunks" do
       transform =
         TransformStream.new(%{start: fn controller -> Controller.terminate(controller) end})

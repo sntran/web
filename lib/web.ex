@@ -273,6 +273,10 @@ defmodule Web do
     do: ": the redirect URL must be HTTP or HTTPS"
 
   defp fetch_error_detail(:redirect_invalid_location), do: ": the redirect URL is not valid"
+
+  defp fetch_error_detail(%{__exception__: true, reason: :timeout}),
+    do: ": the server did not answer in time"
+
   defp fetch_error_detail(_reason), do: ""
 
   defp do_fetch_with_signal(%Web.Request{signal: %Web.AbortSignal{} = signal} = request) do

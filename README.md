@@ -186,6 +186,19 @@ Read or cancel each response body. A body that no process starts to read
 releases its connection after 300 seconds
 (`config :web, unread_body_timeout: ms`), and a later read rejects.
 
+`fetch` has no time limit for a full request, as in the Fetch Standard. Use
+`AbortSignal.timeout/1` for that limit. Two settings limit the wait for the
+network:
+
+| Setting                             | Default   | Time                                                              |
+| ----------------------------------- | --------- | ----------------------------------------------------------------- |
+| `config :web, connect_timeout: ms`  | 10000 ms  | To open a connection.                                             |
+| `config :web, receive_timeout: ms`  | 300000 ms | To wait for the response headers, or for the next part of a body. |
+
+A request that fails for one of these limits rejects with `Web.TypeError`,
+and the field `cause` has the timeout. The value `:infinity` removes a
+limit.
+
 ```elixir
 # Create a stream from any enumerable
 source = ReadableStream.from(["chunk1", "chunk2"])

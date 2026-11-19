@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Time limits for `Web.fetch/2`. `config :web, connect_timeout: ms` is the
+  time to open a connection, also for `Web.connect/2`. The default is
+  10000 ms. `config :web, receive_timeout: ms` is the time to wait for the
+  response headers or for the next part of a body. The default is
+  300000 ms. A request that fails for one of these limits rejects with
+  `Web.TypeError`.
 - `Web.RangeError` and `Web.SyntaxError`, as the errors of ECMAScript.
 - `body_used?/1` for `Web.Request` and `Web.Response`, as the attribute
   `bodyUsed`.
@@ -125,6 +131,11 @@ All notable changes to this project are documented in this file.
     that is not a list.
   - With a request as its input, `new/2` applies the members of `init`.
     Before, it ignored them.
+- A request waits for a free connection with no time limit, as in a
+  browser. Before, more than 25 requests to one origin at the same time
+  could fail after 5000 ms.
+- The default connect time of `Web.connect/2` changes from 5000 ms to
+  10000 ms, which is the new setting `connect_timeout`.
 - **Breaking:** `Web.Response` follows the Fetch Standard.
   - `new/1` raises `Web.RangeError` for a status that is not from 200 to
     599, and `Web.TypeError` for a status text that is not a reason phrase,
@@ -384,6 +395,9 @@ All notable changes to this project are documented in this file.
   it raised in the stream process.
 - The example `examples/secure_byob_stream.exs` operates again. It used the
   field `:task` of the old promise.
+- `Web.fetch/2` rejects when the server gives no response headers, or stops
+  in the body, for the receive time. Before, such a request waited without
+  end unless it had a signal.
 - `Web.fetch/2` rejects when the body of the request is already read.
   Before, it sent the request with an empty body and gave no error.
 - `Web.CountingGovernor` does not lose capacity when a process stops with

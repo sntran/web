@@ -5,6 +5,7 @@ defmodule Web.Dispatcher.HTTP do
 
   @max_redirects 20
   @default_unread_body_timeout 300_000
+  @default_receive_timeout 300_000
   @redirect_statuses [301, 302, 303, 307, 308]
   @credential_headers ["authorization", "cookie", "proxy-authorization"]
   @request_body_headers [
@@ -151,6 +152,10 @@ defmodule Web.Dispatcher.HTTP do
 
   defp unread_body_timeout do
     Application.get_env(:web, :unread_body_timeout, @default_unread_body_timeout)
+  end
+
+  defp receive_timeout do
+    Application.get_env(:web, :receive_timeout, @default_receive_timeout)
   end
 
   # The body stream of the response subscribes to the signal of the request.
@@ -511,7 +516,13 @@ defmodule Web.Dispatcher.HTTP do
             acc
             # coveralls-ignore-stop
         end,
-        receive_timeout: :infinity,
+        # The time to wait for the response headers, and for each subsequent
+        # part of the body. It does not include the time that the reader of
+        # the body uses, nor the time to send the request body.
+        receive_timeout: receive_timeout(),
+        # A request waits for a free connection with no limit, as in a
+        # browser. The signal of the request stops the wait.
+        pool_timeout: :infinity,
         request_timeout: :infinity
       )
 

@@ -19,7 +19,14 @@ defmodule Web.Dispatcher.TCP do
   alias Web.TypeError
   alias Web.WritableStream
 
-  @bridge_boot_timeout 6_000
+  # The bridge has the connect time, and some more time to start.
+  defp bridge_boot_timeout do
+    case Web.Application.connect_timeout() do
+      :infinity -> :infinity
+      timeout -> timeout + 1_000
+    end
+  end
+
   @watcher_poll_interval 25
 
   @impl true
@@ -121,7 +128,7 @@ defmodule Web.Dispatcher.TCP do
         {:error, normalize_exit_reason(reason)}
         # coveralls-ignore-stop
     after
-      @bridge_boot_timeout ->
+      bridge_boot_timeout() ->
         Process.exit(bridge_pid, :kill)
 
         # coveralls-ignore-start

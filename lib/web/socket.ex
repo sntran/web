@@ -16,7 +16,6 @@ defmodule Web.Socket do
   defstruct [:address, :token, :opened, :closed, :upgraded, :readable, :writable]
 
   @call_timeout 5_000
-  @connect_timeout 5_000
   @readable_hwm 65_536
 
   @type t :: %__MODULE__{
@@ -502,7 +501,7 @@ defmodule Web.Socket do
 
   @doc false
   defp connect_transport(state) do
-    timeout = Map.get(state.options, :connect_timeout, @connect_timeout)
+    timeout = Map.get_lazy(state.options, :connect_timeout, &Web.Application.connect_timeout/0)
 
     with {:ok, transport} <- transport_mode(state.secure_transport) do
       transport_connect(transport, state, timeout)

@@ -75,6 +75,8 @@ defmodule Web.MixProject do
       {:jason, "~> 1.4"},
       {:benchee, "~> 1.5", only: [:dev, :test]},
       {:stream_data, "~> 1.3", only: :test},
+      # An HTTP/2 server for the tests of the setting `:http_protocols`.
+      {:bandit, "~> 1.5", only: :test},
       # The TLA+ model checker, in Elixir. It checks the specifications in
       # `tla/`, and the property tests use it to compare the code with them.
       {:accord,

@@ -119,7 +119,7 @@ defmodule Web.Dispatcher.HTTP do
            with_request_signal(request.signal, fn ->
              Web.Response.__network__(
                status: status,
-               status_text: Map.get(@status_texts, status, ""),
+               status_text: status_text(status, request.url),
                headers: headers,
                body: response_body(stream, request.method, status),
                url: Web.URL.href(request.url),
@@ -133,6 +133,22 @@ defmodule Web.Dispatcher.HTTP do
       end
     end
   end
+
+  # The status text of a response. The HTTP client does not give the reason
+  # phrase of an HTTP/1.1 response, thus the text comes from a table of the
+  # usual phrases. An HTTP/2 response has no reason phrase, and its status
+  # text is the empty string, as the Fetch Standard specifies. With the two
+  # versions, a TLS connection can use HTTP/2, thus its text is empty also.
+  @doc false
+  def status_text(status, url) do
+    case Web.Application.http_protocols() do
+      [:http1] -> Map.get(@status_texts, status, "")
+      [:http2] -> ""
+      [:http1, :http2] -> if cleartext?(url), do: Map.get(@status_texts, status, ""), else: ""
+    end
+  end
+
+  defp cleartext?(url), do: Web.URL.protocol(url) == "http:"
 
   # A body that no process reads holds its connection. Thus the body stream
   # has a time limit for the start of the read.

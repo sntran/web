@@ -20,6 +20,14 @@ All notable changes to this project are documented in this file.
   accepted: for example, `latin1` and `ascii` are labels of windows-1252.
   The tables come from the index files of the Standard. The library has no
   decoder for the multi-byte encodings of Chinese, Japanese, and Korean.
+- The setting `config :web, http_protocols: [...]` selects the HTTP versions
+  of `Web.fetch/2`: `[:http1]` (the default), `[:http2]`, or
+  `[:http1, :http2]`. With the two versions, the server of a TLS connection
+  selects the version.
+- The field `status_text` of a `Web.fetch/2` response is `""` for a
+  response that can come from HTTP/2, as the Fetch Standard specifies:
+  HTTP/2 has no reason phrase. For HTTP/1.1, the text stays the usual
+  reason phrase of the status.
 - `Web.Uint8Array.from/1`, which makes a view with a new buffer from a
   binary, iodata, a `Web.ArrayBuffer`, or a `Web.Uint8Array`.
 - A short form for `inspect/1` of a `Web.Uint8Array`:

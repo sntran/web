@@ -199,6 +199,22 @@ A request that fails for one of these limits rejects with `Web.TypeError`,
 and the field `cause` has the timeout. The value `:infinity` removes a
 limit.
 
+`fetch` uses HTTP/1.1. The setting `:http_protocols` selects the HTTP
+versions. The connection pools read it when the application starts.
+
+| Setting                                         | Versions                                                          |
+| ----------------------------------------------- | ----------------------------------------------------------------- |
+| `config :web, http_protocols: [:http1]`         | HTTP/1.1 only. This is the default.                               |
+| `config :web, http_protocols: [:http2]`         | HTTP/2 only. Many requests use one connection.                    |
+| `config :web, http_protocols: [:http1, :http2]` | The server of a TLS connection selects the version (with ALPN).   |
+
+The field `status_text` of a response follows the HTTP version. An HTTP/2
+response has no reason phrase, thus its status text is `""`, as the Fetch
+Standard specifies. For HTTP/1.1, the text is the usual reason phrase of
+the status (for example `"OK"` for 200), because the HTTP client does not
+give the phrase that the server sent. With the two versions, a response
+from a TLS connection has the status text `""`.
+
 ```elixir
 # Create a stream from any enumerable
 source = ReadableStream.from(["chunk1", "chunk2"])

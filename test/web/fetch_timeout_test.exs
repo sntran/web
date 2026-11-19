@@ -203,8 +203,12 @@ defmodule Web.FetchTimeoutTest do
       set_env(:connect_timeout, 1_234)
       assert Web.Application.connect_timeout() == 1_234
 
-      assert [size: 25, count: 1, conn_opts: [transport_opts: [timeout: 1_234]]] =
-               Web.Application.finch_pools().default
+      assert [
+               protocols: [:http1],
+               size: 25,
+               count: 1,
+               conn_opts: [transport_opts: [timeout: 1_234]]
+             ] = Web.Application.finch_pools().default
     end
 
     test "is the connect time of a socket, unless the socket has its own option" do

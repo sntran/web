@@ -91,12 +91,13 @@ defmodule Web.SymbolTest do
   end
 
   defp assert_data_clone_error(channel) do
+    # A closed channel raises InvalidStateError, as the HTML Standard specifies.
     exception =
       assert_raise DOMException, fn ->
         BroadcastChannel.post_message(channel, "boom")
       end
 
-    assert exception.name == "DataCloneError"
+    assert exception.name == "InvalidStateError"
   end
 
   defp unique_name(prefix) do

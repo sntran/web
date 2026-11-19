@@ -164,13 +164,56 @@ defmodule Web do
   end
 
   @doc """
-  Returns a structured clone of `value`.
+  Returns a structured clone of `value`, as `structuredClone()` of the HTML
+  Standard.
+
+  A `Web.MessagePort` and a `Web.BroadcastChannel` use the same algorithm
+  for each message.
+
+  ## The values that can be cloned
+
+  All data can be cloned: numbers, atoms, binaries, lists, tuples, maps, and
+  structs that have only data. An Elixir term cannot change, thus the clone
+  of such data is the same term.
+
+  A value that has an identity gets a new identity:
+
+    * a `Web.ArrayBuffer` and a `Web.Uint8Array`. A change of the clone,
+      such as a detach, does not change the source;
+    * a `Web.Blob` and a `Web.File`.
+
+  Two references to one of these values are two references to one new
+  value in the clone. A `Regex` is compiled again.
+
+  ## The values that cannot be cloned
+
+  The function raises `Web.DOMException` with the name `DataCloneError` for
+  a value that refers to something that runs: a pid, a port, a reference,
+  or a function. Thus a stream cannot be cloned. A `Web.Promise`, a
+  `Web.AbortSignal`, a `Web.AbortController`, a `Web.Request`, and a
+  `Web.Response` cannot be cloned in each of their states. A
+  `Web.MessagePort` can only be transferred.
+
+  ## Options
+
+    * `:transfer` - a list of `Web.ArrayBuffer` and `Web.MessagePort`
+      values to move, not to copy. The function detaches each one: the
+      clone has the bytes of a buffer, and a new handle to a port.
+
+  The function changes nothing when it raises.
 
   ## Examples
 
-      iex> clone = Web.structured_clone(%{"items" => [1, 2, 3]})
-      iex> clone
-      %{"items" => [1, 2, 3]}
+      iex> Web.structured_clone(%{status: :ok, items: [1, 2, {3, "four"}]})
+      %{status: :ok, items: [1, 2, {3, "four"}]}
+
+      iex> buffer = Web.ArrayBuffer.new("hello")
+      iex> clone = Web.structured_clone(buffer, transfer: [buffer])
+      iex> {Web.ArrayBuffer.data(clone), Web.ArrayBuffer.detached?(buffer)}
+      {"hello", true}
+
+      iex> Web.structured_clone(self())
+      ** (Web.DOMException) A pid cannot be cloned.
   """
   @spec structured_clone(term(), keyword()) :: term()
   def structured_clone(value, options \\ []) do

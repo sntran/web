@@ -1,11 +1,21 @@
 defmodule Web.MessageEvent do
   @moduledoc """
-  Minimal WHATWG-style message event payload.
+  The event of a message, as `MessageEvent` of the HTML Standard.
+
+  A `Web.MessagePort` and a `Web.BroadcastChannel` give this event to the
+  listeners of `message` and `messageerror`.
+
+    * `data` - the message;
+    * `origin` - the origin of the sender. It is `""` for a message port;
+    * `ports` - the message ports that came with the message, in the
+      sequence of the transfer list;
+    * `target` - the port or the channel that got the message. Use it to
+      answer.
   """
 
   defstruct type: "message",
             data: nil,
-            origin: nil,
+            origin: "",
             source: nil,
             target: nil,
             current_target: nil,
@@ -15,7 +25,7 @@ defmodule Web.MessageEvent do
   @type t :: %__MODULE__{
           type: String.t(),
           data: term(),
-          origin: String.t() | nil,
+          origin: String.t(),
           source: term(),
           target: term(),
           current_target: term(),
@@ -30,7 +40,7 @@ defmodule Web.MessageEvent do
     %__MODULE__{
       type: to_string(type),
       data: Keyword.get(opts, :data),
-      origin: Keyword.get(opts, :origin),
+      origin: Keyword.get(opts, :origin, ""),
       source: Keyword.get(opts, :source),
       target: target,
       current_target: Keyword.get(opts, :current_target, target),

@@ -1,51 +1,41 @@
 defmodule Web.BroadcastChannel.Adapter.PG do
-  @moduledoc false
+  @moduledoc """
+  The default adapter of `Web.BroadcastChannel`. It uses the module `:pg` of
+  Erlang/OTP.
+
+  The groups are in a scope of `:pg` that only this library uses. The scope
+  connects to the same scope on each node of the cluster, thus a message
+  goes to the channels of all the connected nodes. No node and no process is
+  necessary for the other nodes to continue.
+  """
 
   @behaviour Web.BroadcastChannel.Adapter
 
+  @scope Web.BroadcastChannel
+
+  @doc false
+  # The supervisor of the application starts the scope.
+  def child_spec(_argument) do
+    %{id: __MODULE__, start: {:pg, :start_link, [@scope]}}
+  end
+
   @impl true
   def join(name, pid) when is_binary(name) and is_pid(pid) do
-    ensure_pg_started()
-    :ok = :pg.join(group(name), pid)
+    :pg.join(@scope, name, pid)
   end
 
   @impl true
   def leave(name, pid) when is_binary(name) and is_pid(pid) do
-    if Process.whereis(:pg) do
-      :ok = :pg.leave(group(name), pid)
-    end
-
+    _result = :pg.leave(@scope, name, pid)
     :ok
   end
 
   @impl true
-  def broadcast(name, sender_pid, message) when is_binary(name) and is_pid(sender_pid) do
-    ensure_pg_started()
-
-    name
-    |> group()
-    |> :pg.get_members()
-    |> Enum.reject(&(&1 == sender_pid))
-    |> Enum.each(&send(&1, message))
+  def broadcast(name, sender, message) when is_binary(name) and is_pid(sender) do
+    for member <- :pg.get_members(@scope, name), member != sender do
+      send(member, message)
+    end
 
     :ok
-  end
-
-  defp group(name), do: {Web.BroadcastChannel, name}
-
-  defp ensure_pg_started do
-    case Process.whereis(:pg) do
-      nil ->
-        # coveralls-ignore-start
-        case :pg.start_link() do
-          {:ok, _pid} -> :ok
-          {:error, {:already_started, _pid}} -> :ok
-        end
-
-      # coveralls-ignore-stop
-
-      _pid ->
-        :ok
-    end
   end
 end

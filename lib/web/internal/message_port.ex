@@ -1,683 +1,405 @@
 defmodule Web.Internal.MessagePort do
   @moduledoc false
 
-  use GenServer
+  # The server of one message port. See `Web.Internal.MessageTarget` for the
+  # two processes of a port, and `tla/MessagePort.tla` for the design.
+  #
+  # ## The port message queue
+  #
+  # A message for the port goes into the queue of the server. The server
+  # gives the messages to the listener process one at a time, and only after
+  # the port started. Thus a message that comes before a listener is not
+  # lost, and a transfer moves the messages that were not delivered together
+  # with the port.
+  #
+  # ## The two ports of a channel
+  #
+  # Each server has the pid of the server of the other port, and the two
+  # servers share one reference: the link. A server sends to its peer and
+  # does not wait. All the messages from one port to the other come from one
+  # process, thus they arrive in their sequence, and the notice of a close
+  # arrives after them.
+  #
+  # A server never calls a different server. Only a process that has a
+  # handle calls a server. Thus two servers cannot wait for each other.
+  #
+  # ## The holder
+  #
+  # The VM cannot tell when a port has no more references. A port thus
+  # stays until a process closes it, or until its holder stops. The holder
+  # is the process that made the channel. After a transfer, the holder is
+  # the holder of the port that got the message.
+
+  use GenServer, restart: :temporary
 
   alias Web.AsyncContext.Snapshot
   alias Web.DOMException
-  alias Web.Internal.Envelope
-  alias Web.Internal.EventTarget.Server, as: EventTargetServer
+  alias Web.Internal.MessageTarget
   alias Web.Internal.StructuredData
   alias Web.MessageEvent
   alias Web.MessagePort
-  alias Web.TypeError
 
-  @call_timeout 100
-  @local_state_key {__MODULE__, :local_state}
+  # ---------------------------------------------------------------------------
+  # Functions for the process that has a handle
+  # ---------------------------------------------------------------------------
 
-  @doc false
+  @doc "Makes the two ports of a channel. `holder` keeps them alive."
   @spec start_pair(pid()) :: {MessagePort.t(), MessagePort.t()}
-  def start_pair(holder_pid \\ self()) when is_pid(holder_pid) do
-    {left_pid, left_handle} = start_port(holder_pid)
-    {right_pid, right_handle} = start_port(holder_pid)
+  def start_pair(holder \\ self()) when is_pid(holder) do
+    link = make_ref()
+    left = start_port(holder, link)
+    right = start_port(holder, link)
 
-    :ok =
-      left_pid
-      |> request_target(
-        left_handle.token,
-        {:attach_peer, right_pid, right_handle.token},
-        :infinity
-      )
-      |> raise_on_error()
+    _reply = MessageTarget.call(left, {:entangle, right.address})
+    _reply = MessageTarget.call(right, {:entangle, left.address})
 
-    :ok =
-      right_pid
-      |> request_target(
-        right_handle.token,
-        {:attach_peer, left_pid, left_handle.token},
-        :infinity
-      )
-      |> raise_on_error()
-
-    {left_handle, right_handle}
+    {left, right}
   end
 
-  @doc false
-  @spec get_onmessage(MessagePort.t()) :: MessagePort.callback() | nil
-  def get_onmessage(%MessagePort{} = port) do
-    port
-    |> request(:get_onmessage)
-    |> raise_on_error()
+  defp start_port(holder, link) do
+    token = make_ref()
+    pid = MessageTarget.start_server(__MODULE__, {holder, token, link})
+    %MessagePort{address: pid, token: token}
   end
 
-  @doc false
-  @spec set_onmessage(MessagePort.t(), MessagePort.callback() | nil) :: :ok
-  def set_onmessage(%MessagePort{} = port, callback)
-      when is_nil(callback) or is_function(callback, 0) or is_function(callback, 1) do
-    port
-    |> request({:set_onmessage, callback})
-    |> raise_on_error()
+  @spec start(MessagePort.t()) :: :ok
+  def start(%MessagePort{} = port) do
+    _reply = MessageTarget.call(port, :start)
+    :ok
   end
 
-  @doc false
-  @spec add_event_listener(
-          MessagePort.t(),
-          String.t() | atom(),
-          MessagePort.callback(),
-          keyword() | map()
-        ) ::
-          :ok
-  def add_event_listener(%MessagePort{} = port, type, callback, options)
-      when is_function(callback, 0) or is_function(callback, 1) do
-    port
-    |> request({:add_event_listener, type, callback, options})
-    |> raise_on_error()
-  end
-
-  @doc false
-  @spec remove_event_listener(MessagePort.t(), String.t() | atom(), MessagePort.callback()) :: :ok
-  def remove_event_listener(%MessagePort{} = port, type, callback)
-      when is_function(callback, 0) or is_function(callback, 1) do
-    port
-    |> request({:remove_event_listener, type, callback})
-    |> raise_on_error()
-  end
-
-  @doc false
-  @spec dispatch_event(MessagePort.t(), Web.EventTarget.event()) :: boolean()
-  def dispatch_event(%MessagePort{} = port, %{type: type} = event)
-      when is_binary(type) or is_atom(type) do
-    port
-    |> request({:dispatch_event, event})
-    |> raise_on_error()
-  end
-
-  @doc false
-  @spec post_message(MessagePort.t(), term(), list()) :: :ok
-  def post_message(%MessagePort{} = port, message, transfer) when is_list(transfer) do
-    port
-    |> request({:post_message, message, transfer})
-    |> raise_on_error()
-  end
-
-  @doc false
   @spec close(MessagePort.t()) :: :ok
   def close(%MessagePort{} = port) do
-    port
-    |> request(:close)
-    |> raise_on_error()
+    _reply = MessageTarget.call(port, :close)
+    :ok
   end
 
-  @doc false
+  @doc """
+  Sends a message to the other port, as the steps of `postMessage()` in the
+  HTML Standard.
+  """
+  @spec post_message(MessagePort.t(), term(), list()) :: :ok
+  def post_message(%MessagePort{} = port, message, transfer) when is_list(transfer) do
+    if Enum.any?(transfer, &same_port?(&1, port)) do
+      raise data_clone_error("A MessagePort cannot transfer itself.")
+    end
+
+    peer =
+      case MessageTarget.call(port, :peer) do
+        {:ok, pid} when is_pid(pid) -> pid
+        _other -> nil
+      end
+
+    # A transfer of the port that gets the message makes the message
+    # impossible to deliver. The Standard calls such a message doomed.
+    doomed? = peer != nil and Enum.any?(transfer, &match?(%MessagePort{address: ^peer}, &1))
+
+    # The server of the peer keeps a transferred port until the peer
+    # delivers the message.
+    record = StructuredData.serialize(message, transfer: transfer, port_holder: peer || self())
+    payload = %{record: record, snapshot: Snapshot.take()}
+
+    if peer == nil or doomed? or MessageTarget.call(port, {:post, payload}) != :sent do
+      discard(record)
+    end
+
+    :ok
+  end
+
+  # A message that nobody gets: its ports are lost, thus close them.
+  defp discard(%StructuredData.Record{ports: ports}) do
+    Enum.each(ports, fn fields -> fields |> deserialize() |> close() end)
+  end
+
+  defp same_port?(%MessagePort{address: address, token: token}, %MessagePort{
+         address: address,
+         token: token
+       }),
+       do: true
+
+  defp same_port?(_left, _right), do: false
+
+  @doc "Raises `DataCloneError` when the port cannot be transferred."
   @spec ensure_transferable(MessagePort.t()) :: :ok
   def ensure_transferable(%MessagePort{} = port) do
-    case local_state(port) do
-      {:ok, state} ->
-        case ensure_peer_available(state) do
-          {:ok, next_state} ->
-            put_local_state(next_state)
-            :ok
-
-          {:error, exception} ->
-            raise(exception)
-
-          {:stop, exception, next_state} ->
-            put_local_state(next_state)
-            raise(exception)
-        end
-
-      :error ->
-        port
-        |> request(:ensure_transferable)
-        |> raise_on_error()
+    case MessageTarget.call(port, :transferable?) do
+      :ok -> :ok
+      {:error, _reason} -> raise detached_error()
     end
   end
 
-  @doc false
-  @spec detach_transferable(MessagePort.t(), pid()) :: %{address: reference(), token: reference()}
-  def detach_transferable(%MessagePort{} = port, recipient_pid)
-      when is_pid(recipient_pid) do
-    case local_state(port) do
-      {:ok, state} ->
-        {next_handle, next_state} = rotate_handle(state, recipient_pid)
-        put_local_state(next_state)
-        handle_fields(next_handle)
-
-      :error ->
-        port
-        |> request({:transfer, recipient_pid})
-        |> raise_on_error()
-        |> handle_fields()
+  @doc """
+  Detaches the handle and gives the port to a new holder. Returns the
+  fields of the new handle.
+  """
+  @spec detach_transferable(MessagePort.t(), pid()) :: %{address: pid(), token: reference()}
+  def detach_transferable(%MessagePort{address: address} = port, holder) when is_pid(holder) do
+    case MessageTarget.call(port, {:transfer, holder}) do
+      {:ok, token} -> %{address: address, token: token}
+      {:error, _reason} -> raise detached_error()
     end
   end
 
-  @doc false
-  @spec deserialize(%{address: reference(), token: reference()}) :: MessagePort.t()
+  @doc "Makes a handle from its fields."
+  @spec deserialize(%{address: pid(), token: reference()}) :: MessagePort.t()
   def deserialize(%{address: address, token: token})
-      when is_reference(address) and is_reference(token) do
-    %MessagePort{address: address, token: token, onmessage: nil}
+      when is_pid(address) and is_reference(token) do
+    %MessagePort{address: address, token: token}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Functions that make the events, in the listener process
+  # ---------------------------------------------------------------------------
+
+  @doc false
+  def message_event(record, target) do
+    {data, ports} = StructuredData.deserialize_with_ports(record)
+    MessageEvent.new("message", data: data, ports: ports, target: target)
+  rescue
+    # The Standard fires `messageerror` when the message cannot be made.
+    _exception -> MessageEvent.new("messageerror", target: target)
   end
 
   @doc false
-  @spec debug_server_pid(MessagePort.t()) :: pid()
-  def debug_server_pid(%MessagePort{} = port) do
-    port
-    |> request(:debug_server_pid)
-    |> raise_on_error()
-  end
+  def close_event(target), do: Web.Event.new("close", target: target)
+
+  # ---------------------------------------------------------------------------
+  # The server
+  # ---------------------------------------------------------------------------
+
+  def start_link(argument), do: GenServer.start_link(__MODULE__, argument)
 
   @impl true
-  def init({holder_pid, boot_pid, boot_ref}) do
+  def init({holder, token, link}) do
     Process.flag(:message_queue_data, :off_heap)
 
-    address = Process.alias()
-    token = make_ref()
-
-    {:ok, event_target_pid} = start_event_target(address, token)
-
     state = %{
-      address: address,
       token: token,
-      holder_pid: holder_pid,
-      holder_monitor: Process.monitor(holder_pid),
-      peer_pid: nil,
-      peer_token: nil,
+      link: link,
+      holder: holder,
+      holder_monitor: Process.monitor(holder),
+      peer: nil,
       peer_monitor: nil,
-      event_target_pid: event_target_pid,
-      onmessage: nil,
-      closed: false
+      entangled?: false,
+      started?: false,
+      queue: :queue.new(),
+      # The item that the listener process has now, with its number.
+      in_flight: nil,
+      next_number: 0,
+      target: nil
     }
 
-    send(boot_pid, {__MODULE__, boot_ref, self(), public_handle(state)})
-    {:ok, state}
+    {:ok, start_target(state)}
   end
 
   @impl true
-  def handle_call(
-        %Envelope{
-          headers: %{"Authorization" => token, "X-Async-Context" => snapshot},
-          body: body
-        },
-        _from,
-        %{token: token} = state
-      ) do
-    do_handle_call(body, snapshot, state)
+  def handle_call({token, request}, _from, %{token: token} = state) do
+    request(request, state)
   end
 
-  def handle_call({:envelope, %Envelope{} = envelope}, from, state) do
-    handle_call(envelope, from, state)
-  end
-
-  def handle_call(%Envelope{}, _from, state) do
-    {:reply, {:error, data_clone_error_exception()}, state}
-  end
-
-  def handle_call({:envelope, _envelope}, _from, state) do
-    {:reply, {:error, data_clone_error_exception()}, state}
-  end
+  def handle_call(_request, _from, state), do: {:reply, {:error, :detached}, state}
 
   @impl true
-  def handle_cast(
-        %Envelope{
-          headers: %{"Authorization" => token, "X-Async-Context" => snapshot},
-          body: body
-        },
-        %{token: token} = state
-      ) do
-    do_handle_cast(body, snapshot, state)
-  end
+  def handle_cast(_request, state), do: {:noreply, state}
 
-  def handle_cast({:envelope, %Envelope{} = envelope}, state) do
-    handle_cast(envelope, state)
-  end
-
-  def handle_cast(%Envelope{}, state), do: {:noreply, state}
-  def handle_cast({:envelope, _envelope}, state), do: {:noreply, state}
-
+  # A message from the other port.
   @impl true
-  def handle_info({:DOWN, holder_monitor, :process, holder_pid, _reason}, state)
-      when holder_monitor == state.holder_monitor and holder_pid == state.holder_pid do
-    {:stop, :normal, close_state(state)}
+  def handle_info({:port_message, link, payload}, %{link: link} = state) do
+    {:noreply, state |> enqueue({:message, payload}) |> pump()}
   end
 
-  def handle_info({:DOWN, peer_monitor, :process, peer_pid, _reason}, state)
-      when peer_monitor == state.peer_monitor and peer_pid == state.peer_pid do
-    {:stop, :normal, close_state(state, notify_peer: false)}
+  # The other port closed.
+  def handle_info({:port_closed, link}, %{link: link, peer: peer} = state) when is_pid(peer) do
+    {:noreply, peer_closed(state)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{holder_monitor: ref} = state) do
+    {:stop, :normal, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{peer_monitor: ref} = state) do
+    {:noreply, peer_closed(state)}
+  end
+
+  # The listener process completed the event of the item.
+  def handle_info({:event_done, number}, %{in_flight: {number, _item}} = state) do
+    {:noreply, pump(%{state | in_flight: nil})}
+  end
+
+  # The listener process stopped before it started the item: a transfer
+  # moved the port. The item goes back to the head of the queue.
+  def handle_info({:event_returned, number}, %{in_flight: {number, item}} = state) do
+    queue =
+      if item == :close and :queue.member(:close, state.queue) do
+        # The transfer put the event `close` in the queue for the new holder.
+        state.queue
+      else
+        :queue.in_r(item, state.queue)
+      end
+
+    {:noreply, pump(%{state | in_flight: nil, queue: queue})}
+  end
+
+  # The port that got this port in a message gives it to its holder.
+  def handle_info({:set_holder, token, holder}, %{token: token} = state) when is_pid(holder) do
+    {:noreply, set_holder(state, holder)}
   end
 
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
-    stop_event_target(state.event_target_pid)
-    clear_monitor(state.holder_monitor)
-    clear_monitor(state.peer_monitor)
-    Process.unalias(state.address)
+    MessageTarget.close(state.target)
+
+    if is_pid(state.peer) do
+      send(state.peer, {:port_closed, state.link})
+    end
+
     :ok
   end
 
-  defp start_port(holder_pid) do
-    boot_ref = make_ref()
-    {:ok, pid} = GenServer.start(__MODULE__, {holder_pid, self(), boot_ref})
+  # ---------------------------------------------------------------------------
+  # Requests
+  # ---------------------------------------------------------------------------
 
-    receive do
-      {__MODULE__, ^boot_ref, ^pid, handle} -> {pid, handle}
-    end
+  defp request({:entangle, peer}, %{entangled?: false} = state) when is_pid(peer) do
+    state = %{state | peer: peer, peer_monitor: Process.monitor(peer), entangled?: true}
+    {:reply, :ok, state}
   end
 
-  defp do_handle_call(:debug_server_pid, _snapshot, state), do: {:reply, self(), state}
+  defp request(:peer, state), do: {:reply, {:ok, state.peer}, state}
 
-  defp do_handle_call(:get_onmessage, _snapshot, state) do
-    case ensure_open(state) do
-      :ok -> {:reply, state.onmessage, state}
-      {:error, exception} -> {:reply, {:error, exception}, state}
-    end
+  defp request({:post, payload}, %{peer: peer} = state) when is_pid(peer) do
+    send(peer, {:port_message, state.link, payload})
+    {:reply, :sent, state}
   end
 
-  defp do_handle_call({:set_onmessage, callback}, _snapshot, state) do
-    case ensure_open(state) do
-      :ok -> {:reply, :ok, %{state | onmessage: callback}}
-      {:error, exception} -> {:reply, {:error, exception}, state}
-    end
+  defp request({:post, _payload}, state), do: {:reply, :dropped, state}
+
+  defp request(:start, state) do
+    {:reply, :ok, pump(%{state | started?: true})}
   end
 
-  defp do_handle_call({:add_event_listener, type, callback, options}, _snapshot, state) do
-    case ensure_open(state) do
-      :ok ->
-        :ok =
-          EventTargetServer.add_event_listener(state.event_target_pid, type, callback, options)
+  defp request(:transferable?, state), do: {:reply, :ok, state}
 
-        {:reply, :ok, state}
-
-      {:error, exception} ->
-        {:reply, {:error, exception}, state}
-    end
-  end
-
-  defp do_handle_call({:remove_event_listener, type, callback}, _snapshot, state) do
-    case ensure_open(state) do
-      :ok ->
-        :ok = EventTargetServer.remove_event_listener(state.event_target_pid, type, callback)
-        {:reply, :ok, state}
-
-      {:error, exception} ->
-        {:reply, {:error, exception}, state}
-    end
-  end
-
-  defp do_handle_call({:dispatch_event, event}, snapshot, state) do
-    case ensure_open(state) do
-      :ok ->
-        dispatched? = EventTargetServer.dispatch_event(state.event_target_pid, event, snapshot)
-        {:reply, dispatched?, state}
-
-      {:error, exception} ->
-        {:reply, {:error, exception}, state}
-    end
-  end
-
-  defp do_handle_call(:ensure_transferable, _snapshot, state) do
-    case ensure_peer_available(state) do
-      {:ok, next_state} -> {:reply, :ok, next_state}
-      {:error, exception} -> {:reply, {:error, exception}, state}
-      {:stop, exception, next_state} -> {:stop, :normal, {:error, exception}, next_state}
-    end
-  end
-
-  defp do_handle_call({:post_message, message, transfer}, snapshot, state) do
-    case ensure_peer_available(state) do
-      {:ok, next_state} ->
-        reply_post_message(next_state, message, transfer, snapshot)
-
-      {:error, exception} ->
-        {:reply, {:error, exception}, state}
-
-      {:stop, exception, next_state} ->
-        {:stop, :normal, {:error, exception}, next_state}
-    end
-  end
-
-  defp do_handle_call({:transfer, recipient_pid}, _snapshot, state)
-       when is_pid(recipient_pid) do
-    if Process.alive?(recipient_pid) do
-      case ensure_peer_available(state) do
-        {:ok, next_state} ->
-          {handle, rotated_state} = rotate_handle(next_state, recipient_pid)
-          {:reply, handle, rotated_state}
-
-        {:error, exception} ->
-          {:reply, {:error, exception}, state}
-
-        {:stop, exception, next_state} ->
-          {:stop, :normal, {:error, exception}, next_state}
-      end
-    else
-      {:reply, {:error, data_clone_error_exception()}, state}
-    end
-  end
-
-  defp do_handle_call({:transfer, _recipient}, _snapshot, state) do
-    {:reply, {:error, data_clone_error_exception()}, state}
-  end
-
-  defp do_handle_call({:attach_peer, peer_pid, peer_token}, _snapshot, state)
-       when is_pid(peer_pid) and is_reference(peer_token) do
-    {:reply, :ok, attach_peer(state, peer_pid, peer_token)}
-  end
-
-  defp do_handle_call(:close, _snapshot, state) do
-    {:stop, :normal, :ok, close_state(state)}
-  end
-
-  defp do_handle_call(_body, _snapshot, state) do
-    {:reply, {:error, data_clone_error_exception()}, state}
-  end
-
-  defp reply_post_message(state, message, transfer, snapshot) do
-    case serialize_for_delivery(state, message, transfer) do
-      {:ok, serialized, final_state} ->
-        :ok =
-          cast_target(
-            final_state.peer_pid,
-            final_state.peer_token,
-            {:deliver, serialized},
-            snapshot
-          )
-
-        {:reply, :ok, final_state}
-
-      {:error, exception, final_state} ->
-        {:reply, {:error, exception}, final_state}
-    end
-  end
-
-  defp serialize_for_delivery(state, message, transfer) do
-    case with_local_state(state, fn ->
-           StructuredData.serialize(message,
-             transfer: transfer,
-             message_port_recipient: state.peer_pid
-           )
-         end) do
-      {:ok, serialized, final_state} ->
-        {:ok, serialized, final_state}
-
-      {:error, %DOMException{} = exception, _stacktrace, final_state} ->
-        {:error, exception, final_state}
-
-      {:error, %TypeError{} = exception, _stacktrace, final_state} ->
-        {:error, exception, final_state}
-
-      {:error, exception, stacktrace, _final_state} ->
-        reraise(exception, stacktrace)
-    end
-  end
-
-  defp do_handle_cast({:deliver, serialized}, snapshot, state) do
-    next_state =
-      if state.closed do
-        state
-      else
-        deliver_message(state, serialized, snapshot)
-      end
-
-    {:noreply, next_state}
-  end
-
-  defp do_handle_cast(:peer_closed, _snapshot, state) do
-    {:stop, :normal, close_state(state, notify_peer: false)}
-  end
-
-  defp do_handle_cast({:peer_token_rotated, peer_token}, _snapshot, state)
-       when is_reference(peer_token) do
-    {:noreply, %{state | peer_token: peer_token}}
-  end
-
-  defp do_handle_cast(_body, _snapshot, state), do: {:noreply, state}
-
-  defp deliver_message(state, serialized, snapshot) do
-    Snapshot.run(snapshot, fn ->
-      event =
-        MessageEvent.new("message",
-          data: StructuredData.deserialize(serialized),
-          source: nil,
-          target: public_handle(state)
-        )
-
-      state
-      |> invoke_onmessage(event)
-      |> dispatch_event_target(event)
-    end)
-  end
-
-  defp invoke_onmessage(%{onmessage: nil} = state, _event), do: state
-
-  defp invoke_onmessage(%{onmessage: callback} = state, event) when is_function(callback, 1) do
-    callback.(event)
-    state
-  end
-
-  defp invoke_onmessage(%{onmessage: callback} = state, _event) when is_function(callback, 0) do
-    callback.()
-    state
-  end
-
-  defp dispatch_event_target(state, event) do
-    _dispatched? =
-      EventTargetServer.dispatch_event(state.event_target_pid, event, Snapshot.take())
-
-    state
-  end
-
-  defp rotate_handle(state, holder_pid) do
-    next_state =
-      state
-      |> Map.put(:holder_pid, holder_pid)
-      |> Map.put(:holder_monitor, replace_monitor(state.holder_monitor, holder_pid))
-      |> restart_handle()
-
-    if is_pid(next_state.peer_pid) and is_reference(next_state.peer_token) do
-      :ok =
-        cast_target(
-          next_state.peer_pid,
-          next_state.peer_token,
-          {:peer_token_rotated, next_state.token}
-        )
-    end
-
-    {public_handle(next_state), next_state}
-  end
-
-  defp restart_handle(state) do
-    old_address = state.address
-    stop_event_target(state.event_target_pid)
-
-    address = Process.alias()
+  # A transfer gives the port a new handle and a new holder. The listeners
+  # do not move with the port, and the port does not deliver until its new
+  # holder starts it. The messages in the queue stay.
+  defp request({:transfer, holder}, state) when is_pid(holder) do
+    MessageTarget.close(state.target)
     token = make_ref()
-    {:ok, event_target_pid} = start_event_target(address, token)
 
-    Process.unalias(old_address)
+    state =
+      %{state | token: token, started?: false}
+      |> set_holder(holder)
+      |> start_target()
+      |> close_for_new_holder()
 
-    %{
+    {:reply, {:ok, token}, state}
+  end
+
+  defp request(:close, state), do: {:stop, :normal, :ok, state}
+
+  defp request(request, state) do
+    case MessageTarget.request(state.target, request) do
+      {:reply, reply, target} ->
+        state = %{state | target: target}
+        {:reply, reply, maybe_start(request, state)}
+
+      :unknown ->
+        {:reply, {:error, :unknown_request}, state}
+    end
+  end
+
+  # The first callback of `onmessage` starts the port, as the HTML Standard
+  # specifies.
+  defp maybe_start({:set_handler, "message", callback}, state) when callback != nil do
+    pump(%{state | started?: true})
+  end
+
+  defp maybe_start(_request, state), do: state
+
+  # ---------------------------------------------------------------------------
+  # State changes
+  # ---------------------------------------------------------------------------
+
+  defp start_target(state) do
+    %{state | target: MessageTarget.start(handle(state))}
+  end
+
+  defp handle(state), do: %MessagePort{address: self(), token: state.token}
+
+  defp set_holder(state, holder) do
+    Process.demonitor(state.holder_monitor, [:flush])
+    %{state | holder: holder, holder_monitor: Process.monitor(holder)}
+  end
+
+  # The port has no peer now, and it gets the event `close`.
+  #
+  # A port that started gets the event after the messages that the peer
+  # sent. A port that did not start gets the event immediately: the event
+  # does not wait in the port message queue, as in the HTML Standard. Thus a
+  # port that only sends learns that its peer closed.
+  defp peer_closed(state) do
+    if state.peer_monitor, do: Process.demonitor(state.peer_monitor, [:flush])
+    state = %{state | peer: nil, peer_monitor: nil}
+
+    if state.started? do
+      state |> enqueue(:close) |> pump()
+    else
+      MessageTarget.run(state.target, close_build(state), Snapshot.take())
       state
-      | address: address,
-        token: token,
-        event_target_pid: event_target_pid,
-        onmessage: nil
-    }
-  end
-
-  defp attach_peer(state, peer_pid, peer_token) do
-    %{
-      state
-      | peer_pid: peer_pid,
-        peer_token: peer_token,
-        peer_monitor: replace_monitor(state.peer_monitor, peer_pid)
-    }
-  end
-
-  defp close_state(%{closed: true} = state, _opts), do: state
-
-  defp close_state(state, opts) do
-    if Keyword.get(opts, :notify_peer, true) and is_pid(state.peer_pid) and
-         is_reference(state.peer_token) do
-      :ok = cast_target(state.peer_pid, state.peer_token, :peer_closed)
-    end
-
-    Process.unalias(state.address)
-    %{state | closed: true, onmessage: nil}
-  end
-
-  defp close_state(state), do: close_state(state, notify_peer: true)
-
-  defp ensure_open(%{closed: false}), do: :ok
-  defp ensure_open(_state), do: {:error, data_clone_error_exception()}
-
-  defp ensure_peer_available(state) do
-    case ensure_open(state) do
-      :ok ->
-        cond do
-          not is_pid(state.peer_pid) or not is_reference(state.peer_token) ->
-            {:stop, data_clone_error_exception(), close_state(state, notify_peer: false)}
-
-          not Process.alive?(state.peer_pid) ->
-            {:stop, data_clone_error_exception(), close_state(state, notify_peer: false)}
-
-          true ->
-            {:ok, state}
-        end
-
-      {:error, exception} ->
-        {:error, exception}
     end
   end
 
-  defp request(%MessagePort{} = port, body, timeout \\ @call_timeout) do
-    request_target(port.address, port.token, body, timeout)
+  # The listeners do not move with a port. The new holder of a port whose
+  # peer closed gets the event `close` after it starts the port.
+  defp close_for_new_holder(%{peer: nil, entangled?: true} = state) do
+    if :queue.member(:close, state.queue), do: state, else: enqueue(state, :close)
   end
 
-  defp request_target(target, token, body, timeout)
-       when (is_pid(target) or is_reference(target)) and is_reference(token) do
-    reply_ref = make_ref()
-    send(target, {:"$gen_call", {self(), reply_ref}, Envelope.new(token, body)})
-    await_reply(reply_ref, timeout)
-  end
+  defp close_for_new_holder(state), do: state
 
-  defp cast_target(target, token, body, snapshot \\ Snapshot.take())
-       when (is_pid(target) or is_reference(target)) and is_reference(token) do
-    send(target, {:"$gen_cast", Envelope.new(token, body, snapshot)})
-    :ok
-  end
+  defp close_build(state), do: {__MODULE__, :close_event, [handle(state)]}
 
-  defp await_reply(reply_ref, :infinity) do
-    receive do
-      {^reply_ref, reply} -> reply
+  defp enqueue(state, item), do: %{state | queue: :queue.in(item, state.queue)}
+
+  # Gives the next item to the listener process, when the port started and
+  # the listener process has no item.
+  defp pump(%{started?: true, in_flight: nil} = state) do
+    case :queue.out(state.queue) do
+      {{:value, item}, queue} ->
+        number = state.next_number
+        deliver(item, number, state)
+        %{state | queue: queue, in_flight: {number, item}, next_number: number + 1}
+
+      {:empty, _queue} ->
+        state
     end
   end
 
-  defp await_reply(reply_ref, timeout) do
-    receive do
-      {^reply_ref, reply} -> reply
-    after
-      timeout -> {:error, data_clone_error_exception()}
-    end
+  defp pump(state), do: state
+
+  defp deliver({:message, %{record: record, snapshot: snapshot}}, number, state) do
+    # The holder of this port becomes the holder of each port in the
+    # message.
+    Enum.each(record.ports, fn %{address: pid, token: token} ->
+      send(pid, {:set_holder, token, state.holder})
+    end)
+
+    build = {__MODULE__, :message_event, [record, handle(state)]}
+    MessageTarget.run(state.target, build, snapshot, {self(), number})
   end
 
-  defp replace_monitor(nil, pid) when is_pid(pid), do: Process.monitor(pid)
-
-  defp replace_monitor(monitor_ref, pid) when is_reference(monitor_ref) and is_pid(pid) do
-    Process.demonitor(monitor_ref, [:flush])
-    Process.monitor(pid)
+  defp deliver(:close, number, state) do
+    MessageTarget.run(state.target, close_build(state), Snapshot.take(), {self(), number})
   end
 
-  defp clear_monitor(monitor_ref) do
-    if is_reference(monitor_ref) do
-      Process.demonitor(monitor_ref, [:flush])
-    end
-
-    :ok
+  defp detached_error do
+    data_clone_error("A MessagePort that is closed or detached cannot be transferred.")
   end
 
-  defp with_local_state(state, fun) when is_function(fun, 0) do
-    previous = Process.get(@local_state_key)
-    put_local_state(state)
-
-    try do
-      {:ok, fun.(), current_local_state()}
-    rescue
-      exception ->
-        {:error, exception, __STACKTRACE__, current_local_state()}
-    after
-      restore_local_state(previous)
-    end
+  defp data_clone_error(message) do
+    DOMException.exception(name: "DataCloneError", message: message)
   end
-
-  defp local_state(%MessagePort{} = port) do
-    case Process.get(@local_state_key) do
-      %{key: key, state: state} ->
-        if key == handle_key(port) do
-          {:ok, state}
-        else
-          :error
-        end
-
-      _other ->
-        :error
-    end
-  end
-
-  defp current_local_state do
-    case Process.get(@local_state_key) do
-      %{state: state} -> state
-      # coveralls-ignore-next-line
-      _other -> raise "missing local MessagePort state"
-    end
-  end
-
-  defp put_local_state(state) do
-    Process.put(@local_state_key, %{key: handle_key(public_handle(state)), state: state})
-    state
-  end
-
-  defp restore_local_state(nil) do
-    Process.delete(@local_state_key)
-    :ok
-  end
-
-  defp restore_local_state(previous) do
-    Process.put(@local_state_key, previous)
-    :ok
-  end
-
-  defp start_event_target(address, token) do
-    EventTargetServer.start_link(
-      target: %MessagePort{address: address, token: token, onmessage: nil},
-      callback_module: nil
-    )
-  end
-
-  defp stop_event_target(pid) do
-    if is_pid(pid) and Process.alive?(pid) do
-      Process.unlink(pid)
-      GenServer.stop(pid, :normal)
-    end
-
-    :ok
-  end
-
-  defp public_handle(state) do
-    %MessagePort{address: state.address, token: state.token, onmessage: state.onmessage}
-  end
-
-  defp handle_key(%MessagePort{address: address, token: token}), do: {address, token}
-
-  defp handle_fields(%MessagePort{address: address, token: token}) do
-    %{address: address, token: token}
-  end
-
-  defp data_clone_error_exception do
-    DOMException.exception(name: "DataCloneError", message: "MessagePort is closed or detached")
-  end
-
-  defp raise_on_error({:error, exception}), do: raise(exception)
-  defp raise_on_error(value), do: value
 end

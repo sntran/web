@@ -1,503 +1,191 @@
 defmodule Web.Internal.BroadcastChannel do
   @moduledoc false
 
-  use GenServer
+  # The server of one broadcast channel. See `Web.Internal.MessageTarget`
+  # for the two processes of a channel, and `tla/BroadcastChannel.tla` for
+  # the design.
+  #
+  # The servers of all the channels with one name are the members of one
+  # group of the adapter. A server sends a message to each other member, and
+  # does not wait. Thus:
+  #
+  #   * the messages of one channel arrive at each other channel in their
+  #     sequence, because they come from one process;
+  #   * a channel with a slow listener delays only its own events;
+  #   * the channels have no shared process that can stop or fill up.
+  #
+  # The server stops when the channel closes. A request to a server that
+  # stopped has no effect.
+
+  use GenServer, restart: :temporary
 
   alias Web.AsyncContext.Snapshot
   alias Web.BroadcastChannel
-  alias Web.BroadcastChannel.Dispatcher
+  alias Web.BroadcastChannel.Adapter.PG
   alias Web.DOMException
-  alias Web.Internal.Envelope
-  alias Web.Internal.EventTarget.Server, as: EventTargetServer
+  alias Web.Governor
+  alias Web.Internal.MessageTarget
   alias Web.Internal.StructuredData
   alias Web.MessageEvent
-  alias Web.TypeError
 
-  @call_timeout 100
-  @local_state_key {__MODULE__, :local_state}
+  # ---------------------------------------------------------------------------
+  # Functions for the process that has a handle
+  # ---------------------------------------------------------------------------
 
-  @doc false
+  @doc "Makes a channel. `holder` keeps it alive."
   @spec new(String.t(), pid()) :: BroadcastChannel.t()
-  def new(name, holder_pid \\ self()) when is_binary(name) and is_pid(holder_pid) do
-    boot_ref = make_ref()
-    {:ok, pid} = GenServer.start(__MODULE__, {name, holder_pid, self(), boot_ref})
-
-    receive do
-      {__MODULE__, ^boot_ref, ^pid, channel} -> channel
-    end
+  def new(name, holder \\ self()) when is_binary(name) and is_pid(holder) do
+    token = make_ref()
+    pid = MessageTarget.start_server(__MODULE__, {name, holder, token, adapter()})
+    %BroadcastChannel{address: pid, token: token, name: name}
   end
 
-  @doc false
-  @spec get_onmessage(BroadcastChannel.t()) :: BroadcastChannel.callback() | nil
-  def get_onmessage(%BroadcastChannel{} = channel) do
-    case local_state(channel) do
-      {:ok, state} -> open_local_state!(state).onmessage
-      :error -> channel |> request(:get_onmessage) |> raise_on_error()
-    end
-  end
-
-  @doc false
-  @spec set_onmessage(BroadcastChannel.t(), BroadcastChannel.callback() | nil) :: :ok
-  def set_onmessage(%BroadcastChannel{} = channel, callback)
-      when is_nil(callback) or is_function(callback, 0) or is_function(callback, 1) do
-    case local_state(channel) do
-      {:ok, state} ->
-        state = open_local_state!(state)
-        put_local_state(%{state | onmessage: callback})
-        :ok
-
-      :error ->
-        channel
-        |> request({:set_onmessage, callback})
-        |> raise_on_error()
-    end
-  end
-
-  @doc false
-  @spec add_event_listener(
-          BroadcastChannel.t(),
-          String.t() | atom(),
-          BroadcastChannel.callback(),
-          keyword() | map()
-        ) :: :ok
-  def add_event_listener(%BroadcastChannel{} = channel, type, callback, options)
-      when is_function(callback, 0) or is_function(callback, 1) do
-    case local_state(channel) do
-      {:ok, state} ->
-        state = open_local_state!(state)
-        EventTargetServer.add_event_listener(state.event_target_pid, type, callback, options)
-
-      :error ->
-        channel |> request({:add_event_listener, type, callback, options}) |> raise_on_error()
-    end
-  end
-
-  @doc false
-  @spec remove_event_listener(
-          BroadcastChannel.t(),
-          String.t() | atom(),
-          BroadcastChannel.callback()
-        ) :: :ok
-  def remove_event_listener(%BroadcastChannel{} = channel, type, callback)
-      when is_function(callback, 0) or is_function(callback, 1) do
-    case local_state(channel) do
-      {:ok, state} ->
-        state = open_local_state!(state)
-        EventTargetServer.remove_event_listener(state.event_target_pid, type, callback)
-
-      :error ->
-        channel |> request({:remove_event_listener, type, callback}) |> raise_on_error()
-    end
-  end
-
-  @doc false
-  @spec dispatch_event(BroadcastChannel.t(), Web.EventTarget.event()) :: boolean()
-  def dispatch_event(%BroadcastChannel{} = channel, %{type: type} = event)
-      when is_binary(type) or is_atom(type) do
-    case local_state(channel) do
-      {:ok, state} ->
-        state = open_local_state!(state)
-        EventTargetServer.dispatch_event(state.event_target_pid, event, Snapshot.take())
-
-      :error ->
-        channel |> request({:dispatch_event, event}) |> raise_on_error()
-    end
-  end
-
-  @doc false
+  @doc """
+  Sends a message to each other channel with the same name, as the steps of
+  `postMessage()` in the HTML Standard.
+  """
   @spec post_message(BroadcastChannel.t(), term()) :: :ok
-  def post_message(%BroadcastChannel{} = channel, data) do
-    case local_state(channel) do
-      {:ok, state} -> local_post(state, data)
-      :error -> channel |> request({:post_message, data, origin()}) |> raise_on_error()
+  def post_message(%BroadcastChannel{} = channel, message) do
+    record = serialize(channel, message)
+
+    payload = %{record: record, origin: origin(), snapshot: Snapshot.take()}
+
+    case with_governor(fn -> MessageTarget.call(channel, {:post, payload}) end) do
+      :ok -> :ok
+      {:error, _reason} -> raise closed_error()
     end
   end
 
-  @doc false
+  # The Standard examines the closed state before the message. The usual
+  # message can be cloned, thus the function asks the server only after a
+  # failure.
+  defp serialize(channel, message) do
+    StructuredData.serialize(message)
+  rescue
+    exception in DOMException ->
+      error = if open?(channel), do: exception, else: closed_error()
+      reraise error, __STACKTRACE__
+  end
+
   @spec close(BroadcastChannel.t()) :: :ok
   def close(%BroadcastChannel{} = channel) do
-    case local_state(channel) do
-      {:ok, state} ->
-        put_local_state(close_state(state))
-        :ok
+    _reply = MessageTarget.call(channel, :close)
+    :ok
+  end
 
-      :error ->
-        channel
-        |> request(:close)
-        |> raise_on_error()
+  defp open?(channel), do: MessageTarget.call(channel, :open?) == true
+
+  # The setting `:broadcast_governor` limits the rate of the messages. The
+  # process that sends the message waits for the governor.
+  defp with_governor(fun) do
+    case Application.get_env(:web, :broadcast_governor) do
+      nil ->
+        fun.()
+
+      governor ->
+        governor
+        |> Governor.with(fun)
+        |> Web.Promise.await()
     end
   end
 
+  defp adapter, do: Application.get_env(:web, :broadcast_adapter, PG)
+
+  @doc "The origin of the messages of this node."
+  @spec origin() :: String.t()
+  def origin, do: "node://" <> Atom.to_string(node())
+
+  # ---------------------------------------------------------------------------
+  # The function that makes the event, in the listener process
+  # ---------------------------------------------------------------------------
+
   @doc false
-  @spec debug_server_pid(BroadcastChannel.t()) :: pid()
-  def debug_server_pid(%BroadcastChannel{} = channel) do
-    channel
-    |> request(:debug_server_pid)
-    |> raise_on_error()
+  def message_event(%{record: record, origin: origin}, target) do
+    MessageEvent.new("message",
+      data: StructuredData.deserialize(record),
+      origin: origin,
+      target: target
+    )
+  rescue
+    # The Standard fires `messageerror` when the message cannot be made.
+    _exception -> MessageEvent.new("messageerror", origin: origin, target: target)
   end
 
+  # ---------------------------------------------------------------------------
+  # The server
+  # ---------------------------------------------------------------------------
+
+  def start_link(argument), do: GenServer.start_link(__MODULE__, argument)
+
   @impl true
-  def init({name, holder_pid, boot_pid, boot_ref}) do
+  def init({name, holder, token, adapter}) do
     Process.flag(:message_queue_data, :off_heap)
 
-    address = Process.alias()
-    token = make_ref()
-
-    %{dispatcher: dispatcher, creation_index: creation_index} =
-      Dispatcher.register(name, self(), token)
-
-    {:ok, event_target_pid} =
-      EventTargetServer.start_link(
-        target: %BroadcastChannel{address: address, token: token, name: name, onmessage: nil},
-        server_pid: self(),
-        callback_module: nil
-      )
+    handle = %BroadcastChannel{address: self(), token: token, name: name}
 
     state = %{
-      address: address,
       token: token,
       name: name,
-      holder_pid: holder_pid,
-      holder_monitor: Process.monitor(holder_pid),
-      dispatcher: dispatcher,
-      creation_index: creation_index,
-      event_target_pid: event_target_pid,
-      onmessage: nil,
-      closed: false
+      adapter: adapter,
+      handle: handle,
+      holder_monitor: Process.monitor(holder),
+      target: MessageTarget.start(handle)
     }
 
-    send(boot_pid, {__MODULE__, boot_ref, self(), public_channel(state)})
+    :ok = adapter.join(name, self())
     {:ok, state}
   end
 
   @impl true
-  def handle_call(
-        %Envelope{
-          headers: %{"Authorization" => token, "X-Async-Context" => snapshot},
-          body: body
-        },
-        _from,
-        %{token: token} = state
-      ) do
-    do_handle_call(body, snapshot, state)
+  def handle_call({token, request}, _from, %{token: token} = state) do
+    request(request, state)
   end
 
-  def handle_call({:envelope, %Envelope{} = envelope}, from, state) do
-    handle_call(envelope, from, state)
-  end
-
-  def handle_call(%Envelope{}, _from, state) do
-    {:reply, {:error, data_clone_error_exception()}, state}
-  end
-
-  def handle_call({:envelope, _envelope}, _from, state) do
-    {:reply, {:error, data_clone_error_exception()}, state}
-  end
+  def handle_call(_request, _from, state), do: {:reply, {:error, :detached}, state}
 
   @impl true
-  def handle_cast(
-        %Envelope{
-          headers: %{"Authorization" => token, "X-Async-Context" => snapshot},
-          body: body
-        },
-        %{token: token} = state
-      ) do
-    do_handle_cast(body, snapshot, state)
-  end
+  def handle_cast(_request, state), do: {:noreply, state}
 
-  def handle_cast({:envelope, %Envelope{} = envelope}, state) do
-    handle_cast(envelope, state)
-  end
-
-  def handle_cast(%Envelope{}, state), do: {:noreply, state}
-  def handle_cast({:envelope, _envelope}, state), do: {:noreply, state}
-
+  # A message from a different channel with the same name.
   @impl true
-  def handle_info({:DOWN, holder_monitor, :process, holder_pid, _reason}, state)
-      when holder_monitor == state.holder_monitor and holder_pid == state.holder_pid do
-    {:stop, :normal, close_state(state)}
+  def handle_info(
+        {:broadcast_channel_message, %{record: _, origin: _, snapshot: snapshot} = payload},
+        state
+      ) do
+    build = {__MODULE__, :message_event, [payload, state.handle]}
+    MessageTarget.run(state.target, build, snapshot)
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{holder_monitor: ref} = state) do
+    {:stop, :normal, state}
   end
 
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
-    stop_event_target(state.event_target_pid)
-    Process.demonitor(state.holder_monitor, [:flush])
-
-    if not state.closed do
-      :ok = Dispatcher.unregister(state.dispatcher, self())
-    end
-
-    Process.unalias(state.address)
+    MessageTarget.close(state.target)
+    state.adapter.leave(state.name, self())
     :ok
   end
 
-  defp do_handle_call(:debug_server_pid, _snapshot, state), do: {:reply, self(), state}
+  defp request({:post, payload}, state) do
+    :ok = state.adapter.broadcast(state.name, self(), {:broadcast_channel_message, payload})
+    {:reply, :ok, state}
+  end
 
-  defp do_handle_call(:get_onmessage, _snapshot, state) do
-    case check_open(state) do
-      {:ok, next_state} -> {:reply, next_state.onmessage, next_state}
-      {:error, exception} -> {:reply, {:error, exception}, state}
+  defp request(:open?, state), do: {:reply, true, state}
+  defp request(:close, state), do: {:stop, :normal, :ok, state}
+
+  defp request(request, state) do
+    case MessageTarget.request(state.target, request) do
+      {:reply, reply, target} -> {:reply, reply, %{state | target: target}}
+      :unknown -> {:reply, {:error, :unknown_request}, state}
     end
   end
 
-  defp do_handle_call({:set_onmessage, callback}, _snapshot, state) do
-    case check_open(state) do
-      {:ok, next_state} -> {:reply, :ok, %{next_state | onmessage: callback}}
-      {:error, exception} -> {:reply, {:error, exception}, state}
-    end
+  defp closed_error do
+    DOMException.exception(name: "InvalidStateError", message: "The BroadcastChannel is closed.")
   end
-
-  defp do_handle_call({:add_event_listener, type, callback, options}, _snapshot, state) do
-    case check_open(state) do
-      {:ok, next_state} ->
-        :ok =
-          EventTargetServer.add_event_listener(
-            next_state.event_target_pid,
-            type,
-            callback,
-            options
-          )
-
-        {:reply, :ok, next_state}
-
-      {:error, exception} ->
-        {:reply, {:error, exception}, state}
-    end
-  end
-
-  defp do_handle_call({:remove_event_listener, type, callback}, _snapshot, state) do
-    case check_open(state) do
-      {:ok, next_state} ->
-        :ok = EventTargetServer.remove_event_listener(next_state.event_target_pid, type, callback)
-        {:reply, :ok, next_state}
-
-      {:error, exception} ->
-        {:reply, {:error, exception}, state}
-    end
-  end
-
-  defp do_handle_call({:dispatch_event, event}, snapshot, state) do
-    case check_open(state) do
-      {:ok, next_state} ->
-        dispatched? =
-          EventTargetServer.dispatch_event(next_state.event_target_pid, event, snapshot)
-
-        {:reply, dispatched?, next_state}
-
-      {:error, exception} ->
-        {:reply, {:error, exception}, state}
-    end
-  end
-
-  defp do_handle_call({:post_message, data, origin}, snapshot, state) do
-    case check_open(state) do
-      {:ok, next_state} ->
-        cloned = Web.structured_clone(data)
-        serialized = StructuredData.serialize(cloned)
-
-        :ok =
-          Dispatcher.post(next_state.dispatcher, self(), %{
-            origin: origin,
-            serialized: serialized,
-            snapshot: snapshot
-          })
-
-        {:reply, :ok, next_state}
-
-      {:error, exception} ->
-        {:reply, {:error, exception}, state}
-    end
-  rescue
-    exception in [DOMException, TypeError] ->
-      {:reply, {:error, exception}, state}
-  end
-
-  defp do_handle_call(:close, _snapshot, state) do
-    {:reply, :ok, close_state(state)}
-  end
-
-  defp do_handle_call(_body, _snapshot, state) do
-    {:reply, {:error, data_clone_error_exception()}, state}
-  end
-
-  defp do_handle_cast(
-         {:deliver, dispatcher, dispatch_ref, %{origin: origin, serialized: serialized}},
-         snapshot,
-         state
-       ) do
-    next_state =
-      if state.closed,
-        do: state,
-        else: deliver_message(state, origin, serialized, snapshot)
-
-    send(dispatcher, {:broadcast_channel_delivery_complete, dispatch_ref, self()})
-    {:noreply, next_state}
-  rescue
-    exception ->
-      send(dispatcher, {:broadcast_channel_delivery_complete, dispatch_ref, self()})
-      reraise(exception, __STACKTRACE__)
-  end
-
-  defp do_handle_cast(_body, _snapshot, state), do: {:noreply, state}
-
-  defp deliver_message(state, origin, serialized, snapshot) do
-    Snapshot.run(snapshot, fn ->
-      with_local_state(state, fn ->
-        event =
-          MessageEvent.new("message",
-            data: StructuredData.deserialize(serialized),
-            origin: origin,
-            source: nil,
-            target: public_channel(state)
-          )
-
-        invoke_onmessage(state, event)
-        dispatch_event_target(state, event)
-      end)
-    end)
-  end
-
-  defp invoke_onmessage(%{onmessage: nil}, _event), do: :ok
-
-  defp invoke_onmessage(%{onmessage: callback}, event) when is_function(callback, 1) do
-    callback.(event)
-  end
-
-  defp invoke_onmessage(%{onmessage: callback}, _event) when is_function(callback, 0) do
-    callback.()
-  end
-
-  defp dispatch_event_target(state, event) do
-    _dispatched? =
-      EventTargetServer.dispatch_event(state.event_target_pid, event, Snapshot.take())
-
-    :ok
-  end
-
-  defp local_post(state, _data) when state.closed, do: raise(data_clone_error_exception())
-
-  defp local_post(state, data) do
-    cloned = Web.structured_clone(data)
-    serialized = StructuredData.serialize(cloned)
-
-    :ok =
-      Dispatcher.post(state.dispatcher, self(), %{
-        origin: origin(),
-        serialized: serialized,
-        snapshot: Snapshot.take()
-      })
-  end
-
-  defp with_local_state(state, fun) when is_function(fun, 0) do
-    previous = Process.get(@local_state_key)
-    put_local_state(state)
-
-    try do
-      fun.()
-      current_local_state()
-    after
-      restore_local_state(previous)
-    end
-  end
-
-  defp local_state(%BroadcastChannel{} = channel) do
-    case Process.get(@local_state_key) do
-      %{key: key, state: state} ->
-        if key == handle_key(channel) do
-          {:ok, state}
-        else
-          :error
-        end
-
-      _other ->
-        :error
-    end
-  end
-
-  defp current_local_state do
-    case Process.get(@local_state_key) do
-      %{state: state} -> state
-      _other -> raise "missing local BroadcastChannel state"
-    end
-  end
-
-  defp put_local_state(state) do
-    Process.put(@local_state_key, %{key: handle_key(public_channel(state)), state: state})
-    state
-  end
-
-  defp restore_local_state(previous) do
-    Process.put(@local_state_key, previous)
-    :ok
-  end
-
-  defp close_state(%{closed: true} = state), do: state
-
-  defp close_state(state) do
-    Process.unalias(state.address)
-    :ok = Dispatcher.unregister(state.dispatcher, self())
-    %{state | closed: true, onmessage: nil}
-  end
-
-  defp open_local_state!(state) do
-    case check_open(state) do
-      {:ok, next_state} -> next_state
-      {:error, exception} -> raise(exception)
-    end
-  end
-
-  defp check_open(%{closed: false} = state), do: {:ok, state}
-  defp check_open(_state), do: {:error, data_clone_error_exception()}
-
-  defp request(%BroadcastChannel{} = channel, body, timeout \\ @call_timeout) do
-    request_target(channel.address, channel.token, body, timeout)
-  end
-
-  defp request_target(target, token, body, timeout)
-       when (is_pid(target) or is_reference(target)) and is_reference(token) do
-    reply_ref = make_ref()
-    send(target, {:"$gen_call", {self(), reply_ref}, Envelope.new(token, body)})
-    await_reply(reply_ref, timeout)
-  end
-
-  defp await_reply(reply_ref, timeout) do
-    receive do
-      {^reply_ref, reply} -> reply
-    after
-      timeout -> {:error, data_clone_error_exception()}
-    end
-  end
-
-  defp stop_event_target(pid) do
-    if is_pid(pid) and Process.alive?(pid) do
-      Process.unlink(pid)
-      GenServer.stop(pid, :normal)
-    end
-
-    :ok
-  end
-
-  defp public_channel(state) do
-    %BroadcastChannel{
-      address: state.address,
-      token: state.token,
-      name: state.name,
-      onmessage: state.onmessage
-    }
-  end
-
-  defp handle_key(%BroadcastChannel{address: address, token: token}), do: {address, token}
-
-  defp data_clone_error_exception do
-    DOMException.exception(name: "DataCloneError", message: "BroadcastChannel handle is invalid")
-  end
-
-  defp origin do
-    "node://" <> Atom.to_string(node())
-  end
-
-  defp raise_on_error({:error, exception}), do: raise(exception)
-  defp raise_on_error(value), do: value
 end

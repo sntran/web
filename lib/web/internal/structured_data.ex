@@ -1,529 +1,460 @@
 defmodule Web.Internal.StructuredData do
   @moduledoc false
 
+  # The structured clone algorithm of the HTML Standard, for Elixir terms.
+  #
+  # `serialize/2` makes a record in the process that sends a value, and
+  # `deserialize/1` makes the value again in the process that gets it. A
+  # message port and a broadcast channel send the record between the two.
+  #
+  # An Elixir term cannot change, thus a copy of plain data is the same
+  # term. Only a value that has an identity gets a new one: a
+  # `Web.ArrayBuffer`, a `Web.Uint8Array`, a `Web.Blob`, and a `Web.File`.
+  # The record replaces each of these values with a `Node`. The function
+  # `deserialize/1` makes one new value for each node. Two references to
+  # one value in the input are two references to one new value in the
+  # result.
+  #
+  # The algorithm reads the input one time to find the values that cannot
+  # be cloned. It builds a new term only when the input has a value with an
+  # identity.
+
   alias Web.ArrayBuffer
   alias Web.Blob
   alias Web.DOMException
   alias Web.File
-  alias Web.Headers
-  alias Web.Internal.MessagePort, as: MessagePortRuntime
-  alias Web.Internal.Reference
+  alias Web.Internal.MessagePort, as: PortEngine
   alias Web.MessagePort
   alias Web.TypeError
   alias Web.Uint8Array
-  alias Web.URLSearchParams
 
-  @type node_id :: pos_integer()
-  @type serialized :: %{root: node_id(), nodes: %{node_id() => map()}}
+  defmodule Record do
+    @moduledoc false
 
-  @spec clone(term(), keyword()) :: term()
+    # `plain` is true when `value` has no `Node`. Then `value` is the result.
+    # `ports` has the new handles of the message ports of the transfer list,
+    # in the sequence of that list.
+    @enforce_keys [:value, :plain]
+    defstruct [:value, :plain, ports: []]
+
+    @type t :: %__MODULE__{value: term(), plain: boolean(), ports: [map()]}
+  end
+
+  defmodule Node do
+    @moduledoc false
+
+    # Replaces, in a record, a value that has an identity. Two nodes with
+    # the same key become one value.
+    @enforce_keys [:type, :key]
+    defstruct [:type, :key, :data]
+  end
+
+  @type option :: {:transfer, list()} | {:port_holder, pid()}
+
+  @doc """
+  Returns a structured clone of `value`.
+  """
+  @spec clone(term(), [option()]) :: term()
   def clone(value, opts \\ []) do
     value
     |> serialize(opts)
     |> deserialize()
   end
 
-  @spec serialize(term(), keyword()) :: serialized()
+  @doc """
+  Makes the record of `value`, and moves each value of the transfer list.
+
+  The option `:port_holder` is the process that keeps a transferred message
+  port alive. The default is the process that calls this function.
+
+  The function changes nothing when it raises.
+  """
+  @spec serialize(term(), [option()]) :: Record.t()
   def serialize(value, opts \\ []) do
-    {transfer, message_port_recipient} = normalize_transfer!(opts)
-    transfer_keys = validate_transfer_list!(transfer)
+    {transfer, holder} = options!(opts)
+    transfer_keys = transfer_keys!(transfer)
 
-    {root, ctx} =
-      serialize_node(value, %{
-        next_id: 1,
-        memo: %{},
-        nodes: %{},
-        transfer: transfer,
-        transfer_keys: transfer_keys,
-        message_port_recipient: message_port_recipient
-      })
+    special? = scan(value, false, %{transfer: transfer_keys, inside: nil})
+    :ok = Enum.each(transfer, &attached!/1)
 
-    nodes = detach_transferables(transfer, ctx.nodes, message_port_recipient)
+    {tree, plain?} =
+      if special? do
+        {tree, _ctx} = build(value, %{memo: %{}, next: 0, transfer: transfer_keys})
+        {tree, false}
+      else
+        {value, true}
+      end
 
-    %{root: root, nodes: nodes}
+    %Record{value: tree, plain: plain?, ports: move(transfer, holder)}
   end
 
-  @spec deserialize(serialized()) :: term()
-  def deserialize(%{root: root, nodes: nodes}) when is_integer(root) and is_map(nodes) do
-    {value, _memo} = deserialize_node(root, nodes, %{})
+  @doc """
+  Makes the value of a record.
+  """
+  @spec deserialize(Record.t()) :: term()
+  def deserialize(%Record{} = record) do
+    {value, _ports} = deserialize_with_ports(record)
     value
   end
 
-  defp normalize_transfer!(opts) when is_list(opts) do
-    if Keyword.keyword?(opts) do
-      normalize_keyword_transfer!(opts)
-    else
-      raise ArgumentError, "structured_clone options must be a keyword list"
+  @doc """
+  Makes the value of a record, and the list of the transferred message
+  ports.
+  """
+  @spec deserialize_with_ports(Record.t()) :: {term(), [MessagePort.t()]}
+  def deserialize_with_ports(%Record{value: value, plain: true, ports: ports}) do
+    {value, Enum.map(ports, &PortEngine.deserialize/1)}
+  end
+
+  def deserialize_with_ports(%Record{value: tree, plain: false, ports: ports}) do
+    ports = Enum.map(ports, &PortEngine.deserialize/1)
+
+    memo =
+      ports
+      |> Enum.with_index()
+      |> Map.new(fn {port, index} -> {{:port, index}, port} end)
+
+    {value, _memo} = revive(tree, memo)
+    {value, ports}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Options and the transfer list
+  # ---------------------------------------------------------------------------
+
+  defp options!(opts) do
+    if not Keyword.keyword?(opts) do
+      raise TypeError, "The options must be a keyword list, got: #{inspect(opts)}"
     end
-  end
 
-  defp normalize_transfer!(other) do
-    raise ArgumentError, "structured_clone options must be a keyword list, got: #{inspect(other)}"
-  end
-
-  defp normalize_keyword_transfer!(opts) do
-    case Keyword.keys(opts) -- [:transfer, :message_port_recipient] do
+    case Keyword.keys(opts) -- [:transfer, :port_holder] do
       [] -> :ok
-      unknown -> raise ArgumentError, "unknown structured_clone options: #{inspect(unknown)}"
+      unknown -> raise TypeError, "Unknown options: #{inspect(unknown)}"
     end
 
     transfer = Keyword.get(opts, :transfer, [])
+    holder = Keyword.get(opts, :port_holder, self())
 
-    message_port_recipient =
-      validate_message_port_recipient!(Keyword.get(opts, :message_port_recipient))
-
-    if is_list(transfer) do
-      {transfer, message_port_recipient}
-    else
-      raise ArgumentError, "structured_clone transfer option must be a list"
+    if not is_list(transfer) do
+      raise TypeError, "The option :transfer must be a list, got: #{inspect(transfer)}"
     end
+
+    if not is_pid(holder) do
+      raise TypeError, "The option :port_holder must be a pid, got: #{inspect(holder)}"
+    end
+
+    {transfer, holder}
   end
 
-  defp validate_message_port_recipient!(nil), do: nil
-
-  defp validate_message_port_recipient!(message_port_recipient)
-       when is_pid(message_port_recipient), do: message_port_recipient
-
-  defp validate_message_port_recipient!(_other) do
-    raise ArgumentError, "structured_clone message_port_recipient must be a pid or nil"
-  end
-
-  defp validate_transfer_list!(transfer) do
-    Enum.reduce(transfer, MapSet.new(), fn item, seen ->
-      validate_transferable!(item)
+  # The map from the identity of each value of the transfer list to its
+  # position in the list.
+  defp transfer_keys!(transfer) do
+    transfer
+    |> Enum.with_index()
+    |> Enum.reduce(%{}, fn {item, index}, keys ->
       key = transfer_key!(item)
 
-      if MapSet.member?(seen, key) do
-        data_clone_error!("Transfer list contains duplicate entries")
-      else
-        MapSet.put(seen, key)
+      if is_map_key(keys, key) do
+        data_clone_error!("The transfer list has the same value two times.")
       end
+
+      Map.put(keys, key, index)
     end)
   end
 
-  defp validate_transferable!(%ArrayBuffer{} = buffer) do
+  defp transfer_key!(%ArrayBuffer{} = buffer), do: buffer_key(buffer)
+  defp transfer_key!(%MessagePort{} = port), do: port_key(port)
+
+  defp transfer_key!(other) do
+    data_clone_error!("A value of the transfer list cannot be transferred: #{inspect(other)}")
+  end
+
+  defp buffer_key(%ArrayBuffer{} = buffer) do
+    case ArrayBuffer.identity(buffer) do
+      nil -> {ArrayBuffer, buffer}
+      id -> {ArrayBuffer, id}
+    end
+  end
+
+  defp port_key(%MessagePort{address: address, token: token}), do: {MessagePort, address, token}
+
+  defp attached!(%ArrayBuffer{} = buffer) do
     if ArrayBuffer.detached?(buffer) do
-      raise TypeError.exception("Cannot structured_clone a detached ArrayBuffer")
+      data_clone_error!("A detached ArrayBuffer cannot be transferred.")
+    end
+  end
+
+  defp attached!(%MessagePort{} = port), do: PortEngine.ensure_transferable(port)
+
+  # Detaches the buffers, and gives the ports to their new holder.
+  defp move(transfer, holder) do
+    Enum.flat_map(transfer, fn
+      %ArrayBuffer{} = buffer ->
+        ArrayBuffer.detach(buffer)
+        []
+
+      %MessagePort{} = port ->
+        [PortEngine.detach_transferable(port, holder)]
+    end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # The first read: find the values that cannot be cloned
+  # ---------------------------------------------------------------------------
+
+  # Returns true when the value has a part that needs a node.
+  defp scan(value, special?, _env)
+       when is_atom(value) or is_number(value) or is_bitstring(value),
+       do: special?
+
+  defp scan([head | tail], special?, env), do: scan(tail, scan(head, special?, env), env)
+  defp scan([], special?, _env), do: special?
+
+  defp scan(value, special?, env) when is_tuple(value) do
+    scan(Tuple.to_list(value), special?, env)
+  end
+
+  defp scan(%ArrayBuffer{} = buffer, _special?, _env) do
+    if ArrayBuffer.detached?(buffer) do
+      data_clone_error!("A detached ArrayBuffer cannot be cloned.")
     end
 
-    :ok
+    true
   end
 
-  defp validate_transferable!(%MessagePort{} = port) do
-    MessagePortRuntime.ensure_transferable(port)
+  defp scan(%Uint8Array{buffer: buffer}, special?, env), do: scan(buffer, special?, env)
+
+  defp scan(%Blob{parts: parts}, special?, env) do
+    _special? = scan(parts, special?, %{env | inside: Blob})
+    true
   end
 
-  defp validate_transferable!(other) do
-    data_clone_error!("Transfer list contains a non-transferable value: #{inspect(other)}")
+  defp scan(%File{stream: nil, parts: parts}, special?, env) do
+    _special? = scan(parts, special?, %{env | inside: File})
+    true
   end
 
-  defp serialize_node(value, ctx) do
-    case memo_key(value) do
-      {:ok, key} when is_map_key(ctx.memo, key) ->
-        {Map.fetch!(ctx.memo, key), ctx}
+  defp scan(%File{}, _special?, _env) do
+    data_clone_error!("A file that has a stream cannot be cloned.")
+  end
+
+  defp scan(%MessagePort{} = port, _special?, env) do
+    if not is_map_key(env.transfer, port_key(port)) do
+      data_clone_error!("A MessagePort cannot be cloned. Put it in the transfer list.")
+    end
+
+    true
+  end
+
+  defp scan(%Regex{}, _special?, _env), do: true
+
+  defp scan(%module{}, _special?, _env) when module in [Record, Node] do
+    data_clone_error!("An internal record of the structured clone cannot be cloned.")
+  end
+
+  # These structs are not data, also when they have no pid at this time:
+  # a promise that is settled, a signal that is aborted, a response with no
+  # body. The Standards do not make them serializable.
+  @live [Web.Request, Web.Response, Web.Promise, Web.AbortSignal, Web.AbortController]
+
+  defp scan(%module{}, _special?, _env) when module in @live do
+    data_clone_error!("A #{inspect(module)} cannot be cloned.")
+  end
+
+  defp scan(%module{} = struct, special?, env) do
+    struct
+    |> Map.from_struct()
+    |> Map.values()
+    |> scan(special?, %{env | inside: module})
+  end
+
+  defp scan(%{} = map, special?, env) do
+    :maps.fold(fn key, value, acc -> scan(value, scan(key, acc, env), env) end, special?, map)
+  end
+
+  defp scan(value, _special?, env) do
+    kind =
+      cond do
+        is_pid(value) -> "A pid"
+        is_function(value) -> "A function"
+        is_reference(value) -> "A reference"
+        is_port(value) -> "A port"
+      end
+
+    place =
+      case env.inside do
+        nil -> ""
+        module -> " It is in a #{inspect(module)} struct."
+      end
+
+    data_clone_error!("#{kind} cannot be cloned.#{place}")
+  end
+
+  # ---------------------------------------------------------------------------
+  # The second read: put a node in the place of each value with an identity
+  # ---------------------------------------------------------------------------
+
+  defp build(value, ctx)
+       when is_atom(value) or is_number(value) or is_bitstring(value),
+       do: {value, ctx}
+
+  defp build([head | tail], ctx) do
+    {head, ctx} = build(head, ctx)
+    {tail, ctx} = build(tail, ctx)
+    {[head | tail], ctx}
+  end
+
+  defp build([], ctx), do: {[], ctx}
+
+  defp build(value, ctx) when is_tuple(value) do
+    {items, ctx} = build(Tuple.to_list(value), ctx)
+    {List.to_tuple(items), ctx}
+  end
+
+  defp build(%ArrayBuffer{} = buffer, ctx) do
+    node(ArrayBuffer, ArrayBuffer.identity(buffer), ctx, fn key, ctx ->
+      {%Node{type: :array_buffer, key: key, data: buffer.data}, ctx}
+    end)
+  end
+
+  defp build(%Uint8Array{} = view, ctx) do
+    node(Uint8Array, Uint8Array.identity(view), ctx, fn key, ctx ->
+      {buffer, ctx} = build(view.buffer, ctx)
+      data = {buffer, view.byte_offset, view.byte_length}
+      {%Node{type: :uint8_array, key: key, data: data}, ctx}
+    end)
+  end
+
+  defp build(%Blob{} = blob, ctx) do
+    node(Blob, Blob.identity(blob), ctx, fn key, ctx ->
+      {parts, ctx} = build(blob.parts, ctx)
+      {%Node{type: :blob, key: key, data: {parts, blob.type}}, ctx}
+    end)
+  end
+
+  defp build(%File{} = file, ctx) do
+    node(File, File.identity(file), ctx, fn key, ctx ->
+      {parts, ctx} = build(file.parts, ctx)
+
+      data = [
+        name: file.name,
+        filename: file.filename,
+        type: file.type,
+        size: file.size
+      ]
+
+      {%Node{type: :file, key: key, data: {parts, data}}, ctx}
+    end)
+  end
+
+  defp build(%MessagePort{} = port, ctx) do
+    index = Map.fetch!(ctx.transfer, port_key(port))
+    {%Node{type: :message_port, key: {:port, index}}, ctx}
+  end
+
+  # A compiled pattern is not valid on a different node. The record has the
+  # source, and the result has a pattern that is compiled again.
+  defp build(%Regex{} = regex, ctx) do
+    {%Node{type: :regex, key: nil, data: {Regex.source(regex), Regex.opts(regex)}}, ctx}
+  end
+
+  defp build(%{} = map, ctx) do
+    {pairs, ctx} =
+      map
+      |> Map.to_list()
+      |> Enum.map_reduce(ctx, fn {key, value}, ctx ->
+        {key, ctx} = build(key, ctx)
+        {value, ctx} = build(value, ctx)
+        {{key, value}, ctx}
+      end)
+
+    {:maps.from_list(pairs), ctx}
+  end
+
+  # Makes one node for one identity. A value with no identity gets a new
+  # node each time.
+  defp node(_module, nil, ctx, make) do
+    make.({:node, ctx.next}, %{ctx | next: ctx.next + 1})
+  end
+
+  defp node(module, identity, ctx, make) do
+    case ctx.memo do
+      %{{^module, ^identity} => node} ->
+        {node, ctx}
 
       _ ->
-        serialize_fresh(value, ctx)
+        {node, ctx} = make.({:node, ctx.next}, %{ctx | next: ctx.next + 1})
+        {node, put_in(ctx.memo[{module, identity}], node)}
     end
   end
 
-  defp serialize_fresh(value, ctx) do
-    case reserve_node(value, ctx) do
-      {:ok, id, next_ctx} -> serialize_reserved(value, id, next_ctx)
-      # coveralls-ignore-next-line
-      :error -> serialize_reserved(value, nil, ctx)
-    end
+  # ---------------------------------------------------------------------------
+  # The result: make a new value for each node
+  # ---------------------------------------------------------------------------
+
+  defp revive(value, memo)
+       when is_atom(value) or is_number(value) or is_bitstring(value),
+       do: {value, memo}
+
+  defp revive([head | tail], memo) do
+    {head, memo} = revive(head, memo)
+    {tail, memo} = revive(tail, memo)
+    {[head | tail], memo}
   end
 
-  defp serialize_reserved(value, id, ctx)
+  defp revive([], memo), do: {[], memo}
 
-  defp serialize_reserved(value, id, ctx)
-       when value in [nil, true, false] or is_integer(value) or is_float(value) or
-              is_binary(value) do
-    id = ensure_node_id!(id)
-    {id, put_node(ctx, id, %{type: :primitive, value: value})}
+  defp revive(value, memo) when is_tuple(value) do
+    {items, memo} = revive(Tuple.to_list(value), memo)
+    {List.to_tuple(items), memo}
   end
 
-  defp serialize_reserved(value, _id, _ctx) when is_atom(value) do
-    data_clone_error!("Atoms are not structured-clone serializable: #{inspect(value)}")
-  end
-
-  defp serialize_reserved(value, _id, _ctx) when is_pid(value) do
-    data_clone_error!("PIDs are not structured-clone serializable")
-  end
-
-  defp serialize_reserved(value, _id, _ctx) when is_port(value) do
-    data_clone_error!("Ports are not structured-clone serializable")
-  end
-
-  defp serialize_reserved(value, _id, _ctx) when is_function(value) do
-    data_clone_error!("Functions are not structured-clone serializable")
-  end
-
-  defp serialize_reserved(value, _id, _ctx) when is_reference(value) do
-    data_clone_error!("References are not structured-clone serializable")
-  end
-
-  defp serialize_reserved(%DateTime{} = value, id, ctx) do
-    id = ensure_node_id!(id)
-    {id, put_node(ctx, id, %{type: :date_time, value: Map.from_struct(value)})}
-  end
-
-  defp serialize_reserved(%Regex{} = value, id, ctx) do
-    id = ensure_node_id!(id)
-    node = %{type: :regex, source: Regex.source(value), opts: Regex.opts(value)}
-    {id, put_node(ctx, id, node)}
-  end
-
-  defp serialize_reserved(%ArrayBuffer{} = value, id, ctx) do
-    id = ensure_node_id!(id)
-
-    if ArrayBuffer.detached?(value) do
-      raise TypeError.exception("Cannot structured_clone a detached ArrayBuffer")
-    end
-
-    node = %{
-      type: :array_buffer,
-      data: ArrayBuffer.data(value),
-      transferred: MapSet.member?(ctx.transfer_keys, transfer_key!(value))
-    }
-
-    {id, put_node(ctx, id, node)}
-  end
-
-  defp serialize_reserved(%MessagePort{} = value, id, ctx) do
-    id = ensure_node_id!(id)
-
-    if MapSet.member?(ctx.transfer_keys, transfer_key!(value)) do
-      {id, put_node(ctx, id, %{type: :message_port, address: value.address, token: value.token})}
-    else
-      data_clone_error!("MessagePort values must be transferred")
-    end
-  end
-
-  defp serialize_reserved(%Uint8Array{} = value, id, ctx) do
-    id = ensure_node_id!(id)
-    {buffer_id, final_ctx} = serialize_node(value.buffer, ctx)
-
-    node = %{
-      type: :uint8_array,
-      buffer: buffer_id,
-      byte_offset: value.byte_offset,
-      byte_length: value.byte_length
-    }
-
-    {id, put_node(final_ctx, id, node)}
-  end
-
-  defp serialize_reserved(%Blob{} = value, id, ctx) do
-    id = ensure_node_id!(id)
-    {part_ids, final_ctx} = serialize_many(value.parts, ctx)
-
-    node = %{type: :blob, parts: part_ids, blob_type: value.type}
-    {id, put_node(final_ctx, id, node)}
-  end
-
-  defp serialize_reserved(%File{stream: nil} = value, id, ctx) do
-    id = ensure_node_id!(id)
-    {part_ids, final_ctx} = serialize_many(value.parts, ctx)
-
-    node = %{
-      type: :file,
-      parts: part_ids,
-      file_type: value.type,
-      name: value.name,
-      filename: value.filename,
-      size: value.size
-    }
-
-    {id, put_node(final_ctx, id, node)}
-  end
-
-  defp serialize_reserved(%File{}, _id, _ctx) do
-    data_clone_error!("Files backed by a live stream are not structured-clone serializable")
-  end
-
-  defp serialize_reserved(%Headers{} = value, id, ctx) do
-    id = ensure_node_id!(id)
-    node = %{type: :headers, entries: Headers.to_list(value)}
-    {id, put_node(ctx, id, node)}
-  end
-
-  defp serialize_reserved(%URLSearchParams{} = value, id, ctx) do
-    id = ensure_node_id!(id)
-    node = %{type: :url_search_params, pairs: URLSearchParams.to_list(value)}
-    {id, put_node(ctx, id, node)}
-  end
-
-  defp serialize_reserved(%MapSet{} = value, id, ctx) do
-    id = ensure_node_id!(id)
-    {item_ids, final_ctx} = serialize_many(MapSet.to_list(value), ctx)
-    {id, put_node(final_ctx, id, %{type: :map_set, items: item_ids})}
-  end
-
-  defp serialize_reserved(value, id, ctx) when is_list(value) do
-    id = ensure_node_id!(id)
-    {item_ids, final_ctx} = serialize_many(value, ctx)
-    {id, put_node(final_ctx, id, %{type: :list, items: item_ids})}
-  end
-
-  defp serialize_reserved(value, id, ctx) when is_map(value) do
-    id = ensure_node_id!(id)
-    {entries, final_ctx} = serialize_map_entries(Map.to_list(value), ctx)
-    {id, put_node(final_ctx, id, %{type: :map, entries: entries})}
-  end
-
-  defp serialize_reserved(value, _id, _ctx) when is_tuple(value) do
-    data_clone_error!("Tuples are not structured-clone serializable: #{inspect(value)}")
-  end
-
-  defp serialize_reserved(value, _id, _ctx) do
-    data_clone_error!("Value is not structured-clone serializable: #{inspect(value)}")
-  end
-
-  defp serialize_many(values, ctx) do
-    Enum.map_reduce(values, ctx, fn value, acc ->
-      serialize_node(value, acc)
-    end)
-  end
-
-  defp serialize_map_entries(entries, ctx) do
-    Enum.map_reduce(entries, ctx, fn {key, value}, acc ->
-      {key_id, next_acc} = serialize_node(key, acc)
-      {value_id, final_acc} = serialize_node(value, next_acc)
-      {{key_id, value_id}, final_acc}
-    end)
-  end
-
-  defp deserialize_node(id, nodes, memo) do
-    case Map.get(memo, id) do
-      {:done, value} ->
-        {value, memo}
-
-      :pending ->
-        {%Reference{id: id}, memo}
-
-      nil ->
-        memo = Map.put(memo, id, :pending)
-        {value, next_memo} = build_node(Map.fetch!(nodes, id), nodes, memo)
-        {value, Map.put(next_memo, id, {:done, value})}
-    end
-  end
-
-  defp build_node(%{type: :primitive, value: value}, _nodes, memo), do: {value, memo}
-
-  defp build_node(%{type: :date_time, value: value}, _nodes, memo) do
-    {struct(DateTime, value), memo}
-  end
-
-  defp build_node(%{type: :regex, source: source, opts: opts}, _nodes, memo) do
+  defp revive(%Node{type: :regex, data: {source, opts}}, memo) do
     {Regex.compile!(source, opts), memo}
   end
 
-  defp build_node(%{type: :array_buffer, data: data}, _nodes, memo) do
-    {ArrayBuffer.new(data), memo}
-  end
+  defp revive(%Node{key: key} = node, memo) do
+    case memo do
+      %{^key => value} ->
+        {value, memo}
 
-  defp build_node(%{type: :message_port, address: address, token: token}, _nodes, memo) do
-    {MessagePortRuntime.deserialize(%{address: address, token: token}), memo}
-  end
-
-  defp build_node(
-         %{type: :uint8_array, buffer: buffer_id, byte_offset: offset, byte_length: length},
-         nodes,
-         memo
-       ) do
-    {buffer, next_memo} = deserialize_node(buffer_id, nodes, memo)
-    {Uint8Array.new(buffer, offset, length), next_memo}
-  end
-
-  defp build_node(%{type: :blob, parts: part_ids, blob_type: blob_type}, nodes, memo) do
-    {parts, next_memo} = deserialize_many(part_ids, nodes, memo)
-    {Blob.new(parts, type: blob_type), next_memo}
-  end
-
-  defp build_node(
-         %{
-           type: :file,
-           parts: part_ids,
-           file_type: file_type,
-           name: name,
-           filename: filename,
-           size: size
-         },
-         nodes,
-         memo
-       ) do
-    {parts, next_memo} = deserialize_many(part_ids, nodes, memo)
-
-    file =
-      File.new(parts, name: name, filename: filename, type: file_type, size: size, stream: nil)
-
-    {file, next_memo}
-  end
-
-  defp build_node(%{type: :headers, entries: entries}, _nodes, memo) do
-    {Headers.new(entries), memo}
-  end
-
-  defp build_node(%{type: :url_search_params, pairs: pairs}, _nodes, memo) do
-    {URLSearchParams.new(pairs), memo}
-  end
-
-  defp build_node(%{type: :map_set, items: item_ids}, nodes, memo) do
-    {items, next_memo} = deserialize_many(item_ids, nodes, memo)
-    {MapSet.new(items), next_memo}
-  end
-
-  defp build_node(%{type: :list, items: item_ids}, nodes, memo) do
-    deserialize_many(item_ids, nodes, memo)
-  end
-
-  defp build_node(%{type: :map, entries: entries}, nodes, memo) do
-    Enum.reduce(entries, {%{}, memo}, fn {key_id, value_id}, {acc, current_memo} ->
-      {key, next_memo} = deserialize_node(key_id, nodes, current_memo)
-      {value, final_memo} = deserialize_node(value_id, nodes, next_memo)
-      {Map.put(acc, key, value), final_memo}
-    end)
-  end
-
-  defp deserialize_many(ids, nodes, memo) do
-    Enum.map_reduce(ids, memo, fn id, acc ->
-      deserialize_node(id, nodes, acc)
-    end)
-  end
-
-  defp reserve_node(value, ctx) do
-    case memo_key(value) do
-      {:ok, key} ->
-        id = ctx.next_id
-
-        next_ctx = %{
-          ctx
-          | next_id: id + 1,
-            memo: Map.put(ctx.memo, key, id),
-            nodes: Map.put(ctx.nodes, id, :pending)
-        }
-
-        {:ok, id, next_ctx}
-
-      # coveralls-ignore-next-line
-      :error ->
-        :error
+      _ ->
+        {value, memo} = make(node, memo)
+        {value, Map.put(memo, key, value)}
     end
   end
 
-  defp put_node(ctx, id, node) do
-    %{ctx | nodes: Map.put(ctx.nodes, id, node)}
+  defp revive(%{} = map, memo) do
+    {pairs, memo} =
+      map
+      |> Map.to_list()
+      |> Enum.map_reduce(memo, fn {key, value}, memo ->
+        {key, memo} = revive(key, memo)
+        {value, memo} = revive(value, memo)
+        {{key, value}, memo}
+      end)
+
+    {:maps.from_list(pairs), memo}
   end
 
-  defp detach_transferables(transfer, nodes, message_port_recipient) do
-    Enum.reduce(transfer, nodes, fn
-      %ArrayBuffer{} = buffer, current_nodes ->
-        ArrayBuffer.detach(buffer)
-        current_nodes
+  defp make(%Node{type: :array_buffer, data: data}, memo), do: {ArrayBuffer.new(data), memo}
 
-      %MessagePort{} = port, current_nodes ->
-        detached_fields = detach_message_port(port, message_port_recipient)
-        rewrite_transferred_message_port(current_nodes, port, detached_fields)
-    end)
+  defp make(%Node{type: :uint8_array, data: {buffer, offset, length}}, memo) do
+    {buffer, memo} = revive(buffer, memo)
+    {Uint8Array.new(buffer, offset, length), memo}
   end
 
-  defp detach_message_port(%MessagePort{} = port, message_port_recipient)
-       when is_pid(message_port_recipient) do
-    MessagePortRuntime.detach_transferable(port, message_port_recipient)
+  defp make(%Node{type: :blob, data: {parts, type}}, memo) do
+    {parts, memo} = revive(parts, memo)
+    {Blob.new(parts, type: type), memo}
   end
 
-  defp detach_message_port(%MessagePort{}, nil) do
-    data_clone_error!("MessagePort transfers require a recipient process")
+  defp make(%Node{type: :file, data: {parts, data}}, memo) do
+    {parts, memo} = revive(parts, memo)
+    {File.new(parts, data), memo}
   end
 
-  defp rewrite_transferred_message_port(
-         nodes,
-         %MessagePort{address: address, token: token},
-         detached_fields
-       ) do
-    Map.new(nodes, fn {id, node} ->
-      {id, rewrite_transferred_message_port_node(node, {address, token}, detached_fields)}
-    end)
-  end
-
-  defp rewrite_transferred_message_port_node(
-         %{type: :message_port, address: address, token: token} = node,
-         {address, token},
-         %{address: next_address, token: next_token}
-       ) do
-    %{node | address: next_address, token: next_token}
-  end
-
-  defp rewrite_transferred_message_port_node(node, _current_handle, _detached_fields), do: node
-
-  defp transfer_key!(%ArrayBuffer{} = buffer) do
-    case ArrayBuffer.identity(buffer) do
-      id when is_reference(id) -> {:transferable, ArrayBuffer, id}
-      _other -> memo_key!(buffer)
-    end
-  end
-
-  defp transfer_key!(%MessagePort{address: address, token: token})
-       when is_reference(address) and is_reference(token) do
-    {:transferable, MessagePort, address, token}
-  end
-
-  defp memo_key(%ArrayBuffer{} = value) do
-    reference_memo_key(ArrayBuffer, ArrayBuffer.identity(value), value)
-  end
-
-  defp memo_key(%MessagePort{address: address, token: token})
-       when is_reference(address) and is_reference(token) do
-    {:ok, {:reference, MessagePort, address, token}}
-  end
-
-  defp memo_key(%Uint8Array{} = value) do
-    reference_memo_key(Uint8Array, Uint8Array.identity(value), value)
-  end
-
-  defp memo_key(%Blob{} = value) do
-    reference_memo_key(Blob, Blob.identity(value), value)
-  end
-
-  defp memo_key(%File{} = value) do
-    reference_memo_key(File, File.identity(value), value)
-  end
-
-  defp memo_key(value) do
-    {:ok, :erlang.term_to_binary(value)}
-  catch
-    # coveralls-ignore-next-line
-    :error, :badarg -> :error
-  end
-
-  defp memo_key!(value) do
-    case memo_key(value) do
-      {:ok, key} -> key
-      # coveralls-ignore-next-line
-      :error -> data_clone_error!("Value is not structured-clone serializable: #{inspect(value)}")
-    end
-  end
-
-  defp reference_memo_key(module, id, _value) when is_reference(id) do
-    {:ok, {:reference, module, id}}
-  end
-
-  defp reference_memo_key(_module, _id, value) do
-    {:ok, :erlang.term_to_binary(value)}
-  catch
-    # coveralls-ignore-next-line
-    :error, :badarg -> :error
-  end
-
-  defp ensure_node_id!(id) when is_integer(id), do: id
-
-  defp ensure_node_id!(_id) do
-    # coveralls-ignore-next-line
-    raise ArgumentError, "structured clone memoization failed to reserve a node id"
-  end
-
+  @spec data_clone_error!(String.t()) :: no_return()
   defp data_clone_error!(message) do
     raise DOMException, name: "DataCloneError", message: message
   end

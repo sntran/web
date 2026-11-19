@@ -13,8 +13,11 @@ defmodule Web.Application do
     Web.URLPattern.params()
 
     children = [
-      %{id: :pg, start: {:pg, :start_link, []}},
-      Web.BroadcastChannel.DispatcherSupervisor,
+      # The groups of the broadcast channels. The scope has its own name,
+      # thus it does not conflict with a `:pg` scope of the application.
+      Web.BroadcastChannel.Adapter.PG,
+      # The servers of the message ports and of the broadcast channels.
+      {DynamicSupervisor, name: Web.MessageSupervisor, strategy: :one_for_one},
       {Task.Supervisor, name: Web.TaskSupervisor},
       Web.AbortSignal.Reasons,
       Web.URLPattern.Cache,

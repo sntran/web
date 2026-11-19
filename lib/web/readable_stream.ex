@@ -52,7 +52,9 @@ defmodule Web.ReadableStream do
       ctrl = controller_for(stream_type, pid)
       fun = source.start
 
-      {:producer, state, [{:next_event, :internal, {:start_task, fn -> fun.(ctrl) end}}]}
+      # The stream waits for a promise that the `start` callback returns.
+      start = fn -> ctrl |> fun.() |> await_pull_result() end
+      {:producer, state, [{:next_event, :internal, {:start_task, start}}]}
     else
       {:producer, state}
     end

@@ -27,7 +27,9 @@ defmodule Web.WritableStream do
     if is_map(sink) and is_function(sink[:start], 1) do
       ctrl = %WritableStreamDefaultController{pid: pid}
       fun = sink.start
-      {:consumer, state, [{:next_event, :internal, {:start_task, fn -> fun.(ctrl) end}}]}
+
+      {:consumer, state,
+       [{:next_event, :internal, {:start_task, fn -> run_start(fun, ctrl) end}}]}
     else
       {:consumer, state}
     end
@@ -220,6 +222,15 @@ defmodule Web.WritableStream do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  # The stream waits for a promise that the `start` callback returns. A
+  # rejection puts the stream in the errored state.
+  defp run_start(fun, ctrl) do
+    case fun.(ctrl) do
+      %Web.Promise{} = promise -> Web.Promise.await(promise)
+      other -> other
+    end
+  end
 
   defp invoke_sink_callback(sink, name, args) do
     case Map.get(sink, name) do

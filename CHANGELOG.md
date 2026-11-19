@@ -85,6 +85,16 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- The packages `mint` (1.11.0), `hpax` (1.1.0), and `idna` (8.0.0) are
+  updated, because `mix hex.audit` reported security advisories for the
+  versions before. `idna` 8.0.0 has the tables of Unicode 18.0.
+- The fixtures of the Web Platform Tests are pinned to a newer commit, which
+  agrees with Unicode 18.0.
+- **Breaking:** `Web.URL` accepts each host that is all ASCII and has no
+  forbidden code point, and changes it to lowercase, as the current URL
+  Standard specifies. A label with the prefix `xn--` that is not valid is
+  thus accepted in an ASCII host, as in browsers. Before, such a host was
+  refused.
 - **Breaking:** `Web.Request.new/2` does the checks of the `Request`
   constructor of the Fetch Standard, and raises `Web.TypeError` for input
   that the Standard refuses. Before, such input was accepted and sent.

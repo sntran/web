@@ -3,7 +3,8 @@ defmodule Web.URL.Punycode do
 
   # The "domain to ASCII" operation of the URL Standard.
   #
-  # The operation is ToASCII of Unicode Technical Standard #46, with these
+  # A domain that is all ASCII changes only to lowercase. For each other
+  # domain, the operation is ToASCII of Unicode Technical Standard #46, with these
   # settings: CheckHyphens false, CheckBidi true, CheckJoiners true,
   # UseSTD3ASCIIRules false, Transitional_Processing false, VerifyDnsLength
   # false, and IgnoreInvalidPunycode false.
@@ -63,17 +64,12 @@ defmodule Web.URL.Punycode do
     end
   end
 
-  # The URL Standard permits this short procedure for an ASCII domain that
-  # has no label with the prefix "xn--".
+  # The URL Standard gives an ASCII domain in lowercase, and does not use the
+  # result of Unicode ToASCII for it. This is also applicable to a label with
+  # the prefix "xn--" that is not valid, because browsers accept such a label.
   defp ascii_passthrough_host?(hostname) do
-    ascii_only? = String.match?(hostname, ~r/^[\x00-\x7F]+$/)
-
-    no_alabels? =
-      hostname
-      |> String.split(".", trim: false)
-      |> Enum.all?(fn label -> not String.starts_with?(String.downcase(label), "xn--") end)
-
-    ascii_only? and no_alabels? and not String.match?(hostname, @forbidden_domain_code_points)
+    String.match?(hostname, ~r/^[\x00-\x7F]+$/) and
+      not String.match?(hostname, @forbidden_domain_code_points)
   end
 
   # A host that ends in a number is an IPv4 address, not a domain.
@@ -126,8 +122,6 @@ defmodule Web.URL.Punycode do
       :I -> :ignored
       :X -> :disallowed
     end
-  rescue
-    ArgumentError -> :disallowed
   end
 
   # ---------------------------------------------------------------------------

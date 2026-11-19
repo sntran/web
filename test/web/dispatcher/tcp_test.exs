@@ -109,7 +109,9 @@ defmodule Web.Dispatcher.TCPTest do
   test "fetch/1 handles standard tcp scheme and yields chunks dynamically" do
     port = TCPServer.start_link("", true)
 
-    req = Request.new("tcp://localhost:#{port}", method: "POST", body: "sent body payload")
+    # The request has no body. This server does not read, thus a body that
+    # the client writes causes a TCP reset, and the last chunk can be lost.
+    req = Request.new("tcp://localhost:#{port}")
     {:ok, resp} = TCP.fetch(req)
 
     assert resp.status == 200

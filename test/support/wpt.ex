@@ -12,7 +12,7 @@ defmodule Web.Platform.Test do
   # the test modules refer to `master`. The loader replaces `master` with this
   # commit, thus a change upstream cannot change the test results. To update
   # the fixtures, change this value and correct the new failures.
-  @wpt_revision "468b711b4ffae476c26266ad83966626599c839b"
+  @wpt_revision "61ad038e419a0bfacee26801e584b5057c3fbd60"
   @cache_dir Path.expand("tmp/wpt_cache", Elixir.File.cwd!())
   # The infrastructure uses an AsyncContext.Variable (referenced via
   # @context_key) to store the URL of the remote spec being processed.

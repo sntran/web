@@ -265,8 +265,9 @@ All notable changes to this project are documented in this file.
   - the readable side of a `Web.Socket`, of `Web.CompressionStream`, and of
     `Web.DecompressionStream`;
   - a default read of a byte stream;
-  - `Web.ReadableStream.from/1` for a `Web.Blob`, a `Web.ArrayBuffer`, or a
-    `Web.Uint8Array`.
+  - `Web.ReadableStream.from/1` for a binary, a `Web.Blob`, a
+    `Web.ArrayBuffer`, a `Web.Uint8Array`, or a `Web.URLSearchParams`. An
+    enumerable gives its elements with no change.
 
   Thus `Enum.join/1` on a body does not work. Use `Web.Response.text/1` or
   `Web.Response.bytes/1` for all the bytes, or `Web.Uint8Array.to_binary/1`

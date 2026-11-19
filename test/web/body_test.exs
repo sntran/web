@@ -12,10 +12,11 @@ defmodule Web.BodyTest do
     defstruct [:body, headers: Web.Headers.new()]
   end
 
-  test "ReadableStream.from/1 normalizes strings and arbitrary binaries" do
-    assert "hello" == "hello" |> ReadableStream.from() |> Enum.join("")
-
-    assert <<0, 255, 1>> == <<0, 255, 1>> |> ReadableStream.from() |> Enum.join("")
+  test "ReadableStream.from/1 gives one Uint8Array for a binary, also for bytes that are not text" do
+    for binary <- ["hello", <<0, 255, 1>>, ""] do
+      assert [%Web.Uint8Array{} = chunk] = binary |> ReadableStream.from() |> Enum.to_list()
+      assert Web.Uint8Array.to_binary(chunk) == binary
+    end
   end
 
   test "ReadableStream.from/1 returns an existing stream as-is" do

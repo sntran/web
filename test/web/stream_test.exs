@@ -343,7 +343,8 @@ defmodule Web.StreamTest do
 
       reader = ReadableStream.get_reader(stream)
       assert ReadableStream.locked?(stream.controller_pid) == true
-      assert await(Web.ReadableStreamDefaultReader.read(reader)) == %{value: "hello", done: false}
+      assert %{value: chunk, done: false} = await(Web.ReadableStreamDefaultReader.read(reader))
+      assert Web.Uint8Array.to_binary(chunk) == "hello"
       assert ReadableStream.disturbed?(stream.controller_pid) == true
       assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
 

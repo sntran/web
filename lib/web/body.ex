@@ -141,13 +141,10 @@ defmodule Web.Body do
   # the Fetch Standard specifies. A stream from the caller stays as it is.
   @spec stream(term()) :: Web.ReadableStream.t()
   def stream(%Web.ReadableStream{} = stream), do: stream
-  def stream(body) when is_binary(body), do: body |> Bytes.chunk() |> Web.ReadableStream.from()
+  def stream(body) when is_binary(body), do: Web.ReadableStream.from(body)
 
-  def stream(%Web.URLSearchParams{} = params) do
-    params |> Web.URLSearchParams.to_string() |> stream()
-  end
-
-  def stream(%struct{} = body) when struct in [Web.Blob, Web.ArrayBuffer, Web.Uint8Array] do
+  def stream(%struct{} = body)
+      when struct in [Web.Blob, Web.ArrayBuffer, Web.Uint8Array, Web.URLSearchParams] do
     Web.ReadableStream.from(body)
   end
 

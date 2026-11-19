@@ -355,7 +355,7 @@ defmodule Web.ReadableStreamTest do
 
     test "from/1 normalizes URLSearchParams, Blob, ArrayBuffer, and Uint8Array" do
       params = Web.URLSearchParams.new(%{"a" => "1", "b" => "2"})
-      assert "a=1&b=2" = params |> ReadableStream.from() |> Enum.join("")
+      assert "a=1&b=2" = params |> ReadableStream.from() |> Web.TestBytes.join()
 
       blob = Web.Blob.new(["he", "ll", "o"])
       assert "hello" = blob |> ReadableStream.from() |> Web.TestBytes.join()

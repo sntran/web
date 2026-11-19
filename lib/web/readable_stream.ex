@@ -182,17 +182,35 @@ defmodule Web.ReadableStream do
   end
 
   @doc """
-  Normalizes body-like input into a `ReadableStream`.
+  Makes a `ReadableStream` from an enumerable, or from a value of bytes.
+
+    * An enumerable gives one chunk for each of its elements, with no
+      change, as `ReadableStream.from()` of the Streams Standard does for
+      an iterable.
+    * A value of bytes gives a stream of bytes: each chunk is a
+      `Web.Uint8Array`. A value of bytes is a binary, a `Web.Blob`, a
+      `Web.ArrayBuffer`, a `Web.Uint8Array`, or a `Web.URLSearchParams` (its
+      text). A binary gives one chunk. In ECMAScript, a string is an
+      iterable of its code points. A binary of the BEAM is not an
+      enumerable, thus this function reads it as bytes.
+    * `nil` gives a stream with no chunks.
+    * A `ReadableStream` is returned with no change.
+
+  Raises `Web.TypeError` for each other value.
 
   ## Examples
 
+      iex> stream = Web.ReadableStream.from(["a", "b"])
+      iex> Enum.to_list(stream)
+      ["a", "b"]
+
       iex> stream = Web.ReadableStream.from("hello")
-      iex> Enum.join(stream, "")
-      "hello"
+      iex> Enum.map(stream, &Web.Uint8Array.to_binary/1)
+      ["hello"]
 
       iex> stream = Web.ReadableStream.from(nil)
-      iex> Enum.join(stream, "")
-      ""
+      iex> Enum.to_list(stream)
+      []
 
       iex> existing = Web.ReadableStream.new()
       iex> Web.ReadableStream.from(existing) == existing
@@ -231,7 +249,7 @@ defmodule Web.ReadableStream do
   def from(%ArrayBuffer{} = buffer), do: from_chunk(Uint8Array.from(buffer))
   def from(%Uint8Array{} = bytes), do: from_chunk(bytes)
 
-  def from(data) when is_binary(data), do: from_chunk(data)
+  def from(data) when is_binary(data), do: from_chunk(Uint8Array.from(data))
 
   def from(%__MODULE__{} = stream), do: stream
 

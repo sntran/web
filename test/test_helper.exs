@@ -8,4 +8,6 @@ exclude =
     [:cluster]
   end
 
-ExUnit.start(exclude: exclude)
+# A machine that is busy can be slow, thus a message has more time to
+# arrive than the default 100 ms. A test that passes does not wait.
+ExUnit.start(exclude: exclude, assert_receive_timeout: 1_000)

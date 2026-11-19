@@ -839,9 +839,30 @@ defmodule Web.StreamStandardTest do
         ReadableStreamDefaultController.close(controller)
       end
 
-      # An error after a close has no effect, and does not raise.
-      assert ReadableStreamDefaultController.error(controller, :failed) == :ok
       assert Enum.to_list(stream) == [:chunk]
+    end
+
+    test "an error after a close discards the chunks that no read took" do
+      # The stream is readable, with a close request, until a read takes the
+      # last chunk. An error at that time discards the chunks.
+      {stream, controller} = controller_of()
+      assert ReadableStreamDefaultController.enqueue(controller, :chunk) == :ok
+      assert ReadableStreamDefaultController.close(controller) == :ok
+      assert ReadableStreamDefaultController.error(controller, :failed) == :ok
+
+      reader = ReadableStream.get_reader(stream)
+      assert catch_exit(Web.await(ReadableStreamDefaultReader.read(reader))) == :failed
+    end
+
+    test "an error after a close and the last read has no effect" do
+      {stream, controller} = controller_of()
+      assert ReadableStreamDefaultController.enqueue(controller, :chunk) == :ok
+      assert ReadableStreamDefaultController.close(controller) == :ok
+      assert Enum.to_list(stream) == [:chunk]
+
+      # The stream is closed. An error does not raise and changes nothing.
+      assert ReadableStreamDefaultController.error(controller, :failed) == :ok
+      assert Web.await(ReadableStream.cancel(stream, :late)) == :ok
     end
 
     test "raises a TypeError for an enqueue or a close after an error" do

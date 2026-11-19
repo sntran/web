@@ -643,7 +643,9 @@ defmodule Web.Dispatcher.HTTP do
   # The end of the request. The worker tells the process that waits: the
   # process that called `fetch/1` before the body, and the body stream after.
   defp report({:ok, %{phase: :body} = acc}) do
-    if finish_decoder(acc) == :cont and await_drain(acc) == :cont do
+    # A stream that closes with chunks in its queue stays readable until a
+    # read takes the last chunk: an abort of the request signal errors it.
+    if finish_decoder(acc) == :cont do
       ReadableStream.close(acc.stream)
     end
   rescue
@@ -661,27 +663,4 @@ defmodule Web.Dispatcher.HTTP do
 
   defp finish_decoder(%{decoder: nil}), do: :cont
   defp finish_decoder(acc), do: ContentDecoder.finish(acc.decoder, &deliver(acc, &1))
-
-  # The worker closes the stream when its queue is empty. Until then the
-  # body is readable: an abort of the request signal puts it in the errored
-  # state, as the Fetch Standard specifies for a body that is not read. The
-  # connection is free already, because the HTTP client has the full
-  # response.
-  defp await_drain(acc) do
-    case ReadableStream.get_desired_size(acc.stream) do
-      nil ->
-        :halt
-
-      @body_high_water_mark ->
-        :cont
-
-      _size ->
-        stream_monitor = acc.stream_monitor
-
-        receive do
-          {:http_pull, ref} when ref == acc.ref -> await_drain(acc)
-          {:DOWN, ^stream_monitor, :process, _stream, _reason} -> :halt
-        end
-    end
-  end
 end

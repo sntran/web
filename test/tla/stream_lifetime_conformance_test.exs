@@ -265,7 +265,7 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
       assert slots.disturbed == state["disturbed"]
       assert lock_name(slots.reader_pid, system) == state["lock"]
 
-      # An errored stream keeps its chunks, but no process can read them.
+      # An error discards the chunks, as the Streams Standard specifies.
       assert :queue.len(slots.queue) == state["queue"]
     end
   end

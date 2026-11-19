@@ -251,20 +251,28 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
     eventually(fn -> stopped?([worker, watcher]) end)
   end
 
-  test "the worker keeps a full body readable until a process reads it" do
+  test "the worker stops after a full body, and the body stays readable" do
     port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
     {resp, worker, watcher} = fetch_with_processes(Request.new("http://localhost:#{port}/"))
 
-    # The response is complete, and the worker waits until the queue of the
-    # stream is empty. A stream that stops ends the wait.
-    eventually(fn ->
-      {:current_function, function} = Process.info(worker, :current_function)
-      function == {Web.Dispatcher.HTTP, :await_drain, 1}
-    end)
-
-    Process.exit(resp.body.controller_pid, :kill)
-
+    # The worker closes the stream with the chunk in its queue, and stops.
     eventually(fn -> stopped?([worker, watcher]) end)
+
+    assert Enum.map(resp.body, &Web.Uint8Array.to_binary/1) == ["data"]
+  end
+
+  test "an abort errors a full body that no process read" do
+    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
+    controller = Web.AbortController.new()
+    request = Request.new("http://localhost:#{port}/", signal: controller.signal)
+    {resp, worker, _watcher} = fetch_with_processes(request)
+
+    # The body is complete, but a read did not take its chunk: the stream is
+    # readable, as the Streams Standard specifies for a close with chunks.
+    eventually(fn -> stopped?([worker]) end)
+    Web.AbortController.abort(controller, :stop)
+
+    assert catch_exit(Web.await(Web.Response.text(resp))) == :stop
   end
 
   test "a response with no body gives an error when its connection fails" do

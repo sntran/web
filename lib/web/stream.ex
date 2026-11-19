@@ -1046,7 +1046,7 @@ defmodule Web.Stream do
   defp handle_common(:cast, :terminate_transform, _state, _data), do: :keep_state_and_data
 
   defp handle_common(:cast, {:error, reason}, state, data) do
-    if state in [:closed, :errored] do
+    if final?(state, data) do
       :keep_state_and_data
     else
       fail_stream(reason, data)
@@ -1309,12 +1309,22 @@ defmodule Web.Stream do
   defp handle_ambient_abort(reason, state, data) do
     data = %{data | signal_subscription: nil}
 
-    if state in [:closed, :errored] do
-      {:keep_state, data}
-    else
-      handle_termination(:abort, reason, data)
+    cond do
+      final?(state, data) -> {:keep_state, data}
+      # The source is complete: an abort only discards the chunks.
+      state == :closed -> fail_stream(reason, data)
+      true -> handle_termination(:abort, reason, data)
     end
   end
+
+  # A stream that closed with chunks in its queue is still readable in the
+  # Streams Standard: its state is "readable", with a close request, until a
+  # read takes the last chunk. Until then an error puts it in the errored
+  # state and discards the chunks. Thus the abort of a fetch errors a
+  # complete body that no process read.
+  defp final?(:errored, _data), do: true
+  defp final?(:closed, data), do: :queue.is_empty(data.queue)
+  defp final?(_state, _data), do: false
 
   defp handle_closed_event(:cast, {:enqueue, _chunk}, _data), do: :keep_state_and_data
   defp handle_closed_event(:internal, :flush_requests, data), do: flush_read_requests(data)
@@ -2208,6 +2218,8 @@ defmodule Web.Stream do
       |> Map.put(:enqueue_waiters, :queue.new())
       |> Map.put(:backpressure, false)
       |> Map.put(:error_reason, reason)
+      |> Map.put(:queue, :queue.new())
+      |> Map.put(:total_queued_size, 0)
 
     {:next_state, :errored, new_data,
      actions ++ error_actions ++ [{:next_event, :internal, :flush_requests}]}

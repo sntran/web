@@ -65,11 +65,15 @@ Close ==
     /\ UNCHANGED <<queue, lock, live, running, disturbed>>
 
 \* The source puts the stream in the errored state. A process that holds the
-\* lock keeps it, as the Streams Standard specifies, but it cannot read.
+\* lock keeps it, as the Streams Standard specifies, but it cannot read. The
+\* error discards the chunks. A stream that closed with chunks in its queue
+\* can still get an error: in the Standard it is readable until a read takes
+\* the last chunk.
 Fail ==
-    /\ running /\ phase = "active"
+    /\ running /\ (phase = "active" \/ (phase = "closed" /\ queue > 0))
     /\ phase' = "errored"
-    /\ UNCHANGED <<queue, lock, live, running, disturbed>>
+    /\ queue' = IF Bug = "errored_keeps_chunks" THEN queue ELSE 0
+    /\ UNCHANGED <<lock, live, running, disturbed>>
 
 \* Process p takes the reader lock.
 Lock(p) ==
@@ -133,7 +137,7 @@ UnreadExpire ==
     /\ UnreadLimit
     /\ running /\ ~disturbed /\ lock = "none" /\ phase # "errored"
     /\ IF phase = "active"
-          THEN phase' = "errored" /\ UNCHANGED queue
+          THEN phase' = "errored" /\ queue' = IF Bug = "errored_keeps_chunks" THEN queue ELSE 0
           ELSE queue' = 0 /\ UNCHANGED phase
     /\ disturbed' = TRUE
     /\ UNCHANGED <<lock, live, running>>

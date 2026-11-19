@@ -9,7 +9,7 @@
 ---
 
 ## 🚀 Beyond Fetch: A Standardized Runtime
-`Web` provides a predictable, spec-pure interface for high-concurrency systems. [cite_start]While most Elixir libraries buffer data into memory by default, `Web` is built for **Zero-Buffer Streaming**[cite: 20]. By implementing WHATWG and TC39 standards as **Native Process-backed** entities (`:gen_statem`), `Web` ensures your applications remain responsive even when handling gigabytes of data.
+`Web` provides a predictable, spec-pure interface for high-concurrency systems. While most Elixir libraries buffer data into memory by default, `Web` is built for **Zero-Buffer Streaming**. By implementing WHATWG and TC39 standards as **Native Process-backed** entities (`:gen_statem`), `Web` ensures your applications remain responsive even when handling gigabytes of data.
 
 ### Why Standards on the BEAM?
 * **Predictability**: 100% WPT compliance for core primitives like `URL` and `MIME`.

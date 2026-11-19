@@ -11,6 +11,9 @@ defmodule Web.WritableStream do
 
   defstruct [:controller_pid]
 
+  @typedoc "A writable stream. The field is private."
+  @type t :: %__MODULE__{controller_pid: pid()}
+
   alias Web.TypeError
   alias Web.WritableStreamDefaultController
   alias Web.WritableStreamDefaultWriter

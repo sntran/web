@@ -17,15 +17,18 @@ defmodule Web.ReadableStream do
   operations like `tee/1` if the stream has already been interacted with.
 
   ### Teeing and Backpressure
-  The `tee/1` implementation is built via stream composition: data is piped into a multicaster
-  writable sink that forwards each chunk into two identity `TransformStream` branches.
-  Because each multicaster write waits for both branch writes to settle, branch backpressure
-  naturally throttles upstream pulling.
+  `tee/1` follows the algorithm of the Streams Standard. A pull from one of the two branches
+  starts one read from the source, and the chunk of that read goes to the two branches. Thus
+  the faster branch sets the speed: a branch that no process reads keeps each chunk in its
+  queue, and does not slow down the other branch.
   """
 
   use Web.Stream
 
   defstruct [:controller_pid]
+
+  @typedoc "A readable stream. The field is private."
+  @type t :: %__MODULE__{controller_pid: pid()}
 
   @released_message "The stream is not available. It ended, or its owner stopped."
 

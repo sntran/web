@@ -207,7 +207,7 @@ defmodule Web.URLPattern.Parser do
 
   defp validate_name!(name) do
     # Names cannot start with a digit.
-    <<cp::utf8>> = String.first(name)
+    <<cp::utf8, _rest::binary>> = name
 
     if cp >= ?0 and cp <= ?9 do
       raise ArgumentError,

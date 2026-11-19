@@ -1691,13 +1691,12 @@ defmodule Web.URLPattern do
     has_invalid_group_name?(rest, true)
   end
 
-  # Unicode name start (>= 0x80) — check it's a valid ID_Start (not emoji/surrogate/replacement)
+  # A name start that is not ASCII must have the Unicode property ID_Start.
   defp has_invalid_group_name?(<<":", c::utf8, rest::binary>>, false) when c >= 0x80 do
-    # Emoji (>= 0x1F000), surrogate range (0xD800-0xDFFF), or U+FFFD (replacement char) → invalid
-    if c >= 0x1F000 or (c >= 0xD800 and c <= 0xDFFF) or c == 0xFFFD do
-      true
-    else
+    if identifier_start?(c) do
       has_invalid_group_name?(rest, true)
+    else
+      true
     end
   end
 
@@ -1708,13 +1707,10 @@ defmodule Web.URLPattern do
     has_invalid_group_name?(rest, true)
   end
 
-  # Unicode continue char
+  # A name part that is not ASCII must have the Unicode property ID_Continue,
+  # or be U+200C or U+200D. A different character is the end of the name.
   defp has_invalid_group_name?(<<c::utf8, rest::binary>>, true) when c >= 0x80 do
-    if c >= 0x1F000 or (c >= 0xD800 and c <= 0xDFFF) or c == 0xFFFD do
-      true
-    else
-      has_invalid_group_name?(rest, true)
-    end
+    has_invalid_group_name?(rest, identifier_part?(c))
   end
 
   # End of name — any non-name char
@@ -1724,6 +1720,15 @@ defmodule Web.URLPattern do
 
   defp has_invalid_group_name?(<<_c::utf8, rest::binary>>, false) do
     has_invalid_group_name?(rest, false)
+  end
+
+  defp identifier_start?(code_point) do
+    Regex.match?(~r/^\p{ID_Start}$/u, <<code_point::utf8>>)
+  end
+
+  defp identifier_part?(code_point) do
+    code_point in [0x200C, 0x200D] or
+      Regex.match?(~r/^\p{ID_Continue}$/u, <<code_point::utf8>>)
   end
 
   # ---------------------------------------------------------------------------

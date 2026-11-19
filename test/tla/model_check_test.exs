@@ -99,6 +99,81 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "MessagePort" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("MessagePort"))
+    end
+
+    test "the design has all its properties with more messages and more transfers" do
+      larger = [{"MaxMessages = 2", "MaxMessages = 3"}, {"MaxTransfers = 1", "MaxTransfers = 2"}]
+      assert_holds(SpecModel.check("MessagePort", larger))
+    end
+
+    test "a message that is lost in a transfer is found" do
+      assert_violates(
+        SpecModel.check("MessagePort", bug("returned_item_is_lost")),
+        "NothingLost"
+      )
+    end
+
+    test "a transfer that changes the sequence of the messages is found" do
+      assert_violates(
+        SpecModel.check("MessagePort", bug("returned_item_to_tail")),
+        "MessagesInOrder"
+      )
+    end
+
+    test "a holder that gets the event close two times is found" do
+      assert_violates(SpecModel.check("MessagePort", bug("two_closes")), "OneClosePerHolder")
+    end
+
+    test "a listener process that ignores its gate is found" do
+      assert_violates(SpecModel.check("MessagePort", bug("no_gate")), "MessageOnlyAfterStart")
+    end
+
+    test "a port that waits with no end for a stopped listener process is found" do
+      assert_violates(SpecModel.check("MessagePort", bug("no_answer_at_closed_gate")), "Drains")
+    end
+
+    test "an event close that waits for the start of the port is found" do
+      assert_violates(
+        SpecModel.check("MessagePort", bug("close_waits_for_start")),
+        "CloseDoesNotWaitForStart"
+      )
+    end
+  end
+
+  describe "BroadcastChannel" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("BroadcastChannel"))
+    end
+
+    test "the design has all its properties when no channel is slow" do
+      assert_holds(SpecModel.check("BroadcastChannel", {"Slow = {c3}", "Slow = {}"}))
+    end
+
+    test "a channel that gets its own message is found" do
+      assert_violates(
+        SpecModel.check("BroadcastChannel", bug("message_to_sender")),
+        "NoMessageToSender"
+      )
+    end
+
+    test "one dispatcher that waits for a slow channel is found" do
+      assert_violates(
+        SpecModel.check("BroadcastChannel", bug("one_dispatcher")),
+        "NoWaitForSlowChannel"
+      )
+    end
+
+    test "a closed channel that delivers a message is found" do
+      assert_violates(
+        SpecModel.check("BroadcastChannel", bug("closed_channel_delivers")),
+        "NoMessageAfterClose"
+      )
+    end
+  end
+
   describe "ResponseBody" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("ResponseBody"))

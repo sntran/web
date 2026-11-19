@@ -6,6 +6,7 @@ defmodule Web.DOMException do
 
   @codes %{
     "InvalidStateError" => 11,
+    "SyntaxError" => 12,
     "AbortError" => 20,
     "TimeoutError" => 23,
     "DataCloneError" => 25

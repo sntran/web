@@ -233,6 +233,30 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "Performance" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("Performance"))
+    end
+
+    test "a measure that makes a mark impossible to find is found" do
+      assert_violates(SpecModel.check("Performance", bug("measure_hides_mark")), "MarkIsFound")
+    end
+
+    test "a measure that uses the first mark with a name is found" do
+      assert_violates(
+        SpecModel.check("Performance", bug("measure_uses_first_mark")),
+        "MeasureUsesLastMark"
+      )
+    end
+
+    test "a clear of the marks that removes measures is found" do
+      assert_violates(
+        SpecModel.check("Performance", bug("clear_marks_removes_measures")),
+        "ClearKeepsTheOtherType"
+      )
+    end
+  end
+
   describe "ResponseBody" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("ResponseBody"))

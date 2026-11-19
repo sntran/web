@@ -347,9 +347,12 @@ defmodule Web.StreamTest do
       assert ReadableStream.disturbed?(stream.controller_pid) == true
       assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
 
-      assert_raise TypeError, ~r/already locked/, fn ->
-        ReadableStream.tee(stream)
-      end
+      # The Streams Standard permits a tee of a stream that is disturbed and
+      # not locked. The branches get the chunks that are not read.
+      assert [left, right] = ReadableStream.tee(stream)
+      assert ReadableStream.locked?(stream.controller_pid) == true
+      assert Enum.to_list(left) == []
+      assert Enum.to_list(right) == []
     end
 
     test "disturbed is set when a read is requested" do

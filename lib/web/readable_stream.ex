@@ -33,6 +33,7 @@ defmodule Web.ReadableStream do
   alias Web.ArrayBuffer
   alias Web.AsyncContext.Snapshot
   alias Web.Blob
+  alias Web.Internal.ReadableStreamTee
   alias Web.Promise
   alias Web.ReadableByteStreamController
   alias Web.ReadableStreamBYOBReader
@@ -594,50 +595,33 @@ defmodule Web.ReadableStream do
     :gen_statem.call(pid, :get_slots)
   end
 
-  def tee(pid) when is_pid(pid) do
-    cond do
-      locked?(pid) ->
-        {:error, :already_locked}
-
-      disturbed?(pid) ->
-        {:error, :already_locked}
-
-      true ->
-        do_tee(%__MODULE__{controller_pid: pid})
-    end
-  end
+  def tee(pid) when is_pid(pid), do: do_tee(%__MODULE__{controller_pid: pid})
 
   @doc """
-  Tees the current readable stream into two passive branches via composition.
+  Gives two branches of the stream, as `ReadableStream.prototype.tee()` of
+  the Streams Standard. The stream becomes locked.
 
-  Internally this uses two identity `TransformStream`s plus a multicaster
-  `WritableStream`: each source chunk is written to both branch writers,
-  then the branch readable ends are returned.
+    * Each chunk of the stream goes to the two branches.
+    * A read from one of the two branches reads the stream. A branch that no
+      process reads keeps each chunk in its queue. It does not slow down
+      the other branch, and its queue has no limit.
+    * When the stream ends or has an error, the two branches end or get
+      that error.
+    * A cancel of one branch has no effect on the stream. When the two
+      branches are cancelled, the stream is cancelled, and the reason is
+      the list of the two reasons.
+
+  Raises `Web.TypeError` if the stream is locked.
+
+  The promise of `cancel/2` on one branch fulfils immediately. In the
+  Streams Standard, it stays pending until the second branch is cancelled.
 
   ## Examples
 
-      iex> stream = Web.ReadableStream.new(%{
-      ...>   start: fn c ->
-      ...>     Web.ReadableStreamDefaultController.enqueue(c, "a")
-      ...>     Web.ReadableStreamDefaultController.close(c)
-      ...>   end
-      ...> })
-      iex> [s1, s2] = Web.ReadableStream.tee(stream)
-      iex> Enum.to_list(s1)
-      ["a"]
-      iex> Enum.to_list(s2)
-      ["a"]
-
-  This pattern can be reused manually:
-
-      iex> ts = Web.TransformStream.new()
-      iex> writer = Web.WritableStream.get_writer(ts.writable)
-      iex> Web.await(Web.WritableStreamDefaultWriter.write(writer, "x"))
-      :ok
-      iex> Web.await(Web.WritableStreamDefaultWriter.close(writer))
-      :ok
-      iex> Enum.to_list(ts.readable)
-      ["x"]
+      iex> stream = Web.ReadableStream.from(["a", "b"])
+      iex> [left, right] = Web.ReadableStream.tee(stream)
+      iex> {Enum.to_list(left), Enum.to_list(right)}
+      {["a", "b"], ["a", "b"]}
   """
   def tee(%__MODULE__{controller_pid: pid}) do
     case tee(pid) do
@@ -646,6 +630,9 @@ defmodule Web.ReadableStream do
 
       {:error, :already_locked} ->
         raise TypeError, "ReadableStream is already locked"
+
+      {:error, :released} ->
+        raise TypeError, @released_message
     end
   end
 
@@ -908,82 +895,38 @@ defmodule Web.ReadableStream do
     end
   end
 
-  defp do_tee(%__MODULE__{} = source) do
-    strategy = Web.CountQueuingStrategy.new(16)
-    branch_hwm = Map.get(strategy, :high_water_mark, 16)
-    ts1 = Web.TransformStream.new(%{}, high_water_mark: branch_hwm, readable_strategy: strategy)
-    ts2 = Web.TransformStream.new(%{}, high_water_mark: branch_hwm, readable_strategy: strategy)
+  # The two branches are usual streams of the type of the source. The tee
+  # process reads the source for them.
+  defp do_tee(%__MODULE__{controller_pid: source}) do
+    type = source_type(source)
 
-    writer1 = Web.WritableStream.get_writer(ts1.writable)
-    writer2 = Web.WritableStream.get_writer(ts2.writable)
+    with {:ok, tee} <- ReadableStreamTee.start(source) do
+      [branch1, branch2] = for index <- [1, 2], do: new(tee_branch_source(tee, index, type))
 
-    sink =
-      WritableStream.new(%{
-        write: fn chunk, _controller ->
-          Promise.all([
-            Web.WritableStreamDefaultWriter.ready(writer1)
-            |> Promise.catch(fn _ -> :ok end),
-            Web.WritableStreamDefaultWriter.ready(writer2)
-            |> Promise.catch(fn _ -> :ok end)
-          ])
-          |> Promise.then(fn _ ->
-            Promise.all([
-              Web.WritableStreamDefaultWriter.write(writer1, chunk)
-              |> Promise.catch(fn _ -> :ok end),
-              Web.WritableStreamDefaultWriter.write(writer2, chunk)
-              |> Promise.catch(fn _ -> :ok end)
-            ])
-          end)
-        end,
-        close: fn _controller ->
-          _ =
-            tee_await_all([
-              Web.WritableStreamDefaultWriter.close(writer1)
-              # coveralls-ignore-next-line
-              |> Promise.catch(fn _ -> :ok end),
-              Web.WritableStreamDefaultWriter.close(writer2)
-              # coveralls-ignore-next-line
-              |> Promise.catch(fn _ -> :ok end)
-            ])
+      :ok =
+        ReadableStreamTee.attach(
+          tee,
+          branch1.controller_pid,
+          branch2.controller_pid
+        )
 
-          :ok
-        end,
-        abort: fn reason ->
-          _ =
-            tee_await_all([
-              Web.WritableStreamDefaultWriter.abort(writer1, reason)
-              # coveralls-ignore-next-line
-              |> Promise.catch(fn _ -> :ok end),
-              Web.WritableStreamDefaultWriter.abort(writer2, reason)
-              # coveralls-ignore-next-line
-              |> Promise.catch(fn _ -> :ok end)
-            ])
-
-          :ok
-        end
-      })
-
-    :ok = start_pipe(source, sink, [])
-    tee_await_source_lock(source.controller_pid)
-
-    [ts1.readable, ts2.readable]
+      [branch1, branch2]
+    end
   end
 
-  defp tee_await_all(promises) do
-    promises |> Promise.all() |> Promise.await()
+  defp tee_branch_source(tee, index, type) do
+    source = %{
+      pull: fn _controller -> ReadableStreamTee.pull(tee) end,
+      cancel: fn reason -> ReadableStreamTee.cancel(tee, index, reason) end
+    }
+
+    if type == :bytes, do: Map.put(source, :type, "bytes"), else: source
   end
 
-  defp tee_await_source_lock(pid) do
-    cond do
-      locked?(pid) ->
-        :ok
-
-      disturbed?(pid) ->
-        :ok
-
-      true ->
-        Process.sleep(10)
-        tee_await_source_lock(pid)
+  defp source_type(pid) do
+    case Web.Stream.call(pid, :get_slots, nil) do
+      %{stream_type: type} -> type
+      nil -> :default
     end
   end
 

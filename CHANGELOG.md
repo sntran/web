@@ -121,6 +121,21 @@ All notable changes to this project are documented in this file.
   `Web.Request.new/2` refuses, and a request whose body is already read or
   locked, give a rejection with `Web.TypeError`, and `fetch` makes no
   connection. `fetch` with a request as its input applies `init`.
+- **Breaking:** `Web.ReadableStream.tee/1` follows the algorithm of the
+  Streams Standard.
+  - When the two branches are cancelled, the stream is cancelled, and the
+    reason is the list of the two reasons. Before, the stream was not
+    cancelled, and a stream with no end continued until its owner stopped.
+  - A branch that no process reads keeps each chunk in its queue, with no
+    limit, and does not slow down the other branch. Before, the read of one
+    branch stopped after 16 chunks until a process read the other branch.
+    Thus `Response.clone/1` permits a full read of one of the two responses.
+  - The branches of a byte stream are byte streams.
+  - `tee/1` accepts a stream that is disturbed and not locked, and raises
+    only for a locked stream. The stream stays locked until it stops.
+  - One difference stays: the promise of `cancel/2` on one branch fulfils
+    immediately. In the Standard, it stays pending until the second branch
+    is cancelled.
 - **Breaking:** `Web.ArrayBuffer` is a struct around a binary. It uses no
   table and no process, and the VM collects a buffer as each other term.
   - The detached state is one flag in an `:atomics` array. `detach/1`, a
@@ -326,6 +341,8 @@ All notable changes to this project are documented in this file.
   field `:task` of the old promise.
 - `Web.fetch/2` rejects when the body of the request is already read.
   Before, it sent the request with an empty body and gave no error.
+- An ended stream with the linger time `:infinity` stops after its owner
+  stopped. Before, a lock on such a stream kept it without end.
 - A pipe with a source that has no end stops after the processes that use
   it stopped. Before, such a pipe continued without end when its owner
   stopped normally.

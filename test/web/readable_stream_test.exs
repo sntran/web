@@ -780,7 +780,7 @@ defmodule Web.ReadableStreamTest do
 
       # Cancel branch A
       reader_a = ReadableStream.get_reader(branch_a)
-      ReadableStreamDefaultReader.cancel(reader_a)
+      ReadableStreamDefaultReader.cancel(reader_a, :reason_a)
 
       # Branch B should still be able to get data
       reader_b = ReadableStream.get_reader(branch_b)
@@ -789,11 +789,13 @@ defmodule Web.ReadableStreamTest do
       assert await(ReadableStreamDefaultReader.read(reader_b)) == %{value: "data", done: false}
       assert_receive :pull_called
 
-      # Cancel branch B
-      ReadableStreamDefaultReader.cancel(reader_b)
+      # The cancel of one branch has no effect on the source.
+      refute_receive :original_cancelled, 50
 
-      # Composed tee keeps source lifecycle independent of branch cancellation.
-      refute_receive :original_cancelled
+      # Cancel branch B. The two branches are now cancelled, thus the source
+      # is cancelled, as the Streams Standard specifies.
+      ReadableStreamDefaultReader.cancel(reader_b, :reason_b)
+      assert_receive :original_cancelled
     end
 
     test "tee branch cancellation during flow keeps other branch and source active" do

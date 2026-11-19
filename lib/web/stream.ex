@@ -1760,10 +1760,10 @@ defmodule Web.Stream do
   # time, and read the end of the stream.
   defp complete_linger(data) do
     cond do
-      locked?(data) -> data.linger
-      owner_failed?(data) -> 0
-      owner_down?(data) -> handoff_linger(data.linger)
-      true -> data.linger
+      not owner_down?(data) -> data.linger
+      owner_failed?(data) and not locked?(data) -> 0
+      # The linger time `:infinity` is not applicable after the owner stopped.
+      true -> handoff_linger(data.linger)
     end
   end
 

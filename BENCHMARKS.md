@@ -1,122 +1,98 @@
 # Benchmarks
 
-This draft captures the benchmark suite for the responsive-core refactor and is intended to feed the main `README.md`.
+The scripts in `bench/` measure the properties that the library promises:
+a stream that keeps no data, a mailbox that does not delay an abort, and a
+form upload with flat memory.
 
-## Environment
+The numbers below are from one run of each script. Run the scripts on your
+machine to get your numbers.
 
 | Field | Value |
 | --- | --- |
-| Hardware | Intel Core i5-7400 @ 3.00 GHz, 4 cores, 15.57 GB RAM |
-| OS | Linux 6.6.87.2-microsoft-standard-WSL2 (x86_64) |
-| Erlang/OTP | 28.4 |
-| Elixir | 1.19.5 |
+| Hardware | Intel Xeon @ 2.30 GHz, 4 cores, 15.7 GB of memory (a virtual machine) |
+| Operating system | Linux 6.18 (x86_64) |
+| Erlang/OTP | 29.1.2 |
+| Elixir | 1.20.5 |
 
-## Selective Receive: O(1) Verification
+## Speed of a stream
 
-Benchmark script: `mix run bench/selective_receive.exs`
+```shell
+mix run bench/stream_throughput.exs
+```
 
-Method:
+The script reads 512 MiB in chunks of 64 KiB with `Enum`.
 
-- Preload a dedicated benchmark process mailbox with unrelated `{:data_chunk, n}` messages.
-- Compare a legacy FIFO control receive (`receive do :control -> ... end`) against the ref-tagged selective receive pattern used by the responsive core (`receive do {:control, ^ref} -> ... end`).
-- Reuse the same clogged mailbox for 2,000 control receives per iteration so mailbox setup cost does not dominate the result.
-
-Assumption:
-
-- This comparison now uses the current checkout `9babea0 (HEAD)` against the immediately previous commit `fa74d7f (HEAD~1)`.
-- `fa74d7f` predates `Web.Stream.control_call/3`, `Web.Stream.control_cast/2`, and `Process.flag(:message_queue_data, :off_heap)` in [lib/web/stream.ex](/home/esente/Projects/sntran/web/lib/web/stream.ex), so the benchmark’s legacy side models the old untagged control-message receive behavior from that codebase while the current side models the ref-tagged receive now present at `HEAD`.
-
-### Results
-
-Benchee reports below are per benchmark iteration, where each iteration performs 2,000 control receives against the same preloaded mailbox.
-
-| Mailbox Depth | `fa74d7f` (`HEAD~1`) avg | `9babea0` (`HEAD`) avg | Approx. per receive | Percent Improvement |
-| --- | --- | --- | --- | --- |
-| 1,000 | 13.06 ms | 0.64 ms | 6.53 us -> 0.32 us | 95.10% |
-| 10,000 | 123.00 ms | 0.79 ms | 61.50 us -> 0.40 us | 99.36% |
-| 100,000 | 1.76 s | 2.78 ms | 880.00 us -> 1.39 us | 99.84% |
-
-Observed throughput ratios from Benchee:
-
-- `1k`: `HEAD` is `20.33x` faster than `HEAD~1`.
-- `10k`: `HEAD` is `155.28x` faster than `HEAD~1`.
-- `100k`: `HEAD` is `631.67x` faster than `HEAD~1`.
-
-### Summary
-
-- The `fa74d7f` control path scales linearly with mailbox depth: `13.06 ms` at `1k`, `123.00 ms` at `10k`, and `1.76 s` at `100k`.
-- The `9babea0` ref-tagged path stays effectively flat in the sub-millisecond to low-millisecond range: `0.64 ms`, `0.79 ms`, and `2.78 ms` for the same depths.
-- This is the expected signature of Erlang's reference-optimized selective receive and is the core proof that control-plane messages no longer suffer mailbox-scanning overhead under data-plane pressure.
-
-### Clogged Pipe Abort Latency
-
-Benchmark script: `mix run bench/clogged_abort_latency.exs`
-
-Method:
-
-- Start a `WritableStream` with a blocked first write so the stream stays active.
-- Flood the controller mailbox with 50,000 raw write calls.
-- Measure elapsed microseconds from `WritableStream.abort(stream, :emergency_stop)` to the sink `abort/1` callback firing.
-- Collect 15 samples per revision and report percentile latencies.
-
-Results:
-
-| Metric | `fa74d7f` (`HEAD~1`) | `9babea0` (`HEAD`) | Delta |
+| Source | MiB each second | Chunks each second | Increase of memory |
 | --- | --- | --- | --- |
-| p50 | 1,512,308 us | 1,446,793 us | 4.33% faster |
-| p95 | 4,679,517 us | 16,133,241 us | 244.76% slower |
-| p99 | 4,679,517 us | 16,133,241 us | 244.76% slower |
-| avg | 2,194,247.2 us | 3,023,890.8 us | 37.81% slower |
+| A readable stream | 2093 | 33486 | 1.0 MiB |
+| The stream through one transform stream | 733 | 11735 | 1.5 MiB |
+| A response body of `fetch`, from a server on the machine | 1109 | 578 | 8.3 MiB |
 
-Summary:
+Each chunk goes through one process for each stream, which costs
+approximately 30 microseconds for each chunk and each stream. Thus the
+speed in bytes increases with the size of the chunks: the body of `fetch`
+has chunks of approximately 2 MiB.
 
-- This harness did not show the clean p99 win we expected from priority messaging.
-- `HEAD` improved median abort latency slightly, but long-tail results were worse in this run.
-- Because the distribution is noisy and the result contradicts the existing regression test, this benchmark should be treated as exploratory rather than README headline material until the abort path is instrumented more precisely inside the engine.
+The memory does not increase with the number of bytes.
 
-### Memory and GC Isolation
+## A form upload of 1 GiB
 
-Benchmark script: `mix run bench/gc_isolation.exs`
+```shell
+mix run bench/form_data_memory.exs
+```
 
-Method:
+One file of 1 GiB goes through `Web.FormData` in the two directions.
 
-- Create a `WritableStream` whose sink gzip-compresses each chunk through a zlib-owning `Agent`.
-- Flood the stream controller with 1,600 writes of 64 KiB each for a total of 100 MiB.
-- Sample `:erlang.process_info/2` for `:garbage_collection`, `:total_heap_size`, and `:message_queue_len` while the stream drains.
+| Direction | Seconds | Increase of memory |
+| --- | --- | --- |
+| Parse a `multipart/form-data` body, and read the file as a stream | 1.05 | 2.8 MB |
+| Encode a form with a file that has a stream | 0.94 | 0.4 MB |
 
-Results:
+Before version 0.5.0, a read with `Enum` kept each chunk for 5 seconds:
+the parse of this file added 1156 MB.
 
-| Metric | `fa74d7f` (`HEAD~1`) | `9babea0` (`HEAD`) | Delta |
-| --- | --- | --- | --- |
-| GC count | 0 | 0 | no change observed |
-| max heap words | 225,381 | 229,236 | 1.71% higher |
-| final heap words | 225,340 | 4,264 | 98.11% lower |
-| peak queue len | 1,415 | 905 | 36.04% lower |
+## An abort with a full mailbox
 
-Summary:
+```shell
+mix run bench/clogged_abort_latency.exs
+```
 
-- We did not observe a GC-count reduction in this environment; both revisions stayed at `0` GCs during the sample window.
-- The `:off_heap` queue flag still showed a meaningful isolation benefit after the burst: the controller in `HEAD` drained back to `4,264` heap words instead of remaining inflated at `225,340`.
-- Peak queued messages also dropped from `1,415` to `905`, which suggests smoother recovery under burst pressure even though max heap size was roughly flat.
+The script puts write requests into the mailbox of a writable stream, then
+aborts the stream. It measures the time to the call of the function
+`abort` of the sink.
 
-### Throughput Parity
+| Requests in the mailbox | Time (median of 9) |
+| --- | --- |
+| 1000 | 115 µs |
+| 50000 | 2.4 ms |
+| 200000 | 10.7 ms |
 
-Benchmark script: `mix run bench/throughput.exs`
+An abort is a priority message of Erlang/OTP: the stream gets it before the
+requests. Before version 0.5.0, the stream handled each request first:
+with 5000 requests the abort took 24.6 ms, and the time increased with the
+square of the number of requests.
 
-Method:
+## Compression
 
-- Run a full `ReadableStream.pipe_through/3` gzip pipeline over 32 MiB of input.
-- Compare the built-in `CompressionStream` against a benchmark-local gzip stream that uses the same `Web.Stream` engine.
-- Use Benchee to measure end-to-end runtime and derive MB/s.
+```shell
+mix run bench/throughput.exs
+```
 
-Results:
+The script compresses 32 MiB with `Web.CompressionStream` and with `:zlib`
+in a transform stream that the script makes.
 
-| Pipeline | Avg runtime | Throughput | Relative result |
-| --- | --- | --- | --- |
-| `CompressionStream` | 263.68 ms | 121.36 MB/s | baseline |
-| inline zlib stream | 454.42 ms | 70.42 MB/s | 1.72x slower |
+| Pipeline | Time for 32 MiB |
+| --- | --- |
+| `Web.CompressionStream` | 114.8 ms |
+| `:zlib` in a transform stream | 117.7 ms |
 
-Summary:
+## Garbage collection of a stream process
 
-- The previous commit does not contain `CompressionStream`, so there is no direct `HEAD~1` throughput baseline for this feature.
-- Within `HEAD`, the built-in `CompressionStream` was faster than the benchmark-local inline gzip stream by about 72.34%, so we did not detect a throughput regression from the new wrapper path on this machine.
+```shell
+mix run bench/gc_isolation.exs
+```
+
+The script writes 100 MiB to a writable stream and examines the stream
+process: it had 0 garbage collections of its own data, and its heap had
+227920 words at most. The chunks are binaries that the VM keeps outside
+the heaps of the processes.

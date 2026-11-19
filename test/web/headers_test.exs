@@ -159,6 +159,107 @@ defmodule Web.HeadersTest do
     end
   end
 
+  describe "the checks of the Fetch Standard" do
+    test "refuse a name that is not an HTTP token, in each function" do
+      headers = Headers.new(%{"a" => "1"})
+
+      for name <- ["", "bad name", "a:b", "a\r\n", "é", "a(b", 1, nil, {"a"}] do
+        for fun <- [
+              fn -> Headers.new([{name, "x"}]) end,
+              fn -> Headers.append(headers, name, "x") end,
+              fn -> Headers.set(headers, name, "x") end,
+              fn -> Headers.get(headers, name) end,
+              fn -> Headers.has(headers, name) end,
+              fn -> Headers.delete(headers, name) end
+            ] do
+          assert_raise Web.TypeError, ~r/Invalid header name/, fun
+        end
+      end
+    end
+
+    test "accept each character of an HTTP token in a name" do
+      name = "!#$%&'*+-.^_`|~09AZaz"
+      headers = Headers.new([{name, "x"}])
+      assert Headers.get(headers, name) == "x"
+      assert Enum.to_list(Headers.keys(headers)) == [String.downcase(name)]
+    end
+
+    test "refuse a value with a NUL, CR, or LF character" do
+      for value <- ["a\r\nb: c", "a\nb", "a\rb", <<"a", 0, "b">>] do
+        assert_raise Web.TypeError, ~r/Invalid header value/, fn ->
+          Headers.new([{"x-test", value}])
+        end
+
+        assert_raise Web.TypeError, ~r/Invalid header value/, fn ->
+          Headers.set(Headers.new(), "x-test", value)
+        end
+      end
+
+      assert_raise Web.TypeError, ~r/Invalid header value/, fn ->
+        Headers.new([{"x-test", %{}}])
+      end
+    end
+
+    test "remove the HTTP whitespace at the two ends of a value" do
+      headers = Headers.new([{"x-test", " \t\r\n a  b \n\r\t "}, {"x-empty", " \t "}])
+      assert Headers.get(headers, "x-test") == "a  b"
+      assert Headers.get(headers, "x-empty") == ""
+    end
+
+    test "accept a value that is a number or an atom" do
+      headers = Headers.new([{"content-length", 12}, {"x-flag", true}])
+      assert Headers.get(headers, "content-length") == "12"
+      assert Headers.get(headers, "x-flag") == "true"
+    end
+
+    test "append the values of map keys that are the same name" do
+      headers = Headers.new(%{"X-Test" => "1", "x-test" => "2"})
+      assert Headers.get(headers, "x-test") |> String.split(", ") |> Enum.sort() == ["1", "2"]
+    end
+
+    test "refuse input that is not a collection of pairs" do
+      assert_raise Web.TypeError, ~r/Each header must be a pair/, fn ->
+        Headers.new(["a"])
+      end
+
+      assert_raise Web.TypeError, ~r/Headers must be/, fn -> Headers.new("a: b") end
+    end
+
+    property "a valid name and value are kept, with the name in lowercase" do
+      token = string([?a..?z, ?A..?Z, ?0..?9, ?-, ?_], min_length: 1)
+      value = string([0x21..0x7E], min_length: 1)
+
+      check all(name <- token, value <- value) do
+        headers = Headers.new([{name, value}])
+        assert Headers.get(headers, name) == value
+        assert Headers.has(headers, String.upcase(name))
+        assert Enum.to_list(headers) == [{String.downcase(name), value}]
+      end
+    end
+
+    property "each text is accepted with the standard result, or raises TypeError" do
+      check all(name <- string(:printable), value <- string(:printable)) do
+        try do
+          Headers.new([{name, value}])
+        rescue
+          error in Web.TypeError -> assert error.message =~ "Invalid header"
+        else
+          headers ->
+            [{stored_name, stored_value}] = Enum.to_list(headers)
+            assert stored_name == String.downcase(name, :ascii)
+            assert stored_value == String.trim(value, " ") |> trim_http_whitespace()
+            refute stored_value =~ ~r/[\0\r\n]/
+        end
+      end
+    end
+
+    defp trim_http_whitespace(value) do
+      value
+      |> String.replace(~r/\A[\t\n\r ]+/, "")
+      |> String.replace(~r/[\t\n\r ]+\z/, "")
+    end
+  end
+
   describe "inspect" do
     test "redacts sensitive header values" do
       output =

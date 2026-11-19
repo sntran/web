@@ -34,7 +34,7 @@ defmodule Web.Body do
       iex> response = Web.Response.new(body: "hello")
       iex> %Web.ArrayBuffer{byte_length: 5} = Web.await(Web.Response.array_buffer(response))
 
-      iex> request = Web.Request.new("https://example.com", body: "payload")
+      iex> request = Web.Request.new("https://example.com", method: "POST", body: "payload")
       iex> array_buffer = Web.await(Web.Request.array_buffer(request))
       iex> {array_buffer.byte_length, array_buffer.data}
       {7, "payload"}

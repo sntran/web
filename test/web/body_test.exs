@@ -51,7 +51,7 @@ defmodule Web.BodyTest do
   end
 
   test "request clone disturbance is isolated between original and clone" do
-    request = Request.new("https://example.com", body: "hello")
+    request = Request.new("https://example.com", method: "POST", body: "hello")
 
     assert {request, clone} = Request.clone(request)
     assert "hello" = await(Request.text(request))
@@ -402,6 +402,7 @@ defmodule Web.BodyTest do
 
     request =
       Request.new("https://example.com",
+        method: "POST",
         body: "a=1",
         headers: %{"content-type" => "application/x-www-form-urlencoded"},
         signal: controller.signal

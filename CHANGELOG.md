@@ -85,6 +85,33 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Breaking:** `Web.Request.new/2` does the checks of the `Request`
+  constructor of the Fetch Standard, and raises `Web.TypeError` for input
+  that the Standard refuses. Before, such input was accepted and sent.
+  - The URL must be an absolute URL. A text with no scheme, such as
+    `"example.com/path"` or `"/path"`, is refused. Before, such a text
+    got the prefix `http://` or `http://localhost`.
+  - A URL that includes credentials is refused.
+  - The method must be an HTTP token, and must not be `CONNECT`, `TRACE`,
+    or `TRACK`.
+  - Only the methods `DELETE`, `GET`, `HEAD`, `OPTIONS`, `POST`, and `PUT`
+    are changed to uppercase. Each other method keeps its case: `"patch"`
+    stays `"patch"`. A method that is an atom is always changed to
+    uppercase.
+  - A body is refused with the methods `GET` and `HEAD`. This is also
+    applicable to a `tcp:` request: give a method such as `"POST"`.
+  - The redirect mode must be `"follow"`, `"error"`, or `"manual"`.
+  - With a request as its input, `new/2` applies the members of `init`.
+    Before, it ignored them.
+- **Breaking:** `Web.Headers` validates each name and each value, and
+  raises `Web.TypeError` for a name that is not an HTTP token, or for a
+  value that contains a NUL, CR, or LF character. It removes the HTTP
+  whitespace at the two ends of a value.
+- **Breaking:** `Web.fetch/2` does not raise. Input that
+  `Web.Request.new/2` refuses, and a request whose body is already read or
+  locked, give a rejection with `Web.TypeError`, and `fetch` makes no
+  connection. `fetch` with a request as its input applies `init`.
+
 - **Breaking:** `Web.Promise` has a new engine. A pending promise is a small
   process, not a `Task`. The struct has the fields `:pid` and `:state`, and
   the field `:task` is removed.
@@ -261,6 +288,8 @@ All notable changes to this project are documented in this file.
   stops.
 - An errored stream stops after the linger time, also with chunks in its
   queue. No process can read those chunks.
+- `Web.fetch/2` rejects when the body of the request is already read.
+  Before, it sent the request with an empty body and gave no error.
 - A pipe with a source that has no end stops after the processes that use
   it stopped. Before, such a pipe continued without end when its owner
   stopped normally.

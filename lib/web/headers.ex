@@ -1,6 +1,14 @@
 defmodule Web.Headers do
   @moduledoc """
   A case-insensitive, multi-value HTTP headers container.
+
+  Each function validates its input as the Fetch Standard specifies:
+
+    * A header name must be an HTTP token. A name that is not a token raises
+      `Web.TypeError`.
+    * A header value has its leading and trailing HTTP whitespace removed.
+      A value that contains a NUL, CR, or LF character raises
+      `Web.TypeError`.
   """
 
   @behaviour Access
@@ -22,19 +30,21 @@ defmodule Web.Headers do
   def new(headers \\ %{})
   def new(%__MODULE__{} = headers), do: headers
 
-  def new(headers) when is_map(headers) do
-    data =
-      Enum.reduce(headers, %{}, fn {name, value}, acc ->
-        Map.put(acc, normalize_name(name), [normalize_value(value)])
-      end)
+  def new(headers) when is_map(headers) or is_list(headers) do
+    Enum.reduce(headers, %__MODULE__{}, fn
+      {name, value}, acc ->
+        append(acc, name, value)
 
-    %__MODULE__{data: data}
+      other, _acc ->
+        raise Web.TypeError,
+              "Each header must be a pair of a name and a value, got: #{inspect(other)}"
+    end)
   end
 
-  def new(headers) when is_list(headers) do
-    Enum.reduce(headers, %__MODULE__{}, fn {name, value}, acc ->
-      append(acc, name, value)
-    end)
+  def new(headers) do
+    raise Web.TypeError,
+          "Headers must be a Web.Headers struct, a map, or a list of pairs, " <>
+            "got: #{inspect(headers)}"
   end
 
   @doc """
@@ -182,11 +192,64 @@ defmodule Web.Headers do
   defp join_values(@set_cookie, values), do: Enum.join(values, ", ")
   defp join_values(_name, values), do: Enum.join(values, ", ")
 
-  defp normalize_name(name) when is_binary(name), do: String.downcase(name)
-  defp normalize_name(name) when is_atom(name), do: name |> Atom.to_string() |> normalize_name()
+  # A header name is an HTTP token (RFC 9110).
+  @token ~r/\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/
 
-  defp normalize_value(value) when is_binary(value), do: value
-  defp normalize_value(value), do: to_string(value)
+  @doc false
+  # Returns `true` if `value` is an HTTP token.
+  @spec token?(term()) :: boolean()
+  def token?(value), do: is_binary(value) and Regex.match?(@token, value)
+
+  defp normalize_name(name) when is_binary(name) do
+    if token?(name) do
+      String.downcase(name, :ascii)
+    else
+      raise Web.TypeError, "Invalid header name: #{inspect(name)}"
+    end
+  end
+
+  defp normalize_name(name) when is_atom(name) and not is_nil(name) do
+    name |> Atom.to_string() |> normalize_name()
+  end
+
+  defp normalize_name(name) do
+    raise Web.TypeError, "Invalid header name: #{inspect(name)}"
+  end
+
+  @http_whitespace [?\t, ?\n, ?\r, ?\s]
+
+  defp normalize_value(value) when is_binary(value) do
+    value = value |> trim_leading_whitespace() |> trim_trailing_whitespace()
+
+    if :binary.match(value, [<<0>>, "\r", "\n"]) == :nomatch do
+      value
+    else
+      raise Web.TypeError, "Invalid header value: #{inspect(value)}"
+    end
+  end
+
+  defp normalize_value(value) when is_number(value) or is_atom(value) do
+    value |> to_string() |> normalize_value()
+  end
+
+  defp normalize_value(value) do
+    raise Web.TypeError, "Invalid header value: #{inspect(value)}"
+  end
+
+  defp trim_leading_whitespace(<<byte, rest::binary>>) when byte in @http_whitespace,
+    do: trim_leading_whitespace(rest)
+
+  defp trim_leading_whitespace(value), do: value
+
+  defp trim_trailing_whitespace(value) do
+    size = byte_size(value)
+
+    if size > 0 and :binary.last(value) in @http_whitespace do
+      value |> binary_part(0, size - 1) |> trim_trailing_whitespace()
+    else
+      value
+    end
+  end
 end
 
 defimpl Enumerable, for: Web.Headers do

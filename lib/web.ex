@@ -190,7 +190,7 @@ defmodule Web do
 
   ## Parameters
     - `input`: A string representing the URL, OR a pre-constructed `Web.Request` struct.
-    - `init`: A keyword list of options (ignored if `input` is already a Request struct).
+    - `init`: A keyword list of options. Each option replaces the value of an input request.
       - `:method` (String.t | atom) - HTTP method (default: "GET").
       - `:headers` (Map.t | List.t | Web.Headers.t) - Request headers.
       - `:body` (any) - Request payload.
@@ -200,7 +200,13 @@ defmodule Web do
 
   ## Returns
     - `%Web.Promise{}` resolving to `Web.Response.t()` on success.
-    - The promise rejects with `reason` on failure.
+    - The function does not raise. Each failure is a rejection of the
+      promise:
+      - `Web.TypeError` for input that `Web.Request.new/2` refuses. The
+        function then makes no connection.
+      - The reason of the signal, when the signal aborts the request.
+      - `Web.TypeError` with the failure in the field `cause`, for each
+        network failure.
 
   ## Examples
 
@@ -214,22 +220,18 @@ defmodule Web do
   """
   @spec fetch(String.t() | Web.URL.t() | Web.Request.t(), keyword()) ::
           Web.Promise.t()
-  def fetch(input, init \\ [])
-
-  def fetch(%Web.Request{} = request, _init) do
+  def fetch(input, init \\ []) do
+    request = Web.Request.new(input, init)
+    :ok = Web.Request.ensure_body_usable!(request)
     Web.AbortSignal.check!(request.signal)
     fetch_request(request)
+  rescue
+    # Input that the `Request` constructor refuses gives a rejection, as the
+    # Fetch Standard specifies. The function makes no connection.
+    error in [TypeError] -> Web.Promise.reject(error)
   catch
     :throw, {:abort, reason} ->
       Web.Promise.reject(reason)
-  end
-
-  def fetch(%Web.URL{} = input, init) do
-    fetch(Web.Request.new(input, init))
-  end
-
-  def fetch(input, init) when is_binary(input) do
-    fetch(Web.Request.new(input, init))
   end
 
   defp fetch_request(request) do

@@ -237,27 +237,10 @@ defmodule Web.Dispatcher.HTTPTest do
     assert {:error, _} = HTTP.fetch(req)
   end
 
-  test "fetch/1 defaults empty protocol urls to http before connecting" do
-    req = Request.new("/relative-only")
-    assert {:error, _} = HTTP.fetch(req)
-  end
-
   test "fetch/1 returns request errors after connecting when the request target is invalid" do
     port = HTTPServer.start_link([])
 
     req = Request.new("http://localhost:#{port}?query=1")
-    assert {:error, _} = HTTP.fetch(req)
-  end
-
-  test "fetch/1 returns request errors for invalid request metadata after connecting" do
-    port = HTTPServer.start_link([])
-
-    req =
-      Request.new("http://localhost:#{port}/path",
-        method: "bad method",
-        headers: %{"bad header" => "value"}
-      )
-
     assert {:error, _} = HTTP.fetch(req)
   end
 

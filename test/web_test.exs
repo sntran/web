@@ -179,6 +179,118 @@ defmodule WebTest do
     assert %Web.DOMException{name: "AbortError"} = catch_exit(await(Web.fetch(req)))
   end
 
+  defmodule RecordingDispatcher do
+    @behaviour Web.Dispatcher
+
+    # Tells the test process about each request that gets to the dispatcher.
+    def fetch(%Web.Request{} = request) do
+      send(request.options[:test], {:dispatched, request})
+      {:ok, Web.Response.new(status: 200, url: Web.URL.href(request.url))}
+    end
+  end
+
+  describe "Web.fetch with input that the Request constructor refuses" do
+    test "rejects with TypeError and does not raise" do
+      for {input, init, message} <- [
+            {"", [], ~r/Invalid URL/},
+            {"not a url", [], ~r/Invalid URL/},
+            {"/relative-only", [], ~r/Invalid URL/},
+            {"http://exa mple.com/", [], ~r/Invalid URL/},
+            {"https://user:secret@example.com/", [], ~r/includes credentials/},
+            {"https://example.com/", [method: "BAD METHOD"], ~r/not a valid HTTP method/},
+            {"https://example.com/", [method: "TRACE"], ~r/HTTP method is unsupported/},
+            {"https://example.com/", [body: "x"], ~r/GET\/HEAD method cannot have body/},
+            {"https://example.com/", [headers: %{"bad name" => "x"}], ~r/Invalid header name/},
+            {"https://example.com/", [headers: [{"x", "a\r\nb"}]], ~r/Invalid header value/},
+            {"https://example.com/", [redirect: "sometimes"], ~r/not a valid redirect mode/},
+            {123, [], ~r/Request input must be/},
+            {nil, [], ~r/Request input must be/},
+            {"https://example.com/", %{}, ~r/Request init must be a keyword list/}
+          ] do
+        promise = Web.fetch(input, init)
+        assert %Web.Promise{} = promise
+
+        assert {:rejected, %Web.TypeError{message: text, cause: nil}} = Web.Promise.wait(promise)
+        assert text =~ message
+      end
+    end
+
+    test "makes no connection" do
+      init = [dispatcher: RecordingDispatcher, test: self()]
+
+      for extra <- [
+            [method: "BAD METHOD"],
+            [body: "x"],
+            [headers: %{"bad name" => "x"}],
+            [redirect: "sometimes"]
+          ] do
+        assert {:rejected, %Web.TypeError{}} =
+                 Web.Promise.wait(Web.fetch("mock://success/", init ++ extra))
+      end
+
+      refute_receive {:dispatched, _request}, 50
+
+      # The same dispatcher gets a request that is valid.
+      assert %Web.Response{status: 200} = await(Web.fetch("mock://success/", init))
+      assert_receive {:dispatched, %Web.Request{method: "GET"}}
+    end
+
+    test "rejects when the body of the request is already read, and makes no connection" do
+      init = [dispatcher: RecordingDispatcher, test: self(), method: "POST"]
+
+      for body <- ["in memory", Web.ReadableStream.from(["a", "b"])] do
+        request = Web.Request.new("mock://success/", init ++ [body: body])
+        assert is_binary(await(Web.Request.text(request)))
+
+        assert {:rejected, %Web.TypeError{message: "Request body is already used"}} =
+                 Web.Promise.wait(Web.fetch(request))
+
+        assert_raise Web.TypeError, "Request body is already used", fn ->
+          Web.Request.new(request, method: "PUT")
+        end
+      end
+
+      refute_receive {:dispatched, _request}, 50
+    end
+
+    test "rejects when the body of the request has a reader" do
+      request =
+        Web.Request.new("mock://success/",
+          dispatcher: RecordingDispatcher,
+          test: self(),
+          method: "POST",
+          body: Web.ReadableStream.from(["a"])
+        )
+
+      reader = Web.ReadableStream.get_reader(request.body)
+
+      assert {:rejected, %Web.TypeError{message: "Request body is locked"}} =
+               Web.Promise.wait(Web.fetch(request))
+
+      refute_receive {:dispatched, _request}, 50
+
+      # The request can be sent after the lock is released.
+      Web.ReadableStreamDefaultReader.release_lock(reader)
+      assert %Web.Response{status: 200} = await(Web.fetch(request))
+      assert_receive {:dispatched, _request}
+    end
+
+    test "applies init to a request that is the input" do
+      request = Web.Request.new("mock://success/", dispatcher: RecordingDispatcher, test: self())
+
+      assert %Web.Response{status: 200} =
+               await(Web.fetch(request, method: "post", headers: %{"x-test" => "1"}, body: "x"))
+
+      assert_receive {:dispatched, %Web.Request{method: "POST"} = dispatched}
+      assert Web.Headers.get(dispatched.headers, "x-test") == "1"
+
+      assert {:rejected, %Web.TypeError{message: message}} =
+               Web.Promise.wait(Web.fetch(request, body: "x"))
+
+      assert message =~ "GET/HEAD method cannot have body"
+    end
+  end
+
   test "Web.btoa and Web.atob round-trip latin1 byte strings" do
     assert Web.btoa("hello") == "aGVsbG8="
     assert Web.atob("aGVsbG8=") == "hello"

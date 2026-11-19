@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.fetch/2` decodes a response body with the header
+  `Content-Encoding`, as the Fetch Standard specifies: `gzip`, `x-gzip`,
+  `deflate` (the zlib format, or raw deflate data), and `zstd`. A list of
+  codings is decoded in the opposite sequence. A coding that the library
+  does not know, such as `br`, gives the body with no change. The body is
+  decoded chunk by chunk, in pieces of 64 KiB at most, and the headers of
+  the response do not change. Data that cannot be decoded, or that is
+  cut, gives the reader `Web.TypeError` with the decoder error in `cause`.
+- A request with no header `accept-encoding` sends `gzip, deflate, zstd`.
+  A request with a header `range` sends `identity`. A value of the caller
+  is kept.
+
 - A cancel, an abort, and an error of a stream are priority messages of
   Erlang/OTP 28: the stream gets them before the other messages of its
   mailbox. With 5000 requests in the mailbox, an abort took 24.6 ms
@@ -186,6 +198,35 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- The callbacks of a stream run in one worker process for the life of the
+  stream. Before, each callback started a new task through one supervisor
+  of the application. A read of a stream with `Enum` takes approximately
+  2.5 µs for each chunk, where it took 26 µs, and many streams use all the
+  cores: 16 streams at the same time read 1.9 million chunks each second,
+  where they read 79000. The supervisor `Web.TaskSupervisor` is removed.
+  A promise and a pipe also start with no supervisor.
+- The internal readers of a stream (`Enum`, a pipe, and the body functions
+  such as `Web.Response.text/1`) take all the chunks of the queue in one
+  message, as many reads that wait do in the Streams Standard. A stream
+  with the count strategy keeps up to 64 chunks ready for such a reader.
+  `Enum.take/2` starts with one chunk, thus the source does not run ahead.
+  A pipe reads no more chunks at once than the desired size of its
+  destination.
+- `Web.ReadableStream.from/1` of an enumerable gives several elements for
+  one pull. A cancel stops the enumerable between two elements.
+- A pull that runs at a cancel is stopped, and the cancel runs in a new
+  worker. A callback that fails writes no crash report of a task.
+- The URL parser, the headers, and the MIME parser use binary pattern
+  matching in place of regular expressions. On Erlang/OTP 28 and later,
+  each run of a regular expression imports its pattern again.
+  `Web.Request.new/2` takes approximately 3 µs, where it took 106 µs. A
+  usual URL of a request takes a short path of the parser.
+- The HTTP dispatcher has no bridge process: its worker enqueues the body
+  chunks directly into the body stream. The body stream keeps 64 KiB, thus
+  a small body arrives fully, and its connection goes back to the pool,
+  also when no process reads it. A small request with `fetch` and
+  `Web.Response.text/1` takes approximately 410 µs, where it took 680 µs,
+  and 50 processes do 8200 requests each second, where they did 5200.
 - **Breaking:** the promise `closed` of a `Web.Socket` rejects when the
   socket fails, as the Sockets API specifies. It fulfils for a close, for
   a close of the peer, and for a cancel of the readable side. Before, it
@@ -708,6 +749,21 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A stream that closes with chunks in its queue stays readable until a
+  read takes the last chunk, as the Streams Standard specifies. An error,
+  or the abort of the signal of a fetch, at that time puts it in the
+  errored state and discards the chunks. Before, the error had no effect:
+  the abort of a fetch did not error a complete body that no process
+  read.
+- A URL with an upper-case scheme, such as `HTTPS://example.com/a`, keeps
+  its host. Before, the host was `https` and the path was
+  `//example.com/a`.
+- `Web.MIME.parse/1` refuses a type with a line feed, such as
+  `"text\n/html"`, as the MIME Sniffing Standard specifies.
+- The enumerator of `Web.ReadableStream.from/1` stops when its stream
+  process stops. Before, it stayed.
+- The HTTP worker stops when the process that called `fetch` stops before
+  the body. Before, the bridge and the worker stayed.
 - A stream that a process reads with `Enum`, with `for`, or with a body
   function such as `Web.Response.text/1` keeps no chunk. Before, each read
   made a promise, and the promise kept its chunk for the linger time of

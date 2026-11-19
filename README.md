@@ -249,6 +249,13 @@ the status (for example `"OK"` for 200), because the HTTP client does not
 give the phrase that the server sent. With the two versions, a response
 from a TLS connection has the status text `""`.
 
+`fetch` decodes the body of a response with the header `Content-Encoding`,
+as the Fetch Standard specifies: `gzip`, `x-gzip`, `deflate`, and `zstd`.
+The body is decoded chunk by chunk, and the headers of the response do
+not change. A request with no header `accept-encoding` sends the codings
+that the library can decode. A body with a coding that the library does
+not know, such as `br`, is not changed.
+
 ```elixir
 # Create a stream from any enumerable
 source = ReadableStream.from(["chunk1", "chunk2"])

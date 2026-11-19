@@ -19,9 +19,25 @@ defmodule Web.CountingGovernor do
 
   ## The life of a governor
 
-  The process of a governor does not stop when the process that made it
-  stops. Thus a governor can limit the work of all the processes of an
-  application.
+  A governor is a process. There are two procedures to make one:
+
+    * `new/1` makes a governor that belongs to the process that calls it,
+      as a stream or an abort signal. The governor stops after its owner
+      stopped, when no token is in use and no acquisition waits. It stays
+      for the linger time before it stops, thus a different process that got
+      the governor in a message can use it. This is the equivalent of an
+      object that the garbage collector removes when nothing refers to it.
+
+    * `start_link/1` makes a governor for a supervision tree. Such a
+      governor has no owner, and limits the work of all the processes of an
+      application:
+
+          children = [
+            {Web.CountingGovernor, capacity: 4, name: MyApp.FetchLimit}
+          ]
+
+          governor = Web.CountingGovernor.get(MyApp.FetchLimit)
+          Web.Governor.with(governor, fn -> Web.fetch(url) end)
   """
 
   use GenServer
@@ -32,7 +48,7 @@ defmodule Web.CountingGovernor do
   defstruct [:pid, :capacity]
 
   @type t :: %__MODULE__{
-          pid: pid(),
+          pid: GenServer.server(),
           capacity: non_neg_integer()
         }
 
@@ -44,6 +60,8 @@ defmodule Web.CountingGovernor do
         }
 
   @type state :: %{
+          owner: reference() | {:down, term()} | nil,
+          linger: non_neg_integer() | :infinity | nil,
           capacity: non_neg_integer(),
           in_use: non_neg_integer(),
           queue: :queue.queue(waiter()),
@@ -54,15 +72,65 @@ defmodule Web.CountingGovernor do
         }
 
   @doc """
-  Creates a new counting governor with a fixed concurrency capacity.
+  Makes a governor with a fixed capacity. The governor belongs to the process
+  that calls this function. See the section "The life of a governor".
   """
   @spec new(non_neg_integer()) :: t()
-  def new(capacity) when is_integer(capacity) and capacity >= 0 do
-    {:ok, pid} = GenServer.start(__MODULE__, %{capacity: capacity})
+  def new(capacity) do
+    validate_capacity!(capacity)
+
+    {:ok, pid} =
+      GenServer.start(__MODULE__, %{
+        capacity: capacity,
+        owner: Promise.owner(),
+        linger: Promise.default_linger()
+      })
+
     %__MODULE__{pid: pid, capacity: capacity}
   end
 
-  def new(capacity) do
+  @doc """
+  Starts a governor that has no owner, for a supervision tree.
+
+  ## Options
+
+    * `:capacity` - the number of tokens. This option is necessary.
+    * `:name` - a name for the process, as for `GenServer.start_link/3`.
+  """
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) when is_list(opts), do: start_server(:start_link, opts)
+
+  @doc """
+  Starts a governor that has no owner and no link, as `GenServer.start/3`.
+  The options are the options of `start_link/1`.
+
+  Such a governor stays until the VM stops. Use this function only for a
+  governor that all the processes of the VM use, when no supervision tree is
+  available.
+  """
+  @spec start(keyword()) :: GenServer.on_start()
+  def start(opts) when is_list(opts), do: start_server(:start, opts)
+
+  defp start_server(function, opts) do
+    capacity = Keyword.fetch!(opts, :capacity)
+    validate_capacity!(capacity)
+    init = %{capacity: capacity, owner: nil, linger: nil}
+
+    apply(GenServer, function, [__MODULE__, init, Keyword.take(opts, [:name])])
+  end
+
+  @doc """
+  Returns the governor of a process that `start_link/1` or `start/1` started.
+  `server` is the pid or the name of the process.
+  """
+  @spec get(GenServer.server()) :: t()
+  def get(server) do
+    %__MODULE__{pid: server, capacity: GenServer.call(server, :capacity)}
+  end
+
+  defp validate_capacity!(capacity) when is_integer(capacity) and capacity >= 0, do: :ok
+
+  defp validate_capacity!(capacity) do
     raise ArgumentError,
           "CountingGovernor capacity must be a non-negative integer, got: #{inspect(capacity)}"
   end
@@ -92,9 +160,13 @@ defmodule Web.CountingGovernor do
   end
 
   @doc false
-  def init(%{capacity: capacity}) do
+  def init(%{capacity: capacity, owner: owner, linger: linger}) do
     {:ok,
      %{
+       # The monitor of the owner, `nil` for a governor with no owner, or
+       # `{:down, reason}` after the owner stopped.
+       owner: if(is_pid(owner), do: Process.monitor(owner)),
+       linger: linger,
        capacity: capacity,
        in_use: 0,
        queue: :queue.new(),
@@ -108,7 +180,59 @@ defmodule Web.CountingGovernor do
   end
 
   @doc false
-  def handle_cast({:acquire, waiter_pid, waiter_ref, holder, flag}, state) do
+  def handle_call(:capacity, _from, state) do
+    case with_lifetime({:noreply, state}) do
+      {:noreply, state} -> {:reply, state.capacity, state}
+      # coveralls-ignore-next-line
+      {:noreply, state, time} -> {:reply, state.capacity, state, time}
+    end
+  end
+
+  @doc false
+  def handle_cast(message, state), do: message |> do_cast(state) |> with_lifetime()
+
+  @doc false
+  # No message came in the linger time, thus the governor had no use.
+  def handle_info(:timeout, state) do
+    if is_nil(stop_after(state)), do: {:noreply, state}, else: {:stop, :normal, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{owner: ref} = state) do
+    with_lifetime({:noreply, %{state | owner: {:down, reason}}})
+  end
+
+  def handle_info(message, state), do: message |> do_info(state) |> with_lifetime()
+
+  # ---------------------------------------------------------------------------
+  # The life of the governor
+  #
+  # A governor with an owner stops after the owner stopped, when no token is
+  # in use and no acquisition waits. An owner that stopped normally gets the
+  # linger time, because it can give the governor to a different process. A
+  # message in that time starts the time again.
+  # ---------------------------------------------------------------------------
+
+  @handoff_linger 5_000
+
+  defp with_lifetime({:noreply, state}) do
+    case stop_after(state) do
+      nil -> {:noreply, state}
+      time -> {:noreply, state, time}
+    end
+  end
+
+  defp stop_after(%{owner: {:down, reason}, in_use: 0, waiting: waiting, linger: linger})
+       when map_size(waiting) == 0 do
+    cond do
+      reason not in [:normal, :noproc] -> 0
+      is_integer(linger) -> linger
+      true -> @handoff_linger
+    end
+  end
+
+  defp stop_after(_state), do: nil
+
+  defp do_cast({:acquire, waiter_pid, waiter_ref, holder, flag}, state) do
     # The abort function sets the flag before it sends its message. Thus an
     # abort that came before this call is not lost.
     if aborted?(flag) do
@@ -131,7 +255,7 @@ defmodule Web.CountingGovernor do
     end
   end
 
-  def handle_cast({:abort_waiter, waiter_ref}, state) do
+  defp do_cast({:abort_waiter, waiter_ref}, state) do
     case Map.pop(state.waiting, waiter_ref) do
       # The waiter has its token, or it is not registered. For a waiter that
       # is not registered, the flag rejects the acquisition.
@@ -150,7 +274,7 @@ defmodule Web.CountingGovernor do
     end
   end
 
-  def handle_cast({:release, token_ref}, state) do
+  defp do_cast({:release, token_ref}, state) do
     case Map.pop(state.active_tokens, token_ref) do
       # coveralls-ignore-next-line
       {nil, _active_tokens} ->
@@ -170,7 +294,7 @@ defmodule Web.CountingGovernor do
     end
   end
 
-  def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
+  defp do_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
     case Map.pop(state.waiter_monitors, monitor_ref) do
       {nil, _waiter_monitors} ->
         holder_down(monitor_ref, state)
@@ -185,6 +309,8 @@ defmodule Web.CountingGovernor do
         {:noreply, state}
     end
   end
+
+  defp do_info(_message, state), do: {:noreply, state}
 
   # The process that holds the token stopped. The governor takes the token
   # back, and gives it to the next waiter.

@@ -59,25 +59,220 @@ defmodule Web.GovernorTest do
     eventually(fn -> governor_state(governor).in_use == 0 end)
   end
 
-  test "governors remain alive after the creating process exits" do
-    parent = self()
+  describe "the life of a governor from new/1" do
+    @linger 60
 
-    creator =
-      spawn(fn ->
-        send(parent, {:created_governor, CountingGovernor.new(1)})
+    setup do
+      previous = Application.get_env(:web, :linger)
+      Application.put_env(:web, :linger, @linger)
+
+      on_exit(fn ->
+        if previous == nil do
+          Application.delete_env(:web, :linger)
+        else
+          Application.put_env(:web, :linger, previous)
+        end
       end)
+    end
 
-    assert_receive {:created_governor, governor}, 500
-    creator_ref = Process.monitor(creator)
+    # Makes a governor in a process, and returns after that process stopped.
+    defp governor_of_stopped_owner(capacity, exit_reason \\ :normal) do
+      parent = self()
 
-    assert_receive {:DOWN, ^creator_ref, :process, ^creator, reason}, 500
-    assert reason in [:normal, :noproc]
+      {owner, monitor} =
+        spawn_monitor(fn ->
+          send(parent, {:governor, CountingGovernor.new(capacity)})
+          if exit_reason != :normal, do: exit(exit_reason)
+        end)
 
-    token = await(Governor.acquire(governor))
-    assert %Token{} = token
+      assert_receive {:governor, governor}, 500
+      assert_receive {:DOWN, ^monitor, :process, ^owner, _reason}, 500
+      governor
+    end
 
-    assert :ok = Token.release(token)
-    eventually(fn -> governor_state(governor).in_use == 0 end)
+    defp assert_stops(governor, timeout \\ 1_000) do
+      monitor = Process.monitor(governor.pid)
+      # The reason is `:noproc` if the governor stopped before this monitor.
+      assert_receive {:DOWN, ^monitor, :process, _pid, reason}, timeout
+      assert reason in [:normal, :noproc]
+    end
+
+    defp refute_stops(governor, time) do
+      monitor = Process.monitor(governor.pid)
+      refute_receive {:DOWN, ^monitor, :process, _pid, _reason}, time
+      Process.demonitor(monitor, [:flush])
+    end
+
+    test "stays while its owner is alive" do
+      governor = CountingGovernor.new(1)
+      refute_stops(governor, 4 * @linger)
+
+      token = await(Governor.acquire(governor))
+      assert :ok = Token.release(token)
+      refute_stops(governor, 4 * @linger)
+    end
+
+    test "stops after the linger time when its owner stopped and it has no use" do
+      governor = governor_of_stopped_owner(1)
+      assert Process.alive?(governor.pid)
+      assert_stops(governor)
+    end
+
+    test "stops with no linger time when its owner stopped with a failure" do
+      Application.put_env(:web, :linger, 60_000)
+      governor = governor_of_stopped_owner(1, :failure)
+      assert_stops(governor, 500)
+    end
+
+    test "can be used by a different process in the linger time" do
+      governor = governor_of_stopped_owner(1)
+
+      token = await(Governor.acquire(governor))
+      assert %Token{} = token
+
+      # A token in use keeps the governor.
+      refute_stops(governor, 4 * @linger)
+
+      assert :ok = Token.release(token)
+      assert_stops(governor)
+    end
+
+    test "stays while an acquisition waits" do
+      governor = governor_of_stopped_owner(0)
+      waiting = Governor.acquire(governor)
+
+      refute_stops(governor, 4 * @linger)
+      assert Promise.peek(waiting) == :pending
+    end
+
+    test "starts the linger time again for each message" do
+      governor = governor_of_stopped_owner(1)
+
+      for _ <- 1..6 do
+        Process.sleep(div(@linger, 2))
+        token = await(Governor.acquire(governor))
+        assert :ok = Token.release(token)
+      end
+
+      assert Process.alive?(governor.pid)
+      assert_stops(governor)
+    end
+
+    test "stops after its owner stopped when its last token comes back from a stopped holder" do
+      governor = governor_of_stopped_owner(1)
+
+      {holder, monitor} = spawn_monitor(fn -> await(Governor.acquire(governor)) end)
+      assert_receive {:DOWN, ^monitor, :process, ^holder, _reason}, 500
+      assert_stops(governor)
+    end
+
+    test "rejects an acquisition after it stopped" do
+      governor = governor_of_stopped_owner(1)
+      assert_stops(governor)
+
+      assert %Web.TypeError{message: message} = catch_exit(await(Governor.acquire(governor)))
+      assert message =~ "The governor is not available"
+    end
+
+    test "uses the handoff time when the linger time is :infinity" do
+      Application.put_env(:web, :linger, :infinity)
+      governor = governor_of_stopped_owner(1)
+
+      assert {:noreply, _state, 5_000} =
+               CountingGovernor.handle_cast({:release, make_ref()}, governor_state(governor))
+    end
+  end
+
+  describe "a governor from start_link/1" do
+    test "has no owner and does not stop" do
+      Application.put_env(:web, :linger, 20)
+      on_exit(fn -> Application.delete_env(:web, :linger) end)
+      parent = self()
+
+      # The process that starts the governor traps exits, as a supervisor.
+      starter =
+        spawn(fn ->
+          Process.flag(:trap_exit, true)
+          {:ok, pid} = CountingGovernor.start_link(capacity: 2)
+          send(parent, {:started, pid})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:started, pid}
+      governor = CountingGovernor.get(pid)
+      assert governor == %CountingGovernor{pid: pid, capacity: 2}
+
+      token = await(Governor.acquire(governor))
+      assert :ok = Token.release(token)
+      Process.sleep(100)
+      assert Process.alive?(pid)
+
+      Process.exit(starter, :kill)
+    end
+
+    test "can have a name and a place in a supervision tree" do
+      name = :"governor_#{System.unique_integer([:positive])}"
+
+      # The supervisor of the test has the governor as its child.
+      start_supervised!({CountingGovernor, capacity: 1, name: name})
+
+      governor = CountingGovernor.get(name)
+      assert governor == %CountingGovernor{pid: name, capacity: 1}
+
+      assert await(Governor.with(governor, fn -> :work end)) == :work
+
+      # A waiter gets its token after a release, also with a name.
+      token = await(Governor.acquire(governor))
+      waiting = Governor.acquire(governor)
+      eventually(fn -> queue_length(governor) == 1 end)
+      assert :ok = Token.release(token)
+      assert %Token{} = second = await(waiting)
+      assert :ok = Token.release(second)
+
+      # The supervisor starts the governor again after a failure.
+      first_pid = Process.whereis(name)
+      Process.exit(first_pid, :kill)
+      eventually(fn -> is_pid(Process.whereis(name)) and Process.whereis(name) != first_pid end)
+      assert await(Governor.with(governor, fn -> :again end)) == :again
+    end
+
+    test "validates its options" do
+      assert_raise KeyError, fn -> CountingGovernor.start_link(name: :no_capacity) end
+      assert_raise ArgumentError, fn -> CountingGovernor.start_link(capacity: -1) end
+    end
+
+    test "ignores a message that is not for it" do
+      {:ok, pid} = CountingGovernor.start(capacity: 1)
+      before = :sys.get_state(pid)
+      send(pid, :not_for_the_governor)
+      assert :sys.get_state(pid) == before
+      Process.exit(pid, :kill)
+    end
+  end
+
+  describe "a governor from start/1" do
+    test "has no owner and no link, and stays after the process that started it" do
+      Application.put_env(:web, :linger, 20)
+      on_exit(fn -> Application.delete_env(:web, :linger) end)
+      parent = self()
+
+      {starter, monitor} =
+        spawn_monitor(fn ->
+          {:ok, pid} = CountingGovernor.start(capacity: 3)
+          send(parent, {:started, pid})
+          exit(:failure)
+        end)
+
+      assert_receive {:started, pid}
+      assert_receive {:DOWN, ^monitor, :process, ^starter, :failure}
+
+      Process.sleep(100)
+      assert Process.alive?(pid)
+      governor = CountingGovernor.get(pid)
+      assert governor.capacity == 3
+      assert await(Governor.with(governor, fn -> :work end)) == :work
+      Process.exit(pid, :kill)
+    end
   end
 
   # A process that acquires one token, gives it to the test, and stays alive.
@@ -347,6 +542,8 @@ defmodule Web.GovernorTest do
 
   defp empty_state do
     %{
+      owner: nil,
+      linger: nil,
       capacity: 1,
       in_use: 0,
       queue: :queue.new(),

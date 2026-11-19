@@ -599,7 +599,9 @@ defmodule Web.Platform.Test do
   end
 
   defp new_fetch_governor do
-    governor = CountingGovernor.new(governor_capacity())
+    # All the test processes use this governor, thus it has no owner.
+    {:ok, pid} = CountingGovernor.start(capacity: governor_capacity())
+    governor = CountingGovernor.get(pid)
     :persistent_term.put(@governor_key, governor)
     governor
   end

@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.CountingGovernor.start_link/1`, `start/1`, and `get/1` for a governor
+  that has no owner. Use `{Web.CountingGovernor, capacity: 4, name: MyName}`
+  in a supervision tree for a governor that all the processes of an
+  application use.
 - `Web.Promise.finally/2`, `Web.Promise.await/1`, and `Web.Promise.wait/1`.
   `wait/1` returns the outcome as `{:fulfilled, value}` or
   `{:rejected, reason}`.
@@ -126,6 +130,10 @@ All notable changes to this project are documented in this file.
   `Web.Request.new/2` refuses, and a request whose body is already read or
   locked, give a rejection with `Web.TypeError`, and `fetch` makes no
   connection. `fetch` with a request as its input applies `init`.
+- **Breaking:** a governor from `Web.CountingGovernor.new/1` has an owner,
+  as a stream or an abort signal. It stops after its owner stopped, when no
+  token is in use and no acquisition waits, and after the linger time.
+  Before, the process of a governor never stopped.
 - **Breaking:** a token of `Web.CountingGovernor` belongs to the owner of the
   process that acquired it. When that owner stops, the governor takes the
   token back. If you give a token to a different process, keep the owner

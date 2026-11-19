@@ -101,6 +101,18 @@ A token belongs to the process that acquired it. When that process stops,
 also with a failure, the governor takes the token back. Thus the capacity
 cannot decrease.
 
+A governor from `CountingGovernor.new/1` belongs to the process that made
+it, and stops after that process. For a governor that all the processes of
+an application use, put it in a supervision tree:
+
+```elixir
+children = [
+  {Web.CountingGovernor, capacity: 4, name: MyApp.FetchLimit}
+]
+
+governor = Web.CountingGovernor.get(MyApp.FetchLimit)
+```
+
 Async APIs return `%Web.Promise{}` values. Promise executors capture the current `Web.AsyncContext`, so logger metadata and signals flow into spawned tasks automatically.
 
 ```elixir

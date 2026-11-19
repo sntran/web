@@ -58,6 +58,17 @@ defmodule Web.AbortSignalLifetimeTest do
 
   defp subscribers(signal), do: :sys.get_state(signal.pid).subscribers
 
+  defp wait_for_no_subscribers(signal, attempts \\ 150) do
+    current = subscribers(signal)
+
+    if current == %{} or attempts == 0 do
+      current
+    else
+      Process.sleep(20)
+      wait_for_no_subscribers(signal, attempts - 1)
+    end
+  end
+
   describe "a signal that is not aborted" do
     test "stays while its owner is alive" do
       controller = AbortController.new()
@@ -235,7 +246,11 @@ defmodule Web.AbortSignalLifetimeTest do
       end
 
       assert settle(baseline) <= @tolerance
-      assert subscribers(controller.signal) == %{}
+
+      # The count of processes has a tolerance, thus some streams can be in
+      # their last step at this time. The signal removes each stream that
+      # stops.
+      assert wait_for_no_subscribers(controller.signal) == %{}
     end
   end
 end

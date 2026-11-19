@@ -76,10 +76,6 @@ defmodule Web.Stream do
   # process: see `start_task/2`.
   @worker_key {__MODULE__, :worker}
 
-  # The key of the demand of a pull in the dictionary of the worker: see
-  # `pull_demand/0`.
-  @pull_demand_key {__MODULE__, :pull_demand}
-
   # ---------------------------------------------------------------------------
   # Engine data
   # ---------------------------------------------------------------------------
@@ -118,9 +114,6 @@ defmodule Web.Stream do
     # reason of the cancel), or the transformer called `terminate`.
     writable_error: nil,
     read_requests: :queue.new(),
-    # The chunks that an internal reader asked for with a batch read: see
-    # `handle_read_batch/5`. Only a stream with the count strategy uses it.
-    read_ahead: 0,
     disturbed: false,
     # Consumer (writable) side
     writer_pid: nil,
@@ -747,8 +740,7 @@ defmodule Web.Stream do
         | reader_pid: nil,
           reader_ref: nil,
           reader_mode: nil,
-          read_requests: :queue.new(),
-          read_ahead: 0
+          read_requests: :queue.new()
       }
 
       {:keep_state, new_data,
@@ -1404,20 +1396,18 @@ defmodule Web.Stream do
   end
 
   # A batch read of an internal reader, such as the enumeration of a stream.
-  # It has the effect of `max` calls of `read()` with no await, as the
-  # Streams Standard permits:
+  # The reader gets the chunks that are in the queue at this time, up to
+  # `max`, in one answer `{:chunks, list}`. That is the result of one
+  # `read()` for each chunk, one after the other. With no chunk in the
+  # queue, it is one read that waits, as a usual read.
   #
-  #   * the reader gets all the chunks in the queue, up to `max`, in one
-  #     answer `{:chunks, list}`. With no chunk in the queue, the read waits
-  #     for one chunk, as a usual read;
-  #   * the stream pulls until its queue has `max` chunks for the next batch
-  #     read. Thus the source can work while the reader works.
-  #
-  # The limit of the queue goes back to the high water mark when the reader
-  # releases its lock.
+  # The batch changes neither the desired size of the stream nor the
+  # pulls: the stream pulls only as the Streams Standard specifies. Thus a
+  # batch has more than one chunk only when the source enqueues more than
+  # one chunk for one pull, or when the high water mark is above 1.
   defp handle_read_batch(from, pid, max, state, data)
        when pid == data.reader_pid and data.reader_mode != :byob and state != :errored do
-    data = %{data | disturbed: true, read_ahead: read_ahead(data, max)}
+    data = %{data | disturbed: true}
 
     if :queue.is_empty(data.queue) do
       queue_or_complete_read(from, state, data)
@@ -1429,10 +1419,6 @@ defmodule Web.Stream do
   defp handle_read_batch(from, pid, _max, state, data) do
     handle_read_request(from, pid, state, data)
   end
-
-  # The queue of a stream with a count strategy has one unit for each chunk.
-  defp read_ahead(%{strategy: %Web.CountQueuingStrategy{}}, max), do: max
-  defp read_ahead(_data, _max), do: 0
 
   defp pop_queued_chunks(from, max, data) do
     {chunks, queue, size} = take_chunks(data.queue, max, data, [], 0)
@@ -1765,21 +1751,8 @@ defmodule Web.Stream do
 
   defp readable_wants_chunk?(data) do
     readable_capacity(data) > 0 or not :queue.is_empty(data.read_requests) or
-      not is_nil(data.pending_byob_request) or data.read_ahead > data.total_queued_size
+      not is_nil(data.pending_byob_request)
   end
-
-  # The number of chunks that the stream wants at a pull, at least one. A
-  # source that can give many chunks for one pull reads it with
-  # `pull_demand/0`.
-  defp demand_at_pull(data) do
-    capacity = max(readable_capacity(data), data.read_ahead - data.total_queued_size)
-    max(max(capacity, 0) + :queue.len(data.read_requests), 1)
-  end
-
-  @doc false
-  # The number of chunks that the stream wants, in the pull callback of a
-  # source. Each chunk more than this number waits in the queue.
-  def pull_demand, do: Process.get(@pull_demand_key, 1)
 
   # The actions after a pull is complete.
   defp after_pull_actions(%{pull_again: true}), do: [{:next_event, :internal, :maybe_pull}]
@@ -1788,13 +1761,10 @@ defmodule Web.Stream do
   defp do_trigger_pull(%{module: module, impl_state: impl_state} = data) do
     if function_exported?(module, :pull, 2) do
       ctrl = readable_controller(data)
-      demand = demand_at_pull(data)
 
       task =
         start_task(
           fn ->
-            Process.put(@pull_demand_key, demand)
-
             try do
               module.pull(ctrl, impl_state) |> resolve_if_promise({:ok, impl_state})
             rescue
@@ -2693,7 +2663,6 @@ defmodule Web.Stream do
       |> Map.put(:reader_pid, nil)
       |> Map.put(:reader_ref, nil)
       |> Map.put(:reader_mode, nil)
-      |> Map.put(:read_ahead, 0)
 
     {:keep_state, new_data}
   end

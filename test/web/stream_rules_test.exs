@@ -273,26 +273,38 @@ defmodule Web.StreamRulesTest do
       end)
     end
 
+    # The stream has the high water mark 0: the enumerable starts at the
+    # first read. The read runs in a task, and the test controls the
+    # enumerator.
+    defp read_all_later(stream) do
+      Task.async(fn ->
+        try do
+          {:ok, Enum.to_list(stream)}
+        rescue
+          error -> {:raised, error}
+        end
+      end)
+    end
+
     test "has the error of an enumerator that is killed" do
-      stream = ReadableStream.from(gated_enumerable())
+      read = read_all_later(ReadableStream.from(gated_enumerable()))
       assert_receive {:enumerator, enumerator}
 
       # The pull of the stream waits for the enumerator.
       Process.exit(enumerator, :kill)
 
-      error = assert_raise TypeError, fn -> Enum.to_list(stream) end
-      assert error.cause == :killed
+      assert {:raised, %TypeError{cause: :killed}} = Task.await(read)
     end
 
     test "ends when its enumerator stopped" do
-      stream = ReadableStream.from(gated_enumerable())
+      read = read_all_later(ReadableStream.from(gated_enumerable()))
       assert_receive {:enumerator, enumerator}
 
       # The enumerator gives one element, and then it gets the stop.
       send(enumerator, :stop)
       send(enumerator, :go)
 
-      assert Enum.to_list(stream) == [1]
+      assert Task.await(read) == {:ok, [1]}
     end
 
     test "stops its enumerator at a cancel" do

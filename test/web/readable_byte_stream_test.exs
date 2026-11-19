@@ -168,7 +168,8 @@ defmodule Web.ReadableByteStreamTest do
     assert is_reference(request.address)
     assert request.view_byte_offset == view.byte_offset
     assert request.view_byte_length == view.byte_length
-    assert ReadableByteStreamController.desired_size(%ReadableByteStreamController{pid: pid}) == 1
+    # The high water mark of a byte stream is 0.
+    assert ReadableByteStreamController.desired_size(%ReadableByteStreamController{pid: pid}) == 0
 
     assert_raise ArgumentError,
                  ~r/BYOB requests must respond with a binary payload sent through the request capability/,
@@ -260,7 +261,9 @@ defmodule Web.ReadableByteStreamTest do
   end
 
   test "ReadableByteStreamController wait_for_capacity unblocks when readers drain queued bytes" do
-    stream = ReadableStream.new(%{type: "bytes"})
+    # A stream with the limit of 2 bytes wants more bytes when its queue is
+    # empty.
+    stream = ReadableStream.new(%{type: "bytes"}, high_water_mark: 2)
     controller = %ReadableByteStreamController{pid: stream.controller_pid}
 
     ReadableStream.enqueue(stream.controller_pid, "ab")

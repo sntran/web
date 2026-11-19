@@ -21,7 +21,7 @@ defmodule Web.StreamWorkerTest do
   end
 
   # A source that gives the integers from 1 to `count`, and tells the test
-  # the process and the demand of each pull.
+  # the process of each pull, and the desired size that the pull sees.
   defp counting_source(test, count) do
     counter = :counters.new(1, [])
 
@@ -29,7 +29,8 @@ defmodule Web.StreamWorkerTest do
       pull: fn controller ->
         :counters.add(counter, 1, 1)
         index = :counters.get(counter, 1)
-        send(test, {:pull, self(), index, Web.Stream.pull_demand()})
+        desired = ReadableStreamDefaultController.desired_size(controller)
+        send(test, {:pull, self(), index, desired})
 
         if index <= count do
           ReadableStreamDefaultController.enqueue(controller, index)
@@ -42,7 +43,7 @@ defmodule Web.StreamWorkerTest do
 
   defp pulls(acc \\ []) do
     receive do
-      {:pull, pid, index, demand} -> pulls([{pid, index, demand} | acc])
+      {:pull, pid, index, desired} -> pulls([{pid, index, desired} | acc])
     after
       0 -> Enum.reverse(acc)
     end
@@ -170,25 +171,26 @@ defmodule Web.StreamWorkerTest do
       assert Task.await(read) == {:ok, [:first]}
     end
 
-    test "makes the source fill the queue, and the limit goes back at a release" do
-      stream = ReadableStream.new(counting_source(self(), 1_000))
+    test "changes neither the pulls nor the desired size of the stream" do
+      stream = ReadableStream.new(counting_source(self(), 1_000), high_water_mark: 4)
       reader = ReadableStream.get_reader(stream)
 
-      assert {:ok, [1]} = ReadableStreamDefaultReader.read_batch_now(reader, 8)
-
-      # The stream pulls until its queue has 8 chunks: a pull gives a demand
-      # of more than one chunk.
       eventually(fn ->
-        ReadableStream.__get_slots__(stream.controller_pid).total_queued_size == 8
+        ReadableStream.__get_slots__(stream.controller_pid).total_queued_size == 4
       end)
 
-      assert Enum.any?(pulls(), fn {_pid, _index, demand} -> demand > 1 end)
+      assert {:ok, [1, 2, 3, 4]} = ReadableStreamDefaultReader.read_batch_now(reader, 8)
 
-      assert {:ok, chunks} = ReadableStreamDefaultReader.read_batch_now(reader, 8)
-      assert chunks == Enum.to_list(2..9)
+      # The stream pulls to its high water mark again, and no more: the
+      # batch of 8 does not make the source fill a queue of 8 chunks.
+      eventually(fn ->
+        ReadableStream.__get_slots__(stream.controller_pid).total_queued_size == 4
+      end)
 
-      ReadableStreamDefaultReader.release_lock(reader)
-      assert ReadableStream.__get_slots__(stream.controller_pid).read_ahead == 0
+      Process.sleep(30)
+      assert ReadableStream.__get_slots__(stream.controller_pid).total_queued_size == 4
+
+      for {_pid, _index, desired} <- pulls(), do: assert(desired in 1..4)
     end
 
     test "gives the error of the stream, and refuses a process that has no lock" do
@@ -208,7 +210,7 @@ defmodule Web.StreamWorkerTest do
                |> ReadableStreamDefaultReader.batch_result()
     end
 
-    test "a stream with a byte strategy does not read ahead" do
+    test "a stream with a byte strategy keeps its limit in bytes" do
       source = %{
         pull: fn controller -> ReadableStreamDefaultController.enqueue(controller, "x") end
       }
@@ -216,33 +218,31 @@ defmodule Web.StreamWorkerTest do
       stream = ReadableStream.new(source, strategy: Web.ByteLengthQueuingStrategy.new(1))
 
       reader = ReadableStream.get_reader(stream)
-      assert {:ok, _chunks} = ReadableStreamDefaultReader.read_batch_now(reader, 64)
-      assert ReadableStream.__get_slots__(stream.controller_pid).read_ahead == 0
+      assert {:ok, ["x"]} = ReadableStreamDefaultReader.read_batch_now(reader, 64)
+      Process.sleep(30)
+      assert ReadableStream.__get_slots__(stream.controller_pid).total_queued_size <= 1
     end
   end
 
   describe "a stream from an enumerable" do
-    test "gives each chunk of a pull when the enumerable gives it" do
+    test "takes one element of the enumerable for each read" do
       test = self()
 
       enumerable =
         Stream.map(1..5, fn index ->
-          if index == 2, do: Process.sleep(100)
-          send(test, {:produced, index, System.monotonic_time(:millisecond)})
+          send(test, {:produced, index})
           index
         end)
 
       reader = ReadableStream.get_reader(ReadableStream.from(enumerable))
+      refute_receive {:produced, _index}, 30
 
       assert {:ok, [1]} = ReadableStreamDefaultReader.read_batch_now(reader, 4)
-      read_at = System.monotonic_time(:millisecond)
-      assert_receive {:produced, 2, produced_at}, 1_000
-
-      # The first chunk did not wait for the slow second chunk.
-      assert read_at < produced_at
+      assert_received {:produced, 1}
+      refute_receive {:produced, _index}, 30
     end
 
-    test "a cancel stops the enumerable between two chunks of a pull" do
+    test "a cancel runs the end of the enumerable" do
       test = self()
 
       enumerable =
@@ -272,7 +272,11 @@ defmodule Web.StreamWorkerTest do
           fn _acc -> send(test, :enumerable_ended) end
         )
 
+      # The stream has the high water mark 0: the enumerable starts at the
+      # first read.
       stream = ReadableStream.from(enumerable)
+      reader = ReadableStream.get_reader(stream)
+      assert {:ok, %{value: 1}} = ReadableStreamDefaultReader.read_now(reader)
       assert_receive {:enumerator, enumerator}
 
       Process.exit(stream.controller_pid, :kill)

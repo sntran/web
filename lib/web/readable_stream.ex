@@ -266,21 +266,26 @@ defmodule Web.ReadableStream do
 
   @doc false
   # Makes a stream from an enumerable, with options for the stream engine.
-  # The HTTP dispatcher uses the option `:unread_timeout` for a response
-  # body.
+  #
+  # As `ReadableStream.from()` of the Streams Standard, the stream has the
+  # high water mark 0, and each pull takes one element of the enumerable.
+  # Thus the enumerable advances only for a read, one element for each
+  # read, and an enumerable with side effects runs them at the same times
+  # as in the Standard. The option `:high_water_mark` changes the limit.
   def from_enumerable(enumerable, opts) when is_list(opts) do
     if Enumerable.impl_for(enumerable) do
       enumerator = start_enumerator(enumerable)
 
       new(
         %{
-          # The enumerator gives the chunks to the stream, and the pull waits
-          # until it gave the chunks that the stream wants: see
-          # `enumerator_loop/1`.
-          pull: fn controller -> produce(enumerator, controller.pid, Web.Stream.pull_demand()) end,
+          # The enumerator gives one chunk to the stream, and the pull waits
+          # for it: see `enumerator_loop/1`.
+          pull: fn controller -> produce(enumerator, controller.pid) end,
           cancel: fn _reason -> send(enumerator, :stop) end
         },
-        Keyword.put(opts, :cancel_on_reader_exit, true)
+        opts
+        |> Keyword.put_new(:high_water_mark, 0)
+        |> Keyword.put(:cancel_on_reader_exit, true)
       )
     else
       raise TypeError, "Cannot make a ReadableStream from #{inspect(enumerable)}"
@@ -290,10 +295,15 @@ defmodule Web.ReadableStream do
   defp normalize_stream_options(underlying_source, opts) do
     stream_type = source_stream_type(underlying_source)
 
+    # The Streams Standard gives a byte stream the high water mark 0, and
+    # each other stream the high water mark 1.
     default_hwm =
       case underlying_source do
-        %{} = source -> Map.get(source, :high_water_mark, 1)
-        _ -> 1
+        %{} = source ->
+          Map.get(source, :high_water_mark, if(stream_type == :bytes, do: 0, else: 1))
+
+        _ ->
+          1
       end
 
     strategy_from_source =
@@ -443,22 +453,23 @@ defmodule Web.ReadableStream do
 
   # The process of an enumerable. A slow enumerable thus does not stop the
   # stream process, and a cancel can stop the enumerable while it waits.
+  # The enumerable cannot be in the worker of the stream: a cancel stops a
+  # pull that runs, and the enumerable must then run its code for the end,
+  # such as the `after` of `Stream.resource/3`.
   #
-  # For each pull, the enumerator gives the chunks that the stream wants,
-  # each in its own message, as the enumerable gives them. Thus a chunk does
-  # not wait for the next one. The enumerator also closes the stream, or
-  # puts it in the errored state. These messages come from one process, thus
-  # the stream gets them in their sequence.
+  # For each pull, the enumerator gives one chunk to the stream. It also
+  # closes the stream, or puts it in the errored state. These messages come
+  # from one process, thus the stream gets them in their sequence.
   defp start_enumerator(enumerable) do
     spawn(fn -> enumerator_loop(%{enumerable: {:initial, enumerable}, stream: nil}) end)
   end
 
   defp enumerator_loop(state) do
     receive do
-      {:produce, stream, demand, from, ref} ->
+      {:produce, stream, from, ref} ->
         state = watch_stream(state, stream)
 
-        case produce_chunks(state.enumerable, stream, demand) do
+        case produce_chunk(state.enumerable, stream) do
           {:more, enumerable} ->
             send(from, {ref, :ok})
             enumerator_loop(%{state | enumerable: enumerable})
@@ -485,30 +496,24 @@ defmodule Web.ReadableStream do
 
   defp watch_stream(state, _stream), do: state
 
-  defp produce_chunks(enumerable, _stream, 0), do: {:more, enumerable}
+  # A pull asked for the chunk: in the Streams Standard, the pull calls the
+  # iterator before a cancel can come. Thus a cancel that comes after the
+  # request stops the enumerable after this chunk: see `enumerator_loop/1`.
+  defp produce_chunk(enumerable, stream) do
+    case safe_enumerator_next(enumerable) do
+      {:chunk, chunk, next} ->
+        enqueue(stream, chunk)
+        {:more, next}
 
-  defp produce_chunks(enumerable, stream, demand) do
-    receive do
-      :stop ->
-        halt_enumerator(enumerable)
+      :done ->
+        close(stream)
         :ended
-    after
-      0 ->
-        case safe_enumerator_next(enumerable) do
-          {:chunk, chunk, next} ->
-            enqueue(stream, chunk)
-            produce_chunks(next, stream, demand - 1)
 
-          :done ->
-            close(stream)
-            :ended
-
-          # The stream gets the error as the error of a pull: an exception
-          # for a raise, and the value for a throw or an exit.
-          {:raised, kind, reason, stacktrace} ->
-            :gen_statem.cast(stream, {:error, Exception.normalize(kind, reason, stacktrace)})
-            :ended
-        end
+      # The stream gets the error as the error of a pull: an exception for a
+      # raise, and the value for a throw or an exit.
+      {:raised, kind, reason, stacktrace} ->
+        :gen_statem.cast(stream, {:error, Exception.normalize(kind, reason, stacktrace)})
+        :ended
     end
   end
 
@@ -524,12 +529,12 @@ defmodule Web.ReadableStream do
   defp halt_enumerator(_initial_or_done), do: :ok
 
   # The pull of a stream from an enumerable: it waits until the enumerator
-  # gave the chunks that the stream wants, or stopped. An enumerator that
-  # stopped with no error ends the stream. The error of an enumerator that
-  # failed is the error of the pull.
-  defp produce(enumerator, stream, demand) do
+  # gave one chunk, or stopped. An enumerator that stopped with no error
+  # ends the stream. The error of an enumerator that failed is the error of
+  # the pull.
+  defp produce(enumerator, stream) do
     ref = Process.monitor(enumerator)
-    send(enumerator, {:produce, stream, demand, self(), ref})
+    send(enumerator, {:produce, stream, self(), ref})
 
     receive do
       {^ref, :ok} ->
@@ -1199,8 +1204,10 @@ defimpl Enumerable, for: Web.ReadableStream do
 
   # The enumeration reads the chunks in batches. The first batch has one
   # chunk, and each batch after it has two times the chunks of the batch
-  # before, up to 64. Thus an enumeration that takes few chunks, such as
-  # `Enum.take/2`, does not make the source give many chunks.
+  # before, up to 64. A batch takes only the chunks that are in the queue:
+  # the stream pulls as for one read after the other, as the Streams
+  # Standard specifies. Thus an enumeration that takes few chunks, such as
+  # `Enum.take/2`, takes no chunk that it does not use.
   def reduce(stream, acc, fun) do
     reader = Web.ReadableStream.get_reader(stream)
     do_reduce({reader, [], 1}, acc, fun)

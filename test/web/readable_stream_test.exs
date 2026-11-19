@@ -179,7 +179,9 @@ defmodule Web.ReadableStreamTest do
       ReadableStream.enqueue(stream.controller_pid, "ab")
 
       assert ReadableStream.__get_slots__(stream.controller_pid).stream_type == :bytes
-      assert ReadableStream.get_desired_size(stream.controller_pid) == -1
+      # A byte stream has the high water mark 0, as the Streams Standard
+      # specifies, and its queue counts bytes.
+      assert ReadableStream.get_desired_size(stream.controller_pid) == -2
 
       reader = ReadableStream.get_reader(stream, mode: "byob")
       assert %ReadableStreamBYOBReader{} = reader

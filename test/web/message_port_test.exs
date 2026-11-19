@@ -383,19 +383,19 @@ defmodule Web.MessagePortTest do
     ensure_pid = Engine.debug_server_pid(ensure_port)
     :sys.replace_state(ensure_pid, &%{&1 | peer_pid: nil, peer_token: nil, peer_monitor: nil})
     assert_data_clone_error(fn -> Engine.ensure_transferable(ensure_port) end)
-    refute Process.alive?(ensure_pid)
+    await_process_exit(ensure_pid)
 
     {post_port, _peer} = MessageChannel.new()
     post_pid = Engine.debug_server_pid(post_port)
     :sys.replace_state(post_pid, &%{&1 | peer_pid: nil, peer_token: nil, peer_monitor: nil})
     assert_data_clone_error(fn -> MessagePort.post_message(post_port, "boom") end)
-    refute Process.alive?(post_pid)
+    await_process_exit(post_pid)
 
     {transfer_port, _peer} = MessageChannel.new()
     transfer_pid = Engine.debug_server_pid(transfer_port)
     :sys.replace_state(transfer_pid, &%{&1 | peer_pid: nil, peer_token: nil, peer_monitor: nil})
     assert_raw_data_clone_error(raw_request(transfer_port, {:transfer, self()}))
-    refute Process.alive?(transfer_pid)
+    await_process_exit(transfer_pid)
 
     {dead_peer_port, _peer} = MessageChannel.new()
     dead_peer_pid = Engine.debug_server_pid(dead_peer_port)
@@ -407,7 +407,7 @@ defmodule Web.MessagePortTest do
     end)
 
     assert_data_clone_error(fn -> Engine.ensure_transferable(dead_peer_port) end)
-    refute Process.alive?(dead_peer_pid)
+    await_process_exit(dead_peer_pid)
   end
 
   test "local ensure_transferable raises for closed and invalid embedded state" do

@@ -203,6 +203,11 @@ defmodule Web.Socket do
     authority = init_authority()
     {readable, writable} = init_streams(authority, options)
 
+    # The streams are parts of the socket. If one of them stops with a
+    # failure, the socket stops, and the reverse.
+    Process.link(readable.controller_pid)
+    Process.link(writable.controller_pid)
+
     holder_pid
     |> init_connection_state(host, port, options)
     |> Map.merge(authority)

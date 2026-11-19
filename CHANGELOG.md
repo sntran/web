@@ -161,6 +161,17 @@ All notable changes to this project are documented in this file.
     give `Web.TypeError`.
   - The promises and streams that a stream callback makes belong to the
     stream.
+  - A stream has no link to the process that made it. An owner that stops
+    with a failure or a shutdown gets no linger time: the stream cancels (or
+    aborts) immediately, and its source gets the `cancel` call. A process
+    that holds the lock continues to read. Before, the failure stopped the
+    stream process immediately, with no `cancel` call, also while a
+    different process read the stream. A failure of a stream process does
+    not stop the process that made the stream.
+  - The writer lock of a pipe does not keep the destination stream after
+    the owner of the destination stopped. When the destination stops, the
+    pipe ends and cancels its source. Await the promise of `pipe_to/3`, or
+    keep the owner of the destination alive, until the pipe is complete.
 - **Breaking:** a halt of an enumeration cancels the stream. `Enum.take/2`
   on a `Web.ReadableStream` stops its source. Before, the stream stayed
   open and the source continued.
@@ -239,6 +250,19 @@ All notable changes to this project are documented in this file.
   stops.
 - An errored stream stops after the linger time, also with chunks in its
   queue. No process can read those chunks.
+- A pipe with a source that has no end stops after the processes that use
+  it stopped. Before, such a pipe continued without end when its owner
+  stopped normally.
+- A `cancel` callback of a readable stream, or a `close` callback of a
+  writable stream, that raises does not stop the stream process. The
+  promise of `cancel` or `close` rejects with the thrown value, as the
+  Streams Standard specifies. After a `close` callback that raises, the
+  stream is in the errored state.
+- A stream that is ended and empty stays for the linger time after its
+  owner stopped normally. Before, it stopped immediately, and a process
+  that got the stream in a message could get `Web.TypeError` from
+  `get_reader`. `Web.Dispatcher.TCP` had this failure when the peer closed
+  the connection immediately.
 - `Web.URL` does not keep each host in a table. The table had no limit, and
   it was necessary only for the Node.js call that is now removed.
 - A stream subscribes to its ambient `Web.AbortSignal` in its own process.

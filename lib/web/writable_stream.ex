@@ -132,15 +132,20 @@ defmodule Web.WritableStream do
   @doc """
   Locks the stream and returns a default writer.
   """
-  def get_writer(pid) when is_pid(pid) do
-    case Web.Stream.call(pid, {:get_writer, self()}, {:error, :released}) do
+  def get_writer(target), do: get_writer(target, :writer)
+
+  @doc false
+  # The kind `:pipe` is for the writer lock of a pipe. Such a lock does not
+  # keep the stream after its owner stopped.
+  def get_writer(pid, kind) when is_pid(pid) and kind in [:writer, :pipe] do
+    case Web.Stream.call(pid, {:get_writer, self(), kind}, {:error, :released}) do
       :ok -> :ok
       {:error, reason} -> {:error, reason}
     end
   end
 
-  def get_writer(%__MODULE__{controller_pid: pid}) do
-    case get_writer(pid) do
+  def get_writer(%__MODULE__{controller_pid: pid}, kind) do
+    case get_writer(pid, kind) do
       :ok ->
         %WritableStreamDefaultWriter{controller_pid: pid, owner_pid: self()}
 
@@ -184,10 +189,11 @@ defmodule Web.WritableStream do
   end
 
   def close(pid) when is_pid(pid) do
-    Web.Promise.detached(fn resolve, _reject ->
-      :ok = Web.Stream.terminate_and_wait(pid, :close, nil)
-
-      resolve.(:ok)
+    Web.Promise.detached(fn resolve, reject ->
+      case Web.Stream.terminate_and_wait(pid, :close, nil) do
+        :ok -> resolve.(:ok)
+        {:error, thrown} -> reject.(thrown)
+      end
     end)
   end
 

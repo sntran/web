@@ -581,10 +581,11 @@ defmodule Web.ReadableStream do
   end
 
   def cancel(pid, reason) do
-    Promise.detached(fn resolve, _reject ->
-      :ok = Web.Stream.terminate_and_wait(pid, :cancel, reason)
-
-      resolve.(:ok)
+    Promise.detached(fn resolve, reject ->
+      case Web.Stream.terminate_and_wait(pid, :cancel, reason) do
+        :ok -> resolve.(:ok)
+        {:error, thrown} -> reject.(thrown)
+      end
     end)
   end
 
@@ -897,10 +898,10 @@ defmodule Web.ReadableStream do
   end
 
   defp acquire_writer_for_pipe(%WritableStream{} = writable),
-    do: WritableStream.get_writer(writable)
+    do: WritableStream.get_writer(writable, :pipe)
 
   defp acquire_writer_for_pipe(pid) when is_pid(pid) do
-    case WritableStream.get_writer(pid) do
+    case WritableStream.get_writer(pid, :pipe) do
       :ok -> %Web.WritableStreamDefaultWriter{controller_pid: pid, owner_pid: self()}
       {:error, :already_locked} -> raise TypeError, "WritableStream is already locked"
       {:error, :released} -> raise TypeError, @released_message
@@ -1019,7 +1020,7 @@ defimpl Enumerable, for: Web.ReadableStream do
   # A halt is the end of the enumeration. Cancel the stream, thus its source
   # stops and the stream process can stop.
   defp do_reduce(reader, {:halt, acc}, _fun) do
-    :ok = Web.Stream.terminate_and_wait(reader.controller_pid, :cancel, :halted)
+    _ = Web.Stream.terminate_and_wait(reader.controller_pid, :cancel, :halted)
     {:halted, acc}
   end
 

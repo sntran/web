@@ -109,6 +109,8 @@ defmodule Web.Stream do
     # Consumer (writable) side
     writer_pid: nil,
     writer_ref: nil,
+    # A pipe holds the writer lock. Such a lock does not keep the stream.
+    writer_is_pipe: false,
     pending_write_request: nil,
     pending_close_request: nil,
     queued_write_requests: :queue.new(),
@@ -133,11 +135,18 @@ defmodule Web.Stream do
   # Public start
   # ---------------------------------------------------------------------------
 
-  @doc "Starts a stream engine process for the given implementing module."
+  @doc """
+  Starts a stream engine process for the given implementing module.
+
+  The stream has no link to the caller. It monitors its owner, and it stops
+  by its lifetime rules. A link would stop the stream immediately when the
+  owner stops with an error, also when a different process holds the lock.
+  The name of the function stays for compatibility.
+  """
   def start_link(module, opts) when is_atom(module) do
     snapshot = Snapshot.take()
     owner = Keyword.get_lazy(opts, :owner, &Web.Promise.owner/0)
-    :gen_statem.start_link(__MODULE__, {module, opts, snapshot, owner}, [])
+    :gen_statem.start(__MODULE__, {module, opts, snapshot, owner}, [])
   end
 
   @doc false
@@ -547,16 +556,18 @@ defmodule Web.Stream do
   # Writer lock acquisition
   defp handle_common(
          {:call, from},
-         {:get_writer, pid},
+         {:get_writer, pid, kind},
          _state,
          %{writer_pid: nil} = data
        )
        when data.type in [:consumer, :producer_consumer] do
     ref = Process.monitor(pid)
-    {:keep_state, %{data | writer_pid: pid, writer_ref: ref}, [{:reply, from, :ok}]}
+
+    {:keep_state, %{data | writer_pid: pid, writer_ref: ref, writer_is_pipe: kind == :pipe},
+     [{:reply, from, :ok}]}
   end
 
-  defp handle_common({:call, from}, {:get_writer, _pid}, _state, data)
+  defp handle_common({:call, from}, {:get_writer, _pid, _kind}, _state, data)
        when data.type in [:consumer, :producer_consumer] do
     {:keep_state_and_data, [{:reply, from, {:error, :already_locked}}]}
   end
@@ -696,12 +707,14 @@ defmodule Web.Stream do
   # Error injection (cast)
   defp handle_common({:call, from}, {:terminate, type, reason}, state, data)
        when type in [:cancel, :close, :abort, :error] do
-    case handle_terminate_request(type, reason, state, data) do
+    {result, transition} = terminate_request_with_result(type, reason, state, data)
+
+    case transition do
       :keep_state_and_data ->
-        {:keep_state_and_data, [{:reply, from, :ok}]}
+        {:keep_state_and_data, [{:reply, from, result}]}
 
       {:next_state, next_state, new_data, actions} ->
-        {:next_state, next_state, new_data, [{:reply, from, :ok} | actions]}
+        {:next_state, next_state, new_data, [{:reply, from, result} | actions]}
     end
   end
 
@@ -1661,6 +1674,14 @@ defmodule Web.Stream do
   #     not read, the stream waits for the linger time. This lets a different
   #     process, which got the stream in a message, take a lock. Then the
   #     stream cancels (or aborts) and stops.
+  #   * An owner that stopped with a failure or a shutdown gets no linger
+  #     time: the stream cancels (or aborts) immediately, unless a process
+  #     holds a lock. The stream has no link to its owner. Thus a failure of
+  #     the owner does not stop a stream that a different process reads, and
+  #     the source always gets its `cancel` call.
+  #   * The writer lock of a pipe does not keep the destination stream. When
+  #     the destination stops, the pipe ends and cancels its source. Thus the
+  #     life of a pipe follows the process that uses its destination.
   #   * When the stream is ended and all its chunks are read, it waits for
   #     the linger time and stops. A lock has no effect, because the stream
   #     has no more data for the process that holds the lock.
@@ -1715,22 +1736,43 @@ defmodule Web.Stream do
 
   defp lifetime_timeout(_state, data), do: unread_linger(data)
 
-  # The stream is ended and has no chunks. A lock has no effect.
+  # The stream is ended and has no chunks. A lock does not keep it. A process
+  # that got the stream in a message can still get a reader in the linger
+  # time, and read the end of the stream.
   defp complete_linger(data) do
-    if owner_down?(data) and not locked?(data), do: 0, else: data.linger
+    cond do
+      locked?(data) -> data.linger
+      owner_failed?(data) -> 0
+      owner_down?(data) -> handoff_linger(data.linger)
+      true -> data.linger
+    end
   end
 
   # The stream has work, or chunks that are not read.
   defp unread_linger(data) do
     cond do
       locked?(data) -> nil
+      owner_failed?(data) -> 0
       owner_down?(data) -> handoff_linger(data.linger)
       true -> nil
     end
   end
 
+  # An owner that stopped with a failure or a shutdown gave the stream to no
+  # process. Only a normal stop gets the handoff time.
+  defp owner_failed?(%{owner_down_reason: {:owner_down, reason}}),
+    do: reason not in [:normal, :noproc]
+
+  defp owner_failed?(_data), do: false
+
   defp owner_down?(data), do: not is_nil(data.owner_down_reason)
-  defp locked?(data), do: is_pid(data.reader_pid) or is_pid(data.writer_pid)
+  # The writer lock of a pipe is not a lock for these rules. A pipe writes
+  # for the process that reads the destination, or for the owner. If the
+  # pipe kept the destination, a pipe with an endless source would have no
+  # end after all its users stopped.
+  defp locked?(data) do
+    is_pid(data.reader_pid) or (is_pid(data.writer_pid) and not data.writer_is_pipe)
+  end
 
   defp handoff_linger(linger) when is_integer(linger), do: linger
   defp handoff_linger(_infinity), do: @handoff_linger
@@ -1757,11 +1799,24 @@ defmodule Web.Stream do
   defp owner_down_type(_consumer_or_transform), do: :abort
 
   defp handle_termination(type, reason, data) do
-    data
-    |> clear_owner()
-    |> clear_task()
-    |> signal_terminate(type, reason)
-    |> finalize_termination(type, reason)
+    {_result, transition} = termination_with_result(type, reason, data)
+    transition
+  end
+
+  # Gives the result of the terminal callback together with the transition.
+  # A callback that throws does not stop the stream process: the stream
+  # goes to its terminal state, and the caller gets the thrown value.
+  defp termination_with_result(type, reason, data) do
+    data = data |> clear_owner() |> clear_task()
+
+    case {type, signal_terminate(data, type, reason)} do
+      # A close callback that throws puts the stream in the errored state.
+      {:close, {:error, thrown} = result} ->
+        {result, finalize_termination(data, :error, thrown)}
+
+      {_type, result} ->
+        {result, finalize_termination(data, type, reason)}
+    end
   end
 
   defp finalize_termination(data, type, _reason) when type in [:cancel, :close] do
@@ -1814,12 +1869,16 @@ defmodule Web.Stream do
      error_actions ++ [{:next_event, :internal, :flush_requests}]}
   end
 
-  defp signal_terminate(%{module: module, impl_state: impl_state} = data, type, reason) do
+  defp signal_terminate(%{module: module, impl_state: impl_state}, type, reason) do
     if function_exported?(module, :terminate, 2) do
       module.terminate({type, reason}, impl_state)
     end
 
-    data
+    :ok
+  rescue
+    error -> {:error, error}
+  catch
+    _kind, thrown -> {:error, thrown}
   end
 
   defp clear_owner(%{reader_ref: reader_ref, writer_ref: writer_ref} = data) do
@@ -1966,16 +2025,20 @@ defmodule Web.Stream do
   end
 
   defp handle_terminate_request(type, reason, state, data) do
+    {_result, transition} = terminate_request_with_result(type, reason, state, data)
+    transition
+  end
+
+  defp terminate_request_with_result(type, reason, state, data) do
     cond do
       type == :cancel and state == :closed ->
-        _ = signal_terminate(data, type, reason)
-        :keep_state_and_data
+        {signal_terminate(data, type, reason), :keep_state_and_data}
 
       state in [:closed, :errored] ->
-        :keep_state_and_data
+        {:ok, :keep_state_and_data}
 
       true ->
-        handle_termination(type, reason, data)
+        termination_with_result(type, reason, data)
     end
   end
 

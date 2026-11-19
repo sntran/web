@@ -188,6 +188,78 @@ defmodule Web.StreamLifetimeTest do
       stream = in_short_process(fn -> ReadableStream.from(["a", "b", "c"]) end)
       assert Enum.to_list(stream) == ["a", "b", "c"]
     end
+
+    test "cancels with no linger time when its owner stops with a failure" do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          stream =
+            ReadableStream.new(
+              %{cancel: fn reason -> send(parent, {:cancelled, reason}) end},
+              linger: 60_000
+            )
+
+          send(parent, {:stream, stream})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:stream, stream}
+      Process.exit(owner, :kill)
+
+      assert_receive {:cancelled, {:owner_down, :killed}}, 1_000
+      assert_down(stream.controller_pid, 1_000)
+    end
+
+    test "continues for the process that holds the lock when its owner stops with a failure" do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          stream =
+            ReadableStream.new(
+              %{
+                pull: fn controller ->
+                  ReadableStreamDefaultController.enqueue(controller, "x")
+                end,
+                cancel: fn reason -> send(parent, {:cancelled, reason}) end
+              },
+              linger: 60_000
+            )
+
+          send(parent, {:stream, stream})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:stream, stream}
+      reader = ReadableStream.get_reader(stream)
+      Process.exit(owner, :kill)
+
+      refute_receive {:cancelled, _reason}, 2 * @linger
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "x", done: false}
+
+      # No owner is alive. Thus the stream cancels when the lock is released.
+      ReadableStreamDefaultReader.release_lock(reader)
+      assert_receive {:cancelled, {:owner_down, :killed}}, 1_000
+      assert_down(stream.controller_pid, 1_000)
+    end
+
+    test "has no link to the process that made it" do
+      parent = self()
+
+      creator =
+        spawn(fn ->
+          send(parent, {:stream, ReadableStream.new(%{})})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:stream, stream}
+      Process.exit(stream.controller_pid, :kill)
+      assert_down(stream.controller_pid)
+
+      refute_down(creator, @linger)
+      Process.exit(creator, :kill)
+    end
   end
 
   describe "a stream with the option :unread_timeout" do
@@ -294,6 +366,83 @@ defmodule Web.StreamLifetimeTest do
   end
 
   describe "a pipe" do
+    # A source that has no end, and tells the test when it is cancelled.
+    defp endless_source(parent) do
+      %{
+        pull: fn controller -> ReadableStreamDefaultController.enqueue(controller, "x") end,
+        cancel: fn reason -> send(parent, {:cancelled, reason}) end
+      }
+    end
+
+    test "ends when its owner stops with a failure and its source has no end" do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          source = ReadableStream.new(endless_source(parent))
+          sink = WritableStream.new(%{write: fn _chunk, _controller -> :ok end})
+          ReadableStream.pipe_to(source, sink)
+          send(parent, {:streams, source, sink})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:streams, source, sink}
+      Process.exit(owner, :kill)
+
+      assert_receive {:cancelled, _reason}, 2_000
+      assert_down(sink.controller_pid)
+      assert_down(source.controller_pid)
+    end
+
+    test "ends after the linger time when its owner stops and no process reads its result" do
+      parent = self()
+
+      {source, result} =
+        in_short_process(fn ->
+          source = ReadableStream.new(endless_source(parent))
+
+          # The transform discards each chunk. Thus the pipe gets no backpressure.
+          discard = TransformStream.new(%{transform: fn _chunk, _controller -> :ok end})
+          {source, ReadableStream.pipe_through(source, discard)}
+        end)
+
+      assert_receive {:cancelled, _reason}, 2_000
+      assert_down(result.controller_pid)
+      assert_down(source.controller_pid)
+    end
+
+    test "continues when a different process reads its result" do
+      result =
+        in_short_process(fn ->
+          ReadableStream.from(["a", "b", "c"])
+          |> ReadableStream.pipe_through(TransformStream.new(%{}))
+        end)
+
+      reader = ReadableStream.get_reader(result)
+      Process.sleep(4 * @linger)
+
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "a", done: false}
+      ReadableStreamDefaultReader.release_lock(reader)
+      assert Enum.to_list(result) == ["b", "c"]
+    end
+
+    test "continues while the owner of its destination is alive" do
+      parent = self()
+
+      source = in_short_process(fn -> ReadableStream.from(1..50) end)
+
+      sink =
+        WritableStream.new(%{
+          write: fn chunk, _controller ->
+            Process.sleep(10)
+            send(parent, {:written, chunk})
+          end
+        })
+
+      assert await(ReadableStream.pipe_to(source, sink)) == :ok
+      assert_received {:written, 50}
+    end
+
     test "rejects when the readable stream stopped" do
       source = ReadableStream.from(["a"])
       assert Enum.to_list(source) == ["a"]
@@ -403,6 +552,34 @@ defmodule Web.StreamLifetimeTest do
   end
 
   describe "a callback of a stream" do
+    test "gives its thrown value to the cancel promise, and the stream closes" do
+      stream = ReadableStream.new(%{cancel: fn _reason -> raise "no cancel" end})
+
+      assert %RuntimeError{message: "no cancel"} =
+               catch_exit(await(ReadableStream.cancel(stream, :not_necessary)))
+
+      assert Process.alive?(stream.controller_pid)
+      assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
+    end
+
+    test "gives its thrown value to the close promise, and the stream is errored" do
+      stream = WritableStream.new(%{close: fn _controller -> throw(:no_close) end})
+
+      assert catch_exit(await(WritableStream.close(stream))) == :no_close
+      assert Process.alive?(stream.controller_pid)
+      assert WritableStream.__get_slots__(stream.controller_pid).state == :errored
+    end
+
+    test "does not stop the stream when the owner stops and the cancel callback raises" do
+      stream =
+        in_short_process(fn ->
+          ReadableStream.new(%{cancel: fn _reason -> raise "no cancel" end})
+        end)
+
+      monitor = Process.monitor(stream.controller_pid)
+      assert_receive {:DOWN, ^monitor, :process, _pid, :normal}, 2_000
+    end
+
     test "makes promises and streams that the stream owns" do
       parent = self()
 

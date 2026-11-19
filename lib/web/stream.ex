@@ -168,8 +168,8 @@ defmodule Web.Stream do
   @doc false
   # Calls the stream process. Returns `gone` if the process stopped, also
   # when it stopped with a failure during the call.
-  def call(pid, message, gone, timeout \\ :infinity) when is_pid(pid) do
-    :gen_statem.call(pid, message, timeout)
+  def call(pid, message, gone) when is_pid(pid) do
+    :gen_statem.call(pid, message, :infinity)
   catch
     :exit, {reason, {:gen_statem, :call, _args}}
     when reason in [:noproc, :normal, :killed, :shutdown] or
@@ -360,7 +360,9 @@ defmodule Web.Stream do
   end
 
   @doc false
-  def control_call(pid, message, timeout \\ :infinity) when is_pid(pid) do
+  # A call that waits in the process that calls it. It exits when the
+  # stream stops before the reply.
+  def control_call(pid, message) when is_pid(pid) do
     monitor_ref = Process.monitor(pid)
     ref = make_ref()
     deliver(pid, {:"$gen_call", {self(), ref}, message}, message)
@@ -371,11 +373,7 @@ defmodule Web.Stream do
         reply
 
       {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
-        exit({reason, {__MODULE__, :control_call, [pid, message, timeout]}})
-    after
-      timeout ->
-        Process.demonitor(monitor_ref, [:flush])
-        exit({:timeout, {__MODULE__, :control_call, [pid, message, timeout]}})
+        exit({reason, {__MODULE__, :control_call, [pid, message]}})
     end
   end
 

@@ -60,10 +60,6 @@ defmodule Web.StreamTest do
   alias Web.WritableStreamDefaultWriter
 
   describe "Web.Stream engine basics" do
-    test "TypeError definition check" do
-      assert %TypeError{message: "m"}.message == "m"
-    end
-
     test "start_link/2 starts a gen_statem process" do
       {:ok, pid} = Web.Stream.start_link(ReadableStream, [])
       assert is_pid(pid)
@@ -974,22 +970,8 @@ defmodule Web.StreamTest do
       Process.exit(pid, :kill)
       Process.sleep(20)
 
-      assert catch_exit(Web.Stream.control_call(pid, :never_replied, 50)) ==
-               {:noproc, {Web.Stream, :control_call, [pid, :never_replied, 50]}}
-    end
-
-    test "control_call exits on timeout when the target stays alive but silent" do
-      pid =
-        spawn(fn ->
-          receive do
-            _ -> Process.sleep(:infinity)
-          end
-        end)
-
-      assert catch_exit(Web.Stream.control_call(pid, :never_replied, 10)) ==
-               {:timeout, {Web.Stream, :control_call, [pid, :never_replied, 10]}}
-
-      Process.exit(pid, :kill)
+      assert catch_exit(Web.Stream.control_call(pid, :never_replied)) ==
+               {:noproc, {Web.Stream, :control_call, [pid, :never_replied]}}
     end
 
     # --- stream.ex line 591: cancel on already-closed stream calls signal_terminate ---

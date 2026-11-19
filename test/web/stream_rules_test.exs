@@ -347,6 +347,24 @@ defmodule Web.StreamRulesTest do
       assert_receive {:source_cancelled, ^error}
     end
 
+    test "with a signal that aborted with an exception cancels the source and aborts the destination" do
+      test = self()
+      error = %RuntimeError{message: "the reason of the signal"}
+
+      source =
+        ReadableStream.new(%{
+          pull: fn _controller -> :ok end,
+          cancel: fn reason -> send(test, {:source_cancelled, reason}) end
+        })
+
+      sink = WritableStream.new(%{abort: fn reason -> send(test, {:sink_aborted, reason}) end})
+      signal = Web.AbortSignal.abort(error)
+
+      assert catch_exit(await(ReadableStream.pipe_to(source, sink, signal: signal))) == error
+      assert_receive {:source_cancelled, ^error}
+      assert_receive {:sink_aborted, ^error}
+    end
+
     test "with a signal waits for a slow source" do
       controller = AbortController.new()
 
@@ -364,6 +382,34 @@ defmodule Web.StreamRulesTest do
                await(ReadableStream.pipe_to(source, collecting_sink(), signal: controller.signal))
 
       assert_received {:written, "late"}
+    end
+
+    test "with a signal stops a read that waits when the signal aborts" do
+      test = self()
+      controller = AbortController.new()
+
+      source =
+        ReadableStream.new(%{
+          pull: fn _controller -> :ok end,
+          cancel: fn reason -> send(test, {:source_cancelled, reason}) end
+        })
+
+      sink = WritableStream.new(%{abort: fn reason -> send(test, {:sink_aborted, reason}) end})
+      pipe = ReadableStream.pipe_to(source, sink, signal: controller.signal)
+
+      # The read of the pipe waits for a chunk that does not come.
+      eventually(fn ->
+        {:readable, data} = :sys.get_state(source.controller_pid)
+        :queue.len(data.read_requests) == 1
+      end)
+
+      # Longer than the time between two checks of the signal.
+      Process.sleep(40)
+      AbortController.abort(controller, :stop)
+
+      assert catch_exit(await(pipe)) == :stop
+      assert_receive {:source_cancelled, :stop}
+      assert_receive {:sink_aborted, :stop}
     end
 
     test "that no process awaits ends with no error report when its destination fails" do

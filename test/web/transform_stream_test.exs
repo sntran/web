@@ -83,7 +83,9 @@ defmodule Web.TransformStreamTest do
                    :stopped
         end)
 
-      assert log == ""
+      # The log can have lines of the tests that run at the same time.
+      refute log =~ "start failed"
+      refute log =~ "terminating"
     end
 
     test "does not wait for a promise that the function start returns" do

@@ -213,6 +213,9 @@ defmodule Web.ReadableStreamTeeTest do
 
       assert catch_exit(await(ReadableStreamDefaultReader.closed(left_reader))) == :source_failed
       assert catch_exit(read(left_reader)) == :source_failed
+
+      # The two branches get the error in sequence. Wait for the second one.
+      assert catch_exit(await(ReadableStreamDefaultReader.closed(right_reader))) == :source_failed
       assert catch_exit(read(right_reader)) == :source_failed
     end
 

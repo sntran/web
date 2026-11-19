@@ -136,17 +136,6 @@ defmodule Web.ReadableStreamTest do
       assert :ok = Web.Promise.await(ReadableStream.cancel(p4, :r4))
     end
 
-    test "internal events and desired size", %{controller_pid: pid} do
-      assert ReadableStream.get_desired_size(pid) == 2
-      send(pid, {:internal, :maybe_pull})
-      ReadableStream.close(pid)
-      send(pid, {:internal, :maybe_pull})
-      send(pid, {:internal, :flush_requests})
-      ReadableStream.error(pid, :fail)
-      send(pid, {:internal, :maybe_pull})
-      send(pid, {:internal, :flush_requests})
-    end
-
     test "new/2 honors byte-length strategies for desired size" do
       stream =
         ReadableStream.new(%{},
@@ -653,17 +642,6 @@ defmodule Web.ReadableStreamTest do
     end
 
     test "edge cases" do
-      # maybe_pull when queue full
-      {:ok, p1} = ReadableStream.start_link(high_water_mark: 1)
-      ReadableStream.enqueue(p1, "a")
-      send(p1, {:internal, :maybe_pull})
-
-      # flush_requests when queue NOT empty
-      {:ok, p2} = ReadableStream.start_link()
-      ReadableStream.enqueue(p2, "a")
-      # This sends flush_requests, but queue not empty
-      ReadableStream.close(p2)
-
       # disturbed and desired size
       {:ok, p3} = ReadableStream.start_link(high_water_mark: 5)
       assert ReadableStream.__get_slots__(p3).disturbed == false

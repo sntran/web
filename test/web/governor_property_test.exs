@@ -192,6 +192,14 @@ defmodule Web.GovernorPropertyTest do
   # Properties
   # ---------------------------------------------------------------------------
 
+  defp wait_until(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(2) && wait_until(fun, attempts - 1)
+    end
+  end
+
   defp command do
     tuple({
       frequency([
@@ -269,7 +277,9 @@ defmodule Web.GovernorPropertyTest do
       assert results == durations
       assert :counters.get(counter, 2) <= capacity
       assert :counters.get(counter, 1) == 0
-      assert :sys.get_state(governor.pid).in_use == 0
+
+      # The promise settles before the work releases its token.
+      wait_until(fn -> :sys.get_state(governor.pid).in_use == 0 end)
       Process.exit(governor.pid, :kill)
     end
   end

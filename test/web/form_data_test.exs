@@ -1932,7 +1932,7 @@ defmodule Web.FormDataTest do
             scripted_stream_loop([], locked?)
         end
 
-      {:"$gen_call", {from, ref}, {:release_lock, _pid}} ->
+      {:"$gen_call", {from, ref}, {:release_lock, :reader, _pid}} ->
         send(from, {ref, :ok})
         scripted_stream_loop(read_responses, false)
 

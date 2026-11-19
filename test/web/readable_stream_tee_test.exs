@@ -198,27 +198,36 @@ defmodule Web.ReadableStreamTeeTest do
       assert length(pulls) <= 6
     end
 
-    test "gives its error to the two branches" do
-      {:ok, calls} = Agent.start_link(fn -> 0 end)
-
-      stream =
-        ReadableStream.new(%{
-          pull: fn controller ->
-            if Agent.get_and_update(calls, &{&1, &1 + 1}) == 0 do
-              ReadableStreamDefaultController.enqueue(controller, "first")
-            else
-              ReadableStreamDefaultController.error(controller, :source_failed)
-            end
-          end
-        })
+    test "gives its error to the two branches immediately, and they discard their chunks" do
+      stream = ReadableStream.new(%{})
+      ReadableStream.enqueue(stream.controller_pid, "first")
 
       [left, right] = ReadableStream.tee(stream)
       left_reader = ReadableStream.get_reader(left)
       right_reader = ReadableStream.get_reader(right)
 
       assert read(left_reader) == %{value: "first", done: false}
+
+      # The second branch has the chunk in its queue. No read is in progress.
+      ReadableStream.error(stream.controller_pid, :source_failed)
+
+      assert catch_exit(await(ReadableStreamDefaultReader.closed(left_reader))) == :source_failed
       assert catch_exit(read(left_reader)) == :source_failed
       assert catch_exit(read(right_reader)) == :source_failed
+    end
+
+    test "gives the error of a pull to the two branches" do
+      stream =
+        ReadableStream.new(%{
+          pull: fn controller ->
+            ReadableStreamDefaultController.error(controller, :pull_failed)
+          end
+        })
+
+      [left, right] = ReadableStream.tee(stream)
+
+      assert catch_exit(read(ReadableStream.get_reader(left))) == :pull_failed
+      assert catch_exit(read(ReadableStream.get_reader(right))) == :pull_failed
     end
 
     test "that stops with a failure gives an error to the two branches" do

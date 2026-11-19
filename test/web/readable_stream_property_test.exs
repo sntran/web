@@ -253,8 +253,9 @@ defmodule Web.ReadableStreamPropertyTest do
       # Each read lets the stream pull one more chunk.
       reader = ReadableStream.get_reader(stream)
       assert %{value: :chunk} = await(ReadableStreamDefaultReader.read(reader))
+      assert_receive {:pulled, ^ref}, 1_000
       Process.sleep(10)
-      assert count_pulls(ref) == 1
+      assert count_pulls(ref) == 0
     end
   end
 

@@ -471,7 +471,7 @@ defmodule Web.ReadableStream do
   end
 
   def locked?(pid) when is_pid(pid) do
-    Web.Stream.call(pid, :locked?, false)
+    Web.Stream.call(pid, {:locked?, :reader}, false)
   end
 
   def locked?(_body), do: false
@@ -492,7 +492,7 @@ defmodule Web.ReadableStream do
       :byob ->
         case get_reader(pid, opts) do
           :ok ->
-            %ReadableStreamBYOBReader{controller_pid: pid}
+            %ReadableStreamBYOBReader{controller_pid: pid, owner_pid: self()}
 
           {:error, :already_locked} ->
             raise TypeError, "ReadableStream is already locked"
@@ -527,7 +527,7 @@ defmodule Web.ReadableStream do
   def get_reader(%__MODULE__{controller_pid: pid}) do
     case get_reader(pid, []) do
       :ok ->
-        %Web.ReadableStreamDefaultReader{controller_pid: pid}
+        %Web.ReadableStreamDefaultReader{controller_pid: pid, owner_pid: self()}
 
       {:error, :already_locked} ->
         raise TypeError, "ReadableStream is already locked"
@@ -550,8 +550,23 @@ defmodule Web.ReadableStream do
     :gen_statem.call(pid, :force_unknown_error)
   end
 
-  def release_lock(pid) do
-    Web.Stream.call(pid, {:release_lock, self()}, :ok)
+  def release_lock(pid, owner \\ self()) do
+    Web.Stream.call(pid, {:release_lock, :reader, owner}, :ok)
+  end
+
+  @doc false
+  # The promise `closed` of a reader.
+  def reader_closed(pid, owner) do
+    Web.Stream.promise_call(pid, {:wait_closed, :reader, owner}, :ok, fn
+      :ok ->
+        {:ok, :ok}
+
+      {:error, {:errored, reason}} ->
+        {:error, reason}
+
+      {:error, :lock_released} ->
+        {:error, %TypeError{message: "This reader is no longer locked."}}
+    end)
   end
 
   def get_desired_size(pid) do
@@ -577,16 +592,20 @@ defmodule Web.ReadableStream do
 
   def cancel(target, reason \\ :cancelled)
 
+  # A cancel of the stream object. The Streams Standard refuses it when the
+  # stream has a reader: use the cancel function of the reader.
   def cancel(%__MODULE__{controller_pid: pid}, reason) do
-    cancel(pid, reason)
+    Web.Stream.promise_call(pid, {:terminate_unlocked, :cancel, reason}, :ok, fn
+      :ok -> {:ok, :ok}
+      {:error, :locked} -> {:error, %TypeError{message: "Cannot cancel a locked stream."}}
+      {:error, thrown} -> {:error, thrown}
+    end)
   end
 
   def cancel(pid, reason) do
-    Promise.detached(fn resolve, reject ->
-      case Web.Stream.terminate_and_wait(pid, :cancel, reason) do
-        :ok -> resolve.(:ok)
-        {:error, thrown} -> reject.(thrown)
-      end
+    Web.Stream.promise_call(pid, {:terminate, :cancel, reason}, :ok, fn
+      :ok -> {:ok, :ok}
+      {:error, thrown} -> {:error, thrown}
     end)
   end
 
@@ -878,7 +897,7 @@ defmodule Web.ReadableStream do
 
   defp acquire_reader_for_pipe(pid) when is_pid(pid) do
     case get_reader(pid) do
-      :ok -> %Web.ReadableStreamDefaultReader{controller_pid: pid}
+      :ok -> %Web.ReadableStreamDefaultReader{controller_pid: pid, owner_pid: self()}
       {:error, :already_locked} -> raise TypeError, "ReadableStream is already locked"
       {:error, :released} -> raise TypeError, @released_message
     end

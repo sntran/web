@@ -56,9 +56,11 @@ defmodule Web do
       alias Web.AsyncContext
       alias Web.Blob
       alias Web.BroadcastChannel
+      alias Web.ByteLengthQueuingStrategy
       alias Web.CompressionStream
       alias Web.Console
       alias Web.CountingGovernor
+      alias Web.CountQueuingStrategy
       alias Web.CustomEvent
       alias Web.DecompressionStream
       alias Web.DOMException

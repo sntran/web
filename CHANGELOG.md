@@ -12,6 +12,11 @@ All notable changes to this project are documented in this file.
   response headers or for the next part of a body. The default is
   300000 ms. A request that fails for one of these limits rejects with
   `Web.TypeError`.
+- `closed/1` for `Web.ReadableStreamDefaultReader`,
+  `Web.ReadableStreamBYOBReader`, and `Web.WritableStreamDefaultWriter`, as
+  the attribute `closed`.
+- `use Web` aliases `Web.CountQueuingStrategy` and
+  `Web.ByteLengthQueuingStrategy`.
 - `Web.RangeError` and `Web.SyntaxError`, as the errors of ECMAScript.
 - `body_used?/1` for `Web.Request` and `Web.Response`, as the attribute
   `bodyUsed`.
@@ -136,6 +141,28 @@ All notable changes to this project are documented in this file.
   could fail after 5000 ms.
 - The default connect time of `Web.connect/2` changes from 5000 ms to
   10000 ms, which is the new setting `connect_timeout`.
+- **Breaking:** the readers and writers of a stream follow the Streams
+  Standard for these operations.
+  - A stream gets the calls of one process in the sequence of the calls,
+    also when the promises are not awaited. Before, a `write` and a `close`
+    that were not awaited could change places, and the chunk was lost.
+  - `read/1` of a reader returns a pending promise. Before, it stopped its
+    caller until a chunk came. A reader has the field `:owner_pid`, thus
+    each process that has the reader can read with it.
+  - A release of the lock rejects the reads that are pending. A release of
+    a lock that is released already has no effect. Before, it raised.
+  - After an error, a `write` and the promise `ready` reject with the error
+    of the stream. Before, they rejected with "This writer is no longer
+    locked."
+  - A second `close` of a writer rejects. An `abort` settles after the abort
+    callback of the sink is complete, and rejects with the value that the
+    callback throws.
+  - `cancel/2`, `abort/2`, and `close/1` of a stream object reject with
+    `Web.TypeError` when the stream is locked. Use the function of the
+    reader or the writer.
+  - The desired size of a closed stream is 0. Before, it was `nil`.
+  - The two sides of a transform stream have separate locks. Before,
+    `WritableStream.locked?/1` gave the lock of the readable side.
 - **Breaking:** `Web.Response` follows the Fetch Standard.
   - `new/1` raises `Web.RangeError` for a status that is not from 200 to
     599, and `Web.TypeError` for a status text that is not a reason phrase,
@@ -395,6 +422,11 @@ All notable changes to this project are documented in this file.
   it raised in the stream process.
 - The example `examples/secure_byob_stream.exs` operates again. It used the
   field `:task` of the old promise.
+- `Web.Socket` settles its promises `opened` and `closed` when one of its
+  streams stops with a failure. Before, a process that awaited `closed`
+  waited without end.
+- `Web.ReadableStream.tee/1` gives an error of the stream to the two
+  branches immediately, as the Streams Standard specifies.
 - `Web.fetch/2` rejects when the server gives no response headers, or stops
   in the body, for the receive time. Before, such a request waited without
   end unless it had a signal.

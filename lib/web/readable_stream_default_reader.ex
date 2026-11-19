@@ -5,9 +5,8 @@ defmodule Web.ReadableStreamDefaultReader do
   Follows WHATWG §3.5: `read/1` returns a `%Web.Promise{}` that resolves to a
   `ReadableStreamReadResult` map (`%{value: term(), done: boolean()}`).
   """
-  defstruct [:controller_pid]
+  defstruct [:controller_pid, :owner_pid]
 
-  alias Web.Promise
   alias Web.ReadableStream
   alias Web.TypeError
 
@@ -35,42 +34,47 @@ defmodule Web.ReadableStreamDefaultReader do
       iex> Web.await(Web.ReadableStreamDefaultReader.read(reader))
       %{value: nil, done: true}
   """
-  def read(%__MODULE__{controller_pid: pid}) do
-    case ReadableStream.read(pid) do
+  def read(%__MODULE__{controller_pid: pid} = reader) do
+    Web.Stream.promise_call(pid, {:read, owner(reader)}, {:error, :not_locked_by_reader}, fn
       {:ok, chunk} ->
-        Promise.resolve(%{value: chunk, done: false})
+        {:ok, %{value: chunk, done: false}}
 
       :done ->
-        Promise.resolve(%{value: nil, done: true})
+        {:ok, %{value: nil, done: true}}
 
       {:error, :not_locked_by_reader} ->
-        Promise.reject(%TypeError{message: "This reader is no longer locked."})
+        {:error, %TypeError{message: "This reader is no longer locked."}}
 
       {:error, :errored} ->
-        Promise.reject(%TypeError{message: "The stream is errored."})
+        {:error, %TypeError{message: "The stream is errored."}}
 
       {:error, {:errored, reason}} ->
-        Promise.reject(reason)
+        {:error, reason}
 
       {:error, reason} ->
-        Promise.reject(reason)
-    end
+        {:error, reason}
+    end)
   end
+
+  # The process that has the lock. A reader from `get_reader/1` has it in
+  # the struct, thus each process can use the reader.
+  defp owner(%__MODULE__{owner_pid: owner}) when is_pid(owner), do: owner
+  defp owner(%__MODULE__{}), do: self()
 
   @doc """
   Releases the reader's lock on the stream.
   """
-  def release_lock(%__MODULE__{controller_pid: pid}) do
-    case ReadableStream.release_lock(pid) do
-      :ok ->
-        :ok
+  def release_lock(%__MODULE__{controller_pid: pid} = reader) do
+    ReadableStream.release_lock(pid, owner(reader))
+  end
 
-      {:error, :not_locked_by_reader} ->
-        raise TypeError, "This reader is no longer locked."
-
-      {:error, reason} ->
-        raise TypeError, "Unknown error: #{inspect(reason)}"
-    end
+  @doc """
+  Returns a promise that fulfils when the stream is closed, as the attribute
+  `closed`. It rejects with the error of the stream when the stream is
+  errored, and with `Web.TypeError` when the lock of the reader is released.
+  """
+  def closed(%__MODULE__{controller_pid: pid} = reader) do
+    ReadableStream.reader_closed(pid, owner(reader))
   end
 
   @doc """

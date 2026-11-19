@@ -12,7 +12,8 @@ defmodule Web.Internal.ReadableStreamTee do
   #     branches. Thus a branch that no process reads keeps each chunk in its
   #     queue, and does not slow down the other branch.
   #   * When the source ends, the two branches close. When the source has an
-  #     error, the two branches get that error.
+  #     error, the two branches get that error immediately, and the chunks
+  #     in their queues are discarded.
   #   * A cancel of one branch has no effect on the source. When the two
   #     branches are cancelled, the source is cancelled with the list of the
   #     two reasons.
@@ -61,10 +62,15 @@ defmodule Web.Internal.ReadableStreamTee do
           branches: nil,
           # The request of the read that is in progress, or `nil`.
           request: nil,
+          # The request for the end of the source. Its reply tells the tee
+          # about an error of the source when no read is in progress.
+          closed_request: :gen_statem.send_request(source, {:wait_closed, :reader, self()}),
           # A branch asked for a chunk before the branches were given.
           pull_wanted?: false,
           # The cancelled branches: index => reason.
           canceled: %{},
+          # The error of the source, if it came before the branches.
+          early_error: nil,
           # The monitor of the source, after the work of the tee is complete.
           source_monitor: nil
         }
@@ -86,7 +92,13 @@ defmodule Web.Internal.ReadableStreamTee do
     }
 
     state = %{state | caller: nil, branches: branches}
-    {:reply, :ok, if(state.pull_wanted?, do: start_read(state), else: state)}
+
+    cond do
+      # The source had an error before the branches came.
+      state.early_error -> {:reply, :ok, fail_branches(state.early_error, state)}
+      state.pull_wanted? -> {:reply, :ok, start_read(state)}
+      true -> {:reply, :ok, state}
+    end
   end
 
   @impl true
@@ -134,15 +146,27 @@ defmodule Web.Internal.ReadableStreamTee do
     %{state | request: request, pull_wanted?: false}
   end
 
-  defp handle_response(_message, %{request: nil} = state), do: {:noreply, state}
-
-  defp handle_response(message, %{request: request} = state) do
-    case :gen_statem.check_response(message, request) do
+  defp handle_response(message, state) do
+    case check_response(message, state.request) do
       {:reply, reply} -> handle_read(reply, %{state | request: nil})
       {:error, {_reason, _server}} -> handle_read({:error, :released}, %{state | request: nil})
+      :no_reply -> handle_closed_response(message, state)
+    end
+  end
+
+  # The source is errored, or it stopped. A source that is closed has no
+  # effect here: the read that gets the end closes the branches.
+  defp handle_closed_response(message, state) do
+    case check_response(message, state.closed_request) do
+      {:reply, {:error, {:errored, _reason} = error}} -> handle_read({:error, error}, state)
+      {:reply, _closed_or_released} -> {:noreply, %{state | closed_request: nil}}
+      {:error, {_reason, _server}} -> handle_read({:error, :released}, state)
       :no_reply -> {:noreply, state}
     end
   end
+
+  defp check_response(_message, nil), do: :no_reply
+  defp check_response(message, request), do: :gen_statem.check_response(message, request)
 
   defp handle_read({:ok, chunk}, state) do
     each_active_branch(state, &ReadableStream.enqueue(&1, chunk))
@@ -154,16 +178,28 @@ defmodule Web.Internal.ReadableStreamTee do
     {:noreply, complete(state)}
   end
 
-  defp handle_read({:error, reason}, state) do
+  defp handle_read({:error, reason}, %{branches: nil} = state) do
+    {:noreply, %{state | early_error: reason, closed_request: nil}}
+  end
+
+  defp handle_read({:error, reason}, state), do: {:noreply, fail_branches(reason, state)}
+
+  defp fail_branches(reason, state) do
     error = stored_error(reason)
     each_active_branch(state, &ReadableStream.error(&1, error))
-    {:noreply, complete(state)}
+    complete(state)
   end
 
   # The work is complete. The process waits for the stop of the source.
   defp complete(state) do
     for {_index, {_pid, monitor}} <- state.branches, do: Process.demonitor(monitor, [:flush])
-    %{state | request: nil, source_monitor: Process.monitor(state.source)}
+
+    %{
+      state
+      | request: nil,
+        closed_request: nil,
+        source_monitor: Process.monitor(state.source)
+    }
   end
 
   defp stored_error({:errored, reason}), do: reason

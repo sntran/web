@@ -18,7 +18,7 @@ defmodule Web.ReadableStreamBYOBReader do
   the number of bytes of each read to the length of the view.
   """
 
-  defstruct [:controller_pid]
+  defstruct [:controller_pid, :owner_pid]
 
   alias Web.Promise
   alias Web.ReadableStream
@@ -28,44 +28,49 @@ defmodule Web.ReadableStreamBYOBReader do
   @type t :: %__MODULE__{controller_pid: pid()}
 
   @spec read(t(), Uint8Array.t()) :: Promise.t()
-  def read(%__MODULE__{controller_pid: pid}, %Uint8Array{} = view) do
-    case ReadableStream.byob_read(pid, view) do
+  def read(%__MODULE__{controller_pid: pid} = reader, %Uint8Array{} = view) do
+    message = {:byob_read, owner(reader), view}
+
+    Web.Stream.promise_call(pid, message, {:error, :not_locked_by_reader}, fn
       {:ok, %Uint8Array{} = chunk_view} ->
-        Promise.resolve(%{value: chunk_view, done: false})
+        {:ok, %{value: chunk_view, done: false}}
 
       {:done, %Uint8Array{} = empty_view} ->
-        Promise.resolve(%{value: empty_view, done: true})
+        {:ok, %{value: empty_view, done: true}}
 
       {:error, :not_locked_by_reader} ->
-        Promise.reject(%TypeError{message: "This BYOB reader is no longer locked."})
+        {:error, %TypeError{message: "This BYOB reader is no longer locked."}}
 
       {:error, :invalid_byob_view} ->
-        Promise.reject(%TypeError{message: "BYOB reads require a Uint8Array view."})
+        {:error, %TypeError{message: "BYOB reads require a Uint8Array view."}}
 
       {:error, {:errored, reason}} ->
-        Promise.reject(reason)
+        {:error, reason}
 
       {:error, reason} ->
-        Promise.reject(reason)
-    end
+        {:error, reason}
+    end)
   end
 
   def read(%__MODULE__{}, _view) do
     Promise.reject(%TypeError{message: "BYOB reads require a Uint8Array view."})
   end
 
+  defp owner(%__MODULE__{owner_pid: owner}) when is_pid(owner), do: owner
+  defp owner(%__MODULE__{}), do: self()
+
   @spec release_lock(t()) :: :ok
-  def release_lock(%__MODULE__{controller_pid: pid}) do
-    case ReadableStream.release_lock(pid) do
-      :ok ->
-        :ok
+  def release_lock(%__MODULE__{controller_pid: pid} = reader) do
+    ReadableStream.release_lock(pid, owner(reader))
+  end
 
-      {:error, :not_locked_by_reader} ->
-        raise TypeError, "This BYOB reader is no longer locked."
-
-      {:error, reason} ->
-        raise TypeError, "Unknown error: #{inspect(reason)}"
-    end
+  @doc """
+  Returns a promise that fulfils when the stream is closed, as the attribute
+  `closed`.
+  """
+  @spec closed(t()) :: Promise.t()
+  def closed(%__MODULE__{controller_pid: pid} = reader) do
+    ReadableStream.reader_closed(pid, owner(reader))
   end
 
   @spec cancel(t(), term()) :: Promise.t()

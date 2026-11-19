@@ -607,12 +607,12 @@ defmodule Web.StreamTest do
       assert slots.desired_size == 1
     end
 
-    test "terminal states always report nil desired size" do
+    test "a closed stream reports the desired size 0, and an errored stream nil" do
       closed_stream = WritableStream.new()
       closed_writer = WritableStream.get_writer(closed_stream)
 
       assert :ok = await(WritableStreamDefaultWriter.close(closed_writer))
-      assert WritableStream.desired_size(closed_stream) == nil
+      assert WritableStream.desired_size(closed_stream) == 0
       assert :ok = WritableStreamDefaultWriter.release_lock(closed_writer)
 
       errored_stream = WritableStream.new()
@@ -863,18 +863,21 @@ defmodule Web.StreamTest do
       assert WritableStream.__get_slots__(stream.controller_pid).state == :errored
     end
 
-    test "abort terminate callback raise is caught by rescue clause" do
+    test "an abort rejects with the error that the cancel callback raises" do
       ts = TransformStream.new(%{cancel: fn _reason -> raise "cancel error" end})
       writer = WritableStream.get_writer(ts.writable)
-      assert :ok = await(WritableStreamDefaultWriter.abort(writer, :reason))
+
+      assert %RuntimeError{message: "cancel error"} =
+               catch_exit(await(WritableStreamDefaultWriter.abort(writer, :reason)))
+
       Process.sleep(50)
       assert WritableStream.__get_slots__(ts.writable.controller_pid).state == :errored
     end
 
-    test "abort terminate callback throw is caught by catch clause" do
+    test "an abort rejects with the value that the cancel callback throws" do
       ts = TransformStream.new(%{cancel: fn _reason -> throw(:my_throw) end})
       writer = WritableStream.get_writer(ts.writable)
-      assert :ok = await(WritableStreamDefaultWriter.abort(writer, :reason))
+      assert catch_exit(await(WritableStreamDefaultWriter.abort(writer, :reason))) == :my_throw
       Process.sleep(50)
       assert WritableStream.__get_slots__(ts.writable.controller_pid).state == :errored
     end
@@ -1106,7 +1109,10 @@ defmodule Web.StreamTest do
       assert {:error, :closed} =
                :gen_statem.call(stream.controller_pid, {:write, writer.owner_pid, "x"})
 
-      assert :ok = :gen_statem.call(stream.controller_pid, {:close, writer.owner_pid})
+      # A second close is an error, and an abort of a closed stream has no effect.
+      assert {:error, :closed} =
+               :gen_statem.call(stream.controller_pid, {:close, writer.owner_pid})
+
       assert :ok = :gen_statem.call(stream.controller_pid, {:abort, writer.owner_pid, :boom})
     end
 

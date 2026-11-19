@@ -258,7 +258,10 @@ defmodule Web.ReadableStreamTest do
 
     test "unlocked actions", %{controller_pid: pid} do
       assert {:error, :not_locked_by_reader} = ReadableStream.read(pid)
-      assert {:error, :not_locked_by_reader} = ReadableStream.release_lock(pid)
+
+      # A release by a process that has no lock has no effect, as in the
+      # Streams Standard.
+      assert :ok = ReadableStream.release_lock(pid)
     end
 
     test "disturbed?/1, locked?/1, and read_all/1 helpers" do
@@ -674,17 +677,6 @@ defmodule Web.ReadableStreamTest do
       ReadableStream.error(p3, :force_unexpected_read)
       ReadableStream.__get_slots__(p3)
       assert :unexpected = catch_exit(await(ReadableStreamDefaultReader.read(r3)))
-
-      # Unexpected release — release_lock still raises directly
-      {:ok, p4} = ReadableStream.start_link()
-      s4 = %ReadableStream{controller_pid: p4}
-      r4 = ReadableStream.get_reader(s4)
-      ReadableStream.error(p4, :force_unexpected_release)
-      ReadableStream.__get_slots__(p4)
-
-      assert_raise TypeError, ~r/Unknown error/, fn ->
-        ReadableStreamDefaultReader.release_lock(r4)
-      end
     end
 
     test "PID mismatch", %{controller_pid: pid} do
@@ -693,9 +685,8 @@ defmodule Web.ReadableStreamTest do
       assert %TypeError{message: "This reader is no longer locked."} =
                catch_exit(await(ReadableStreamDefaultReader.read(r)))
 
-      assert_raise TypeError, ~r/longer locked/, fn ->
-        ReadableStreamDefaultReader.release_lock(r)
-      end
+      # A release by a reader that has no lock has no effect.
+      assert :ok = ReadableStreamDefaultReader.release_lock(r)
     end
 
     test "cancel", %{stream: stream} do

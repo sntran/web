@@ -181,6 +181,14 @@ defmodule Web.Socket do
     {:stop, :normal, next_state}
   end
 
+  # One of the two streams stopped with a failure. A process that waits for
+  # `closed` or `opened` gets the reason.
+  def handle_info({:EXIT, pid, reason}, %{readable_pid: readable, writable_pid: writable} = state)
+      when pid in [readable, writable] and reason != :normal do
+    next_state = shutdown_state(state, {:stream_down, reason}, :stream_down)
+    {:stop, {:shutdown, {:stream_down, reason}}, next_state}
+  end
+
   def handle_info(_message, state), do: {:noreply, state}
 
   @doc false
@@ -202,8 +210,10 @@ defmodule Web.Socket do
     authority = init_authority()
     {readable, writable} = init_streams(authority, options)
 
-    # The streams are parts of the socket. If one of them stops with a
-    # failure, the socket stops, and the reverse.
+    # The streams are parts of the socket. If the socket stops with a
+    # failure, the streams stop. If one of the streams stops with a failure,
+    # the socket settles its promises and stops: see the EXIT message.
+    Process.flag(:trap_exit, true)
     Process.link(readable.controller_pid)
     Process.link(writable.controller_pid)
 

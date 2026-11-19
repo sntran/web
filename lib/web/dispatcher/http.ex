@@ -320,7 +320,11 @@ defmodule Web.Dispatcher.HTTP do
   defp request_body(%Web.Request{body: body}) when is_binary(body) or is_list(body), do: body
 
   defp request_body(%Web.Request{body: body}) do
-    if Enumerable.impl_for(body), do: {:stream, body}, else: body
+    if Enumerable.impl_for(body) do
+      {:stream, body}
+    else
+      raise Web.TypeError, "The request body is not valid: #{inspect(body)}"
+    end
   end
 
   defp start_stream_bridge(finch_request) do

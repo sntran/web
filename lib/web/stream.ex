@@ -113,6 +113,10 @@ defmodule Web.Stream do
     writer_is_pipe: false,
     pending_write_request: nil,
     pending_close_request: nil,
+    # The caller of an abort, until the abort callback of the sink is complete.
+    pending_abort_request: nil,
+    # The callers that wait for the end of the stream: {from, pid}.
+    closed_waiters: [],
     queued_write_requests: :queue.new(),
     ready_waiters: :queue.new(),
     # Transform-side readable backpressure (transform task parks here until readable has space)
@@ -150,11 +154,56 @@ defmodule Web.Stream do
   end
 
   @doc false
-  # Calls the stream process. Returns `gone` if the process stopped.
+  # Calls the stream process. Returns `gone` if the process stopped, also
+  # when it stopped with a failure during the call.
   def call(pid, message, gone, timeout \\ :infinity) when is_pid(pid) do
     :gen_statem.call(pid, message, timeout)
   catch
-    :exit, {reason, {:gen_statem, :call, _args}} when reason in [:noproc, :normal] -> gone
+    :exit, {reason, {:gen_statem, :call, _args}}
+    when reason in [:noproc, :normal, :killed, :shutdown] or
+           (is_tuple(reason) and elem(reason, 0) == :shutdown) ->
+      gone
+  end
+
+  @doc false
+  # Sends `message` to the stream as a call, and returns a promise for the
+  # reply. `mapper` changes the reply into `{:ok, value}` or `{:error, reason}`.
+  # `gone` is the reply for a stream that stopped.
+  #
+  # The process that calls this function sends the message. Thus the stream
+  # gets the calls of one process in the sequence of the calls. The Streams
+  # Standard specifies this for operations that are not awaited: a `write`
+  # before a `close` is written before the close.
+  def promise_call(pid, message, gone, mapper) when is_pid(pid) and is_function(mapper, 1) do
+    caller = self()
+    tag = make_ref()
+
+    promise =
+      Web.Promise.detached(fn resolve, reject ->
+        monitor = Process.monitor(pid)
+        send(caller, {tag, self()})
+
+        reply =
+          receive do
+            {^tag, reply} -> reply
+            {:DOWN, ^monitor, :process, _pid, _reason} -> gone
+          end
+
+        Process.demonitor(monitor, [:flush])
+
+        case mapper.(reply) do
+          {:ok, value} -> resolve.(value)
+          {:error, reason} -> reject.(reason)
+        end
+      end)
+
+    # The process of the promise is ready for the reply. The stream sends the
+    # reply to that process.
+    receive do
+      {^tag, replier} -> send(pid, {:"$gen_call", {replier, tag}, message})
+    end
+
+    promise
   end
 
   @doc false
@@ -436,17 +485,18 @@ defmodule Web.Stream do
         {:internal, :flush_requests} ->
           flush_errored_requests(data)
 
-        {{:call, from}, {:write, pid, _chunk}} ->
-          _ = pid
-          {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
+        # A write to an errored stream rejects with the error of the stream.
+        # An error releases the lock, thus the lock is not examined.
+        {{:call, from}, {:write, _pid, _chunk}} ->
+          {:keep_state_and_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
 
-        {{:call, from}, {:close, pid}} ->
-          _ = pid
-          {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
+        {{:call, from}, {:close, _pid}} ->
+          {:keep_state_and_data, [{:reply, from, {:error, :errored}}]}
 
-        {{:call, from}, {:abort, pid, _reason}} ->
-          _ = pid
-          {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
+        # An abort of an errored stream has no effect, unless its abort
+        # callback is not complete: then this caller waits for it also.
+        {{:call, from}, {:abort, _pid, _reason}} ->
+          {:keep_state_and_data, [{:reply, from, :ok}]}
 
         _ ->
           :keep_state_and_data
@@ -524,32 +574,81 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, {:error, :invalid_byob_view}}]}
   end
 
-  # Release force-error for release_lock
-  defp handle_common(
-         {:call, from},
-         {:release_lock, _pid},
-         _state,
-         %{error_reason: :force_unexpected_release} = data
-       ) do
-    {:keep_state, %{data | error_reason: nil}, [{:reply, from, {:error, :unexpected}}]}
-  end
-
-  # Reader lock release
-  defp handle_common({:call, from}, {:release_lock, pid}, _state, data)
-       when data.type in [:producer, :producer_consumer] and is_pid(data.reader_pid) do
+  # The release of the lock of one side. The two sides of a transform stream
+  # have separate locks, thus the caller names the side. A release by a
+  # process that does not hold the lock has no effect, as in the Streams
+  # Standard.
+  defp handle_common({:call, from}, {:release_lock, :reader, pid}, _state, data) do
     if pid == data.reader_pid do
       if(data.reader_ref, do: Process.demonitor(data.reader_ref, [:flush]))
 
-      new_data =
-        data
-        |> drop_pending_byob_request()
-        |> Map.put(:reader_pid, nil)
-        |> Map.put(:reader_ref, nil)
-        |> Map.put(:reader_mode, nil)
+      # The read requests of the reader reject, as the Streams Standard
+      # specifies.
+      {data, pending_byob_actions} =
+        settle_pending_byob_request(data, {:error, :not_locked_by_reader})
 
-      {:keep_state, new_data, [{:reply, from, :ok}]}
+      read_actions =
+        data.read_requests
+        |> :queue.to_list()
+        |> Enum.map(&{:reply, &1, {:error, :not_locked_by_reader}})
+
+      {data, closed_actions} = release_closed_waiters(data, :reader, pid)
+
+      new_data = %{
+        data
+        | reader_pid: nil,
+          reader_ref: nil,
+          reader_mode: nil,
+          read_requests: :queue.new()
+      }
+
+      {:keep_state, new_data,
+       [{:reply, from, :ok}] ++ read_actions ++ pending_byob_actions ++ closed_actions}
     else
-      {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_reader}}]}
+      {:keep_state_and_data, [{:reply, from, :ok}]}
+    end
+  end
+
+  defp handle_common({:call, from}, {:release_lock, :writer, pid}, _state, data) do
+    if pid == data.writer_pid do
+      if data.writer_ref, do: Process.demonitor(data.writer_ref, [:flush])
+      {data, closed_actions} = release_closed_waiters(data, :writer, pid)
+
+      {:keep_state, %{data | writer_pid: nil, writer_ref: nil},
+       [{:reply, from, :ok} | closed_actions]}
+    else
+      {:keep_state_and_data, [{:reply, from, :ok}]}
+    end
+  end
+
+  # The promise `closed` of a reader or a writer. The caller waits until the
+  # stream is closed or errored.
+  defp handle_common({:call, from}, {:wait_closed, side, pid}, state, data) do
+    cond do
+      state == :closed ->
+        {:keep_state_and_data, [{:reply, from, :ok}]}
+
+      state == :errored ->
+        {:keep_state_and_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
+
+      lock_holder(data, side) != pid ->
+        {:keep_state_and_data, [{:reply, from, {:error, :lock_released}}]}
+
+      true ->
+        {:keep_state, %{data | closed_waiters: [{from, side, pid} | data.closed_waiters]}}
+    end
+  end
+
+  # A terminal event from the stream object, not from a reader or a writer.
+  # The Streams Standard refuses it when the stream is locked.
+  defp handle_common({:call, from}, {:terminate_unlocked, type, reason}, state, data)
+       when type in [:cancel, :close, :abort] do
+    side = if type == :cancel, do: :reader, else: :writer
+
+    if is_pid(lock_holder(data, side)) do
+      {:keep_state_and_data, [{:reply, from, {:error, :locked}}]}
+    else
+      handle_common({:call, from}, {:terminate, type, reason}, state, data)
     end
   end
 
@@ -572,31 +671,13 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, {:error, :already_locked}}]}
   end
 
-  # Writer lock release
-  defp handle_common({:call, from}, {:release_lock, pid}, _state, data)
-       when data.type in [:consumer, :producer_consumer] and is_pid(data.writer_pid) do
-    if pid == data.writer_pid do
-      if data.writer_ref, do: Process.demonitor(data.writer_ref, [:flush])
-      {:keep_state, %{data | writer_pid: nil, writer_ref: nil}, [{:reply, from, :ok}]}
-    else
-      {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
-    end
-  end
-
-  # Generic release_lock (no lock held or wrong type)
-  defp handle_common({:call, from}, {:release_lock, _pid}, _state, data) do
-    error =
-      if data.type in [:producer, :producer_consumer],
-        do: :not_locked_by_reader,
-        else: :not_locked_by_writer
-
-    {:keep_state_and_data, [{:reply, from, {:error, error}}]}
-  end
-
   # Ready (backpressure signal for writers)
   defp handle_common({:call, from}, {:ready, pid}, state, data)
        when data.type in [:consumer, :producer_consumer] do
     cond do
+      state == :errored ->
+        {:keep_state_and_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
+
       pid != data.writer_pid ->
         {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
 
@@ -631,6 +712,15 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, data.disturbed}]}
   end
 
+  # The two sides of a transform stream have separate locks.
+  defp handle_common({:call, from}, {:locked?, :reader}, _state, data) do
+    {:keep_state_and_data, [{:reply, from, is_pid(data.reader_pid)}]}
+  end
+
+  defp handle_common({:call, from}, {:locked?, :writer}, _state, data) do
+    {:keep_state_and_data, [{:reply, from, is_pid(data.writer_pid)}]}
+  end
+
   defp handle_common({:call, from}, :locked?, _state, data) do
     locked =
       cond do
@@ -645,12 +735,14 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, data.backpressure}]}
   end
 
+  # The desired size of the Streams Standard: `nil` for an errored stream,
+  # and 0 for a closed stream.
   defp handle_common({:call, from}, :desired_size, state, data) do
     desired =
-      if state in [:closed, :errored] do
-        nil
-      else
-        internal_desired_size(data)
+      case state do
+        :errored -> nil
+        :closed -> 0
+        _ -> internal_desired_size(data)
       end
 
     {:keep_state_and_data, [{:reply, from, desired}]}
@@ -658,10 +750,10 @@ defmodule Web.Stream do
 
   defp handle_common({:call, from}, :get_desired_size, state, data) do
     desired =
-      if state in [:closed, :errored] do
-        nil
-      else
-        readable_desired_size(data)
+      case state do
+        :errored -> nil
+        :closed -> 0
+        _ -> readable_desired_size(data)
       end
 
     {:keep_state_and_data, [{:reply, from, desired}]}
@@ -839,7 +931,12 @@ defmodule Web.Stream do
     if ref == data.task_ref and data.active_task do
       operation = timeout_operation(data.active_operation)
       Task.shutdown(data.active_task, :brutal_kill)
-      fail_stream(task_timeout_error(operation, data), clear_active_operation(data))
+      error = task_timeout_error(operation, data)
+
+      # The caller of an abort gets the timeout as its rejection reason.
+      abort_actions = abort_reply_actions(data, {:error, error})
+      data = clear_active_operation(%{data | pending_abort_request: nil})
+      fail_stream(error, data, abort_actions)
     else
       :keep_state_and_data
     end
@@ -880,8 +977,10 @@ defmodule Web.Stream do
       ref == data.writer_ref ->
         {:keep_state, %{data | writer_pid: nil, writer_ref: nil}}
 
+      # The process of the abort callback stopped with no result.
       ref == data.task_ref and data.active_operation == :abort ->
-        {:keep_state, clear_active_operation(data)}
+        {:keep_state, clear_active_operation(data), abort_reply_actions(data, :ok)}
+        |> clear_abort_request()
 
       ref == data.task_ref and reason == :normal ->
         :keep_state_and_data
@@ -968,7 +1067,7 @@ defmodule Web.Stream do
   end
 
   defp handle_closed_event({:call, from}, {:close, pid}, data) do
-    reply_to_writer(from, pid, data.writer_pid, :ok)
+    reply_to_writer(from, pid, data.writer_pid, {:error, :closed})
   end
 
   defp handle_closed_event({:call, from}, {:abort, pid, _reason}, data) do
@@ -1386,10 +1485,10 @@ defmodule Web.Stream do
         Task.shutdown(data.active_task, :brutal_kill)
       end
 
-      :gen_statem.reply(from, :ok)
-
+      # The caller gets its reply when the abort callback is complete.
       data
       |> clear_active_operation()
+      |> Map.put(:pending_abort_request, from)
       |> start_abort_task(reason)
       |> then(&fail_stream(reason, &1))
     end
@@ -1458,16 +1557,19 @@ defmodule Web.Stream do
     task =
       start_task(
         fn ->
+          # The result of the callback has no use. A value that it throws is
+          # the rejection reason of the abort.
           try do
-            if function_exported?(module, :terminate, 2) do
-              module.terminate(reason, impl_state)
-            else
-              :ok
-            end
+            result =
+              if function_exported?(module, :terminate, 2) do
+                module.terminate({:abort, reason}, impl_state) |> resolve_if_promise(:ok)
+              end
+
+            if match?({:error, _reason}, result), do: result, else: :ok
           rescue
-            _ -> :ok
+            error -> {:error, error}
           catch
-            _, _ -> :ok
+            _kind, thrown -> {:error, thrown}
           end
         end,
         data.async_context
@@ -1555,8 +1657,18 @@ defmodule Web.Stream do
     |> close_consumer_stream([{:reply, from, :ok}])
   end
 
-  defp handle_abort_task_result(_result, data) do
-    {:keep_state, clear_active_operation(data)}
+  defp handle_abort_task_result(result, data) do
+    reply = if match?({:error, _thrown}, result), do: result, else: :ok
+
+    {:keep_state, clear_active_operation(data), abort_reply_actions(data, reply)}
+    |> clear_abort_request()
+  end
+
+  defp abort_reply_actions(%{pending_abort_request: nil}, _reply), do: []
+  defp abort_reply_actions(%{pending_abort_request: from}, reply), do: [{:reply, from, reply}]
+
+  defp clear_abort_request({:keep_state, data, actions}) do
+    {:keep_state, %{data | pending_abort_request: nil}, actions}
   end
 
   # coveralls-ignore-start
@@ -1714,19 +1826,51 @@ defmodule Web.Stream do
   defp with_lifetime(result, state, data) do
     case transition(result, state, data) do
       {next_state, new_data, actions} ->
+        {new_data, closed_actions} = closed_waiter_actions(next_state, new_data)
         timeout = lifetime_timeout(next_state, new_data)
 
-        if timeout == new_data.lifetime_timer do
-          result
-        else
-          {:next_state, next_state, %{new_data | lifetime_timer: timeout},
-           actions ++ [lifetime_action(timeout)]}
+        cond do
+          timeout != new_data.lifetime_timer ->
+            {:next_state, next_state, %{new_data | lifetime_timer: timeout},
+             actions ++ closed_actions ++ [lifetime_action(timeout)]}
+
+          closed_actions != [] ->
+            {:next_state, next_state, new_data, actions ++ closed_actions}
+
+          true ->
+            result
         end
 
       :stop ->
         result
     end
   end
+
+  # The processes that wait for the promise `closed` get the end of the
+  # stream.
+  defp closed_waiter_actions(state, %{closed_waiters: [_ | _] = waiters} = data)
+       when state in [:closed, :errored] do
+    reply = if state == :closed, do: :ok, else: {:error, {:errored, data.error_reason}}
+
+    {%{data | closed_waiters: []},
+     Enum.map(waiters, fn {from, _, _} -> {:reply, from, reply} end)}
+  end
+
+  defp closed_waiter_actions(_state, data), do: {data, []}
+
+  # A release of the lock rejects the promise `closed` of that reader or writer.
+  defp release_closed_waiters(data, side, pid) do
+    {released, kept} =
+      Enum.split_with(data.closed_waiters, fn {_from, waiter_side, waiter_pid} ->
+        waiter_side == side and waiter_pid == pid
+      end)
+
+    actions = Enum.map(released, fn {from, _, _} -> {:reply, from, {:error, :lock_released}} end)
+    {%{data | closed_waiters: kept}, actions}
+  end
+
+  defp lock_holder(data, :reader), do: data.reader_pid
+  defp lock_holder(data, :writer), do: data.writer_pid
 
   defp transition(:keep_state_and_data, state, data), do: {state, data, []}
   defp transition({:keep_state_and_data, actions}, state, data), do: {state, data, actions}

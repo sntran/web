@@ -309,7 +309,8 @@ defmodule Web.Dispatcher.TCPTest do
 
     assert_receive :debug_pull_started, 1_000
     Process.sleep(50)
-    assert :ok = await(ReadableStream.cancel(socket.readable, :bridge_cancelled))
+    # The bridge holds the reader lock, thus the test cancels with the pid.
+    assert :ok = await(ReadableStream.cancel(socket.readable.controller_pid, :bridge_cancelled))
     assert :ok = Task.await(pull_task, 1_000)
     assert Enum.to_list(proxy) == []
     assert_receive :tcp_client_closed, 1_000
@@ -333,10 +334,11 @@ defmodule Web.Dispatcher.TCPTest do
 
     assert_receive :debug_pull_started, 1_000
     Process.sleep(50)
+    bridge_monitor = Process.monitor(bridge_pid)
     Process.exit(socket.readable.controller_pid, :kill)
 
     assert :ok = Task.await(pull_task, 1_000)
-    refute Process.alive?(bridge_pid)
+    assert_receive {:DOWN, ^bridge_monitor, :process, ^bridge_pid, _reason}, 1_000
     assert Enum.to_list(proxy) == []
     assert_receive :tcp_client_closed, 1_000
   end
@@ -351,7 +353,7 @@ defmodule Web.Dispatcher.TCPTest do
     read_task = Task.async(fn -> Enum.to_list(resp.body) end)
 
     Process.sleep(50)
-    assert :ok = await(ReadableStream.cancel(socket.readable, :bridge_cancelled))
+    assert :ok = await(ReadableStream.cancel(socket.readable.controller_pid, :bridge_cancelled))
     assert {:ok, []} = Task.yield(read_task, 1_000)
     assert_receive :tcp_client_closed, 1_000
   end

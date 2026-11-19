@@ -343,9 +343,7 @@ defmodule Web.ReadableByteStreamTest do
                await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(1))))
              )
 
-    assert_raise Web.TypeError, ~r/no longer locked/, fn ->
-      ReadableStreamBYOBReader.release_lock(reader)
-    end
+    assert :ok = ReadableStreamBYOBReader.release_lock(reader)
 
     invalid_pid =
       start_byob_reader_server(fn {:byob_read, _owner, _view} -> {:error, :invalid_byob_view} end)
@@ -371,14 +369,6 @@ defmodule Web.ReadableByteStreamTest do
                  )
                )
              )
-
-    release_pid = start_byob_reader_server(fn {:release_lock, _owner} -> {:error, :weird} end)
-
-    assert_raise Web.TypeError, ~r/Unknown error: :weird/, fn ->
-      ReadableStreamBYOBReader.release_lock(%ReadableStreamBYOBReader{
-        controller_pid: release_pid
-      })
-    end
   end
 
   test "BYOB readers propagate stream errors and default cancel reasons" do

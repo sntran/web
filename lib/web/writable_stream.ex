@@ -115,7 +115,7 @@ defmodule Web.WritableStream do
   Returns whether the stream has an active writer lock.
   """
   def locked?(%__MODULE__{controller_pid: pid}), do: locked?(pid)
-  def locked?(pid) when is_pid(pid), do: Web.Stream.call(pid, :locked?, false)
+  def locked?(pid) when is_pid(pid), do: Web.Stream.call(pid, {:locked?, :writer}, false)
 
   @doc """
   Returns the stream desired size or `nil` once it is closed or errored.
@@ -184,16 +184,16 @@ defmodule Web.WritableStream do
     end
   end
 
+  # A close of the stream object. The Streams Standard refuses it when the
+  # stream has a writer: use the close function of the writer.
   def close(%__MODULE__{controller_pid: pid}) do
-    close(pid)
+    terminate_unlocked(pid, :close, nil)
   end
 
   def close(pid) when is_pid(pid) do
-    Web.Promise.detached(fn resolve, reject ->
-      case Web.Stream.terminate_and_wait(pid, :close, nil) do
-        :ok -> resolve.(:ok)
-        {:error, thrown} -> reject.(thrown)
-      end
+    Web.Stream.promise_call(pid, {:terminate, :close, nil}, :ok, fn
+      :ok -> {:ok, :ok}
+      {:error, thrown} -> {:error, thrown}
     end)
   end
 
@@ -202,14 +202,13 @@ defmodule Web.WritableStream do
   end
 
   def abort(%__MODULE__{controller_pid: pid}, reason) do
-    abort(pid, reason)
+    terminate_unlocked(pid, :abort, reason)
   end
 
   def abort(pid, reason) when is_pid(pid) do
-    Web.Promise.detached(fn resolve, _reject ->
-      :ok = Web.Stream.terminate_and_wait(pid, :abort, reason)
-
-      resolve.(:ok)
+    Web.Stream.promise_call(pid, {:terminate, :abort, reason}, :ok, fn
+      :ok -> {:ok, :ok}
+      {:error, thrown} -> {:error, thrown}
     end)
   end
 
@@ -218,11 +217,19 @@ defmodule Web.WritableStream do
   end
 
   def release_lock(pid) when is_pid(pid) do
-    Web.Stream.call(pid, {:release_lock, self()}, :ok)
+    Web.Stream.call(pid, {:release_lock, :writer, self()}, :ok)
   end
 
   def release_lock(pid, owner_pid) when is_pid(pid) and is_pid(owner_pid) do
-    Web.Stream.call(pid, {:release_lock, owner_pid}, :ok)
+    Web.Stream.call(pid, {:release_lock, :writer, owner_pid}, :ok)
+  end
+
+  defp terminate_unlocked(pid, type, reason) do
+    Web.Stream.promise_call(pid, {:terminate_unlocked, type, reason}, :ok, fn
+      :ok -> {:ok, :ok}
+      {:error, :locked} -> {:error, %Web.TypeError{message: "Cannot #{type} a locked stream."}}
+      {:error, thrown} -> {:error, thrown}
+    end)
   end
 
   @doc false
@@ -253,14 +260,8 @@ defmodule Web.WritableStream do
     end
   end
 
-  defp invoke_abort(%{abort: abort}, reason) when is_function(abort, 1) do
-    abort.(reason)
-    :ok
-  rescue
-    _error -> :ok
-  catch
-    _kind, _abort_reason -> :ok
-  end
+  # A value that the callback throws is the rejection reason of the abort.
+  defp invoke_abort(%{abort: abort}, reason) when is_function(abort, 1), do: abort.(reason)
 
   defp invoke_abort(_sink, _reason), do: :ok
 end

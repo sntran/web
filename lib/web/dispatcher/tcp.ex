@@ -210,7 +210,7 @@ defmodule Web.Dispatcher.TCP do
   end
 
   defp cancel_bridge(bridge_pid, socket, reason) do
-    _ = await_promise(ReadableStream.cancel(socket.readable, reason))
+    _ = await_promise(ReadableStream.cancel(socket.readable.controller_pid, reason))
 
     if Process.alive?(bridge_pid) do
       send(bridge_pid, {:cancel, reason})
@@ -378,7 +378,7 @@ defmodule Web.Dispatcher.TCP do
   end
 
   defp abort_socket(socket, bridge_pid, reason) do
-    _ = await_promise(ReadableStream.cancel(socket.readable, reason))
+    _ = await_promise(ReadableStream.cancel(socket.readable.controller_pid, reason))
     send(bridge_pid, {:abort, reason})
     :ok
   end

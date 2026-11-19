@@ -595,7 +595,7 @@ defmodule Web.SocketTest do
     assert_alias_revoked(socket.address, Envelope.new(socket.token, :debug))
   end
 
-  test "writer abort keeps API semantics while the sink timeout path rejects in the background" do
+  test "writer abort rejects with the reason of the sink when the sink cannot close in time" do
     gate = make_ref()
 
     socket =
@@ -607,7 +607,9 @@ defmodule Web.SocketTest do
     assert_receive {:connect_blocked, ^gate}, 1_000
 
     writer = Web.WritableStream.get_writer(socket.writable)
-    assert :ok = await(WritableStreamDefaultWriter.abort(writer, :user_abort))
+
+    assert {:user_abort, :closed} =
+             catch_exit(await(WritableStreamDefaultWriter.abort(writer, :user_abort)))
 
     send(socket.address, {gate, {:error, :abort_connect_timeout}})
 

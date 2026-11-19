@@ -198,6 +198,7 @@ defmodule Web.FetchTimeoutTest do
       acceptor =
         spawn(fn ->
           Stream.repeatedly(fn -> :gen_tcp.accept(listener) end)
+          |> Stream.take_while(&match?({:ok, _socket}, &1))
           |> Enum.each(fn {:ok, socket} ->
             spawn(fn ->
               serve = fn serve ->

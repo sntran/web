@@ -31,7 +31,18 @@ defmodule Web.WritableStreamDefaultWriter do
   Aborts the stream and notifies the underlying sink.
   """
   def abort(%__MODULE__{controller_pid: pid, owner_pid: owner_pid}, reason) do
-    promise_call(pid, {:abort, owner_pid, reason})
+    # A value that the abort callback of the sink throws is the rejection
+    # reason, with no change.
+    Web.Stream.promise_call(pid, {:abort, owner_pid, reason}, {:error, :released}, fn
+      :ok ->
+        {:ok, :ok}
+
+      {:error, reason} when reason in [:not_locked_by_writer, :released] ->
+        {:error, map_stream_error(reason)}
+
+      {:error, thrown} ->
+        {:error, thrown}
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -39,11 +50,9 @@ defmodule Web.WritableStreamDefaultWriter do
   # ---------------------------------------------------------------------------
 
   defp promise_call(pid, message) do
-    Web.Promise.detached(fn resolve, reject ->
-      case Web.Stream.call(pid, message, {:error, :released}) do
-        :ok -> resolve.(:ok)
-        {:error, reason} -> reject.(map_stream_error(reason))
-      end
+    Web.Stream.promise_call(pid, message, {:error, :released}, fn
+      :ok -> {:ok, :ok}
+      {:error, reason} -> {:error, map_stream_error(reason)}
     end)
   end
 
@@ -55,6 +64,12 @@ defmodule Web.WritableStreamDefaultWriter do
 
   defp map_stream_error(:closed),
     do: TypeError.exception("The stream is closed.")
+
+  defp map_stream_error(:errored),
+    do: TypeError.exception("The stream is errored.")
+
+  defp map_stream_error(:lock_released),
+    do: TypeError.exception("This writer is no longer locked.")
 
   # A write to an errored stream rejects with the error of the stream.
   defp map_stream_error({:errored, reason}), do: reason
@@ -72,18 +87,16 @@ defmodule Web.WritableStreamDefaultWriter do
   Releases the writer's lock on the stream.
   """
   def release_lock(%__MODULE__{controller_pid: pid, owner_pid: owner_pid}) do
-    case Web.Stream.call(pid, {:release_lock, owner_pid}, :ok) do
-      :ok ->
-        :ok
+    Web.Stream.call(pid, {:release_lock, :writer, owner_pid}, :ok)
+  end
 
-      {:error, :not_locked_by_writer} ->
-        raise TypeError, "This writer is no longer locked."
-
-      # coveralls-ignore-start
-      {:error, reason} ->
-        raise TypeError, "Unknown error: #{inspect(reason)}"
-        # coveralls-ignore-stop
-    end
+  @doc """
+  Returns a promise that fulfils when the stream is closed, as the attribute
+  `closed`. It rejects with the error of the stream when the stream is
+  errored, and with `Web.TypeError` when the lock of the writer is released.
+  """
+  def closed(%__MODULE__{controller_pid: pid, owner_pid: owner_pid}) do
+    promise_call(pid, {:wait_closed, :writer, owner_pid})
   end
 
   @doc """

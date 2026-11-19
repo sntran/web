@@ -606,22 +606,23 @@ defmodule Web.Dispatcher.HTTP do
   defp raise_abort(state, reason) do
     cancel_bridge(state.bridge_pid, state.bridge_ref)
 
-    reason =
-      case reason do
-        :aborted -> abort_reason(state.signal)
-        other -> other
-      end
-
-    raise Web.DOMException, name: "AbortError", message: inspect(reason)
+    case reason do
+      :aborted -> raise abort_reason(state.signal)
+      reason when is_exception(reason) -> raise reason
+      reason -> raise Web.DOMException, name: "AbortError", message: inspect(reason)
+    end
   end
 
-  defp abort_reason(%Web.AbortSignal{} = signal), do: Web.AbortSignal.reason(signal) || :aborted
-  defp abort_reason(_signal), do: :aborted
+  defp abort_reason(%Web.AbortSignal{} = signal) do
+    Web.AbortSignal.reason(signal) || Web.AbortSignal.default_reason()
+  end
 
-  defp raise_body_error(reason) when is_exception(reason), do: raise(reason)
+  defp abort_reason(_signal), do: Web.AbortSignal.default_reason()
 
+  # A network error in the body is a `TypeError`, as the Fetch Standard
+  # specifies.
   defp raise_body_error(reason) do
-    raise Web.TypeError, "The response body is not complete: #{inspect(reason)}"
+    raise Web.TypeError, message: "The response body is not complete.", cause: reason
   end
 
   defp cleanup_stream(state) do

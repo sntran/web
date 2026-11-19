@@ -98,6 +98,22 @@ All notable changes to this project are documented in this file.
     for the linger time. An `await` after that time rejects with
     `Web.TypeError`. The `opened`, `closed`, and `upgraded` promises of
     `Web.Socket` do not expire.
+- **Breaking:** rejections have the forms of the Web Standards.
+  - `Web.fetch/2` rejects with the abort reason of the signal, or with
+    `Web.TypeError` for each other failure. The new field `cause` of
+    `Web.TypeError` has the failure of the dispatcher. Before, the reason
+    was an atom such as `:redirect_error`, or a struct of the HTTP client.
+  - A signal that aborts with no reason has the reason
+    `Web.DOMException` `AbortError`. `Web.AbortSignal.timeout/1` gives
+    `TimeoutError`. Before, the reasons were the atoms `:aborted` and
+    `:timeout`.
+  - `Web.AbortSignal.throw_if_aborted/1` raises the reason of the signal.
+  - A read, a write, a body function, and a pipe reject with the error of
+    the stream. Before, some of them rejected with `{:errored, reason}`,
+    `{:aborted, reason}`, or a general `Web.TypeError`.
+  - The error of a stream is the value that its callback raised or threw.
+    Before, a thrown value was `{:throw, value}`. A callback that does not
+    return in time gives a `Web.TypeError`.
 - **Breaking:** `Web.fetch/2` follows the redirect rules of the Fetch
   Standard.
   - `301` and `302` change `POST` to `GET`. `303` changes each method to
@@ -107,8 +123,8 @@ All notable changes to this project are documented in this file.
     `authorization`, `cookie`, and `proxy-authorization`.
   - The location is relative to the URL of the request, and `Web.URL` reads
     it. A location with no fragment gets the fragment of the request.
-  - A redirect that must send a stream body again rejects with
-    `:redirect_stream_body`. A body from memory is sent again.
+  - A redirect that must send a stream body again rejects. A body from
+    memory is sent again.
   - `Web.Response` has the field `redirected`.
 - **Breaking:** `Web.fetch/2` sends a `Web.ReadableStream` body chunk by
   chunk. Before, it read the full stream into memory. A body from memory is

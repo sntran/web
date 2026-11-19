@@ -74,10 +74,10 @@ defmodule Web.FetchSignalTest do
   test "fetch stops immediately if message received before fetch" do
     req = Web.Request.new("mock://slow", signal: :my_ref, dispatcher: SlowDispatcher)
     send(self(), {:abort, :my_ref})
-    assert :aborted = catch_exit(await(Web.fetch(req)))
+    assert %Web.DOMException{name: "AbortError"} = catch_exit(await(Web.fetch(req)))
     send(self(), {:abort, :my_ref})
 
-    assert :aborted =
+    assert %Web.DOMException{name: "AbortError"} =
              catch_exit(
                await(Web.fetch("mock://slow", signal: :my_ref, dispatcher: SlowDispatcher))
              )
@@ -88,7 +88,7 @@ defmodule Web.FetchSignalTest do
     Process.sleep(10)
 
     req = Web.Request.new("mock://slow", signal: dead_pid, dispatcher: SlowDispatcher)
-    assert :aborted = catch_exit(await(Web.fetch(req)))
+    assert %Web.DOMException{name: "AbortError"} = catch_exit(await(Web.fetch(req)))
   end
 
   test "fetch aborts when a pid signal dies during http header I/O" do
@@ -108,8 +108,8 @@ defmodule Web.FetchSignalTest do
 
     shutdown = catch_exit(await(promise))
 
-    assert shutdown == :aborted or
-             match?(%Mint.TransportError{reason: :closed}, shutdown)
+    assert match?(%Web.DOMException{name: "AbortError"}, shutdown) or
+             match?(%Web.TypeError{cause: %Mint.TransportError{reason: :closed}}, shutdown)
 
     Process.exit(server.pid, :kill)
   end

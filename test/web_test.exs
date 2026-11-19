@@ -70,7 +70,7 @@ defmodule WebTest do
     assert %Web.Response{ok: true, url: "mock://success/"} =
              await(Web.fetch("mock://success", dispatcher: MockDispatcher))
 
-    assert :simulated_error =
+    assert %Web.TypeError{message: "fetch failed", cause: :simulated_error} =
              catch_exit(await(Web.fetch("mock://error", dispatcher: MockDispatcher)))
   end
 
@@ -110,7 +110,7 @@ defmodule WebTest do
   end
 
   test "await macro exits on promise rejection" do
-    assert :simulated_error =
+    assert %Web.TypeError{message: "fetch failed", cause: :simulated_error} =
              catch_exit(await(Web.fetch("mock://error/", dispatcher: MockDispatcher)))
   end
 
@@ -165,16 +165,18 @@ defmodule WebTest do
     controller = Web.AbortController.new()
     Web.AbortController.abort(controller)
 
-    assert :aborted =
+    assert %Web.DOMException{name: "AbortError"} =
              catch_exit(await(Web.fetch("https://example.com", signal: controller.signal)))
 
     # Also via Web.URL
     url = Web.URL.new("https://example.com")
-    assert :aborted = catch_exit(await(Web.fetch(url, signal: controller.signal)))
+
+    assert %Web.DOMException{name: "AbortError"} =
+             catch_exit(await(Web.fetch(url, signal: controller.signal)))
 
     # Also via Web.Request
     req = Web.Request.new(url, signal: controller.signal)
-    assert :aborted = catch_exit(await(Web.fetch(req)))
+    assert %Web.DOMException{name: "AbortError"} = catch_exit(await(Web.fetch(req)))
   end
 
   test "Web.btoa and Web.atob round-trip latin1 byte strings" do

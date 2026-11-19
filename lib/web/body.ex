@@ -234,6 +234,11 @@ defmodule Web.Body do
     end
   end
 
+  # A read from an errored stream rejects with the error of the stream, as
+  # the Streams Standard specifies.
+  defp stream_error({:errored, reason}), do: reason
+  defp stream_error(reason), do: reason
+
   defp read_stream_chunks(pid, acc) do
     case Web.ReadableStream.read(pid) do
       {:ok, chunk} ->
@@ -245,7 +250,7 @@ defmodule Web.Body do
 
       {:error, reason} ->
         Web.ReadableStream.release_lock(pid)
-        {:error, reason}
+        {:error, stream_error(reason)}
     end
   end
 
@@ -289,7 +294,7 @@ defmodule Web.Body do
 
       {:error, reason} ->
         Web.ReadableStream.release_lock(pid)
-        {:error, reason}
+        {:error, stream_error(reason)}
     end
   end
 

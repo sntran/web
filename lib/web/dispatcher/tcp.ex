@@ -215,7 +215,9 @@ defmodule Web.Dispatcher.TCP do
   defp signal_aborted?(nil), do: false
   defp signal_aborted?(signal), do: Web.AbortSignal.aborted?(signal)
 
-  defp signal_reason(signal), do: Web.AbortSignal.reason(signal) || :aborted
+  defp signal_reason(signal) do
+    Web.AbortSignal.reason(signal) || Web.AbortSignal.default_reason()
+  end
 
   defp register_controller(bridge_pid, controller) do
     if Process.alive?(bridge_pid) do

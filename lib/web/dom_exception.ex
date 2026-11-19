@@ -6,6 +6,8 @@ defmodule Web.DOMException do
 
   @codes %{
     "InvalidStateError" => 11,
+    "AbortError" => 20,
+    "TimeoutError" => 23,
     "DataCloneError" => 25
   }
 
@@ -31,5 +33,23 @@ defmodule Web.DOMException do
 
   def exception(name) when is_binary(name) do
     exception(name: name)
+  end
+
+  @doc """
+  The reason of a signal that aborted with no reason, as the DOM Standard
+  specifies.
+  """
+  @spec abort_error() :: t()
+  def abort_error do
+    exception(name: "AbortError", message: "signal is aborted without reason")
+  end
+
+  @doc """
+  The reason of a signal from `Web.AbortSignal.timeout/1`, as the DOM
+  Standard specifies.
+  """
+  @spec timeout_error() :: t()
+  def timeout_error do
+    exception(name: "TimeoutError", message: "signal timed out")
   end
 end

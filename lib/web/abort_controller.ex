@@ -51,7 +51,10 @@ defmodule Web.AbortController do
       iex> Web.AbortController.abort(controller, :manual_cancel)
       :ok
   """
-  def abort(%__MODULE__{signal: %Web.AbortSignal{pid: pid}}, reason \\ :aborted) do
+  def abort(
+        %__MODULE__{signal: %Web.AbortSignal{pid: pid}},
+        reason \\ Web.DOMException.abort_error()
+      ) do
     if Process.alive?(pid) do
       try do
         GenServer.call(pid, {:abort, reason}, :infinity)

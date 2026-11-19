@@ -56,8 +56,8 @@ defmodule Web.WritableStreamDefaultWriter do
   defp map_stream_error(:closed),
     do: TypeError.exception("The stream is closed.")
 
-  defp map_stream_error({:errored, _reason}),
-    do: TypeError.exception("The stream is errored.")
+  # A write to an errored stream rejects with the error of the stream.
+  defp map_stream_error({:errored, reason}), do: reason
 
   defp map_stream_error(:released),
     do: TypeError.exception("The stream is not available. It ended, or its owner stopped.")

@@ -114,8 +114,13 @@ defmodule Web.AbortSignal do
       iex> signal = Web.AbortSignal.abort(:timeout)
       iex> {signal.aborted, signal.reason, signal.pid == nil}
       {true, :timeout, true}
+
+  With no reason, the reason is an `AbortError`:
+
+      iex> Web.AbortSignal.abort().reason.name
+      "AbortError"
   """
-  def abort(reason \\ :aborted) do
+  def abort(reason \\ DOMException.abort_error()) do
     %__MODULE__{aborted: true, reason: reason, ref: make_ref()}
   end
 
@@ -133,7 +138,8 @@ defmodule Web.AbortSignal do
   """
   def timeout(ms) do
     controller = Web.AbortController.new()
-    Process.send_after(controller.signal.pid, {:abort_signal_timeout, :timeout}, ms)
+    timeout_reason = DOMException.timeout_error()
+    Process.send_after(controller.signal.pid, {:abort_signal_timeout, timeout_reason}, ms)
     controller.signal
   end
 
@@ -301,42 +307,45 @@ defmodule Web.AbortSignal do
   def reason(_), do: nil
 
   @doc """
-  Raises a `Web.DOMException` when the signal has already aborted.
+  Raises the reason of the signal when the signal has already aborted.
+
+  A reason that is not an exception is put in a `Web.DOMException` with the
+  name `AbortError`.
   """
   @spec throw_if_aborted(t() | nil) :: :ok
   def throw_if_aborted(nil), do: :ok
 
   def throw_if_aborted(%__MODULE__{aborted: true, reason: reason}) do
-    raise DOMException, name: "AbortError", message: inspect(reason)
+    raise_reason(reason)
   end
 
   def throw_if_aborted(%__MODULE__{} = signal) do
     case any_abort_result(signal) do
-      {:aborted, reason} ->
-        raise DOMException, name: "AbortError", message: inspect(reason)
-
-      nil ->
-        :ok
+      {:aborted, reason} -> raise_reason(reason)
+      nil -> :ok
     end
   end
 
-  defp normalize_reason(signal, :aborted), do: reason(signal) || :aborted
+  defp raise_reason(reason) when is_exception(reason), do: raise(reason)
+
+  defp raise_reason(reason) do
+    raise DOMException, name: "AbortError", message: inspect(reason)
+  end
+
+  @doc false
+  # The reason of a signal that gave no reason: the process of the signal
+  # stopped, or a token signal sent no reason.
+  @spec default_reason() :: DOMException.t()
+  def default_reason, do: DOMException.abort_error()
+
+  defp normalize_reason(signal, :aborted), do: reason(signal) || default_reason()
   defp normalize_reason(_signal, reason), do: reason
 
-  defp receive_signal_reason(%__MODULE__{pid: pid, ref: ref, reason: fallback}) do
-    subscription = %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: Process.monitor(pid)}
-
-    try do
-      case receive_abort(subscription, 0, true) do
-        {:error, :aborted, reason} ->
-          reason
-
-        :ok ->
-          remembered_reason(ref) || fallback || if(Process.alive?(pid), do: nil, else: :aborted)
-      end
-    after
-      Process.demonitor(subscription.monitor_ref, [:flush])
-    end
+  # The process of the signal stopped. The reason is in the store for the
+  # linger time. After that time, or for a signal that stopped with no
+  # abort, the reason is the default reason.
+  defp receive_signal_reason(%__MODULE__{ref: ref, reason: fallback}) do
+    remembered_reason(ref) || fallback || default_reason()
   end
 
   defp remember_reason(ref, reason) when is_reference(ref), do: Reasons.put(ref, reason)
@@ -385,8 +394,9 @@ defmodule Web.AbortSignal do
       {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:aborted, reason}}} ->
         {:error, :aborted, reason}
 
-      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
-        {:error, :aborted, reason}
+      # The process of the signal stopped with no abort.
+      {:DOWN, ^monitor_ref, :process, ^pid, _exit_reason} ->
+        {:error, :aborted, default_reason()}
     after
       timeout ->
         :ok
@@ -402,14 +412,14 @@ defmodule Web.AbortSignal do
         {:error, :aborted, reason}
     after
       timeout ->
-        if Process.alive?(pid), do: :ok, else: {:error, :aborted, :aborted}
+        if Process.alive?(pid), do: :ok, else: {:error, :aborted, default_reason()}
     end
   end
 
   def receive_abort(%{type: :token, token: token}, timeout, true) do
     receive do
       {:abort, ^token} ->
-        {:error, :aborted, :aborted}
+        {:error, :aborted, default_reason()}
 
       {:abort, ^token, reason} ->
         {:error, :aborted, reason}
@@ -616,8 +626,8 @@ defmodule Web.AbortSignal do
       {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:aborted, reason}}} ->
         {:aborted, reason}
 
-      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
-        {:aborted, reason}
+      {:DOWN, ^monitor_ref, :process, ^pid, _exit_reason} ->
+        {:aborted, default_reason()}
 
       {:DOWN, ^coordinator_monitor, :process, ^coordinator, _reason} ->
         :ok
@@ -648,7 +658,7 @@ defmodule Web.AbortSignal do
        ) do
     receive do
       {:abort, ^token} ->
-        {:aborted, :aborted}
+        {:aborted, default_reason()}
 
       {:abort, ^token, reason} ->
         {:aborted, reason}

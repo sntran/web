@@ -410,6 +410,16 @@ defmodule Web.Platform.Test do
     status in [403, 408, 425, 429] or status >= 500
   end
 
+  # A fetch that fails rejects with a TypeError. Its cause is the failure of
+  # the dispatcher.
+  defp retryable_fetch_error?(%Web.TypeError{cause: cause}) when not is_nil(cause) do
+    retryable_fetch_error?(cause)
+  end
+
+  defp retryable_fetch_error?(%Web.DOMException{name: name})
+       when name in ["AbortError", "TimeoutError"],
+       do: true
+
   defp retryable_fetch_error?(%Mint.TransportError{reason: reason}) do
     transient_network_error?(reason)
   end

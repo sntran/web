@@ -700,18 +700,22 @@ defmodule Web.ReadableStream do
             maybe_close_writer(writer, options)
             resolve.(:ok)
 
+          # The pipe rejects with the error of the stream, or with the reason
+          # of the signal, as the Streams Standard specifies.
           {:source_error, reason} ->
+            reason = stored_error(reason)
             maybe_abort_writer(writer, reason, options)
             reject.(reason)
 
           {:sink_error, reason} ->
+            reason = stored_error(reason)
             maybe_cancel_reader(reader, reason, options)
             reject.(reason)
 
           {:aborted, reason} ->
             maybe_cancel_reader(reader, reason, options)
             maybe_abort_writer(writer, reason, options)
-            reject.({:aborted, reason})
+            reject.(reason)
         end
       rescue
         error in TypeError ->
@@ -738,6 +742,9 @@ defmodule Web.ReadableStream do
   # ---------------------------------------------------------------------------
   # Private pipe helpers
   # ---------------------------------------------------------------------------
+
+  defp stored_error({:errored, reason}), do: reason
+  defp stored_error(reason), do: reason
 
   defp pump(reader, writer, options) do
     owner_pid = self()
@@ -841,7 +848,10 @@ defmodule Web.ReadableStream do
   defp ensure_pipe_signal_active!(signal), do: AbortSignal.check!(signal)
 
   # coveralls-ignore-start
-  defp normalize_abort_reason(signal, :aborted), do: AbortSignal.reason(signal) || :aborted
+  defp normalize_abort_reason(signal, :aborted) do
+    AbortSignal.reason(signal) || AbortSignal.default_reason()
+  end
+
   defp normalize_abort_reason(_signal, reason), do: reason
   # coveralls-ignore-stop
 
@@ -1058,7 +1068,10 @@ defimpl Enumerable, for: Web.ReadableStream do
 
   # Gives the error of the stream, when it is an exception.
   defp raise_stream_error(reason) when is_exception(reason), do: raise(reason)
-  defp raise_stream_error(_reason), do: raise(Web.TypeError, "The stream is errored.")
+
+  defp raise_stream_error(reason) do
+    raise Web.TypeError, message: "The stream is errored.", cause: reason
+  end
 
   def count(_stream), do: {:error, __MODULE__}
   def member?(_stream, _element), do: {:error, __MODULE__}

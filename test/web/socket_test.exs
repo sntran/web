@@ -217,7 +217,7 @@ defmodule Web.SocketTest do
     writer = Web.WritableStream.get_writer(socket.writable)
 
     reason = catch_exit(await(WritableStreamDefaultWriter.write(writer, %{bad: :payload})))
-    assert match?(%TypeError{}, reason)
+    assert match?({:transport_error, %TypeError{}}, reason)
     assert match?({:transport_error, %TypeError{}}, await(socket.closed))
   end
 
@@ -585,7 +585,7 @@ defmodule Web.SocketTest do
 
     writer = Web.WritableStream.get_writer(socket.writable)
 
-    assert %TypeError{message: "The stream is errored."} =
+    assert :closed =
              catch_exit(await(WritableStreamDefaultWriter.close(writer)))
 
     send(socket.address, {gate, {:error, :connect_timeout}})

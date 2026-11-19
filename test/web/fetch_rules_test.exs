@@ -123,7 +123,7 @@ defmodule Web.FetchRulesTest do
       for status <- [307, 308] do
         body = ReadableStream.from(Stream.map(["a", "b"], & &1))
         promise = fetch(redirect(port, status, "/echo"), method: "POST", body: body)
-        assert catch_exit(await(promise)) == :redirect_stream_body
+        assert %TypeError{cause: :redirect_stream_body} = catch_exit(await(promise))
       end
     end
 
@@ -181,12 +181,12 @@ defmodule Web.FetchRulesTest do
 
     test "must have the scheme http or https", %{port: port} do
       promise = fetch(redirect(port, 302, "ftp://example.com/file"))
-      assert catch_exit(await(promise)) == :redirect_unsupported_scheme
+      assert %TypeError{cause: :redirect_unsupported_scheme} = catch_exit(await(promise))
     end
 
     test "must be a valid URL", %{port: port} do
       promise = fetch(redirect(port, 302, "http://[not-valid"))
-      assert catch_exit(await(promise)) == :redirect_invalid_location
+      assert %TypeError{cause: :redirect_invalid_location} = catch_exit(await(promise))
     end
   end
 
@@ -210,8 +210,10 @@ defmodule Web.FetchRulesTest do
       assert response.status == 200
 
       # The reader does not get a part of the body as the full body.
-      assert {:errored, error} = catch_exit(await(Response.text(response)))
-      assert is_exception(error)
+      assert %TypeError{message: "The response body is not complete.", cause: cause} =
+               catch_exit(await(Response.text(response)))
+
+      assert is_exception(cause)
     end
 
     test "gives the abort reason when the signal aborts", %{port: port} do
@@ -219,7 +221,7 @@ defmodule Web.FetchRulesTest do
       response = await(fetch(url(port, "/echo"), signal: controller.signal))
 
       assert AbortController.abort(controller, :stop_now) == :ok
-      assert catch_exit(await(Response.text(response))) == {:errored, :stop_now}
+      assert catch_exit(await(Response.text(response))) == :stop_now
     end
 
     test "gives an error when the process of the signal stops", %{port: port} do
@@ -227,7 +229,7 @@ defmodule Web.FetchRulesTest do
       response = await(fetch(url(port, "/echo"), signal: controller.signal))
 
       Process.exit(controller.signal.pid, :kill)
-      assert catch_exit(await(Response.text(response))) == {:errored, :aborted}
+      assert %DOMException{name: "AbortError"} = catch_exit(await(Response.text(response)))
     end
   end
 

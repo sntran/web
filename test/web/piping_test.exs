@@ -122,7 +122,7 @@ defmodule Web.PipingTest do
     :ok = AbortController.abort(controller, reason)
     send(sink_write_pid, :continue)
 
-    assert catch_exit(await(promise)) == {:aborted, :my_custom_reason}
+    assert catch_exit(await(promise)) == :my_custom_reason
     assert_receive {:source_cancelled, :my_custom_reason}
     assert_receive {:sink_aborted, :my_custom_reason}
   end
@@ -147,8 +147,8 @@ defmodule Web.PipingTest do
 
     promise = ReadableStream.pipe_to(source, sink)
 
-    assert catch_exit(await(promise)) == {:errored, :boom}
-    assert_receive {:sink_aborted, {:errored, :boom}}
+    assert catch_exit(await(promise)) == :boom
+    assert_receive {:sink_aborted, :boom}
 
     source_2 =
       ReadableStream.new(%{
@@ -167,7 +167,7 @@ defmodule Web.PipingTest do
 
     promise_2 = ReadableStream.pipe_to(source_2, sink_2, preventAbort: true)
 
-    assert catch_exit(await(promise_2)) == {:errored, :boom}
+    assert catch_exit(await(promise_2)) == :boom
     refute_received {:sink_aborted_prevented, _reason}
   end
 
@@ -195,8 +195,8 @@ defmodule Web.PipingTest do
 
     promise = ReadableStream.pipe_to(source, sink)
 
-    assert catch_exit(await(promise)) == {:errored, :sink_boom}
-    assert_receive {:source_cancelled, {:errored, :sink_boom}}
+    assert catch_exit(await(promise)) == :sink_boom
+    assert_receive {:source_cancelled, :sink_boom}
 
     source_2 =
       ReadableStream.new(%{
@@ -219,7 +219,7 @@ defmodule Web.PipingTest do
 
     promise_2 = ReadableStream.pipe_to(source_2, sink_2, preventCancel: true)
 
-    assert catch_exit(await(promise_2)) == {:errored, :sink_boom}
+    assert catch_exit(await(promise_2)) == :sink_boom
     refute_received {:source_cancelled_prevented, _reason}
   end
 
@@ -306,7 +306,7 @@ defmodule Web.PipingTest do
     assert_receive :source_pull_started
     assert :ok = AbortController.abort(controller, :timeout)
 
-    assert catch_exit(await(promise)) == {:aborted, :timeout}
+    assert catch_exit(await(promise)) == :timeout
     assert_receive {:source_cancelled_preemptively, :timeout}
     assert_receive {:sink_aborted_preemptively, :timeout}
     refute_received :sink_write_called
@@ -343,7 +343,7 @@ defmodule Web.PipingTest do
     assert_receive :token_pull_started
     send(pipe_process(source), {:abort, :pipe_token, :token_reason})
 
-    assert catch_exit(await(promise)) == {:aborted, :token_reason}
+    assert catch_exit(await(promise)) == :token_reason
     assert_receive {:token_source_cancelled, :token_reason}
     assert_receive {:token_sink_aborted, :token_reason}
   end
@@ -379,9 +379,9 @@ defmodule Web.PipingTest do
     assert_receive :token_default_pull_started
     send(pipe_process(source), {:abort, :pipe_token_default})
 
-    assert catch_exit(await(promise)) == {:aborted, :aborted}
-    assert_receive {:token_default_source_cancelled, :aborted}
-    assert_receive {:token_default_sink_aborted, :aborted}
+    assert %Web.DOMException{name: "AbortError"} = catch_exit(await(promise))
+    assert_receive {:token_default_source_cancelled, %Web.DOMException{name: "AbortError"}}
+    assert_receive {:token_default_sink_aborted, %Web.DOMException{name: "AbortError"}}
   end
 
   # The process that does the pipe holds the reader lock of the source.

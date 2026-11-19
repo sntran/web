@@ -111,7 +111,7 @@ defmodule Web.StreamTest do
       assert {:ok, :readable, %Web.Stream{}, _actions} =
                Web.Stream.init({UsingMacroStream, [], %{ambient_signal: signal}, self()})
 
-      assert_receive {:ambient_signal_abort, :aborted}
+      assert_receive {:ambient_signal_abort, %Web.DOMException{name: "AbortError"}}
     end
 
     test "start_task falls back to plain execution when async_context is not a snapshot" do
@@ -329,7 +329,8 @@ defmodule Web.StreamTest do
 
       writer = WritableStream.get_writer(stream)
 
-      assert %TypeError{} = catch_exit(await(WritableStreamDefaultWriter.write(writer, "x")))
+      assert %RuntimeError{message: "write failed"} =
+               catch_exit(await(WritableStreamDefaultWriter.write(writer, "x")))
     end
   end
 
@@ -546,7 +547,8 @@ defmodule Web.StreamTest do
 
       writer = WritableStream.get_writer(ts.writable)
 
-      assert %TypeError{} = catch_exit(await(WritableStreamDefaultWriter.write(writer, "x")))
+      assert %RuntimeError{message: "transform failed"} =
+               catch_exit(await(WritableStreamDefaultWriter.write(writer, "x")))
 
       Process.sleep(50)
       assert ReadableStream.__get_slots__(ts.readable.controller_pid).state == :errored
@@ -668,8 +670,10 @@ defmodule Web.StreamTest do
 
       Process.sleep(50)
       refute Process.alive?(sink_task_pid)
-      assert {:ok, {:errored, message}} = Task.yield(write_task, 1_000)
-      assert message in ["The stream is errored.", "This writer is no longer locked."]
+      # The write rejects with the abort reason, which is the error of the
+      # stream.
+      assert {:ok, result} = Task.yield(write_task, 1_000)
+      assert result in [:abort_now, {:errored, "This writer is no longer locked."}]
     end
 
     test "transform bridge check keeps writer readiness independent from readable saturation" do
@@ -739,12 +743,14 @@ defmodule Web.StreamTest do
       stream = %WritableStream{controller_pid: pid}
       writer = WritableStream.get_writer(stream)
 
-      assert %TypeError{message: "The stream is errored."} =
+      assert %TypeError{cause: {:task_timeout, :write}} =
                catch_exit(await(WritableStreamDefaultWriter.write(writer, "slow")))
 
       assert_wait(fn ->
         slots = WritableStream.__get_slots__(stream.controller_pid)
-        slots.state == :errored and slots.error_reason == {:error, {:task_timeout, :write}}
+
+        slots.state == :errored and
+          match?(%TypeError{cause: {:task_timeout, :write}}, slots.error_reason)
       end)
     end
 
@@ -782,12 +788,14 @@ defmodule Web.StreamTest do
       stream = %WritableStream{controller_pid: pid}
       writer = WritableStream.get_writer(stream)
 
-      assert %TypeError{message: "The stream is errored."} =
+      assert %TypeError{cause: {:task_timeout, :flush}} =
                catch_exit(await(WritableStreamDefaultWriter.close(writer)))
 
       assert_wait(fn ->
         slots = WritableStream.__get_slots__(stream.controller_pid)
-        slots.state == :errored and slots.error_reason == {:error, {:task_timeout, :flush}}
+
+        slots.state == :errored and
+          match?(%TypeError{cause: {:task_timeout, :flush}}, slots.error_reason)
       end)
     end
 
@@ -807,7 +815,9 @@ defmodule Web.StreamTest do
 
       assert_wait(fn ->
         slots = ReadableStream.__get_slots__(pid)
-        slots.state == :errored and slots.error_reason == {:error, {:task_timeout, :pull}}
+
+        slots.state == :errored and
+          match?(%TypeError{cause: {:task_timeout, :pull}}, slots.error_reason)
       end)
     end
   end
@@ -835,7 +845,7 @@ defmodule Web.StreamTest do
 
       writer = WritableStream.get_writer(stream)
 
-      assert %TypeError{} = catch_exit(await(WritableStreamDefaultWriter.close(writer)))
+      assert :flush_thrown = catch_exit(await(WritableStreamDefaultWriter.close(writer)))
 
       assert WritableStream.__get_slots__(stream.controller_pid).state == :errored
     end
@@ -844,7 +854,8 @@ defmodule Web.StreamTest do
       stream = WritableStream.new(%{close: fn _ctrl -> raise "flush error" end})
       writer = WritableStream.get_writer(stream)
 
-      assert %TypeError{} = catch_exit(await(WritableStreamDefaultWriter.close(writer)))
+      assert %RuntimeError{message: "flush error"} =
+               catch_exit(await(WritableStreamDefaultWriter.close(writer)))
 
       assert WritableStream.__get_slots__(stream.controller_pid).state == :errored
     end

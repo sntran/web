@@ -237,7 +237,7 @@ defmodule Web do
       try do
         case do_fetch_with_signal(request) do
           {:ok, response} -> resolve.(response)
-          {:error, reason} -> reject.(reason)
+          {:error, reason} -> reject.(fetch_error(reason, request))
         end
       catch
         # coveralls-ignore-next-line
@@ -245,6 +245,33 @@ defmodule Web do
       end
     end)
   end
+
+  # The Fetch Standard has two forms of rejection: the abort reason of the
+  # signal, and `TypeError` for each other failure. The field `cause` of the
+  # `TypeError` has the failure of the dispatcher.
+  defp fetch_error(:aborted, %Web.Request{signal: %Web.AbortSignal{} = signal}) do
+    Web.AbortSignal.reason(signal) || Web.AbortSignal.default_reason()
+  end
+
+  defp fetch_error(:aborted, _request), do: Web.AbortSignal.default_reason()
+  defp fetch_error(%Web.DOMException{} = error, _request), do: error
+  defp fetch_error(%TypeError{} = error, _request), do: error
+
+  defp fetch_error(reason, _request) do
+    TypeError.exception(message: "fetch failed" <> fetch_error_detail(reason), cause: reason)
+  end
+
+  defp fetch_error_detail(:redirect_error), do: ": the redirect mode is \"error\""
+  defp fetch_error_detail(:too_many_redirects), do: ": too many redirects"
+
+  defp fetch_error_detail(:redirect_stream_body),
+    do: ": a redirect cannot send a stream body again"
+
+  defp fetch_error_detail(:redirect_unsupported_scheme),
+    do: ": the redirect URL must be HTTP or HTTPS"
+
+  defp fetch_error_detail(:redirect_invalid_location), do: ": the redirect URL is not valid"
+  defp fetch_error_detail(_reason), do: ""
 
   defp do_fetch_with_signal(%Web.Request{signal: %Web.AbortSignal{} = signal} = request) do
     Web.AsyncContext.with_signal(signal, fn ->

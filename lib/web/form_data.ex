@@ -1072,7 +1072,7 @@ defmodule Web.FormData do
             type: :token,
             token: make_ref(),
             aborted: true,
-            reason: AbortSignal.reason(signal) || :aborted
+            reason: AbortSignal.reason(signal) || AbortSignal.default_reason()
           }
       end
     end

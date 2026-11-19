@@ -43,7 +43,7 @@ defmodule Web.AbortSignalTest do
     token_subscription = %{type: :token, token: :token}
     send(self(), {:abort, :token})
 
-    assert {:error, :aborted, :aborted} =
+    assert {:error, :aborted, %Web.DOMException{name: "AbortError"}} =
              Web.AbortSignal.receive_abort(token_subscription, 0, true)
 
     send(self(), {:abort, :token, :token_abort})
@@ -83,11 +83,34 @@ defmodule Web.AbortSignalTest do
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal)
   end
 
+  test "timeout/1 gives a TimeoutError, as the DOM Standard specifies" do
+    signal = Web.AbortSignal.timeout(1)
+    Process.sleep(30)
+
+    assert %Web.DOMException{name: "TimeoutError", message: "signal timed out", code: 23} =
+             Web.AbortSignal.reason(signal)
+  end
+
+  test "throw_if_aborted/1 raises the reason of the signal" do
+    assert_raise RuntimeError, "my reason", fn ->
+      Web.AbortSignal.throw_if_aborted(Web.AbortSignal.abort(%RuntimeError{message: "my reason"}))
+    end
+
+    assert_raise Web.DOMException, "signal is aborted without reason", fn ->
+      Web.AbortSignal.throw_if_aborted(Web.AbortSignal.abort())
+    end
+
+    # A reason that is not an exception goes into an AbortError.
+    assert_raise Web.DOMException, ":my_atom", fn ->
+      Web.AbortSignal.throw_if_aborted(Web.AbortSignal.abort(:my_atom))
+    end
+  end
+
   test "abort/0 uses the default aborted reason" do
     signal = Web.AbortSignal.abort()
 
     assert signal.aborted
-    assert signal.reason == :aborted
+    assert %Web.DOMException{name: "AbortError"} = signal.reason
   end
 
   test "aborted?/1 and reason/1 helper fallbacks" do
@@ -259,7 +282,7 @@ defmodule Web.AbortSignalTest do
     send(waiter, {:abort, :token})
 
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
-    assert Web.AbortSignal.reason(signal) == :aborted
+    assert %Web.DOMException{name: "AbortError"} = Web.AbortSignal.reason(signal)
   end
 
   test "any/1 token waiters abort on reasoned token messages" do
@@ -342,14 +365,14 @@ defmodule Web.AbortSignalTest do
     assert Web.AbortSignal.reason(signal) == :signal_reason
   end
 
-  test "any/1 abort-signal waiters surface generic exit reasons" do
+  test "any/1 abort-signal waiters give the default reason for a signal that stops" do
     source = start_fake_abort_signal()
     {signal, _coordinator, _waiter} = start_any_with_waiter(source)
     Process.sleep(25)
     send(source.pid, {:stop, :signal_down})
 
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
-    assert Web.AbortSignal.reason(signal) == :signal_down
+    assert %Web.DOMException{name: "AbortError"} = Web.AbortSignal.reason(signal)
   end
 
   test "any/1 abort-signal waiters stop quietly when their coordinator exits" do
@@ -383,7 +406,7 @@ defmodule Web.AbortSignalTest do
 
     Process.exit(signal_pid, :custom_shutdown)
 
-    assert {:error, :aborted, :custom_shutdown} =
+    assert {:error, :aborted, %Web.DOMException{name: "AbortError"}} =
              Web.AbortSignal.receive_abort(signal_subscription, 100, true)
 
     pid =

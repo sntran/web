@@ -300,7 +300,7 @@ defmodule Web.Stream do
                   rescue
                     e -> {:error, e}
                   catch
-                    kind, r -> {:error, {kind, r}}
+                    _kind, r -> {:error, r}
                   end
                 end,
                 data.async_context
@@ -354,7 +354,7 @@ defmodule Web.Stream do
                 rescue
                   e -> {:error, e}
                 catch
-                  kind, r -> {:error, {kind, r}}
+                  _kind, r -> {:error, r}
                 end
               end,
               data.async_context
@@ -826,7 +826,7 @@ defmodule Web.Stream do
     if ref == data.task_ref and data.active_task do
       operation = timeout_operation(data.active_operation)
       Task.shutdown(data.active_task, :brutal_kill)
-      fail_stream({:error, {:task_timeout, operation}}, clear_active_operation(data))
+      fail_stream(task_timeout_error(operation, data), clear_active_operation(data))
     else
       :keep_state_and_data
     end
@@ -843,7 +843,7 @@ defmodule Web.Stream do
     reason =
       case down_reason do
         {:shutdown, {:aborted, reason}} -> reason
-        _other -> :aborted
+        _other -> AbortSignal.default_reason()
       end
 
     handle_ambient_abort(reason, state, data)
@@ -929,6 +929,13 @@ defmodule Web.Stream do
   end
 
   defp handle_common(_type, _content, _state, _data), do: :not_handled
+
+  defp task_timeout_error(operation, data) do
+    Web.TypeError.exception(
+      message: "The #{operation} callback did not return in #{data.timeout_ms} ms.",
+      cause: {:task_timeout, operation}
+    )
+  end
 
   defp handle_ambient_abort(reason, state, data) do
     data = %{data | signal_subscription: nil}
@@ -1277,7 +1284,7 @@ defmodule Web.Stream do
             rescue
               e -> {:error, e}
             catch
-              kind, reason -> {:error, {kind, reason}}
+              _kind, reason -> {:error, reason}
             end
           end,
           data.async_context
@@ -1374,7 +1381,7 @@ defmodule Web.Stream do
           rescue
             e -> {:error, e}
           catch
-            kind, reason -> {:error, {kind, reason}}
+            _kind, reason -> {:error, reason}
           end
         end,
         data.async_context
@@ -1403,7 +1410,7 @@ defmodule Web.Stream do
           rescue
             e -> {:error, e}
           catch
-            kind, reason -> {:error, {kind, reason}}
+            _kind, reason -> {:error, reason}
           end
         end,
         data.async_context
@@ -2160,7 +2167,8 @@ defmodule Web.Stream do
         subscription
 
       {:error, :aborted} ->
-        send(self(), {:ambient_signal_abort, AbortSignal.reason(signal) || :aborted})
+        reason = AbortSignal.reason(signal) || AbortSignal.default_reason()
+        send(self(), {:ambient_signal_abort, reason})
         nil
     end
   end

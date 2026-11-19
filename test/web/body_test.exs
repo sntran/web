@@ -114,11 +114,11 @@ defmodule Web.BodyTest do
     # read_stream_chunks error branch: when stream is errored, read() returns {:error, reason}
     {:ok, pid} = ReadableStream.start_link()
     stream = %ReadableStream{controller_pid: pid}
-    # Error the stream so read() returns {:error, {:errored, :stream_fail}}
+    # Error the stream so read() returns {:error, :stream_fail}
     ReadableStream.error(pid, :stream_fail)
     response = Response.new(body: stream)
     result = catch_exit(await(Response.text(response)))
-    assert result == {:errored, :stream_fail}
+    assert result == :stream_fail
   end
 
   test "Response.text/1 returns empty string for nil body" do
@@ -165,7 +165,7 @@ defmodule Web.BodyTest do
     ReadableStream.error(pid, :stream_fail)
     response = Response.new(body: stream)
 
-    assert {:errored, :stream_fail} = catch_exit(await(Response.array_buffer(response)))
+    assert :stream_fail = catch_exit(await(Response.array_buffer(response)))
   end
 
   test "Response.text/1 replaces invalid direct UTF-8 body bytes" do

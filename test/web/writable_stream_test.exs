@@ -440,7 +440,7 @@ defmodule Web.WritableStreamTest do
 
     raised_writer = WritableStream.get_writer(raised_write_stream)
 
-    assert %TypeError{message: "The stream is errored."} =
+    assert %RuntimeError{message: "write failed"} =
              catch_exit(await(WritableStreamDefaultWriter.write(raised_writer, "boom")))
 
     thrown_write_stream =
@@ -452,7 +452,7 @@ defmodule Web.WritableStreamTest do
 
     thrown_writer = WritableStream.get_writer(thrown_write_stream)
 
-    assert %TypeError{message: "The stream is errored."} =
+    assert :write_thrown =
              catch_exit(await(WritableStreamDefaultWriter.write(thrown_writer, "boom")))
   end
 

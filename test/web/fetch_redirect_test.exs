@@ -211,7 +211,7 @@ defmodule Web.FetchRedirectTest do
   end
 
   test "redirect loop stops after the fetch maximum", %{port: port} do
-    assert :too_many_redirects =
+    assert %Web.TypeError{cause: :too_many_redirects} =
              catch_exit(await(Web.fetch("http://localhost:#{port}/loop")))
   end
 
@@ -223,7 +223,7 @@ defmodule Web.FetchRedirectTest do
   end
 
   test "redirect error returns redirect_error", %{port: port} do
-    assert :redirect_error =
+    assert %Web.TypeError{cause: :redirect_error} =
              catch_exit(await(Web.fetch("http://localhost:#{port}/redir-301", redirect: "error")))
   end
 
@@ -274,7 +274,7 @@ defmodule Web.FetchRedirectTest do
       )
 
     # A stream cannot be sent a second time.
-    assert catch_exit(await(promise)) == :redirect_stream_body
+    assert %Web.TypeError{cause: :redirect_stream_body} = catch_exit(await(promise))
   end
 
   test "follow closes the previous response body before opening the next request", %{port: port} do

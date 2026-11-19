@@ -138,7 +138,7 @@ defmodule Web.AbortSignalLifetimeTest do
 
       # The store removes old reasons one time each second.
       Process.sleep(@linger + 1_300)
-      assert AbortSignal.reason(signal) == :aborted
+      assert %DOMException{name: "AbortError"} = AbortSignal.reason(signal)
     end
 
     test "stays when the linger time is :infinity" do

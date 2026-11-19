@@ -288,8 +288,7 @@ defmodule Web.StreamLifetimeTest do
       reader = ReadableStream.get_reader(stream)
 
       capture_log(fn ->
-        assert {:exit, :enumerable_exit} =
-                 catch_exit(await(ReadableStreamDefaultReader.read(reader)))
+        assert :enumerable_exit = catch_exit(await(ReadableStreamDefaultReader.read(reader)))
       end)
     end
   end

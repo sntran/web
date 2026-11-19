@@ -255,7 +255,7 @@ defmodule Web.TextEncodingTest do
 
     assert :ok = await(WritableStreamDefaultWriter.write(writer, <<0xF0, 0x9F>>))
 
-    assert %Web.TypeError{message: "The stream is errored."} =
+    assert %Web.TypeError{} =
              catch_exit(await(WritableStreamDefaultWriter.close(writer)))
   end
 
@@ -274,7 +274,7 @@ defmodule Web.TextEncodingTest do
     stream = TextEncoderStream.new()
     writer = WritableStream.get_writer(stream.writable)
 
-    assert %Web.TypeError{message: "The stream is errored."} =
+    assert %Web.TypeError{} =
              catch_exit(await(WritableStreamDefaultWriter.write(writer, 123)))
   end
 

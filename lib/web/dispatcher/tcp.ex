@@ -234,7 +234,9 @@ defmodule Web.Dispatcher.TCP do
   end
 
   defp await_socket_chunk(socket_reader) do
-    case await_promise(ReadableStreamDefaultReader.read(socket_reader)) do
+    # A read with no promise: a promise for each chunk keeps the chunk for
+    # the linger time.
+    case ReadableStreamDefaultReader.read_now(socket_reader) do
       {:ok, %{done: false, value: chunk}} ->
         {:chunk, chunk}
 

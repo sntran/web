@@ -198,6 +198,20 @@ All notable changes to this project are documented in this file.
   value that is not a promise with no change, as `await` of ECMAScript.
   Before, a call needed `require Web`, and a value that was not a promise
   raised.
+- **Breaking:** a pipe to a destination, or from a source, that is closed
+  or stopped rejects with `Web.TypeError`. Before, it rejected with an atom
+  such as `:closed`. A pipe to an errored destination rejects with the
+  error of the destination and cancels the source. Before, it did not
+  settle.
+- **Breaking:** a body read on a stream that stops rejects with
+  `Web.TypeError` and the cause. Before, it rejected with the atom
+  `:not_locked_by_reader`.
+- The callback `error/2` of the behaviour `Web.Stream`,
+  `Web.ReadableStream.force_unknown_error/1`, and the socket option
+  `:ssl_start_fun` are removed: nothing used them. The functions
+  `Web.Stream.call` and `control_call` have no time limit argument.
+- The code has 3 lines that the coverage does not count, where it had 59,
+  and the coverage is 100 % with no line that only some runs cover.
 - The benchmark scripts in `bench/` use the functions of this version.
   `bench/selective_receive.exs` is removed: it measured the VM, not the
   library.
@@ -694,6 +708,20 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A stream that a process reads with `Enum`, with `for`, or with a body
+  function such as `Web.Response.text/1` keeps no chunk. Before, each read
+  made a promise, and the promise kept its chunk for the linger time of
+  5 seconds: a read of 256 MiB left 4235 processes and 268 MB in memory.
+  The memory of a stream is now flat for each speed. A parse of a 1 GiB
+  form upload added 1156 MB at its peak, and now adds 2.8 MB.
+- `Web.fetch/2` ignores an informational response, such as 103 Early Hints
+  or 100 Continue, that comes before the response. Before, it became the
+  response, with no body.
+- `Web.TransformStreamDefaultController.wait_for_capacity/1` continues
+  when a read waits. Before, it had no end with the default limit of the
+  readable side.
+- A reducer of `Enum` that throws or exits releases the lock of the
+  stream.
 - A write to a `Web.Socket` that waits for a slow peer does not stop the
   reads of the socket. Before, the process of the socket sent the bytes:
   while a write waited, the socket did not read, and the two sides could

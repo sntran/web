@@ -1,7 +1,8 @@
 defmodule Web.Internal.MessageTarget do
   @moduledoc false
 
-  # The part that a message port and a broadcast channel have in common.
+  # The part that a message port and a broadcast channel have in common. A
+  # socket uses the handle and the supervisor of this module too.
   #
   # Each port and each channel is two processes:
   #
@@ -35,7 +36,7 @@ defmodule Web.Internal.MessageTarget do
           optional(atom()) => term()
         }
 
-  @supervisor Web.MessageSupervisor
+  @supervisor Web.HandleSupervisor
 
   # ---------------------------------------------------------------------------
   # Functions for the server

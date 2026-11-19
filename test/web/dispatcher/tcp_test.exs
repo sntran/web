@@ -6,7 +6,6 @@ defmodule Web.Dispatcher.TCPTest do
 
   alias Web.Dispatcher.TCP
   alias Web.Headers
-  alias Web.Internal.Envelope
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController
   alias Web.Request
@@ -613,18 +612,7 @@ defmodule Web.Dispatcher.TCPTest do
     socket_request(socket, :debug)
   end
 
-  defp socket_request(socket, body, timeout \\ 1_000) do
-    socket_raw_request(socket.address, Envelope.new(socket.token, body), timeout)
-  end
-
-  defp socket_raw_request(target, body, timeout) do
-    reply_ref = make_ref()
-    send(target, {:"$gen_call", {self(), reply_ref}, body})
-
-    receive do
-      {^reply_ref, reply} -> reply
-    after
-      timeout -> flunk("socket request timed out")
-    end
+  defp socket_request(socket, body) do
+    GenServer.call(socket.address, {socket.token, body})
   end
 end

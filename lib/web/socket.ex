@@ -1,14 +1,58 @@
 defmodule Web.Socket do
   @moduledoc """
-  Capability-gated TCP/TLS socket handle.
+  A TCP or TLS socket, as `Socket` of the Sockets API of WinterTC.
+
+  `Web.connect/2` makes a socket:
+
+      socket = Web.connect("example.com:80")
+      writer = Web.WritableStream.get_writer(socket.writable)
+      Web.await(Web.WritableStreamDefaultWriter.write(writer, "GET / HTTP/1.0\r\n\r\n"))
+
+      for chunk <- socket.readable do
+        IO.write(Web.Uint8Array.to_binary(chunk))
+      end
+
+  ## The fields
+
+    * `readable` - a `Web.ReadableStream` of the bytes from the peer. Each
+      chunk is a `Web.Uint8Array`. The socket reads from the network only
+      when the stream wants data.
+    * `writable` - a `Web.WritableStream` of the bytes to the peer. A chunk
+      is a binary, a `Web.Uint8Array`, a `Web.ArrayBuffer`, or iodata. A
+      write is complete when the operating system has the bytes: a slow
+      peer makes the writes wait, and does not stop the reads.
+    * `opened` - a `Web.Promise` that fulfils with the information of the
+      connection, or rejects when the connection fails.
+    * `closed` - a `Web.Promise` that fulfils when the socket closes, with
+      the cause: `:closed`, `:upgraded`, or `{:readable_cancel, reason}`. It
+      rejects with the error when the socket fails.
+    * `upgraded` - a `Web.Promise` that fulfils with the TLS socket after
+      `start_tls/2`.
+
+  ## Options of `Web.connect/2`
+
+    * `:secure_transport` - `"off"` (the default), `"on"` for TLS, or
+      `"starttls"` for a connection that becomes TLS with `start_tls/2`;
+    * `:ssl_options` - options of the Erlang application `:ssl`. The socket
+      verifies the certificate of the server and its host name, unless the
+      options have `verify: :verify_none`;
+    * `:tcp_options` - options of `:gen_tcp`;
+    * `:connect_timeout` - the time to open the connection, in
+      milliseconds;
+    * `:readable_high_water_mark` - the bytes that the readable side keeps.
+
+  ## Lifetime
+
+  A socket stays until `close/2`, until the peer closes, or until the
+  process that made it stops. A function on a socket that is closed has no
+  effect. Close a socket when the work is complete, or use `Web.using/2`.
   """
 
-  use GenServer
+  use GenServer, restart: :temporary
 
-  alias Web.AsyncContext.Snapshot
   alias Web.ByteLengthQueuingStrategy
   alias Web.Internal.Bytes
-  alias Web.Internal.Envelope
+  alias Web.Internal.MessageTarget
   alias Web.Promise
   alias Web.ReadableStream
   alias Web.TypeError
@@ -16,11 +60,13 @@ defmodule Web.Socket do
 
   defstruct [:address, :token, :opened, :closed, :upgraded, :readable, :writable]
 
-  @call_timeout 5_000
+  # The time for the TLS handshake of `start_tls/2`.
+  @handshake_timeout 5_000
   @readable_hwm 65_536
 
+  @typedoc "A handle to one socket. The fields `address` and `token` are private."
   @type t :: %__MODULE__{
-          address: reference(),
+          address: pid(),
           token: reference(),
           opened: Web.Promise.t(),
           closed: Web.Promise.t(),
@@ -39,8 +85,8 @@ defmodule Web.Socket do
     {upgraded, upgraded_info} = deferred_promise()
     boot_ref = make_ref()
 
-    {:ok, pid} =
-      GenServer.start(
+    pid =
+      MessageTarget.start_server(
         __MODULE__,
         {holder_pid, host, port, options, opened, opened_info, closed, closed_info, upgraded,
          upgraded_info, self(), boot_ref}
@@ -51,17 +97,44 @@ defmodule Web.Socket do
     end
   end
 
+  @doc """
+  Closes the socket and its two streams. Returns the promise `closed`.
+
+  A second call has no effect.
+  """
   @spec close(t(), any()) :: Web.Promise.t()
   def close(%__MODULE__{} = socket, reason \\ :closed) do
-    _ = cast_target(socket.address, socket.token, {:close, reason})
+    _reply = MessageTarget.call(socket, {:close, reason})
     socket.closed
   end
 
+  @doc """
+  Starts TLS on a socket that was made with `secure_transport: "starttls"`.
+
+  Returns a promise of the TLS socket. The first socket closes: its promise
+  `closed` fulfils with `:upgraded`, and its streams end. `options` are
+  options of the Erlang application `:ssl`.
+
+  The promise rejects with `:not_starttls`, `:already_tls`, or
+  `:not_connected` when the socket cannot start TLS, and with `:closed` when
+  the socket is closed. It rejects with `{:tls_upgrade_failed, reason}`
+  when the handshake fails: the socket then closes.
+  """
   @spec start_tls(t(), map() | keyword()) :: Web.Promise.t()
   def start_tls(%__MODULE__{} = socket, options \\ %{}) do
     promises = deferred_socket_promises()
-    promise_request(socket, {:start_tls, normalize_ssl_options(options), promises})
+    request = {:start_tls, normalize_ssl_options(options), promises}
+
+    Promise.detached(fn resolve, reject ->
+      case MessageTarget.call(socket, request) do
+        {:error, :detached} -> reject.(:closed)
+        {:error, reason} -> reject.(reason)
+        tls_socket -> resolve.(tls_socket)
+      end
+    end)
   end
+
+  def start_link(argument), do: GenServer.start_link(__MODULE__, argument)
 
   @doc false
   def init(
@@ -106,46 +179,20 @@ defmodule Web.Socket do
   end
 
   @doc false
-  def handle_call(
-        %Envelope{
-          headers: %{"Authorization" => token, "X-Async-Context" => snapshot},
-          body: body
-        },
-        _from,
-        %{token: token} = state
-      ) do
-    do_handle_call(body, snapshot, state)
+  def handle_call({token, request}, _from, %{token: token} = state) do
+    do_handle_call(request, state)
   end
 
-  def handle_call({:envelope, %Envelope{} = envelope}, from, state) do
-    handle_call(envelope, from, state)
-  end
-
-  def handle_call(%Envelope{}, _from, state) do
-    {:reply, {:error, :unauthorized}, state}
-  end
-
-  def handle_call({:envelope, _envelope}, _from, state) do
-    {:reply, {:error, :unauthorized}, state}
-  end
+  # The handle does not have the token of the socket: it is the handle of a
+  # socket that started TLS, or it is not a handle of this socket.
+  def handle_call(_request, _from, state), do: {:reply, {:error, :detached}, state}
 
   @doc false
-  def handle_cast(
-        %Envelope{
-          headers: %{"Authorization" => token, "X-Async-Context" => snapshot},
-          body: body
-        },
-        %{token: token} = state
-      ) do
-    do_handle_cast(body, snapshot, state)
+  def handle_cast({token, request}, %{token: token} = state) do
+    do_handle_cast(request, state)
   end
 
-  def handle_cast({:envelope, %Envelope{} = envelope}, state) do
-    handle_cast(envelope, state)
-  end
-
-  def handle_cast(%Envelope{}, state), do: {:noreply, state}
-  def handle_cast({:envelope, _envelope}, state), do: {:noreply, state}
+  def handle_cast(_request, state), do: {:noreply, state}
 
   @doc false
   def handle_info({:DOWN, holder_monitor, :process, holder_pid, reason}, state)
@@ -202,11 +249,9 @@ defmodule Web.Socket do
     |> settle_closed_if_needed(state.close_reason || :closed)
     |> settle_upgraded_if_needed({:error, state.close_reason || :closed})
 
-    Process.unalias(state.address)
     :ok
   end
 
-  @doc false
   defp build_state(holder_pid, {host, port}, options, promises) do
     authority = init_authority()
     {readable, writable} = init_streams(authority, options)
@@ -225,12 +270,10 @@ defmodule Web.Socket do
     |> Map.merge(promises)
   end
 
-  @doc false
   defp init_authority do
-    %{address: Process.alias(), token: make_ref()}
+    %{address: self(), token: make_ref()}
   end
 
-  @doc false
   defp init_connection_state(holder_pid, host, port, options) do
     %{
       holder_pid: holder_pid,
@@ -243,20 +286,19 @@ defmodule Web.Socket do
       transport: :tcp,
       socket: nil,
       active: false,
-      close_reason: nil
+      close_reason: nil,
+      failed?: false
     }
   end
 
-  @doc false
-  defp init_streams(%{address: address, token: token}, options) do
+  defp init_streams(%{address: address, token: token} = handle, options) do
     readable_hwm = Map.get(options, :readable_high_water_mark, @readable_hwm)
-    request_timeout = Map.get(options, :request_timeout, @call_timeout)
 
     readable =
       ReadableStream.new(
         %{
-          pull: fn _controller -> cast_target(address, token, :readable_pull) end,
-          cancel: fn reason -> cast_target(address, token, {:readable_cancel, reason}) end
+          pull: fn _controller -> GenServer.cast(address, {token, :readable_pull}) end,
+          cancel: fn reason -> GenServer.cast(address, {token, {:readable_cancel, reason}}) end
         },
         high_water_mark: readable_hwm,
         strategy: ByteLengthQueuingStrategy.new(readable_hwm),
@@ -266,15 +308,14 @@ defmodule Web.Socket do
     writable =
       WritableStream.new(%{
         high_water_mark: Map.get(options, :writable_high_water_mark, 1),
-        write: fn chunk, _controller -> write_promise(address, token, chunk, request_timeout) end,
-        close: fn _controller -> close_promise(address, token, request_timeout) end,
-        abort: fn reason -> abort_promise(address, token, reason, request_timeout) end
+        write: fn chunk, _controller -> sink_write(handle, chunk) end,
+        close: fn _controller -> sink_close(handle) end,
+        abort: fn _reason -> sink_close(handle) end
       })
 
     {readable, writable}
   end
 
-  @doc false
   defp init_stream_state(readable, writable) do
     %{
       readable: readable,
@@ -284,7 +325,6 @@ defmodule Web.Socket do
     }
   end
 
-  @doc false
   defp init_promises({opened, opened_info}, {closed, closed_info}, {upgraded, upgraded_info}) do
     %{
       opened: opened,
@@ -299,36 +339,36 @@ defmodule Web.Socket do
     }
   end
 
-  defp do_handle_call(:debug, _snapshot, state) do
+  defp do_handle_call(:debug, state) do
     {:reply, debug_info(state), state}
   end
 
-  defp do_handle_call({:close, reason}, _snapshot, state) do
+  defp do_handle_call({:close, reason}, state) do
     next_state = shutdown_state(state, reason, :local_close)
     {:stop, :normal, :ok, next_state}
   end
 
-  defp do_handle_call({:write, chunk}, _snapshot, state) do
-    with :ok <- ensure_connected(state),
-         {:ok, payload} <- normalize_payload(chunk),
-         :ok <- transport_send(state.transport, state.socket, payload) do
-      {:reply, :ok, state}
-    else
-      # A chunk that is not bytes is an error of the caller, not of the
-      # transport. The write rejects with the `TypeError`, and the writable
-      # side has that error, as the Streams Standard specifies for a sink
-      # that fails.
-      {:error, %TypeError{} = error} ->
-        next_state = shutdown_state(state, error, :write_error)
-        {:stop, :normal, {:error, error}, next_state}
+  # A close of the writable side closes the socket. The writable side is
+  # closing already, thus the socket does not give it an error.
+  defp do_handle_call(:sink_close, state) do
+    next_state = shutdown_state(state, :closed, :sink_close)
+    {:stop, :normal, :ok, next_state}
+  end
 
-      {:error, reason} ->
-        next_state = shutdown_state(state, {:transport_error, reason}, :write_error)
-        {:stop, :normal, {:error, reason}, next_state}
+  # The process of the sink sends the bytes: see `sink_write/2`.
+  defp do_handle_call(:transport, state) do
+    case ensure_connected(state) do
+      :ok -> {:reply, {:ok, state.transport, state.socket}, state}
+      error -> {:reply, error, state}
     end
   end
 
-  defp do_handle_call({:start_tls, options, promises}, _snapshot, state) do
+  defp do_handle_call({:write_failed, reason}, state) do
+    next_state = shutdown_state(state, reason, :write_error)
+    {:stop, :normal, :ok, next_state}
+  end
+
+  defp do_handle_call({:start_tls, options, promises}, state) do
     with :ok <- ensure_connected(state),
          :ok <- ensure_starttls(state),
          :ok <- ensure_tcp(state),
@@ -353,25 +393,20 @@ defmodule Web.Socket do
     end
   end
 
-  defp do_handle_call(_body, _snapshot, state) do
+  defp do_handle_call(_request, state) do
     {:reply, {:error, :unsupported_operation}, state}
   end
 
-  defp do_handle_cast(:readable_pull, _snapshot, state) do
+  defp do_handle_cast(:readable_pull, state) do
     {:noreply, maybe_resume_transport(state)}
   end
 
-  defp do_handle_cast({:readable_cancel, reason}, _snapshot, state) do
+  defp do_handle_cast({:readable_cancel, reason}, state) do
     next_state = shutdown_state(state, {:readable_cancel, reason}, :readable_cancel)
     {:stop, :normal, next_state}
   end
 
-  defp do_handle_cast({:close, reason}, _snapshot, state) do
-    next_state = shutdown_state(state, reason, :local_close)
-    {:stop, :normal, next_state}
-  end
-
-  defp do_handle_cast(_body, _snapshot, state) do
+  defp do_handle_cast(_request, state) do
     {:noreply, state}
   end
 
@@ -395,9 +430,14 @@ defmodule Web.Socket do
     end
   end
 
+  # The modes of a close that is not a failure. For each other mode, the
+  # promise `closed` rejects, as the Sockets API specifies.
+  @graceful [:local_close, :sink_close, :transport_closed, :readable_cancel]
+
   defp shutdown_state(state, reason, mode) do
     state
     |> Map.put(:close_reason, reason)
+    |> Map.put(:failed?, mode not in @graceful)
     |> settle_opened_if_needed({:error, reason})
     |> settle_closed_if_needed(reason)
     |> settle_upgraded_if_needed({:error, reason})
@@ -405,7 +445,14 @@ defmodule Web.Socket do
     |> close_transport_if_needed()
   end
 
+  # `close/2` ends the two streams.
   defp notify_streams(state, _reason, :local_close) do
+    ReadableStream.close(state.readable_pid)
+    WritableStream.error(state.writable_pid, :closed)
+    state
+  end
+
+  defp notify_streams(state, _reason, :sink_close) do
     ReadableStream.close(state.readable_pid)
     state
   end
@@ -449,6 +496,11 @@ defmodule Web.Socket do
 
   defp settle_opened_if_needed(state, result), do: settle_opened(state, result)
 
+  defp settle_closed_if_needed(%{closed_settled?: false, failed?: true} = state, reason) do
+    state.closed_info.reject.(reason)
+    %{state | closed_settled?: true}
+  end
+
   defp settle_closed_if_needed(%{closed_settled?: false} = state, reason) do
     state.closed_info.resolve.(reason)
     %{state | closed_settled?: true}
@@ -471,7 +523,6 @@ defmodule Web.Socket do
   defp settle_upgraded_if_needed(state, result), do: settle_upgraded(state, result)
 
   defp upgrade_generation(state, ssl_socket, promises) do
-    old_address = state.address
     old_readable_pid = state.readable_pid
     old_writable_pid = state.writable_pid
 
@@ -514,12 +565,10 @@ defmodule Web.Socket do
     WritableStream.error(old_writable_pid, :upgraded)
     state.closed_info.resolve.(:upgraded)
     state.upgraded_info.resolve.(tls_socket)
-    Process.unalias(old_address)
 
     {next_state, tls_socket}
   end
 
-  @doc false
   defp connect_transport(state) do
     timeout = Map.get_lazy(state.options, :connect_timeout, &Web.Application.connect_timeout/0)
 
@@ -528,19 +577,14 @@ defmodule Web.Socket do
     end
   end
 
-  @doc false
   defp transport_mode("off"), do: {:ok, :tcp}
 
-  @doc false
   defp transport_mode("starttls"), do: {:ok, :starttls}
 
-  @doc false
   defp transport_mode("on"), do: {:ok, :ssl}
 
-  @doc false
   defp transport_mode(other), do: {:error, {:unsupported_secure_transport, other}}
 
-  @doc false
   defp transport_connect(:tcp, state, timeout) do
     connect_fun = Map.get(state.options, :connect_fun, &:gen_tcp.connect/4)
 
@@ -550,12 +594,10 @@ defmodule Web.Socket do
     end
   end
 
-  @doc false
   defp transport_connect(:starttls, state, timeout) do
     transport_connect(:tcp, state, timeout)
   end
 
-  @doc false
   defp transport_connect(:ssl, state, timeout) do
     with :ok <- ensure_ssl_started(state.options) do
       connect_fun = Map.get(state.options, :ssl_connect_fun, &:ssl.connect/4)
@@ -575,7 +617,7 @@ defmodule Web.Socket do
   defp upgrade_transport(state, options) do
     _ = transport_set_active_safe(:tcp, state.socket, false)
 
-    case :ssl.connect(state.socket, merge_ssl_options(options, state.host), @call_timeout) do
+    case :ssl.connect(state.socket, merge_ssl_options(options, state.host), @handshake_timeout) do
       {:ok, ssl_socket} -> {:ok, ssl_socket}
       {:error, reason} -> {:error, reason}
     end
@@ -740,57 +782,34 @@ defmodule Web.Socket do
     {promise, %{resolve: resolve, reject: reject}}
   end
 
-  defp promise_request(%__MODULE__{} = socket, body) do
-    Promise.detached(fn resolve, reject ->
-      case request_target(socket.address, socket.token, body, @call_timeout) do
-        {:error, reason} -> reject.(reason)
-        value -> resolve.(value)
-      end
-    end)
-  end
+  # The process of the sink sends the bytes, not the server. Thus a write
+  # that waits for a slow peer does not stop the server, which reads the
+  # data from the peer.
+  defp sink_write(handle, chunk) do
+    with {:ok, payload} <- normalize_payload(chunk),
+         {:ok, transport, socket} <- MessageTarget.call(handle, :transport),
+         :ok <- transport_send(transport, socket, payload) do
+      :ok
+    else
+      # A chunk that is not bytes is an error of the caller. The write
+      # rejects with the `TypeError`, and the socket closes.
+      {:error, %TypeError{} = error} ->
+        _reply = MessageTarget.call(handle, {:write_failed, error})
+        Promise.reject(error)
 
-  defp write_promise(address, token, chunk, timeout) do
-    Promise.detached(fn resolve, reject ->
-      case request_target(address, token, {:write, chunk}, timeout) do
-        :ok -> resolve.(:ok)
-        {:error, reason} -> reject.(reason)
-      end
-    end)
-  end
+      # The socket is closed, or it started TLS.
+      {:error, reason} when reason in [:closed, :detached, :not_connected] ->
+        Promise.reject(:closed)
 
-  defp close_promise(address, token, timeout) do
-    Promise.detached(fn resolve, reject ->
-      case request_target(address, token, {:close, :closed}, timeout) do
-        :ok -> resolve.(:ok)
-        {:error, reason} -> reject.(reason)
-      end
-    end)
-  end
-
-  defp abort_promise(address, token, reason, timeout) do
-    Promise.detached(fn resolve, reject ->
-      case request_target(address, token, {:close, :closed}, timeout) do
-        :ok -> resolve.(:ok)
-        {:error, abort_reason} -> reject.({reason, abort_reason})
-      end
-    end)
-  end
-
-  defp request_target(target, token, body, timeout)
-       when is_reference(target) and is_reference(token) do
-    reply_ref = make_ref()
-    send(target, {:"$gen_call", {self(), reply_ref}, Envelope.new(token, body)})
-
-    receive do
-      {^reply_ref, reply} -> reply
-    after
-      timeout -> {:error, :closed}
+      {:error, reason} ->
+        _reply = MessageTarget.call(handle, {:write_failed, {:transport_error, reason}})
+        Promise.reject(reason)
     end
   end
 
-  defp cast_target(target, token, body, snapshot \\ Snapshot.take())
-       when is_reference(target) and is_reference(token) do
-    send(target, {:"$gen_cast", Envelope.new(token, body, snapshot)})
+  # A close and an abort of the writable side close the socket.
+  defp sink_close(handle) do
+    _reply = MessageTarget.call(handle, :sink_close)
     :ok
   end
 

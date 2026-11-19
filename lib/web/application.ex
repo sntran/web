@@ -16,8 +16,9 @@ defmodule Web.Application do
       # The groups of the broadcast channels. The scope has its own name,
       # thus it does not conflict with a `:pg` scope of the application.
       Web.BroadcastChannel.Adapter.PG,
-      # The servers of the message ports and of the broadcast channels.
-      {DynamicSupervisor, name: Web.MessageSupervisor, strategy: :one_for_one},
+      # The servers of the message ports, the broadcast channels, and the
+      # sockets.
+      {DynamicSupervisor, name: Web.HandleSupervisor, strategy: :one_for_one},
       {Task.Supervisor, name: Web.TaskSupervisor},
       Web.AbortSignal.Reasons,
       Web.URLPattern.Cache,

@@ -3,7 +3,6 @@ defmodule Web.SocketTest do
 
   import Web, only: [await: 1]
 
-  alias Web.Internal.Envelope
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultReader
   alias Web.Socket
@@ -57,7 +56,7 @@ defmodule Web.SocketTest do
     Socket.close(socket)
   end
 
-  test "wrong authorization tokens cannot close or write to the socket server" do
+  test "a handle with a token that is not correct has no effect" do
     parent = self()
 
     {port, _task} =
@@ -67,33 +66,15 @@ defmodule Web.SocketTest do
 
     socket = Web.connect("localhost:#{port}")
     assert_opened_remote(socket, "localhost:#{port}")
+    forged = %{socket | token: make_ref()}
 
-    bad_close_ref = make_ref()
+    assert GenServer.call(socket.address, {make_ref(), {:close, :closed}}) == {:error, :detached}
+    assert GenServer.call(socket.address, {make_ref(), :debug}) == {:error, :detached}
+    assert GenServer.call(socket.address, :not_a_request) == {:error, :detached}
+    assert catch_exit(await(Socket.start_tls(forged))) == :closed
 
-    send(
-      socket.address,
-      {:"$gen_call", {self(), bad_close_ref}, Envelope.new(make_ref(), {:close, :closed})}
-    )
-
-    assert_receive {^bad_close_ref, {:error, :unauthorized}}, 1_000
-
-    bad_debug_ref = make_ref()
-
-    send(
-      socket.address,
-      {:"$gen_call", {self(), bad_debug_ref}, Envelope.new(make_ref(), :debug)}
-    )
-
-    assert_receive {^bad_debug_ref, {:error, :unauthorized}}, 1_000
-
-    bad_write_ref = make_ref()
-
-    send(
-      socket.address,
-      {:"$gen_call", {self(), bad_write_ref}, Envelope.new(make_ref(), {:write, "nope"})}
-    )
-
-    assert_receive {^bad_write_ref, {:error, :unauthorized}}, 1_000
+    # A close with a forged handle returns the promise, and closes nothing.
+    assert %Web.Promise{} = Socket.close(forged)
 
     reader = ReadableStream.get_reader(socket.readable)
     writer = Web.WritableStream.get_writer(socket.writable)
@@ -103,39 +84,32 @@ defmodule Web.SocketTest do
     assert :closed = await(Socket.close(socket))
   end
 
-  test "server handles envelope wrappers, unsupported operations, and stray info messages" do
+  test "the server ignores a request and a message that it does not know" do
     {port, _task} = start_tcp_server(&wait_for_tcp_stop_or_close/1)
 
     socket = Web.connect("localhost:#{port}")
     assert_opened_remote(socket, "localhost:#{port}")
 
-    envelope = Envelope.new(socket.token, :debug)
-
-    assert %{transport: :tcp} = socket_raw_request(socket.address, {:envelope, envelope})
     refute Map.has_key?(socket_debug(socket), :server_pid)
     refute Map.has_key?(socket_debug(socket), :socket)
-    assert socket_raw_request(socket.address, {:envelope, :bogus}) == {:error, :unauthorized}
+    assert socket_request(socket, :bogus) == {:error, :unsupported_operation}
 
-    assert socket_raw_request(socket.address, Envelope.new(socket.token, :bogus)) ==
-             {:error, :unsupported_operation}
-
-    socket_raw_cast(socket.address, {:envelope, Envelope.new(socket.token, :bogus_cast)})
-    socket_raw_cast(socket.address, {:envelope, :bogus})
-    socket_raw_cast(socket.address, %Envelope{})
+    GenServer.cast(socket.address, {socket.token, :bogus_cast})
+    GenServer.cast(socket.address, :bogus)
     send(socket.address, :bogus_info)
 
     assert %{transport: :tcp} = socket_debug(socket)
     assert :closed = await(Socket.close(socket))
   end
 
-  test "opened rejects on connection timeout and closed resolves with the timeout reason" do
+  test "opened and closed reject when the connection fails" do
     socket =
       Web.connect("localhost:9",
         connect_fun: fn _host, _port, _opts, _timeout -> {:error, :timeout} end
       )
 
     assert :timeout = catch_exit(await(socket.opened))
-    assert await(socket.closed) == :timeout
+    assert catch_exit(await(socket.closed)) == :timeout
     assert :timeout = catch_exit(await(socket.upgraded))
   end
 
@@ -143,7 +117,7 @@ defmodule Web.SocketTest do
     socket = Web.connect("localhost:25", secureTransport: "udp")
 
     assert {:unsupported_secure_transport, "udp"} = catch_exit(await(socket.opened))
-    assert await(socket.closed) == {:unsupported_secure_transport, "udp"}
+    assert catch_exit(await(socket.closed)) == {:unsupported_secure_transport, "udp"}
   end
 
   test "initial tls connect failures reject the opened promise" do
@@ -154,7 +128,7 @@ defmodule Web.SocketTest do
       )
 
     assert :ssl_timeout = catch_exit(await(socket.opened))
-    assert await(socket.closed) == :ssl_timeout
+    assert catch_exit(await(socket.closed)) == :ssl_timeout
     assert :ssl_timeout = catch_exit(await(socket.upgraded))
   end
 
@@ -246,7 +220,7 @@ defmodule Web.SocketTest do
     # rejects with the TypeError, and the writable side has that error.
     reason = catch_exit(await(WritableStreamDefaultWriter.write(writer, %{bad: :payload})))
     assert %TypeError{} = reason
-    assert await(socket.closed) == reason
+    assert catch_exit(await(socket.closed)) == reason
     assert catch_exit(await(WritableStreamDefaultWriter.write(writer, "late"))) == reason
   end
 
@@ -308,9 +282,9 @@ defmodule Web.SocketTest do
     # certificate authority, and it verifies the host name.
     upgraded = await(Socket.start_tls(socket, cacertfile: fixture_path("test_ca.pem")))
     assert %Socket{} = upgraded
-    assert upgraded.address != socket.address
+    # The TLS socket is a new handle to the same process.
     assert upgraded.token != socket.token
-    assert await(socket.upgraded).address == upgraded.address
+    assert await(socket.upgraded) == upgraded
     assert await(socket.closed) == :upgraded
 
     upgraded_reader = ReadableStream.get_reader(upgraded.readable)
@@ -350,9 +324,9 @@ defmodule Web.SocketTest do
 
     reason = catch_exit(await(Socket.start_tls(socket, verify: :verify_none)))
     assert match?({:tls_upgrade_failed, _}, reason)
-    assert match?({:tls_upgrade_failed, _}, await(socket.closed))
+    assert match?({:tls_upgrade_failed, _}, catch_exit(await(socket.closed)))
     assert match?({:tls_upgrade_failed, _}, catch_exit(await(socket.upgraded)))
-    assert_alias_revoked(socket.address, Envelope.new(socket.token, :debug))
+    assert_stopped(socket)
   end
 
   test "server closing immediately after connect shuts down the socket and revokes the alias" do
@@ -362,7 +336,7 @@ defmodule Web.SocketTest do
     assert_opened_remote(socket, "localhost:#{port}")
 
     assert await(socket.closed) == :closed
-    assert_alias_revoked(socket.address, Envelope.new(socket.token, :debug))
+    assert_stopped(socket)
   end
 
   describe "the verification of the server certificate" do
@@ -557,8 +531,8 @@ defmodule Web.SocketTest do
 
     assert_opened_remote(tcp_error_socket, "localhost:0")
     send(tcp_error_socket.address, {:tcp_error, tcp_error_handle, :econnreset})
-    assert await(tcp_error_socket.closed) == {:transport_error, :econnreset}
-    assert_alias_revoked(tcp_error_socket.address, Envelope.new(tcp_error_socket.token, :debug))
+    assert catch_exit(await(tcp_error_socket.closed)) == {:transport_error, :econnreset}
+    assert_stopped(tcp_error_socket)
 
     tcp_closed_handle = {:fake_tcp, make_ref()}
 
@@ -570,7 +544,7 @@ defmodule Web.SocketTest do
     assert_opened_remote(tcp_closed_socket, "localhost:0")
     send(tcp_closed_socket.address, {:tcp_closed, tcp_closed_handle})
     assert await(tcp_closed_socket.closed) == :closed
-    assert_alias_revoked(tcp_closed_socket.address, Envelope.new(tcp_closed_socket.token, :debug))
+    assert_stopped(tcp_closed_socket)
 
     ssl_error_handle = {:fake_ssl, make_ref()}
 
@@ -583,8 +557,8 @@ defmodule Web.SocketTest do
 
     assert_opened_remote(ssl_error_socket, "localhost:0")
     send(ssl_error_socket.address, {:ssl_error, ssl_error_handle, :closed})
-    assert await(ssl_error_socket.closed) == {:transport_error, :closed}
-    assert_alias_revoked(ssl_error_socket.address, Envelope.new(ssl_error_socket.token, :debug))
+    assert catch_exit(await(ssl_error_socket.closed)) == {:transport_error, :closed}
+    assert_stopped(ssl_error_socket)
 
     ssl_closed_handle = {:fake_ssl, make_ref()}
 
@@ -598,7 +572,7 @@ defmodule Web.SocketTest do
     assert_opened_remote(ssl_closed_socket, "localhost:0")
     send(ssl_closed_socket.address, {:ssl_closed, ssl_closed_handle})
     assert await(ssl_closed_socket.closed) == :closed
-    assert_alias_revoked(ssl_closed_socket.address, Envelope.new(ssl_closed_socket.token, :debug))
+    assert_stopped(ssl_closed_socket)
   end
 
   test "debug transport info exposes metadata without backend pid" do
@@ -615,7 +589,7 @@ defmodule Web.SocketTest do
     assert Map.has_key?(info, :desired_size)
 
     assert :closed = await(Socket.close(socket))
-    assert_alias_revoked(socket.address, Envelope.new(socket.token, :debug))
+    assert_stopped(socket)
   end
 
   test "connect raises for invalid address formats" do
@@ -676,7 +650,7 @@ defmodule Web.SocketTest do
 
     assert :not_connected = catch_exit(await(Socket.start_tls(socket)))
     assert :closed = await(Socket.close(socket))
-    assert_alias_revoked(socket.address, Envelope.new(socket.token, :debug))
+    assert_stopped(socket)
   end
 
   test "starttls connection failures reject opened and closed" do
@@ -687,7 +661,7 @@ defmodule Web.SocketTest do
       )
 
     assert :starttls_timeout = catch_exit(await(socket.opened))
-    assert await(socket.closed) == :starttls_timeout
+    assert catch_exit(await(socket.closed)) == :starttls_timeout
   end
 
   test "ssl bootstrap failures reject secure connections" do
@@ -698,54 +672,126 @@ defmodule Web.SocketTest do
       )
 
     assert :ssl_boot_failed = catch_exit(await(socket.opened))
-    assert await(socket.closed) == :ssl_boot_failed
+    assert catch_exit(await(socket.closed)) == :ssl_boot_failed
   end
 
-  test "writer close times out while connect is blocked and the alias is later revoked" do
+  test "a close of the writer waits for the connection, then closes the socket" do
     gate = make_ref()
-
-    socket =
-      Web.connect("localhost:0",
-        request_timeout: 25,
-        connect_fun: blocking_connect(self(), gate)
-      )
-
+    socket = Web.connect("localhost:0", connect_fun: blocking_connect(self(), gate))
     assert_receive {:connect_blocked, ^gate}, 1_000
 
     writer = Web.WritableStream.get_writer(socket.writable)
+    close = WritableStreamDefaultWriter.close(writer)
 
-    assert :closed =
-             catch_exit(await(WritableStreamDefaultWriter.close(writer)))
+    # The close has no time limit: it waits for the connection.
+    assert Web.Promise.wait(Web.Promise.race([close, timeout_promise(100)])) ==
+             {:fulfilled, :still_pending}
 
+    send(socket.address, {gate, {:ok, {:fake_tcp, make_ref()}}})
+
+    assert :ok = await(close)
+    assert await(socket.closed) == :closed
+    assert_stopped(socket)
+  end
+
+  test "a close of the writer rejects when the connection fails" do
+    gate = make_ref()
+    socket = Web.connect("localhost:0", connect_fun: blocking_connect(self(), gate))
+    assert_receive {:connect_blocked, ^gate}, 1_000
+
+    writer = Web.WritableStream.get_writer(socket.writable)
+    close = WritableStreamDefaultWriter.close(writer)
     send(socket.address, {gate, {:error, :connect_timeout}})
 
     assert :connect_timeout = catch_exit(await(socket.opened))
-    assert await(socket.closed) == :connect_timeout
-    assert_alias_revoked(socket.address, Envelope.new(socket.token, :debug))
+    assert catch_exit(await(socket.closed)) == :connect_timeout
+    assert catch_exit(await(close)) == :connect_timeout
+    assert_stopped(socket)
   end
 
-  test "writer abort rejects with the reason of the sink when the sink cannot close in time" do
-    gate = make_ref()
-
-    socket =
-      Web.connect("localhost:0",
-        request_timeout: 25,
-        connect_fun: blocking_connect(self(), gate)
-      )
-
-    assert_receive {:connect_blocked, ^gate}, 1_000
+  test "an abort of the writer closes the socket" do
+    {port, _task} = start_tcp_server(&wait_for_tcp_stop_or_close/1)
+    socket = Web.connect("localhost:#{port}")
+    assert_opened_remote(socket, "localhost:#{port}")
 
     writer = Web.WritableStream.get_writer(socket.writable)
+    assert :ok = await(WritableStreamDefaultWriter.abort(writer, :user_abort))
+    assert await(socket.closed) == :closed
+    assert_stopped(socket)
+  end
 
-    assert {:user_abort, :closed} =
-             catch_exit(await(WritableStreamDefaultWriter.abort(writer, :user_abort)))
+  test "close ends the two streams, and a second close has no effect" do
+    {port, _task} = start_tcp_server(&wait_for_tcp_stop_or_close/1)
+    socket = Web.connect("localhost:#{port}")
+    assert_opened_remote(socket, "localhost:#{port}")
+    writer = Web.WritableStream.get_writer(socket.writable)
 
-    send(socket.address, {gate, {:error, :abort_connect_timeout}})
+    assert :closed = await(Socket.close(socket))
+    assert :closed = await(Socket.close(socket))
 
-    assert :abort_connect_timeout = catch_exit(await(socket.opened))
-    assert await(socket.closed) == :abort_connect_timeout
-    Process.sleep(75)
-    assert_alias_revoked(socket.address, Envelope.new(socket.token, :debug))
+    assert Enum.to_list(socket.readable) == []
+    assert catch_exit(await(WritableStreamDefaultWriter.write(writer, "late"))) == :closed
+    assert catch_exit(await(Socket.start_tls(socket))) == :closed
+  end
+
+  test "a write that waits for a slow peer does not stop the reads" do
+    parent = self()
+
+    # The peer sends data, and reads nothing until the test tells it.
+    {port, _task} =
+      start_tcp_server(fn peer ->
+        :ok = :gen_tcp.send(peer, "from the peer")
+        send(parent, {:peer, self()})
+
+        receive do
+          :read -> :ok
+        end
+
+        drain = fn drain ->
+          case :gen_tcp.recv(peer, 0, 2_000) do
+            {:ok, _data} -> drain.(drain)
+            {:error, _reason} -> :ok
+          end
+        end
+
+        drain.(drain)
+      end)
+
+    socket = Web.connect("localhost:#{port}")
+    assert_opened_remote(socket, "localhost:#{port}")
+    assert_receive {:peer, peer}
+
+    # The test writes until the buffers of the two sides are full: that
+    # write waits.
+    writer = Web.WritableStream.get_writer(socket.writable)
+    chunk = :binary.copy("x", 8_000_000)
+
+    write =
+      Enum.find_value(1..40, fn _index ->
+        write = WritableStreamDefaultWriter.write(writer, chunk)
+
+        case Web.Promise.wait(Web.Promise.race([write, timeout_promise(200)])) do
+          {:fulfilled, :still_pending} -> write
+          {:fulfilled, :ok} -> nil
+        end
+      end)
+
+    assert %Web.Promise{} = write
+
+    # The socket reads while the write waits.
+    reader = ReadableStream.get_reader(socket.readable)
+    assert read_chunk!(reader) == "from the peer"
+
+    send(peer, :read)
+    assert :ok = await(write)
+    assert :closed = await(Socket.close(socket))
+  end
+
+  defp timeout_promise(ms) do
+    Web.Promise.new(fn resolve, _reject ->
+      Process.sleep(ms)
+      resolve.(:still_pending)
+    end)
   end
 
   test "connect normalizes alternate address and option forms" do
@@ -966,30 +1012,13 @@ defmodule Web.SocketTest do
     socket_request(socket, :debug)
   end
 
-  defp socket_raw_cast(target, body) do
-    send(target, {:"$gen_cast", body})
-    :ok
+  # The server of the socket stopped.
+  defp assert_stopped(socket) do
+    assert_eventually(fn -> not Process.alive?(socket.address) end)
   end
 
-  defp socket_request(socket, body, timeout \\ 1_000) do
-    socket_raw_request(socket.address, Envelope.new(socket.token, body), timeout)
-  end
-
-  defp socket_raw_request(target, body, timeout \\ 1_000) do
-    reply_ref = make_ref()
-    send(target, {:"$gen_call", {self(), reply_ref}, body})
-
-    receive do
-      {^reply_ref, reply} -> reply
-    after
-      timeout -> flunk("socket request timed out")
-    end
-  end
-
-  defp assert_alias_revoked(target, body, timeout \\ 100) do
-    reply_ref = make_ref()
-    send(target, {:"$gen_call", {self(), reply_ref}, body})
-    refute_receive {^reply_ref, _reply}, timeout
+  defp socket_request(socket, body) do
+    GenServer.call(socket.address, {socket.token, body})
   end
 
   defp blocking_connect(parent, gate) do

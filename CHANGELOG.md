@@ -170,6 +170,19 @@ All notable changes to this project are documented in this file.
   before its promise settles.
 - The pipe options have Elixir names: `:prevent_close`, `:prevent_abort`, and
   `:prevent_cancel`. The names of the Standard are accepted also.
+- **Breaking:** `Web.TextDecoder.new/2` and `Web.TextDecoderStream.new/2`
+  raise `Web.RangeError` for a label that is not a label of UTF-8, as the
+  Encoding Standard specifies. Before, they raised `Web.TypeError`. All the
+  six labels of UTF-8 are accepted. The option `:ignore_bom` has its Elixir
+  name; the name `:ignoreBOM` is accepted also.
+- `Web.TextDecoderStream` has the fields `:encoding`, `:fatal`, and
+  `:ignore_bom`, and `Web.TextEncoderStream` has the field `:encoding`.
+- `Web.TextEncoderStream` gives no chunk for an empty string, joins a code
+  point that is divided between two chunks, and gives U+FFFD for bytes that
+  are not valid UTF-8. `Web.TextEncoder.encode/2` gives U+FFFD for such
+  bytes also.
+- The compression streams, and `Web.TextDecoder`, accept a
+  `Web.ArrayBuffer` as a chunk of bytes.
 - **Breaking:** `Web.TransformStream` follows the Streams Standard.
   - The transform of a chunk starts only when the readable side wants a
     chunk, and until then the write waits. Before, a transform stream gave
@@ -474,6 +487,10 @@ All notable changes to this project are documented in this file.
   it raised in the stream process.
 - The example `examples/secure_byob_stream.exs` operates again. It used the
   field `:task` of the old promise.
+- `Web.DecompressionStream` gives `Web.TypeError` when the stream closes
+  before the end of the compressed data, and when data comes after that
+  end. Before, it accepted such data and gave a part of the result, or
+  ignored the remaining data, with no error.
 - A readable stream does not call `pull` again and again when `pull` gives
   no chunk immediately. Before, the stream called such a `pull` without a
   pause: 36,725 calls in 300 ms in a measurement, each one in a new process.

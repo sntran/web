@@ -27,7 +27,10 @@ defmodule Web.TextEncoder do
 
   @spec encode(t(), String.t()) :: Uint8Array.t()
   def encode(%__MODULE__{encoding: "utf-8"}, input) when is_binary(input) do
+    # A string of the BEAM can contain bytes that are not valid UTF-8. They
+    # become U+FFFD, as the Encoding Standard does for a lone surrogate.
     input
+    |> String.replace_invalid()
     |> ArrayBuffer.new()
     |> Uint8Array.new()
   end

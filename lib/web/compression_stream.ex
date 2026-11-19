@@ -159,9 +159,10 @@ defmodule Web.CompressionStream do
 
   defp to_binary!(bin, _ctx) when is_binary(bin), do: bin
   defp to_binary!(%Uint8Array{} = arr, _ctx), do: Uint8Array.to_binary(arr)
+  defp to_binary!(%Web.ArrayBuffer{} = buffer, _ctx), do: Web.ArrayBuffer.data(buffer)
 
   defp to_binary!(_, ctx),
-    do: raise(TypeError, "#{ctx} chunk must be a binary or Uint8Array")
+    do: raise(TypeError, "#{ctx} chunk must be a binary, a Uint8Array, or an ArrayBuffer")
 
   # Stop the Agent idempotently.
   defp stop_agent(agent) do

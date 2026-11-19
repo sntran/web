@@ -89,7 +89,9 @@ defmodule Web.DecompressionStream do
     {:ok, agent} =
       Agent.start_link(fn ->
         z = :zlib.open()
-        :zlib.inflateInit(z, window_bits)
+        # The option `:error` refuses data after the end of the compressed
+        # stream, as the Compression Standard specifies.
+        :zlib.inflateInit(z, window_bits, :error)
         z
       end)
 
@@ -118,41 +120,20 @@ defmodule Web.DecompressionStream do
   end
 
   @impl Web.Stream
-  def flush(ctrl, %{zlib_agent: agent} = state) do
-    # Attempt to flush any remaining buffered output.
-    # Per the WHATWG Compression specification, closing a decompression
-    # stream before the compressed payload is complete MUST raise a
-    # TypeError. Zlib signals this via :buf_error (Z_BUF_ERROR) when
-    # there is no more output and Z_STREAM_END was never seen. We do NOT
-    # suppress this error — a truncated stream is an integrity violation.
-    # NOTE: In OTP 27+ inflate/2 returns {:ok, []} instead of raising
-    # :buf_error with empty input, so the rescue and error branches below
-    # are unreachable in current runtimes but kept for older OTP.
+  def flush(_ctrl, %{zlib_agent: agent} = state) do
+    # The Compression Standard gives a `TypeError` when the stream closes
+    # before the end of the compressed data. `inflateEnd/1` raises if zlib
+    # did not get to that end. This is also true for a stream with no data.
     maybe_log_runtime_event("flush", 0)
-    result = run_zlib(agent, fn z -> :zlib.inflate(z, <<>>) end, "DecompressionStream")
-
-    # Always stop the agent — whether flush succeeds or fails.
+    result = run_zlib(agent, fn z -> :zlib.inflateEnd(z) end, "DecompressionStream")
     stop_agent(agent)
 
     case result do
-      {:ok, final_chunks} ->
-        # coveralls-ignore-start
-        # In practice, inflate(<<>>) after a complete stream returns [].
-        # This guard is kept for hypothetical edge cases where decompressor
-        # state yields final output only on Z_FINISH flush.
-        for chunk <- final_chunks, byte_size(chunk) > 0 do
-          ReadableStreamDefaultController.wait_for_capacity(ctrl)
-          ReadableStreamDefaultController.enqueue(ctrl, chunk)
-        end
-
-        # coveralls-ignore-stop
-
+      {:ok, :ok} ->
         {:ok, state}
 
-      # coveralls-ignore-start
-      {:error, e} ->
-        raise TypeError, zlib_error_message(e)
-        # coveralls-ignore-stop
+      {:error, _error} ->
+        raise TypeError, "Decompression failed: the compressed data is not complete"
     end
   end
 
@@ -172,9 +153,10 @@ defmodule Web.DecompressionStream do
 
   defp to_binary!(bin, _ctx) when is_binary(bin), do: bin
   defp to_binary!(%Uint8Array{} = arr, _ctx), do: Uint8Array.to_binary(arr)
+  defp to_binary!(%Web.ArrayBuffer{} = buffer, _ctx), do: Web.ArrayBuffer.data(buffer)
 
   defp to_binary!(_, ctx),
-    do: raise(TypeError, "#{ctx} chunk must be a binary or Uint8Array")
+    do: raise(TypeError, "#{ctx} chunk must be a binary, a Uint8Array, or an ArrayBuffer")
 
   # Stop the Agent idempotently.
   defp stop_agent(agent) do
@@ -239,24 +221,5 @@ defmodule Web.DecompressionStream do
     end
   end
 
-  defp zlib_error_message(%ErlangError{original: :data_error}),
-    do: "Decompression failed: invalid data"
-
-  # coveralls-ignore-start
-  # The following clauses handle errors that are unreachable in OTP 27+:
-  # inflate/2 with empty input returns {:ok, []} rather than raising :buf_error;
-  # :stream_error and the catch-all patterns require API misuse.
-  defp zlib_error_message(%ErlangError{original: :buf_error}),
-    do: "Decompression failed: compressed stream is truncated or incomplete"
-
-  defp zlib_error_message(%ErlangError{original: :stream_error}),
-    do: "Decompression failed: stream error"
-
-  defp zlib_error_message(%ErlangError{original: {:error, reason}}),
-    do: "Decompression failed: #{inspect(reason)}"
-
-  defp zlib_error_message(%ErlangError{original: reason}),
-    do: "Decompression failed: #{inspect(reason)}"
-
-  # coveralls-ignore-stop
+  defp zlib_error_message(%ErlangError{}), do: "Decompression failed: invalid data"
 end

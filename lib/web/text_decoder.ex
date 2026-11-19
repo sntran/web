@@ -55,7 +55,15 @@ defmodule Web.TextDecoder do
 
   @bom <<0xEF, 0xBB, 0xBF>>
   @replacement_char <<0xEF, 0xBF, 0xBD>>
-  @utf8_labels MapSet.new(["utf-8", "utf8", "unicode-1-1-utf-8"])
+  # The labels of UTF-8 in the Encoding Standard.
+  @utf8_labels MapSet.new([
+                 "unicode-1-1-utf-8",
+                 "unicode11utf8",
+                 "unicode20utf8",
+                 "utf-8",
+                 "utf8",
+                 "x-unicode20utf8"
+               ])
 
   defstruct [:encoding, :state_pid, :fatal, :ignore_bom]
 
@@ -66,17 +74,26 @@ defmodule Web.TextDecoder do
           ignore_bom: boolean()
         }
 
-  @type options :: %{optional(:fatal) => boolean(), optional(:ignoreBOM) => boolean()}
+  @type options ::
+          %{
+            optional(:fatal) => boolean(),
+            optional(:ignore_bom) => boolean(),
+            optional(:ignoreBOM) => boolean()
+          }
+          | keyword()
   @type decode_options :: %{optional(:stream) => boolean()}
 
   @spec new(String.t(), options()) :: t()
   def new(label \\ "utf-8", options \\ %{}) do
     encoding = normalize_label(label)
-    fatal = Map.get(options, :fatal, false)
-    ignore_bom = Map.get(options, :ignoreBOM, false)
+    options = Map.new(options)
+    fatal = Map.get(options, :fatal, false) == true
+    ignore_bom = Map.get(options, :ignore_bom, Map.get(options, :ignoreBOM, false)) == true
 
+    # The Encoding Standard gives `RangeError` for a label that is not known.
+    # This library has only the UTF-8 decoder.
     unless MapSet.member?(@utf8_labels, encoding) do
-      raise TypeError, "TextDecoder only supports UTF-8"
+      raise Web.RangeError, "TextDecoder supports only UTF-8, got the label: #{inspect(label)}"
     end
 
     {:ok, state_pid} = State.start(Web.Promise.owner(), initial_state())
@@ -170,6 +187,7 @@ defmodule Web.TextDecoder do
 
   defp normalize_input(input) when is_binary(input), do: input
   defp normalize_input(%Uint8Array{} = input), do: Uint8Array.to_binary(input)
+  defp normalize_input(%Web.ArrayBuffer{} = input), do: Web.ArrayBuffer.data(input)
 
   defp normalize_input(_input) do
     raise TypeError, "TextDecoder.decode input must be a binary or Uint8Array"

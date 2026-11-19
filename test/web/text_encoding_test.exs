@@ -234,7 +234,8 @@ defmodule Web.TextEncodingTest do
           ) do
       assert %TextDecoder{encoding: "utf-8"} = TextDecoder.new(valid_label)
 
-      assert_raise Web.TypeError, "TextDecoder only supports UTF-8", fn ->
+      # The Encoding Standard gives RangeError for a label that is not known.
+      assert_raise Web.RangeError, ~r/supports only UTF-8/, fn ->
         TextDecoder.new(invalid_label)
       end
     end
@@ -289,6 +290,117 @@ defmodule Web.TextEncodingTest do
     assert %Web.TypeError{} = catch_exit(await(read))
   end
 
+  describe "the text streams and the Encoding Standard" do
+    defp through(chunks, transform) do
+      chunks
+      |> Web.ReadableStream.from()
+      |> Web.ReadableStream.pipe_through(transform)
+      |> Enum.to_list()
+    end
+
+    test "TextEncoderStream gives no chunk for an empty string, and has the encoding utf-8" do
+      stream = TextEncoderStream.new()
+      assert stream.encoding == "utf-8"
+
+      assert ["", "a", "", "b", ""] |> through(stream) |> Enum.map(&Uint8Array.to_binary/1) == [
+               "a",
+               "b"
+             ]
+    end
+
+    test "TextEncoderStream joins a code point that is divided between two chunks" do
+      chunks = [<<"a", 0xC3>>, <<0xA9, 0xF0, 0x9F>>, <<0x8C, 0x8D, "z">>]
+
+      assert chunks |> through(TextEncoderStream.new()) |> Enum.map_join(&Uint8Array.to_binary/1) ==
+               "aé🌍z"
+    end
+
+    test "TextEncoderStream gives U+FFFD for bytes that are not valid, also at the end" do
+      assert [<<"a", 0xFF, "b">>]
+             |> through(TextEncoderStream.new())
+             |> Enum.map_join(&Uint8Array.to_binary/1) ==
+               "a\uFFFDb"
+
+      assert [<<"a", 0xF0, 0x9F>>]
+             |> through(TextEncoderStream.new())
+             |> Enum.map_join(&Uint8Array.to_binary/1) ==
+               "a\uFFFD"
+    end
+
+    test "TextEncoderStream keeps a byte order mark" do
+      assert ["\uFEFFa"]
+             |> through(TextEncoderStream.new())
+             |> Enum.map_join(&Uint8Array.to_binary/1) ==
+               "\uFEFFa"
+    end
+
+    test "TextEncoder gives U+FFFD for bytes that are not valid" do
+      encoded = TextEncoder.encode(TextEncoder.new(), <<"a", 0xFF, "b">>)
+      assert Uint8Array.to_binary(encoded) == "a\uFFFDb"
+    end
+
+    property "TextEncoderStream gives valid UTF-8 for each sequence of binaries" do
+      check all(chunks <- list_of(binary(max_length: 8), max_length: 12), max_runs: 100) do
+        output =
+          chunks |> through(TextEncoderStream.new()) |> Enum.map_join(&Uint8Array.to_binary/1)
+
+        assert String.valid?(output)
+        assert output == chunks |> IO.iodata_to_binary() |> String.replace_invalid()
+      end
+    end
+
+    test "TextDecoderStream has the attributes encoding, fatal, and ignore_bom" do
+      stream = TextDecoderStream.new("UTF8", %{fatal: true})
+      assert {stream.encoding, stream.fatal, stream.ignore_bom} == {"utf-8", true, false}
+
+      stream = TextDecoderStream.new("utf-8", ignore_bom: true)
+      assert {stream.encoding, stream.fatal, stream.ignore_bom} == {"utf-8", false, true}
+    end
+
+    test "TextDecoderStream keeps the byte order mark only with the option ignore_bom" do
+      bom = <<0xEF, 0xBB, 0xBF>>
+      assert through([bom <> "a"], TextDecoderStream.new()) == ["a"]
+
+      assert through([bom <> "a"], TextDecoderStream.new("utf-8", %{ignore_bom: true})) == [
+               "\uFEFFa"
+             ]
+
+      assert through([bom <> "a"], TextDecoderStream.new("utf-8", %{ignoreBOM: true})) == [
+               "\uFEFFa"
+             ]
+    end
+
+    test "TextDecoderStream accepts each kind of byte chunk" do
+      chunks = ["h", Uint8Array.new(Web.ArrayBuffer.new("é")), Web.ArrayBuffer.new("llo")]
+      assert chunks |> through(TextDecoderStream.new()) |> Enum.join() == "héllo"
+    end
+
+    test "the labels of UTF-8 are accepted, and each other label gives RangeError" do
+      for label <- [
+            "utf-8",
+            "UTF-8",
+            " utf8 ",
+            "unicode-1-1-utf-8",
+            "unicode11utf8",
+            "unicode20utf8",
+            "x-unicode20utf8"
+          ] do
+        assert TextDecoder.new(label).encoding == "utf-8"
+        assert TextDecoderStream.new(label).encoding == "utf-8"
+      end
+
+      for label <- ["utf-16le", "latin1", "no-such-encoding", ""] do
+        assert_raise Web.RangeError, ~r/supports only UTF-8/, fn -> TextDecoder.new(label) end
+
+        assert_raise Web.RangeError, ~r/supports only UTF-8/, fn ->
+          TextDecoderStream.new(label)
+        end
+      end
+
+      assert_raise Web.TypeError, fn -> TextDecoder.new(:utf8) end
+    end
+  end
+
   defp split_binary_into_chunks(binary, sizes) do
     do_split_binary_into_chunks(binary, sizes, sizes, [])
   end
@@ -330,7 +442,14 @@ defmodule Web.TextEncodingTest do
         |> String.trim()
         |> String.downcase()
 
-      normalized not in ["utf-8", "utf8", "unicode-1-1-utf-8"]
+      normalized not in [
+        "utf-8",
+        "utf8",
+        "unicode-1-1-utf-8",
+        "unicode11utf8",
+        "unicode20utf8",
+        "x-unicode20utf8"
+      ]
     end)
   end
 end

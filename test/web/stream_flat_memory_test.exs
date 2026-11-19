@@ -32,19 +32,14 @@ defmodule Web.StreamFlatMemoryTest do
 
   defp processes, do: length(Process.list())
 
-  # The cells of the promises, and the tasks of the streams.
-  defp tasks, do: length(Task.Supervisor.children(Web.TaskSupervisor))
-
   test "an enumeration keeps no process for each chunk" do
     stream = source(@chunks, & &1)
     processes_before = processes()
-    tasks_before = tasks()
 
     assert Enum.reduce(stream, 0, &(&1 + &2)) == div(@chunks * (@chunks + 1), 2)
 
     # With one promise for each chunk, 2000 processes stayed for 5 seconds.
     assert processes() - processes_before < 50
-    assert tasks() - tasks_before < 50
   end
 
   test "an enumeration that halts, and one that is suspended, keep no process" do
@@ -67,13 +62,11 @@ defmodule Web.StreamFlatMemoryTest do
       })
 
     processes_before = processes()
-    tasks_before = tasks()
 
     assert :ok = Web.await(ReadableStream.pipe_to(stream, sink))
     assert_received :last_chunk
 
     assert processes() - processes_before < 50
-    assert tasks() - tasks_before < 50
   end
 
   test "an enumeration does not keep the chunks" do

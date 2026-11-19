@@ -494,8 +494,11 @@ defmodule Web.Promise do
     linger = Keyword.get_lazy(opts, :linger, &default_linger/0)
     snapshot = Snapshot.take()
 
-    {:ok, pid} =
-      Task.Supervisor.start_child(Web.TaskSupervisor, fn ->
+    # A cell has no supervisor: it monitors its owner, and it stops with its
+    # rules. A supervisor is one process for all the cells, and each start
+    # waits for it.
+    pid =
+      spawn(fn ->
         cell_init(%{
           token: token,
           owner: owner,

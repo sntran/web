@@ -388,6 +388,23 @@ defmodule Web.ReadableStreamTeeTest do
   end
 
   describe "the processes of a tee" do
+    test "do no read of the source before a branch pulls" do
+      parent = self()
+      stream = ReadableStream.new(counting_source(parent), high_water_mark: 0)
+      {:ok, tee} = ReadableStreamTee.start(stream.controller_pid)
+
+      # Two branches that do not pull.
+      branches = for _index <- 1..2, do: spawn(fn -> Process.sleep(:infinity) end)
+      [branch1, branch2] = branches
+      assert :ok = ReadableStreamTee.attach(tee, branch1, branch2)
+      refute_receive {:pulled, _index}, 50
+
+      ReadableStreamTee.pull(tee)
+      assert_receive {:pulled, 0}
+
+      Enum.each(branches, &Process.exit(&1, :kill))
+    end
+
     test "stop when the stream ends" do
       stream = ReadableStream.from(["a", "b"])
       [left, right] = ReadableStream.tee(stream)

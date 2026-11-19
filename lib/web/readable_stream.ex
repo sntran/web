@@ -774,8 +774,8 @@ defmodule Web.ReadableStream do
     ignore = fn _outcome -> :ok end
     {ready, wait_for_locks} = pipe_lock_signal()
 
-    {:ok, _pid} =
-      Task.Supervisor.start_child(Web.TaskSupervisor, fn ->
+    _pid =
+      spawn(fn ->
         try do
           Snapshot.run(snapshot, fn ->
             run_pipe(readable, writable, options, ignore, ignore, ready)

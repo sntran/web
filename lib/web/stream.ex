@@ -72,6 +72,10 @@ defmodule Web.Stream do
     end
   end
 
+  # The key of the worker of a stream in the dictionary of the stream
+  # process: see `start_task/2`.
+  @worker_key {__MODULE__, :worker}
+
   # ---------------------------------------------------------------------------
   # Engine data
   # ---------------------------------------------------------------------------
@@ -474,8 +478,12 @@ defmodule Web.Stream do
   end
 
   def terminate(_reason, _state, data) do
-    if data.active_task, do: Task.shutdown(data.active_task, :brutal_kill)
-    :ok
+    if data.active_task, do: kill_task(data.active_task)
+
+    case Process.get(@worker_key) do
+      pid when is_pid(pid) -> stop_worker(pid)
+      nil -> :ok
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1137,8 +1145,11 @@ defmodule Web.Stream do
     :keep_state_and_data
   end
 
-  # Task result (info message: {ref, result})
+  # The result of a callback: `{ref, result}` from the worker.
   defp handle_common(:info, {ref, result}, state, data) when is_reference(ref) do
+    # The worker stays: remove the monitor of this callback.
+    Process.demonitor(ref, [:flush])
+
     cond do
       ref != data.task_ref ->
         :keep_state_and_data
@@ -1161,7 +1172,7 @@ defmodule Web.Stream do
   defp handle_common(:info, {:task_timeout, ref}, _state, data) do
     if ref == data.task_ref and data.active_task do
       operation = timeout_operation(data.active_operation)
-      Task.shutdown(data.active_task, :brutal_kill)
+      kill_task(data.active_task)
       error = task_timeout_error(operation, data)
 
       # The caller of an abort gets the timeout as its rejection reason.
@@ -1795,7 +1806,7 @@ defmodule Web.Stream do
       {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
     else
       if data.active_task && data.active_operation != :abort do
-        Task.shutdown(data.active_task, :brutal_kill)
+        kill_task(data.active_task)
       end
 
       # The caller gets its reply when the abort callback is complete.
@@ -2085,7 +2096,7 @@ defmodule Web.Stream do
         :ok
 
       true ->
-        Task.shutdown(data.active_task, :brutal_kill)
+        kill_task(data.active_task)
     end
 
     {data, pending_byob_actions} = settle_pending_byob_request(data, {:error, {:errored, reason}})
@@ -2448,7 +2459,7 @@ defmodule Web.Stream do
   end
 
   defp clear_task(data) do
-    if data.active_task, do: Task.shutdown(data.active_task, :brutal_kill)
+    if data.active_task, do: kill_task(data.active_task)
     data |> clear_active_operation() |> Map.put(:pulling, false)
   end
 
@@ -2738,17 +2749,87 @@ defmodule Web.Stream do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # The worker
+  #
+  # The callbacks of a stream run in one worker process, one at a time. The
+  # worker stays for the life of the stream. Thus a callback costs two
+  # messages, and no new process.
+  #
+  # The stream monitors the worker for each callback, and the worker sends
+  # `{ref, result}` with the reference of that monitor: the messages of a
+  # task of Elixir. A worker that stops during a callback gives a `:DOWN`
+  # message with that reference.
+  #
+  # The stream kills the worker to stop a callback that runs, for example at
+  # a cancel. The next callback starts a new worker. The worker stops when
+  # the stream stops.
+  # ---------------------------------------------------------------------------
+
   defp start_task(fun, snapshot) do
+    worker = worker()
+    ref = Process.monitor(worker)
+    send(worker, {:run, ref, fun, snapshot})
+    %{ref: ref, pid: worker}
+  end
+
+  defp worker do
+    case Process.get(@worker_key) do
+      pid when is_pid(pid) ->
+        if Process.alive?(pid), do: pid, else: start_worker()
+
+      nil ->
+        start_worker()
+    end
+  end
+
+  defp start_worker do
     stream = self()
+    pid = spawn(fn -> worker_init(stream) end)
+    Process.put(@worker_key, pid)
+    pid
+  end
 
-    Task.Supervisor.async_nolink(Web.TaskSupervisor, fn ->
-      Web.Promise.put_owner(stream)
+  defp worker_init(stream) do
+    # The promises and streams that the callbacks make belong to the stream.
+    Web.Promise.put_owner(stream)
+    worker_loop(stream, Process.monitor(stream))
+  end
 
-      case snapshot do
-        %Snapshot{} -> Snapshot.run(snapshot, fun)
-        _ -> fun.()
-      end
-    end)
+  defp worker_loop(stream, monitor) do
+    receive do
+      {:run, ref, fun, snapshot} ->
+        result =
+          case snapshot do
+            %Snapshot{} -> Snapshot.run(snapshot, fun)
+            _ -> fun.()
+          end
+
+        send(stream, {ref, result})
+        worker_loop(stream, monitor)
+
+      {:DOWN, ^monitor, :process, ^stream, _reason} ->
+        :ok
+    end
+  end
+
+  # Stops the callback that runs, and waits until the worker stopped. Thus
+  # no callback of the stream runs at the same time as the next one.
+  defp kill_task(%{ref: ref, pid: pid}) do
+    Process.demonitor(ref, [:flush])
+    stop_worker(pid)
+  end
+
+  defp stop_worker(pid) do
+    monitor = Process.monitor(pid)
+    Process.exit(pid, :kill)
+
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+    end
+
+    if Process.get(@worker_key) == pid, do: Process.delete(@worker_key)
+    :ok
   end
 
   # Resolve a callback result that may be a %Web.Promise{}, awaiting it and

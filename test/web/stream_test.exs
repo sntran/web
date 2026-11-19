@@ -129,7 +129,10 @@ defmodule Web.StreamTest do
                )
 
       assert_receive :started, 1_000
-      assert {:ok, :init_done} = Task.await(next_data.active_task, 1_000)
+      # The worker sends the result to the process of the stream: here, the
+      # test process.
+      ref = next_data.active_task.ref
+      assert_receive {^ref, {:ok, :init_done}}, 1_000
     end
   end
 

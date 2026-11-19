@@ -323,10 +323,22 @@ defmodule Web.ReadableStreamTest do
       assert_receive :resource_halted, 1_000
     end
 
-    test "from/1 halts untouched enumerators on cancel" do
-      stream = ReadableStream.from(["a", "b", "c"])
+    test "a cancel before the first pull does not start the enumerable" do
+      parent = self()
+
+      resource =
+        Stream.resource(
+          fn -> send(parent, :resource_started) end,
+          fn acc -> {["a"], acc} end,
+          fn _acc -> send(parent, :resource_halted) end
+        )
+
+      # With the limit 0, the stream does not pull before a read.
+      stream = ReadableStream.from_enumerable(resource, high_water_mark: 0)
 
       assert :ok = await(ReadableStream.cancel(stream, :stop))
+      refute_receive :resource_started, 50
+      refute_received :resource_halted
     end
 
     test "from/1 swallows continuation halt exceptions on cancel" do

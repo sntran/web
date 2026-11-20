@@ -66,7 +66,7 @@ defmodule Web.Dispatcher.HTTP.Exchange do
     state = %{
       origin: {scheme(url), url.hostname, port(url)},
       method: request.method,
-      path: url.pathname <> Web.URL.search(url),
+      path: url.pathname <> query(url),
       headers: request_headers(request.headers),
       body: request_body(request),
       redirect: redirect_mode(request),
@@ -987,6 +987,18 @@ defmodule Web.Dispatcher.HTTP.Exchange do
   defp port(%Web.URL{port: "", protocol: "https:"}), do: 443
   defp port(%Web.URL{port: ""}), do: 80
   defp port(%Web.URL{port: port}), do: String.to_integer(port)
+
+  # The query of the request target, with its "?". An empty query keeps the
+  # "?": the URL "http://a/?" asks for "/?". The getter of `search` gives ""
+  # for an empty query.
+  defp query(%Web.URL{search: nil}), do: ""
+
+  defp query(url) do
+    case Web.URL.search(url) do
+      "" -> "?"
+      search -> search
+    end
+  end
 
   defp redirect_mode(request), do: request.options[:redirect] || request.redirect || "follow"
 

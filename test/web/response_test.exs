@@ -277,7 +277,9 @@ defmodule Web.ResponseTest do
 
     test "raises TypeError for a URL that is not valid, before it examines the status" do
       for url <- ["", "/relative", "http://exa mple.com/", 123] do
-        assert_raise TypeError, ~r/Invalid URL/, fn -> Response.redirect(url, 200) end
+        assert_raise TypeError, "Invalid URL: #{inspect(url)}", fn ->
+          Response.redirect(url, 200)
+        end
       end
     end
   end

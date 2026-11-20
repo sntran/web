@@ -1,9 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "URLSearchParams constructed with: &": "library: a different result",
-    "URLSearchParams constructed with: &&&a=b&&&&c=d&": "library: a different result",
-    "URLSearchParams constructed with: &a": "library: a different result",
     "request.formData() with input: ": "runner: no Request",
     "request.formData() with input: %61+%4d%4D=": "runner: no Request",
     "request.formData() with input: %61=a": "runner: no Request",

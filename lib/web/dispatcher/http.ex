@@ -230,7 +230,8 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   # The location is relative to the URL of the request. A location with no
-  # fragment gets the fragment of the request.
+  # fragment gets the fragment of the request. An empty fragment is a
+  # fragment: the location "/a#" keeps its "#".
   defp redirect_url(request_url, location) do
     next_url = Web.URL.new(location, Web.URL.href(request_url))
 
@@ -238,15 +239,20 @@ defmodule Web.Dispatcher.HTTP do
       Web.URL.protocol(next_url) not in ["http:", "https:"] ->
         {:error, :redirect_unsupported_scheme}
 
-      Web.URL.hash(next_url) == "" ->
-        {:ok, Web.URL.hash(next_url, Web.URL.hash(request_url))}
+      next_url.fragment == nil ->
+        {:ok, Web.URL.hash(next_url, fragment_text(request_url))}
 
       true ->
         {:ok, next_url}
     end
   rescue
-    ArgumentError -> {:error, :redirect_invalid_location}
+    Web.TypeError -> {:error, :redirect_invalid_location}
   end
+
+  # The value for the setter of the hash: "#" for an empty fragment, as the
+  # getter gives "" for it.
+  defp fragment_text(%Web.URL{fragment: nil}), do: ""
+  defp fragment_text(%Web.URL{fragment: fragment}), do: "#" <> fragment
 
   defp redirect_request(request, status, next_url) do
     headers = redirect_headers(request, next_url)

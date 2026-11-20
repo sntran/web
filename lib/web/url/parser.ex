@@ -21,7 +21,7 @@ defmodule Web.URL.Parser do
   def parse!(input, base \\ nil) do
     case parse(input, base) do
       {:ok, fields} -> fields
-      {:error, reason} -> raise ArgumentError, reason
+      {:error, reason} -> raise Web.TypeError, reason
     end
   end
 
@@ -138,7 +138,7 @@ defmodule Web.URL.Parser do
        pathname: Encoding.percent_encode_non_ascii(pathname),
        search: normalized_search,
        fragment: normalized_fragment,
-       search_params: Web.URLSearchParams.new(normalized_search || ""),
+       search_params: Web.URLSearchParams.__parse__(normalized_search || ""),
        hash: hash_value(normalized_fragment),
        authority_present?: true,
        search_present?: search_present?,
@@ -177,7 +177,7 @@ defmodule Web.URL.Parser do
        pathname: normalized_pathname,
        search: normalized_search,
        fragment: normalized_fragment,
-       search_params: Web.URLSearchParams.new(normalized_search || ""),
+       search_params: Web.URLSearchParams.__parse__(normalized_search || ""),
        hash: hash_value(normalized_fragment),
        authority_present?: false,
        search_present?: search_present?,
@@ -465,7 +465,7 @@ defmodule Web.URL.Parser do
        pathname: normalize_path(hostname, "file:", pathname),
        search: normalized_search,
        fragment: normalized_fragment,
-       search_params: Web.URLSearchParams.new(normalized_search || ""),
+       search_params: Web.URLSearchParams.__parse__(normalized_search || ""),
        hash: hash_value(normalized_fragment),
        authority_present?: true,
        search_present?: search_present?,
@@ -786,7 +786,7 @@ defmodule Web.URL.Parser do
       pathname: normalize_path(hostname, context.protocol, uri.path || ""),
       search: context.search,
       fragment: context.fragment,
-      search_params: Web.URLSearchParams.new(context.search || ""),
+      search_params: Web.URLSearchParams.__parse__(context.search || ""),
       hash: hash_value(context.fragment),
       authority_present?: context.authority_present?,
       search_present?: not is_nil(context.search),

@@ -43,7 +43,7 @@ defmodule Web.URLPropertyTest do
   defp parse(text) do
     {:ok, URL.new(text)}
   rescue
-    ArgumentError -> :error
+    Web.TypeError -> :error
   end
 
   # ---------------------------------------------------------------------------
@@ -75,11 +75,14 @@ defmodule Web.URLPropertyTest do
 
       port = if URL.port(url) == "", do: "", else: ":" <> URL.port(url)
 
+      # The getters give "" for an empty query and for an empty fragment.
+      # The text keeps their "?" and "#".
+      search = if URL.search(url) == "" and url.search != nil, do: "?", else: URL.search(url)
+      hash = if URL.hash(url) == "" and url.fragment != nil, do: "#", else: URL.hash(url)
+
       assert URL.href(url) ==
                URL.protocol(url) <>
-                 "//" <>
-                 URL.hostname(url) <>
-                 port <> URL.pathname(url) <> URL.search(url) <> URL.hash(url)
+                 "//" <> URL.hostname(url) <> port <> URL.pathname(url) <> search <> hash
     end
   end
 
@@ -112,7 +115,7 @@ defmodule Web.URLPropertyTest do
       {:ok, URL.new(reference, base)}
     end
   rescue
-    ArgumentError -> :error
+    Web.TypeError -> :error
   end
 
   # ---------------------------------------------------------------------------
@@ -214,6 +217,140 @@ defmodule Web.URLPropertyTest do
 
       assert Enum.reject(URLSearchParams.to_list(params), &(elem(&1, 0) == name)) ==
                Enum.reject(pairs, &(elem(&1, 0) == name))
+    end
+  end
+
+  defp pair_text({name, value}) do
+    URLSearchParams.to_string(URLSearchParams.new([{name, value}]))
+  end
+
+  property "the parser skips each empty sequence between two \"&\"" do
+    check all(
+            pairs <- pairs(),
+            gaps <- list_of(integer(1..3), length: length(pairs) + 1),
+            first <- integer(0..2)
+          ) do
+      [_ | separators] = Enum.map(gaps, &String.duplicate("&", &1))
+
+      text =
+        String.duplicate("&", first) <>
+          (pairs
+           |> Enum.map(&pair_text/1)
+           |> Enum.zip(separators)
+           |> Enum.map_join(&Tuple.to_list/1))
+
+      assert URLSearchParams.to_list(URLSearchParams.new(text)) == pairs
+    end
+  end
+
+  # The bytes that the serializer keeps: the URL Standard percent-encodes
+  # each other byte, and changes a space to "+".
+  @form_safe Enum.concat([?a..?z, ?A..?Z, ?0..?9, [?*, ?-, ?., ?_]])
+
+  property "the serializer keeps the safe bytes, and percent-encodes each other byte" do
+    check all(
+            safe <- string(@form_safe, max_length: 8),
+            other <- string(:printable, max_length: 8)
+          ) do
+      assert pair_text({safe, ""}) == safe <> "="
+
+      encoded = pair_text({other, ""})
+      assert encoded =~ ~r/\A([A-Za-z0-9*\-._+]|%[0-9A-F]{2})*=\z/
+
+      kept = for <<byte <- other>>, byte in @form_safe, into: "", do: <<byte>>
+      assert String.replace(encoded, ~r/%[0-9A-F]{2}|[+=]/, "") == kept
+    end
+  end
+
+  # The UTF-16 code units of a text, as a list of integers.
+  defp utf16_units(text) do
+    text
+    |> String.to_charlist()
+    |> Enum.flat_map(fn
+      char when char < 0x10000 ->
+        [char]
+
+      char ->
+        offset = char - 0x10000
+        [0xD800 + Bitwise.bsr(offset, 10), 0xDC00 + Bitwise.band(offset, 0x3FF)]
+    end)
+  end
+
+  property "sort/1 sorts by UTF-16 code units, and keeps the sequence of equal names" do
+    name = string([?a, ?b, 0xE9, 0xFB03, 0xFFFD, 0x1F308, 0x1F4A9], max_length: 3)
+
+    check all(pairs <- list_of(tuple({name, string(?0..?9, max_length: 2)}), max_length: 8)) do
+      expected =
+        pairs
+        |> Enum.with_index()
+        |> Enum.sort_by(fn {{name, _value}, index} -> {utf16_units(name), index} end)
+        |> Enum.map(&elem(&1, 0))
+
+      sorted = pairs |> URLSearchParams.new() |> URLSearchParams.sort()
+      assert URLSearchParams.to_list(sorted) == expected
+    end
+  end
+
+  property "new/1 raises Web.TypeError for an inner list that does not have two items" do
+    check all(
+            item <-
+              filter(
+                list_of(string(:printable, max_length: 3), max_length: 4),
+                &(length(&1) != 2)
+              ),
+            pairs <- pairs()
+          ) do
+      assert_raise Web.TypeError, fn -> URLSearchParams.new(pairs ++ [item]) end
+    end
+  end
+
+  property "has/3 and delete/3 find the pairs with the name and the value" do
+    small = string([?a, ?b], max_length: 2)
+
+    check all(
+            pairs <- list_of(tuple({small, small}), max_length: 6),
+            name <- small,
+            value <- small
+          ) do
+      params = URLSearchParams.new(pairs)
+
+      assert URLSearchParams.has(params, name, value) == {name, value} in pairs
+      assert URLSearchParams.has(params, name, nil) == URLSearchParams.has?(params, name)
+
+      assert URLSearchParams.to_list(URLSearchParams.delete(params, name, value)) ==
+               Enum.reject(pairs, &(&1 == {name, value}))
+
+      assert URLSearchParams.delete(params, name, nil) == URLSearchParams.delete(params, name)
+      assert URLSearchParams.size(params) == length(pairs)
+    end
+  end
+
+  property "parse/2 and can_parse/2 agree with new/2" do
+    check all(
+            text <- one_of([url_text(), string(:printable, max_length: 20)]),
+            base <- one_of([constant(nil), url_text()])
+          ) do
+      expected =
+        try do
+          URL.new(text, base)
+        rescue
+          Web.TypeError -> nil
+        end
+
+      assert URL.parse(text, base) == expected
+      assert URL.can_parse(text, base) == (expected != nil)
+    end
+  end
+
+  property "search and hash give \"\" for an empty query and an empty fragment" do
+    check all(text <- url_text()) do
+      url = URL.new(text)
+      href = URL.href(url)
+
+      assert URL.search(url) != "?"
+      assert URL.hash(url) != "#"
+      assert String.contains?(href, "?") == (url.search != nil)
+      assert String.contains?(href, "#") == (url.fragment != nil)
     end
   end
 

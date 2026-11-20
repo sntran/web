@@ -51,7 +51,7 @@ defmodule Web.URL.FastPath do
          search: search,
          fragment: fragment,
          hash: if(fragment in [nil, ""], do: "", else: "#" <> fragment),
-         search_params: Web.URLSearchParams.new(search || ""),
+         search_params: Web.URLSearchParams.__parse__(search || ""),
          authority_present?: true,
          search_present?: search != nil,
          hash_present?: fragment != nil

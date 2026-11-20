@@ -237,7 +237,7 @@ defmodule Web.Response do
   defp redirect_location!(url) when is_binary(url) do
     url |> Web.URL.new() |> Web.URL.href()
   rescue
-    ArgumentError ->
+    Web.TypeError ->
       reraise Web.TypeError, [message: "Invalid URL: #{inspect(url)}"], __STACKTRACE__
   end
 

@@ -160,11 +160,11 @@ defmodule Web.RequestTest do
   describe "the checks of the Request constructor" do
     test "refuse a URL that is not valid" do
       for input <- ["", " ", "not a url", "/relative-only", "?query", "example.com/path"] do
-        assert_raise TypeError, ~r/Invalid URL/, fn -> Request.new(input) end
+        assert_raise TypeError, "Invalid URL: #{inspect(input)}", fn -> Request.new(input) end
       end
 
       for input <- ["http://exa mple.com/", "http://[::1/", "http://localhost:99999/"] do
-        assert_raise TypeError, ~r/Invalid URL/, fn -> Request.new(input) end
+        assert_raise TypeError, "Invalid URL: #{inspect(input)}", fn -> Request.new(input) end
       end
     end
 

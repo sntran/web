@@ -1,9 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "Serialize *-._": "library: a different result",
-    "Serialize U+0000 to U+00FF": "library: a different result",
-    "URLSearchParams connected to URL": "library: a different result",
-    "URLSearchParams.toString": "library: a different result"
+    "URLSearchParams connected to URL": "library: a different result"
   }
 }

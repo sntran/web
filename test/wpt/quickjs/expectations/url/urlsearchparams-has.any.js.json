@@ -1,7 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Two-argument has()": "library: no Web.URLSearchParams.has/3",
-    "Two-argument has() respects undefined as second arg": "library: no Web.URLSearchParams.has/3"
-  }
-}

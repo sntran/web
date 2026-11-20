@@ -1941,7 +1941,7 @@ defmodule Web.URLPattern do
         {:ok, url, parse_input}
       end
     rescue
-      ArgumentError ->
+      Web.TypeError ->
         if String.contains?(parse_input, "://") do
           {:ok, %URL{pathname: ensure_leading_slash_for_input(parse_input)}, parse_input}
         else

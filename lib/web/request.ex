@@ -123,7 +123,7 @@ defmodule Web.Request do
   defp parse_url(input) do
     Web.URL.new(input)
   rescue
-    ArgumentError ->
+    Web.TypeError ->
       reraise Web.TypeError, [message: "Invalid URL: #{inspect(input)}"], __STACKTRACE__
   end
 

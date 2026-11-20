@@ -57,7 +57,7 @@ defmodule Web.Resolver do
     |> Web.URL.new()
     |> resolve()
   rescue
-    ArgumentError -> Web.Dispatcher.HTTP
+    Web.TypeError -> Web.Dispatcher.HTTP
   end
 
   # A remote name: a letter or a digit, then letters, digits, "+", ".", and

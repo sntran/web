@@ -85,4 +85,116 @@ defmodule Web.URLSearchParamsTest do
 
     assert URLSearchParams.to_string(params) == "q=hello+world&tag=one&tag=two"
   end
+
+  # ============================================================================
+  # The rules of the URL Standard
+  # ============================================================================
+
+  test "the parser skips each empty sequence between two \"&\"" do
+    for {input, pairs} <- [
+          {"&", []},
+          {"&a", [{"a", ""}]},
+          {"a&", [{"a", ""}]},
+          {"&&&a=b&&&&c=d&", [{"a", "b"}, {"c", "d"}]},
+          {"?&a", [{"a", ""}]},
+          {"=", [{"", ""}]},
+          {"&=&", [{"", ""}]}
+        ] do
+      assert URLSearchParams.to_list(URLSearchParams.new(input)) == pairs, inspect(input)
+    end
+  end
+
+  test "the parser decodes \"+\", percent-encoded bytes, and UTF-8 that is not valid" do
+    for {input, pairs} <- [
+          {"a+b=c+d", [{"a b", "c d"}]},
+          {"%2B=%2b", [{"+", "+"}]},
+          {"%61=%4D%4d", [{"a", "MM"}]},
+          {"id=0&value=%", [{"id", "0"}, {"value", "%"}]},
+          {"b=%2sf%2a", [{"b", "%2sf*"}]},
+          {"%a_=a", [{"%a_", "a"}]},
+          {"%FE%FF", [{"\uFFFD\uFFFD", ""}]},
+          {"%C2x", [{"\uFFFDx", ""}]},
+          {"%EF%BB%BFtest=%EF%BB%BF", [{"\uFEFFtest", "\uFEFF"}]},
+          {"a==b", [{"a", "=b"}]}
+        ] do
+      assert URLSearchParams.to_list(URLSearchParams.new(input)) == pairs, inspect(input)
+    end
+  end
+
+  test "a \"?\" at the start goes away only in the constructor" do
+    assert URLSearchParams.to_list(URLSearchParams.new("??a=b")) == [{"?a", "b"}]
+
+    url = Web.URL.new("https://example.com/??a=b&c=d")
+    assert Web.URL.search(url) == "??a=b&c=d"
+    assert URLSearchParams.to_list(Web.URL.search_params(url)) == [{"?a", "b"}, {"c", "d"}]
+
+    url = Web.URL.search(url, "??x")
+    assert URLSearchParams.to_list(Web.URL.search_params(url)) == [{"?x", ""}]
+  end
+
+  test "the serializer keeps the bytes * - . _ and the ASCII alphanumerics" do
+    params = URLSearchParams.new([{"a*-._z", "A Z09"}, {"~!'()", "\u00E9\u{1F308}"}])
+
+    assert URLSearchParams.to_string(params) ==
+             "a*-._z=A+Z09&%7E%21%27%28%29=%C3%A9%F0%9F%8C%88"
+
+    assert URLSearchParams.to_string(URLSearchParams.new([{"a+b", "%"}])) == "a%2Bb=%25"
+  end
+
+  test "sort/1 compares the UTF-16 code units, and keeps the sequence of equal names" do
+    for {input, pairs} <- [
+          {"\uFB03&\u{1F308}", [{"\u{1F308}", ""}, {"\uFB03", ""}]},
+          {"z=b&a=b&z=a&a=a", [{"a", "b"}, {"a", "a"}, {"z", "b"}, {"z", "a"}]},
+          {"\uFFFD=x&\uFFFC&\uFFFD=a", [{"\uFFFC", ""}, {"\uFFFD", "x"}, {"\uFFFD", "a"}]},
+          {"bbb&bb&aaa&aa=x&aa=y",
+           [{"aa", "x"}, {"aa", "y"}, {"aaa", ""}, {"bb", ""}, {"bbb", ""}]},
+          {"z=z&=f&=t&=x", [{"", "f"}, {"", "t"}, {"", "x"}, {"z", "z"}]}
+        ] do
+      sorted = input |> URLSearchParams.new() |> URLSearchParams.sort()
+      assert URLSearchParams.to_list(sorted) == pairs, inspect(input)
+    end
+  end
+
+  test "sort/1 compares a name that is not valid UTF-8 as U+FFFD" do
+    params = URLSearchParams.new([{<<0xFF>>, "1"}, {"\u{1F308}", "2"}, {"b", "3"}])
+
+    assert URLSearchParams.to_list(URLSearchParams.sort(params)) ==
+             [{"b", "3"}, {"\u{1F308}", "2"}, {<<0xFF>>, "1"}]
+  end
+
+  test "new/1 takes lists of two items, and refuses an item that is not a pair" do
+    params = URLSearchParams.new([["a", "b"], ["c", 1], {"d", "e"}])
+    assert URLSearchParams.to_list(params) == [{"a", "b"}, {"c", "1"}, {"d", "e"}]
+
+    for item <- [[1], [1, 2, 3], [], "ab", {"a"}, {"a", "b", "c"}] do
+      assert_raise Web.TypeError, ~r/must have two items/, fn ->
+        URLSearchParams.new([["a", "b"], item])
+      end
+    end
+
+    copy = URLSearchParams.new(params)
+    assert copy == params
+  end
+
+  test "has/3 and delete/3 compare the value when it is not nil" do
+    params = URLSearchParams.new("a=b&a=c&a=b&b=b")
+
+    assert URLSearchParams.has(params, "a", "c")
+    refute URLSearchParams.has(params, "a", "d")
+    refute URLSearchParams.has(params, "b", "c")
+    assert URLSearchParams.has(params, "a", nil)
+    refute URLSearchParams.has(params, "c", nil)
+
+    assert URLSearchParams.to_string(URLSearchParams.delete(params, "a", "b")) == "a=c&b=b"
+    assert URLSearchParams.delete(params, "a", "d") == params
+    assert URLSearchParams.to_string(URLSearchParams.delete(params, "a", nil)) == "b=b"
+  end
+
+  test "size/1 gives the number of pairs" do
+    params = URLSearchParams.new("a=1&b=2&a=3")
+    assert URLSearchParams.size(params) == 3
+    assert URLSearchParams.size(URLSearchParams.delete(params, "a")) == 1
+    assert URLSearchParams.size(URLSearchParams.append(params, "b", "4")) == 4
+    assert URLSearchParams.size(URLSearchParams.new("&&")) == 0
+  end
 end

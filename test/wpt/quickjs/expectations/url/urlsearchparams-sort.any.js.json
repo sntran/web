@@ -1,7 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "Parse and sort: ﬃ&🌈": "library: a different result",
     "Sorting non-existent params removes ? from URL": "library: a different result",
     "URL parse and sort: bbb&bb&aaa&aa=x&aa=y": "library: a different result",
     "URL parse and sort: z=b&a=b&z=a&a=a": "library: a different result",

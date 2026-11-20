@@ -64,13 +64,13 @@ defmodule Web.URL.RegexEquivalenceTest do
     end
   end
 
-  test "the two trim functions raise ArgumentError for text that is not UTF-8" do
-    assert_raise ArgumentError, "The URL is not valid UTF-8.", fn ->
+  test "the two trim functions raise Web.TypeError for text that is not UTF-8" do
+    assert_raise Web.TypeError, "The URL is not valid UTF-8.", fn ->
       Encoding.trim_c0_whitespace(<<0xFF>>)
     end
 
-    assert_raise ArgumentError, fn -> Encoding.strip_ascii_tab_and_newline(<<"a", 0xFF>>) end
-    assert_raise ArgumentError, fn -> Web.URL.new("http://a.example/" <> <<0xFF>>) end
+    assert_raise Web.TypeError, fn -> Encoding.strip_ascii_tab_and_newline(<<"a", 0xFF>>) end
+    assert_raise Web.TypeError, fn -> Web.URL.new("http://a.example/" <> <<0xFF>>) end
   end
 
   property "dot_segment_type/1 finds the dot segments of the first regular expression" do
@@ -126,7 +126,7 @@ defmodule Web.URL.RegexEquivalenceTest do
           try do
             value |> Web.URL.new() |> Web.Resolver.resolve()
           rescue
-            ArgumentError -> Web.Dispatcher.HTTP
+            Web.TypeError -> Web.Dispatcher.HTTP
           end
         end
 
@@ -208,7 +208,7 @@ defmodule Web.URL.RegexEquivalenceTest do
   defp safe_url(input) do
     {:ok, Web.URL.new(input)}
   rescue
-    ArgumentError -> :error
+    Web.TypeError -> :error
   end
 
   defp lower_ascii(value) do

@@ -463,8 +463,11 @@ defmodule Web.Body do
     e in Web.TypeError -> {:error, e}
   end
 
+  # The parser of `application/x-www-form-urlencoded` reads all the bytes: a
+  # "?" at the start is a part of the first name. Only the constructor of
+  # `URLSearchParams` removes it.
   defp parse_urlencoded_form_data(binary) do
-    params = Web.URLSearchParams.new(binary)
+    params = Web.URLSearchParams.__parse__(binary)
 
     Enum.reduce(Web.URLSearchParams.to_list(params), Web.FormData.new(), fn {name, value}, form ->
       Web.FormData.append(form, name, value)

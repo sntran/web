@@ -47,6 +47,9 @@ defmodule Web.URL do
   @doc """
   Creates a URL from a string and optional base URL.
 
+  Raises `Web.TypeError` when the string is not a valid URL, or when the
+  base URL is not valid.
+
   ## Examples
 
       iex> url = Web.URL.new("https://example.com/search?q=elixir#docs")
@@ -56,6 +59,9 @@ defmodule Web.URL do
       iex> url = Web.URL.new("remote:path/to/file")
       iex> {Web.URL.protocol(url), Web.URL.pathname(url)}
       {"remote:", "path/to/file"}
+
+      iex> Web.URL.new("/path")
+      ** (Web.TypeError) Invalid URL: relative URL without a base
   """
   @spec new(String.t() | t(), String.t() | t() | nil) :: t()
   def new(url, base \\ nil)
@@ -78,6 +84,57 @@ defmodule Web.URL do
           else: parse_standard(trimmed, base)
     end
   end
+
+  @doc """
+  Parses a string with an optional base URL, as `new/2` does. Returns the
+  URL, or `nil` when the string or the base URL is not valid.
+
+  ## Examples
+
+      iex> url = Web.URL.parse("/docs", "https://example.com/start")
+      iex> Web.URL.href(url)
+      "https://example.com/docs"
+
+      iex> Web.URL.parse("/docs")
+      nil
+  """
+  @spec parse(String.t() | t(), String.t() | t() | nil) :: t() | nil
+  def parse(url, base \\ nil) do
+    new(url, base)
+  rescue
+    Web.TypeError -> nil
+  end
+
+  @doc """
+  Returns `true` when `new/2` can parse the string with the optional base
+  URL. Returns `false` when `new/2` raises `Web.TypeError`.
+
+  ## Examples
+
+      iex> Web.URL.can_parse("https://example.com/")
+      true
+
+      iex> Web.URL.can_parse("/docs")
+      false
+
+      iex> Web.URL.can_parse("/docs", "https://example.com/")
+      true
+  """
+  @spec can_parse(String.t() | t(), String.t() | t() | nil) :: boolean()
+  def can_parse(url, base \\ nil), do: parse(url, base) != nil
+
+  @doc """
+  Returns the serialized URL (href). `JSON.stringify` uses this value for a
+  URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com/search?q=elixir")
+      iex> Web.URL.to_json(url)
+      "https://example.com/search?q=elixir"
+  """
+  @spec to_json(t()) :: String.t()
+  def to_json(%__MODULE__{} = url), do: href(url)
 
   @doc """
   Returns the serialized URL (href).
@@ -114,6 +171,16 @@ defmodule Web.URL do
     end
   end
 
+  @doc """
+  Sets the URL from a serialized URL (href). Raises `Web.TypeError` when the
+  value is not a valid URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com/")
+      iex> Web.URL.href(url, "https://example.org/docs") |> Web.URL.hostname()
+      "example.org"
+  """
   @spec href(t(), String.t()) :: t()
   def href(%__MODULE__{} = _url, value) do
     new(value)
@@ -165,7 +232,7 @@ defmodule Web.URL do
           updated
         end
       rescue
-        ArgumentError -> url
+        Web.TypeError -> url
       end
     else
       url
@@ -394,20 +461,23 @@ defmodule Web.URL do
   end
 
   @doc """
-  Returns the search (query) portion of the URL, including the '?'.
+  Returns the search (query) portion of the URL, with the "?" at the start.
+  Returns `""` when the URL has no query, or when its query is empty.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com/search?q=elixir")
       iex> Web.URL.search(url)
       "?q=elixir"
+
+      iex> url = Web.URL.new("https://example.com/search?")
+      iex> {Web.URL.search(url), Web.URL.href(url)}
+      {"", "https://example.com/search?"}
   """
   @spec search(t()) :: String.t()
   def search(%__MODULE__{} = url) do
     case effective_search(url) do
-      nil -> ""
-      "" when url.search_present? -> "?"
-      "" -> ""
+      search when search in [nil, ""] -> ""
       search -> "?" <> search
     end
   end
@@ -433,18 +503,21 @@ defmodule Web.URL do
   end
 
   @doc """
-  Returns the hash portion of the URL, including the '#'.
+  Returns the hash (fragment) portion of the URL, with the "#" at the start.
+  Returns `""` when the URL has no fragment, or when its fragment is empty.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com/#top")
       iex> Web.URL.hash(url)
       "#top"
+
+      iex> url = Web.URL.new("https://example.com/#")
+      iex> {Web.URL.hash(url), Web.URL.href(url)}
+      {"", "https://example.com/#"}
   """
   @spec hash(t()) :: String.t()
-  def hash(%__MODULE__{fragment: nil}), do: ""
-  def hash(%__MODULE__{fragment: "", hash_present?: true}), do: "#"
-  def hash(%__MODULE__{fragment: ""}), do: ""
+  def hash(%__MODULE__{fragment: fragment}) when fragment in [nil, ""], do: ""
   def hash(%__MODULE__{fragment: fragment}), do: "#" <> fragment
 
   @spec hash(t(), String.t()) :: t()
@@ -485,7 +558,7 @@ defmodule Web.URL do
       "null"
     end
   rescue
-    ArgumentError -> "null"
+    Web.TypeError -> "null"
   end
 
   def origin(%__MODULE__{protocol: "file:"}), do: "null"
@@ -564,7 +637,7 @@ defmodule Web.URL do
       pathname: path,
       search: normalized_search,
       fragment: normalize_fragment_value(fragment_value),
-      search_params: Web.URLSearchParams.new(normalized_search || ""),
+      search_params: Web.URLSearchParams.__parse__(normalized_search || ""),
       hash: hash_value(normalize_fragment_value(fragment_value)),
       authority_present?: false,
       search_present?: String.contains?(path_and_search, "?"),
@@ -612,7 +685,12 @@ defmodule Web.URL do
   end
 
   defp put_search(%__MODULE__{} = url, search) do
-    %{url | search: search, search_params: Web.URLSearchParams.new(search), search_present?: true}
+    %{
+      url
+      | search: search,
+        search_params: Web.URLSearchParams.__parse__(search),
+        search_present?: true
+    }
   end
 
   defp put_fragment(%__MODULE__{} = url, nil) do
@@ -640,7 +718,7 @@ defmodule Web.URL do
   defp effective_search(%__MODULE__{search: nil}), do: nil
 
   defp effective_search(%__MODULE__{} = url) do
-    derived = Web.URLSearchParams.new(url.search || "")
+    derived = Web.URLSearchParams.__parse__(url.search || "")
 
     if url.search_params == derived do
       url.search

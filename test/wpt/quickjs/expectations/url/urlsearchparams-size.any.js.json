@@ -1,9 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "URLSearchParams's size and addition": "library: no Web.URLSearchParams.size/1",
-    "URLSearchParams's size and deletion": "library: no Web.URLSearchParams.size/1",
-    "URLSearchParams's size when obtained from a URL": "library: no Web.URLSearchParams.size/1",
-    "URLSearchParams's size when obtained from a URL and using .search": "library: no Web.URLSearchParams.size/1"
+    "URLSearchParams's size when obtained from a URL": "library: a different result"
   }
 }

@@ -77,6 +77,11 @@ defmodule Web.FetchRulesTest do
       assert target(url(port, "/target#part")) == {"/target", "localhost:#{port}"}
     end
 
+    test "keeps the \"?\" of an empty query", %{port: port} do
+      assert target(url(port, "/target?")) == {"/target?", "localhost:#{port}"}
+      assert target(url(port, "/target?#")) == {"/target?", "localhost:#{port}"}
+    end
+
     test "has the path in its serialized form", %{port: port} do
       assert target(url(port, "/target/ä b/../c")) == {"/target/c", "localhost:#{port}"}
       assert target(url(port, "/target/ä b")) == {"/target/%C3%A4%20b", "localhost:#{port}"}
@@ -254,6 +259,15 @@ defmodule Web.FetchRulesTest do
 
       response = await(fetch(redirect(port, 302, "/echo#other") <> "#section"))
       assert response.url == url(port, "/echo#other")
+    end
+
+    test "keeps an empty fragment, as an empty fragment is not a missing fragment",
+         %{port: port} do
+      response = await(fetch(redirect(port, 302, "/echo#") <> "#section"))
+      assert response.url == url(port, "/echo#")
+
+      response = await(fetch(redirect(port, 302, "/echo") <> "#"))
+      assert response.url == url(port, "/echo#")
     end
 
     test "must have the scheme http or https", %{port: port} do

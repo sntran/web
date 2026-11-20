@@ -341,6 +341,21 @@ defmodule Web.BodyTest do
     assert Web.FormData.get(form_data, "b") == "two"
   end
 
+  # The URL Standard: the parser keeps a "?" at the start. Only the
+  # constructor of URLSearchParams removes it.
+  test "Response.form_data/1 keeps a ? at the start of a urlencoded payload" do
+    response =
+      Response.new(
+        body: "?a=1",
+        headers: %{"content-type" => "application/x-www-form-urlencoded"}
+      )
+
+    form_data = await(Response.form_data(response))
+
+    assert Web.FormData.get(form_data, "?a") == "1"
+    assert Web.FormData.get(form_data, "a") == nil
+  end
+
   test "Response.form_data/1 rejects multipart payload when boundary is missing" do
     response =
       Response.new(

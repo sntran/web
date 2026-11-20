@@ -4,8 +4,7 @@ defmodule Web.URL.Encoding do
   alias Web.Internal.Ascii
 
   # Removes the C0 control characters and the spaces at the start and at the
-  # end. Raises `ArgumentError` for a value that is not valid UTF-8, as the
-  # regular expression of the first version did.
+  # end. Raises `Web.TypeError` for a value that is not valid UTF-8.
   @spec trim_c0_whitespace(term()) :: String.t()
   def trim_c0_whitespace(value), do: value |> to_string() |> valid_utf8!() |> trim_c0()
 
@@ -19,7 +18,7 @@ defmodule Web.URL.Encoding do
 
   defp c0_or_space?(char), do: char <= 0x20
 
-  # Removes each tab, line feed, and carriage return. Raises `ArgumentError`
+  # Removes each tab, line feed, and carriage return. Raises `Web.TypeError`
   # for a value that is not valid UTF-8.
   @spec strip_ascii_tab_and_newline(term()) :: String.t()
   def strip_ascii_tab_and_newline(value) do
@@ -40,7 +39,9 @@ defmodule Web.URL.Encoding do
 
   @spec valid_utf8!(binary()) :: binary()
   def valid_utf8!(value) do
-    if String.valid?(value), do: value, else: raise(ArgumentError, "The URL is not valid UTF-8.")
+    if String.valid?(value),
+      do: value,
+      else: raise(Web.TypeError, "The URL is not valid UTF-8.")
   end
 
   # The type of a path segment: "." and ".." are dot segments, also when a

@@ -67,7 +67,11 @@ defmodule Web.Internal.PromiseCellTest do
     assert Web.await(promise) == :kept
 
     send(promise.pid, :linger)
-    Process.sleep(20)
+
+    # The process must stay while time goes by. This negative check has no
+    # other end than a time limit.
+    monitor = Process.monitor(promise.pid)
+    refute_receive {:DOWN, ^monitor, :process, _pid, _reason}, 20
     assert Process.alive?(promise.pid)
     assert Web.await(promise) == :kept
   end

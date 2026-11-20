@@ -72,9 +72,15 @@ defmodule Web.PromiseTest do
     test "a different process can resolve the promise after the executor returns" do
       promise =
         Promise.new(fn resolve, _reject ->
+          executor = self()
+
+          # The other process resolves the promise after the executor stopped.
           spawn(fn ->
-            Process.sleep(20)
-            resolve.(:late)
+            monitor = Process.monitor(executor)
+
+            receive do
+              {:DOWN, ^monitor, :process, ^executor, _reason} -> resolve.(:late)
+            end
           end)
         end)
 
@@ -82,8 +88,12 @@ defmodule Web.PromiseTest do
     end
 
     test "the promise stays pending when the executor returns and does not settle it" do
-      promise = Promise.new(fn _resolve, _reject -> :ok end)
-      Process.sleep(20)
+      parent = self()
+      promise = Promise.new(fn _resolve, _reject -> send(parent, {:executor, self()}) end)
+
+      # The executor stopped before the peek.
+      assert_receive {:executor, executor}
+      assert_down(executor)
       assert Promise.peek(promise) == :pending
     end
 
@@ -188,6 +198,8 @@ defmodule Web.PromiseTest do
     test "a different process can settle the promise at a later time" do
       {promise, resolve, _reject} = Promise.with_resolvers()
 
+      # The sleep is part of the scenario: the settle comes after the start
+      # of the await.
       spawn(fn ->
         Process.sleep(10)
         resolve.(:later)
@@ -241,11 +253,13 @@ defmodule Web.PromiseTest do
     end
 
     test "it returns before a pending promise settles" do
-      promise = later(1, 200)
+      # The promise settles only when the test resolves it.
+      {promise, resolve, _reject} = Promise.with_resolvers()
       {microseconds, chained} = :timer.tc(fn -> Promise.then(promise, &(&1 + 1)) end)
 
       assert microseconds < 100_000
       assert Promise.peek(chained) == :pending
+      resolve.(1)
       assert await(chained) == 2
     end
 
@@ -413,7 +427,10 @@ defmodule Web.PromiseTest do
 
   describe "any/1" do
     test "it gives the first value that is fulfilled" do
-      promise = Promise.any([later_rejection(:e1, 5), later(:slow, 200), later(:fast, 20)])
+      # The slow promise does not settle. Thus no time limit decides the
+      # first value.
+      {slow, _resolve, _reject} = Promise.with_resolvers()
+      promise = Promise.any([later_rejection(:e1, 5), slow, later(:fast, 20)])
       assert await(promise) == :fast
     end
 
@@ -432,12 +449,16 @@ defmodule Web.PromiseTest do
   end
 
   describe "race/1" do
+    # The slow promise of these tests does not settle. Thus no time limit
+    # decides the first outcome.
     test "it gives the outcome of the first promise that settles" do
-      assert await(Promise.race([later(:slow, 200), later(:fast, 10)])) == :fast
+      {slow, _resolve, _reject} = Promise.with_resolvers()
+      assert await(Promise.race([slow, later(:fast, 10)])) == :fast
     end
 
     test "it rejects when the first promise that settles is rejected" do
-      promise = Promise.race([later(:slow, 200), later_rejection(:fast_fail, 10)])
+      {slow, _resolve, _reject} = Promise.with_resolvers()
+      promise = Promise.race([slow, later_rejection(:fast_fail, 10)])
       assert catch_exit(await(promise)) == :fast_fail
     end
 
@@ -446,14 +467,30 @@ defmodule Web.PromiseTest do
     end
 
     test "the other promises continue" do
-      slow = later(:slow, 50)
+      parent = self()
+
+      # The slow executor continues when the test lets it.
+      slow =
+        Promise.new(fn resolve, _reject ->
+          send(parent, {:slow, self()})
+
+          receive do
+            :continue -> resolve.(:slow)
+          end
+        end)
+
       assert await(Promise.race([slow, later(:fast, 5)])) == :fast
+      assert_receive {:slow, executor}
+      send(executor, :continue)
       assert await(slow) == :slow
     end
 
     test "an empty input stays pending" do
       promise = Promise.race([])
-      Process.sleep(20)
+
+      # The promise has no executor: no process can settle it. Thus the
+      # check needs no wait.
+      assert Process.info(promise.pid, :links) == {:links, []}
       assert Promise.peek(promise) == :pending
     end
   end
@@ -547,7 +584,11 @@ defmodule Web.PromiseTest do
 
     test "an outcome that was not delivered stays available" do
       promise = Promise.new(fn resolve, _reject -> resolve.(:kept) end, linger: 10)
-      Process.sleep(60)
+
+      # The wait is longer than the linger time. This negative check has no
+      # other end than a time limit.
+      monitor = Process.monitor(promise.pid)
+      refute_receive {:DOWN, ^monitor, :process, _pid, _reason}, 60
       assert await(promise) == :kept
     end
 
@@ -578,7 +619,11 @@ defmodule Web.PromiseTest do
       resolve.(:kept)
 
       assert await(promise) == :kept
-      Process.sleep(30)
+
+      # The outcome stays after a delivery. This negative check has no other
+      # end than a time limit.
+      monitor = Process.monitor(promise.pid)
+      refute_receive {:DOWN, ^monitor, :process, _pid, _reason}, 30
       assert await(promise) == :kept
     end
 

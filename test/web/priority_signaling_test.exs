@@ -12,7 +12,8 @@ defmodule Web.PrioritySignalingTest do
 
   # Stops the stream process, runs the function, and lets the process
   # continue. The messages that the function sends are in the mailbox of the
-  # stream in the sequence of the calls.
+  # stream in the sequence of the calls. An abort, a close, a cancel, and an
+  # error send their message before they return: they need no wait.
   defp while_suspended(pid, fun) do
     :erlang.suspend_process(pid)
 
@@ -24,12 +25,25 @@ defmodule Web.PrioritySignalingTest do
   end
 
   # A usual request that waits in the mailbox of the stream. Its answer
-  # tells if the stream handled it before or after the signal.
-  defp usual_request(fun) do
+  # tells if the stream handled it before or after the signal. The function
+  # returns when the request of the task is in the mailbox of the stream.
+  defp usual_request(pid, fun) do
     task = Task.async(fun)
-    # The task sends its request, then it waits for the answer.
-    Process.sleep(20)
+    task_pid = task.pid
+    await_message(pid, &match?({:"$gen_call", {^task_pid, _tag}, _request}, &1))
     task
+  end
+
+  # Waits until the mailbox of the process has a message for which `fun`
+  # gives true. The process can be suspended.
+  defp await_message(pid, fun, attempts \\ 200) do
+    {:messages, messages} = Process.info(pid, :messages)
+
+    cond do
+      Enum.any?(messages, fun) -> :ok
+      attempts == 0 -> flunk("the message did not come")
+      true -> Process.sleep(5) && await_message(pid, fun, attempts - 1)
+    end
   end
 
   defp blocked_sink do
@@ -56,9 +70,10 @@ defmodule Web.PrioritySignalingTest do
 
     request =
       while_suspended(stream.controller_pid, fn ->
-        request = usual_request(fn -> WritableStream.desired_size(stream) end)
+        request =
+          usual_request(stream.controller_pid, fn -> WritableStream.desired_size(stream) end)
+
         _abort = WritableStreamDefaultWriter.abort(writer, :stop)
-        Process.sleep(20)
         request
       end)
 
@@ -72,9 +87,10 @@ defmodule Web.PrioritySignalingTest do
 
     request =
       while_suspended(stream.controller_pid, fn ->
-        request = usual_request(fn -> WritableStream.desired_size(stream) end)
+        request =
+          usual_request(stream.controller_pid, fn -> WritableStream.desired_size(stream) end)
+
         _close = WritableStreamDefaultWriter.close(writer)
-        Process.sleep(20)
         request
       end)
 
@@ -97,7 +113,6 @@ defmodule Web.PrioritySignalingTest do
       # A source that is a process sends chunks and does not wait.
       Enum.each(1..1_000, &ReadableStream.enqueue(pid, &1))
       _cancel = ReadableStream.cancel(stream, :stop)
-      Process.sleep(20)
     end)
 
     assert_receive {:source_cancelled, :stop}
@@ -112,9 +127,8 @@ defmodule Web.PrioritySignalingTest do
 
     request =
       while_suspended(pid, fn ->
-        request = usual_request(fn -> ReadableStream.get_desired_size(pid) end)
+        request = usual_request(pid, fn -> ReadableStream.get_desired_size(pid) end)
         ReadableStream.error(pid, :failed)
-        Process.sleep(20)
         request
       end)
 
@@ -137,7 +151,6 @@ defmodule Web.PrioritySignalingTest do
         end
 
         abort = WritableStreamDefaultWriter.abort(writer, :emergency_stop)
-        Process.sleep(20)
         {abort, System.monotonic_time(:millisecond)}
       end)
 

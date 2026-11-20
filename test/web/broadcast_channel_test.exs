@@ -298,8 +298,12 @@ defmodule Web.BroadcastChannelTest do
       slow = open(name)
       _fast = listen(name, :fast)
 
+      # The slow listener waits until the test lets it continue.
       BroadcastChannel.onmessage(slow, fn event ->
-        Process.sleep(400)
+        receive do
+          :continue -> :ok
+        end
+
         send(test, {:slow, event.data})
       end)
 
@@ -312,6 +316,10 @@ defmodule Web.BroadcastChannelTest do
 
       assert time < 300_000
       refute_received {:slow, _data}
+
+      listener = listener_pid(slow)
+      for _index <- 1..5, do: send(listener, :continue)
+      for index <- 1..5, do: assert_receive({:slow, ^index})
     end
 
     test "the event handler and the listeners get the event", %{name: name} do
@@ -434,11 +442,17 @@ defmodule Web.BroadcastChannelTest do
     test "a channel delivers no event after close returns", %{name: name} do
       test = self()
       sender = open(name)
+      receiver = open(name)
 
-      BroadcastChannel.onmessage(open(name), fn event ->
+      BroadcastChannel.onmessage(receiver, fn event ->
         send(test, {:got, event.data})
-        # The other messages are in the mailbox of the listener process.
-        Process.sleep(30)
+
+        # The test lets the callback continue when the other messages are in
+        # the mailbox of the listener process.
+        receive do
+          :continue -> :ok
+        end
+
         BroadcastChannel.close(event.target)
         send(test, :closed)
       end)
@@ -446,6 +460,14 @@ defmodule Web.BroadcastChannelTest do
       Enum.each(1..20, &BroadcastChannel.post_message(sender, &1))
 
       assert_receive {:got, 1}
+      listener = listener_pid(receiver)
+
+      eventually(fn ->
+        {:messages, messages} = Process.info(listener, :messages)
+        Enum.count(messages, &match?({:"$gen_cast", {:task, _task}}, &1)) == 19
+      end)
+
+      send(listener, :continue)
       assert_receive :closed
       refute_receive {:got, _data}, 80
     end

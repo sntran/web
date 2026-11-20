@@ -13,25 +13,27 @@ defmodule Web.GovernorTest do
   defmodule TrackingDispatcher do
     @behaviour Web.Dispatcher
 
+    # The dispatcher tells the test that it started. Then it waits until the
+    # test lets it continue. Thus the test controls the work that runs at
+    # the same time.
     def fetch(%Web.Request{} = request) do
       tracker = Keyword.fetch!(request.options, :tracker)
       test_pid = Keyword.fetch!(request.options, :test_pid)
-      label = Keyword.fetch!(request.options, :label)
 
-      current =
-        Agent.get_and_update(tracker, fn %{current: current, max: max} = state ->
-          next = current + 1
-          {next, %{state | current: next, max: Kernel.max(max, next)}}
-        end)
+      Agent.update(tracker, fn %{current: current, max: max} = state ->
+        next = current + 1
+        %{state | current: next, max: Kernel.max(max, next)}
+      end)
 
-      send(test_pid, {:dispatcher_started, label, current})
-      Process.sleep(40)
+      send(test_pid, {:job_started, self()})
+
+      receive do
+        :finish -> :ok
+      end
 
       Agent.update(tracker, fn %{current: current} = state ->
         %{state | current: max(current - 1, 0)}
       end)
-
-      send(test_pid, {:dispatcher_finished, label})
 
       {:ok, Web.Response.new(status: 200, body: ["ok"], url: Web.URL.href(request.url))}
     end
@@ -154,16 +156,21 @@ defmodule Web.GovernorTest do
     end
 
     test "starts the linger time again for each message" do
+      # The sleeps are the scenario: each sleep is much shorter than the
+      # linger time, and the sum of the sleeps is longer. On a busy machine,
+      # a sleep can take much more time. Thus the margin is almost 1 s.
+      linger = 16 * @linger
+      Application.put_env(:web, :linger, linger)
       governor = governor_of_stopped_owner(1)
 
-      for _ <- 1..6 do
-        Process.sleep(div(@linger, 2))
+      for _ <- 1..18 do
+        Process.sleep(@linger)
         token = await(Governor.acquire(governor))
         assert :ok = Token.release(token)
       end
 
       assert Process.alive?(governor.pid)
-      assert_stops(governor)
+      assert_stops(governor, 3 * linger)
     end
 
     test "stops after its owner stopped when its last token comes back from a stopped holder" do
@@ -212,8 +219,10 @@ defmodule Web.GovernorTest do
 
       token = await(Governor.acquire(governor))
       assert :ok = Token.release(token)
-      Process.sleep(100)
-      assert Process.alive?(pid)
+
+      # The governor must stay after the linger time of 20 ms. This negative
+      # check has no other end than a time limit.
+      refute_stops(governor, 100)
 
       Process.exit(starter, :kill)
     end
@@ -274,9 +283,10 @@ defmodule Web.GovernorTest do
       assert_receive {:started, pid}
       assert_receive {:DOWN, ^monitor, :process, ^starter, :failure}
 
-      Process.sleep(100)
-      assert Process.alive?(pid)
+      # The governor must stay after the linger time of 20 ms. This negative
+      # check has no other end than a time limit.
       governor = CountingGovernor.get(pid)
+      refute_stops(governor, 100)
       assert governor.capacity == 3
       assert await(Governor.with(governor, fn -> :work end)) == :work
       Process.exit(pid, :kill)
@@ -461,8 +471,7 @@ defmodule Web.GovernorTest do
   test "Governor.with/2 rejects when acquisition fails" do
     governor = CountingGovernor.new(1)
     Process.unlink(governor.pid)
-    Process.exit(governor.pid, :kill)
-    Process.sleep(10)
+    kill_and_wait(governor.pid)
 
     assert %Web.TypeError{message: message} =
              catch_exit(await(Governor.with(governor, fn -> :ok end)))
@@ -493,19 +502,26 @@ defmodule Web.GovernorTest do
   test "Governor.with/2 limits pending promises to the capacity" do
     governor = CountingGovernor.new(2)
     counter = :counters.new(2, [])
+    parent = self()
 
     work = fn ->
       Promise.new(fn resolve, _reject ->
         :counters.add(counter, 1, 1)
         active = :counters.get(counter, 1)
         if active > :counters.get(counter, 2), do: :counters.put(counter, 2, active)
-        Process.sleep(20)
+        send(parent, {:job_started, self()})
+
+        receive do
+          :finish -> :ok
+        end
+
         :counters.sub(counter, 1, 1)
         resolve.(active)
       end)
     end
 
     promises = for _ <- 1..8, do: Governor.with(governor, work)
+    finish_two_at_a_time(governor, 8)
     results = await(Promise.all(promises))
 
     assert length(results) == 8
@@ -538,7 +554,8 @@ defmodule Web.GovernorTest do
         end)
       end)
 
-    Process.sleep(20)
+    # The work of the task waits in the queue of the governor.
+    eventually(fn -> queue_length(governor) == 1 end)
     assert :ok = Token.release(token)
     assert Task.await(task, 500) == "req-42"
   end
@@ -649,8 +666,7 @@ defmodule Web.GovernorTest do
     governor = CountingGovernor.new(1)
     token = await(Governor.acquire(governor))
 
-    Process.exit(governor.pid, :kill)
-    Process.sleep(10)
+    kill_and_wait(governor.pid)
 
     acquisition = AbortableGovernor.acquire_abortable(governor)
 
@@ -661,8 +677,7 @@ defmodule Web.GovernorTest do
 
   test "acquire/1 rejects when the governor process is gone" do
     governor = CountingGovernor.new(1)
-    Process.exit(governor.pid, :kill)
-    Process.sleep(10)
+    kill_and_wait(governor.pid)
 
     assert %Web.TypeError{message: message} = catch_exit(await(Governor.acquire(governor)))
     assert message =~ "The governor is not available"
@@ -723,14 +738,26 @@ defmodule Web.GovernorTest do
 
     test "is not the process of a promise: the token stays after that process stopped" do
       governor = CountingGovernor.new(1)
+      parent = self()
 
       # The acquisition runs in the process of the promise. The owner of that
       # process is the test process.
       promise =
-        Promise.new(fn resolve, _reject -> resolve.(await(Governor.acquire(governor))) end)
+        Promise.new(fn resolve, _reject ->
+          send(parent, {:executor, self()})
+          resolve.(await(Governor.acquire(governor)))
+        end)
 
+      assert_receive {:executor, executor}
       token = await(promise)
-      Process.sleep(50)
+      monitor = Process.monitor(executor)
+      assert_receive {:DOWN, ^monitor, :process, ^executor, _reason}
+
+      # The governor must not monitor the process of the promise. If it does,
+      # the monitor is in this list, or the governor gets the DOWN message
+      # before the call of governor_state/1.
+      {:monitors, monitors} = Process.info(governor.pid, :monitors)
+      refute {:process, executor} in monitors
       assert governor_state(governor).in_use == 1
 
       assert :ok = Token.release(token)
@@ -747,7 +774,8 @@ defmodule Web.GovernorTest do
 
       current = await(Governor.acquire(governor))
       assert :ok = Token.release(stale)
-      Process.sleep(20)
+      # The release is a cast from this process. The call of
+      # governor_state/1 comes after it, thus the governor handled it.
       assert governor_state(governor).in_use == 1
       assert :ok = Token.release(current)
     end
@@ -757,15 +785,18 @@ defmodule Web.GovernorTest do
       parent = self()
 
       in_stopped_process(fn ->
+        owner = self()
+
         Governor.with(governor, fn ->
+          work = Promise.new(fn _resolve, _reject -> Process.sleep(:infinity) end)
           send(parent, {:work, self()})
-          Promise.new(fn _resolve, _reject -> Process.sleep(:infinity) end)
+          send(owner, :work_started)
+          work
         end)
 
+        # The owner stops when the work has the token.
         receive do
-          :never -> :ok
-        after
-          50 -> :ok
+          :work_started -> :ok
         end
       end)
 
@@ -778,18 +809,30 @@ defmodule Web.GovernorTest do
 
     test "of Governor.with/2 keeps the token for the full time of the work" do
       governor = CountingGovernor.new(1)
+      parent = self()
 
       slow =
         Governor.with(governor, fn ->
+          send(parent, {:holder, self()})
+
           Promise.new(fn resolve, _reject ->
-            Process.sleep(100)
-            resolve.(:slow)
+            send(parent, {:work, self()})
+
+            receive do
+              :finish -> resolve.(:slow)
+            end
           end)
         end)
 
-      eventually(fn -> governor_state(governor).in_use == 1 end)
-      Process.sleep(50)
+      assert_receive {:holder, holder}
+      assert_receive {:work, work}
+
+      # The process of with/2 waits for the work. If it releases the token
+      # too early, it sends the release before this wait.
+      eventually(fn -> Process.info(holder, :status) == {:status, :waiting} end)
       assert governor_state(governor).in_use == 1
+
+      send(work, :finish)
       assert await(slow) == :slow
       eventually(fn -> governor_state(governor).in_use == 0 end)
     end
@@ -806,12 +849,12 @@ defmodule Web.GovernorTest do
           Web.fetch("mock://#{label}",
             dispatcher: TrackingDispatcher,
             tracker: tracker,
-            test_pid: parent,
-            label: label
+            test_pid: parent
           )
         end)
       end
 
+    finish_two_at_a_time(governor, 5)
     responses = await(Promise.all(requests))
 
     assert length(responses) == 5
@@ -832,7 +875,41 @@ defmodule Web.GovernorTest do
 
   defp apply_fun(value, fun), do: fun.(value)
 
-  defp eventually(fun, attempts \\ 20)
+  # Stops a process, and returns after it stopped.
+  defp kill_and_wait(pid) do
+    monitor = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}
+  end
+
+  # Lets `count` jobs of a governor with the capacity 2 end. Each job sends
+  # `{:job_started, pid}`, and then it waits for `:finish`. The helper waits
+  # until two jobs run and the other jobs wait in the queue of the governor.
+  # Then it lets the oldest job end each time that a new job starts. Thus
+  # two jobs run at the same time, with no time limit.
+  defp finish_two_at_a_time(governor, count) do
+    first = assert_job_started()
+    second = assert_job_started()
+    eventually(fn -> queue_length(governor) == count - 2 end)
+
+    {oldest, newest} =
+      Enum.reduce(3..count//1, {first, second}, fn _index, {oldest, newest} ->
+        send(oldest, :finish)
+        {newest, assert_job_started()}
+      end)
+
+    send(oldest, :finish)
+    send(newest, :finish)
+  end
+
+  defp assert_job_started do
+    assert_receive {:job_started, pid}, 1_000
+    pid
+  end
+
+  # A busy machine can stop the processes for some hundred milliseconds,
+  # thus the limit is 1 s.
+  defp eventually(fun, attempts \\ 100)
 
   defp eventually(fun, 0) do
     assert fun.()

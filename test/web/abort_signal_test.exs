@@ -71,6 +71,8 @@ defmodule Web.AbortSignalTest do
   end
 
   test "subscribe returns aborted when given a live pid that is not a signal server" do
+    # The process does not answer the call of subscribe/1. The sleep is part
+    # of the scenario: the process stops after it, and then the call ends.
     pid = spawn(fn -> Process.sleep(100) end)
     signal = %Web.AbortSignal{pid: pid, ref: make_ref()}
 
@@ -87,7 +89,8 @@ defmodule Web.AbortSignalTest do
 
   test "timeout/1 gives a TimeoutError, as the DOM Standard specifies" do
     signal = Web.AbortSignal.timeout(1)
-    Process.sleep(30)
+    # The process of the signal stops when the time limit aborts it.
+    assert_down(signal.pid)
 
     assert %Web.DOMException{name: "TimeoutError", message: "signal timed out", code: 23} =
              Web.AbortSignal.reason(signal)
@@ -154,7 +157,8 @@ defmodule Web.AbortSignalTest do
     third = Web.AbortController.new()
 
     signal = Web.AbortSignal.any([first.signal, second.signal, third.signal])
-    Process.sleep(20)
+    # The waiters of the new signal subscribed to each source.
+    for controller <- [first, second, third], do: await_subscriber(controller.signal)
 
     assert :ok = Web.AbortController.abort(second, :middle_first)
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
@@ -177,12 +181,12 @@ defmodule Web.AbortSignalTest do
   end
 
   test "any/1 ignores sources that are already dead while waiting on the rest" do
-    dead_pid = spawn(fn -> :ok end)
-    Process.sleep(10)
+    {dead_pid, monitor} = spawn_monitor(fn -> :ok end)
+    assert_receive {:DOWN, ^monitor, :process, ^dead_pid, _reason}
 
     controller = Web.AbortController.new()
     signal = Web.AbortSignal.any([dead_pid, controller.signal])
-    Process.sleep(20)
+    await_subscriber(controller.signal)
 
     assert :ok = Web.AbortController.abort(controller, :survivor)
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
@@ -296,12 +300,13 @@ defmodule Web.AbortSignalTest do
   end
 
   test "any/1 token waiters stop quietly when their coordinator exits" do
-    {signal, coordinator, _waiter} = start_any_with_waiter(:token)
+    {signal, coordinator, waiter} = start_any_with_waiter(:token)
     Process.unlink(coordinator)
     monitor_ref = Process.monitor(coordinator)
     Process.exit(coordinator, :kill)
     assert_receive {:DOWN, ^monitor_ref, :process, ^coordinator, :killed}
-    Process.sleep(25)
+    # The waiter did all its steps when it stopped.
+    assert_down(waiter)
 
     refute Web.AbortSignal.aborted?(signal)
   end
@@ -330,8 +335,8 @@ defmodule Web.AbortSignalTest do
         end
       end)
 
-    {signal, _coordinator, _waiter} = start_any_with_waiter(pid)
-    Process.sleep(25)
+    {signal, _coordinator, waiter} = start_any_with_waiter(pid)
+    await_waiting(waiter)
     Process.exit(pid, :pid_shutdown)
 
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
@@ -346,21 +351,22 @@ defmodule Web.AbortSignalTest do
         end
       end)
 
-    {signal, coordinator, _waiter} = start_any_with_waiter(pid)
+    {signal, coordinator, waiter} = start_any_with_waiter(pid)
     Process.unlink(coordinator)
     monitor_ref = Process.monitor(coordinator)
     Process.exit(coordinator, :kill)
     assert_receive {:DOWN, ^monitor_ref, :process, ^coordinator, :killed}
     send(pid, :stop)
-    Process.sleep(25)
+    # The waiter did all its steps when it stopped.
+    assert_down(waiter)
 
     refute Web.AbortSignal.aborted?(signal)
   end
 
   test "any/1 abort-signal waiters surface shutdown aborted reasons" do
     source = start_fake_abort_signal()
-    {signal, _coordinator, _waiter} = start_any_with_waiter(source)
-    Process.sleep(25)
+    {signal, _coordinator, waiter} = start_any_with_waiter(source)
+    await_waiting(waiter)
     send(source.pid, {:stop, {:shutdown, {:aborted, :signal_reason}}})
 
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
@@ -369,8 +375,8 @@ defmodule Web.AbortSignalTest do
 
   test "any/1 abort-signal waiters give the default reason for a signal that stops" do
     source = start_fake_abort_signal()
-    {signal, _coordinator, _waiter} = start_any_with_waiter(source)
-    Process.sleep(25)
+    {signal, _coordinator, waiter} = start_any_with_waiter(source)
+    await_waiting(waiter)
     send(source.pid, {:stop, :signal_down})
 
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
@@ -379,13 +385,14 @@ defmodule Web.AbortSignalTest do
 
   test "any/1 abort-signal waiters stop quietly when their coordinator exits" do
     source = start_fake_abort_signal()
-    {signal, coordinator, _waiter} = start_any_with_waiter(source)
+    {signal, coordinator, waiter} = start_any_with_waiter(source)
     Process.unlink(coordinator)
     monitor_ref = Process.monitor(coordinator)
     Process.exit(coordinator, :kill)
     assert_receive {:DOWN, ^monitor_ref, :process, ^coordinator, :killed}
     send(source.pid, {:stop, {:shutdown, {:aborted, :ignored}}})
-    Process.sleep(25)
+    # The waiter did all its steps when it stopped.
+    assert_down(waiter)
 
     refute Web.AbortSignal.aborted?(signal)
   end
@@ -483,6 +490,32 @@ defmodule Web.AbortSignalTest do
 
       {:stop, reason} ->
         exit(reason)
+    end
+  end
+
+  defp assert_down(pid) do
+    monitor = Process.monitor(pid)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}, 1_000
+  end
+
+  # Waits until the process of `signal` has a subscriber.
+  defp await_subscriber(signal) do
+    eventually(fn -> map_size(:sys.get_state(signal.pid).subscribers) > 0 end)
+  end
+
+  # Waits until the waiter has its subscription, and waits for an abort.
+  defp await_waiting(waiter) do
+    eventually(fn ->
+      Process.info(waiter, :current_function) ==
+        {:current_function, {Web.AbortSignal, :wait_for_subscription_or_coordinator, 3}}
+    end)
+  end
+
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
     end
   end
 

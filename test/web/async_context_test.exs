@@ -487,7 +487,8 @@ defmodule Web.AsyncContextTest do
 
       # Now abort
       Web.AbortController.abort(controller, :cancelled)
-      Process.sleep(100)
+      # The reader is closed when the stream handled the abort.
+      _closed = Promise.wait(ReadableStreamDefaultReader.closed(reader))
 
       # Stream should be cancelled — subsequent reads return done or reject
       result =
@@ -519,7 +520,8 @@ defmodule Web.AsyncContextTest do
         end)
 
       reader = ReadableStream.get_reader(stream)
-      Process.sleep(100)
+      # The reader is closed when the stream handled the abort.
+      _closed = Promise.wait(ReadableStreamDefaultReader.closed(reader))
 
       result =
         try do
@@ -910,7 +912,11 @@ defmodule Web.AsyncContextTest do
       # backpressure, as the Streams Standard specifies.
       third = Web.WritableStreamDefaultWriter.write(writer, "c")
       ready = Web.WritableStreamDefaultWriter.ready(writer)
-      Process.sleep(50)
+
+      # This process sent the write and the request of `ready` before this
+      # call. Thus the stream handled them, and the write waits in its queue.
+      slots = WritableStream.__get_slots__(ts.writable.controller_pid)
+      assert :queue.len(slots.queued_write_requests) == 1
       assert Promise.peek(third) == :pending
       assert Promise.peek(ready) == :pending
       assert :counters.get(pull_count, 1) == 2

@@ -69,6 +69,31 @@ defmodule Web.AbortSignalLifetimeTest do
     end
   end
 
+  # Examines `fun` until it gives true. Returns false at the limit.
+  defp eventually(fun, attempts \\ 150) do
+    cond do
+      fun.() -> true
+      attempts == 0 -> false
+      true -> Process.sleep(20) && eventually(fun, attempts - 1)
+    end
+  end
+
+  # Waits until the store of the reasons did one sweep. The store sends
+  # `:sweep` to itself one time each second.
+  defp await_sweep do
+    store = Process.whereis(Reasons)
+    :erlang.trace(store, true, [:receive])
+
+    try do
+      assert_receive {:trace, ^store, :receive, :sweep}, 3_000
+    after
+      :erlang.trace(store, false, [:receive])
+    end
+
+    # This call comes after the sweep message, thus the store did the sweep.
+    :sys.get_state(store)
+  end
+
   describe "a signal that is not aborted" do
     test "stays while its owner is alive" do
       controller = AbortController.new()
@@ -135,8 +160,7 @@ defmodule Web.AbortSignalLifetimeTest do
       signal = AbortController.new().signal
 
       in_short_process(fn -> AbortSignal.subscribe(signal) end)
-      Process.sleep(20)
-      assert subscribers(signal) == %{}
+      assert wait_for_no_subscribers(signal) == %{}
     end
   end
 
@@ -150,8 +174,9 @@ defmodule Web.AbortSignalLifetimeTest do
       assert AbortSignal.reason(signal) == :my_reason
 
       # The store removes old reasons one time each second.
-      Process.sleep(@linger + 1_300)
-      assert %DOMException{name: "AbortError"} = AbortSignal.reason(signal)
+      assert eventually(fn ->
+               match?(%DOMException{name: "AbortError"}, AbortSignal.reason(signal))
+             end)
     end
 
     test "stays when the linger time is :infinity" do
@@ -161,7 +186,7 @@ defmodule Web.AbortSignalLifetimeTest do
       assert AbortController.abort(controller, :kept_reason) == :ok
       assert_down(controller.signal.pid)
 
-      Process.sleep(1_300)
+      await_sweep()
       assert AbortSignal.reason(controller.signal) == :kept_reason
     end
 

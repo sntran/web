@@ -165,7 +165,10 @@ defmodule Web.EventTargetTest do
         signal: controller.signal
       )
 
-    Process.sleep(60)
+    # The watcher subscribed to the signal. Thus the stop of the signal
+    # process comes to the watcher as a DOWN message.
+    assert [%{watcher: watcher}] = listeners(target)["signal-down"]
+    await_subscriber(controller.signal, watcher)
     Process.exit(controller.signal.pid, :kill)
     await_no_listeners(target)
     assert listeners(target) == %{}
@@ -213,9 +216,10 @@ defmodule Web.EventTargetTest do
              Web.EventTarget.dispatch_event(target, %{type: "tick", target: target})
 
     assert_receive :removable
+    # The server casts the add, the remove, and the nested dispatch to itself
+    # in this sequence. Thus the event "nested" tells that the server did
+    # the add and the remove.
     assert_receive :nested
-
-    Process.sleep(60)
 
     assert {^target, true} =
              Web.EventTarget.dispatch_event(target, %{type: "tick", target: target})
@@ -439,8 +443,8 @@ defmodule Web.EventTargetTest do
   end
 
   test "dead signal pids trigger the aborted subscribe cleanup path" do
-    dead_signal = spawn(fn -> :ok end)
-    Process.sleep(20)
+    {dead_signal, monitor} = spawn_monitor(fn -> :ok end)
+    assert_receive {:DOWN, ^monitor, :process, ^dead_signal, _reason}
 
     target =
       FixtureTarget.new()
@@ -498,7 +502,7 @@ defmodule Web.EventTargetTest do
   defp event_target_pid(%{event_target_pid: event_target_pid}) when is_pid(event_target_pid),
     do: event_target_pid
 
-  defp await_no_listeners(target, attempts \\ 20)
+  defp await_no_listeners(target, attempts \\ 50)
 
   defp await_no_listeners(_target, 0), do: flunk("expected listener cleanup")
 
@@ -511,7 +515,7 @@ defmodule Web.EventTargetTest do
     end
   end
 
-  defp await_process_exit(pid, attempts \\ 20)
+  defp await_process_exit(pid, attempts \\ 50)
 
   defp await_process_exit(_pid, 0), do: flunk("expected process shutdown")
 
@@ -524,7 +528,7 @@ defmodule Web.EventTargetTest do
     end
   end
 
-  defp await_watcher_monitor(watcher, signal, attempts \\ 20)
+  defp await_watcher_monitor(watcher, signal, attempts \\ 50)
   defp await_watcher_monitor(_watcher, _signal, 0), do: flunk("expected watcher monitor")
 
   defp await_watcher_monitor(watcher, signal, attempts) do
@@ -540,6 +544,18 @@ defmodule Web.EventTargetTest do
       _other ->
         Process.sleep(20)
         await_watcher_monitor(watcher, signal, attempts - 1)
+    end
+  end
+
+  defp await_subscriber(signal, subscriber, attempts \\ 50)
+  defp await_subscriber(_signal, _subscriber, 0), do: flunk("expected a subscription")
+
+  defp await_subscriber(signal, subscriber, attempts) do
+    if Map.has_key?(:sys.get_state(signal.pid).subscribers, subscriber) do
+      :ok
+    else
+      Process.sleep(20)
+      await_subscriber(signal, subscriber, attempts - 1)
     end
   end
 end

@@ -173,7 +173,9 @@ defmodule Web.GovernorPropertyTest do
     }
   end
 
-  defp assert_same(governor, clients, model, attempts \\ 200) do
+  # A machine that is busy can make the processes slow, thus the limit of
+  # the tries is large.
+  defp assert_same(governor, clients, model, attempts \\ 1_000) do
     expected = %{model | queue: length(model.queue)}
     real = real_state(governor, clients, model)
 
@@ -194,7 +196,7 @@ defmodule Web.GovernorPropertyTest do
   # Properties
   # ---------------------------------------------------------------------------
 
-  defp wait_until(fun, attempts \\ 200) do
+  defp wait_until(fun, attempts \\ 1_000) do
     cond do
       fun.() -> :ok
       attempts == 0 -> flunk("the condition did not become true")

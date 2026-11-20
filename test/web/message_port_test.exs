@@ -262,7 +262,8 @@ defmodule Web.MessagePortTest do
 
       MessagePort.post_message(port1, "first")
       MessagePort.post_message(port1, "second")
-      Process.sleep(30)
+      # The two messages wait in the queue of the second port.
+      eventually(fn -> :queue.len(:sys.get_state(port2.address).queue) == 2 end)
 
       MessagePort.onmessage(port2, forward_data(:got))
 
@@ -574,8 +575,13 @@ defmodule Web.MessagePortTest do
 
       MessagePort.onmessage(port2, fn event ->
         send(test, {:got, event.data})
-        # The other messages are in the queue at this time.
-        Process.sleep(30)
+
+        # The test lets the callback continue when the other messages are in
+        # the queue.
+        receive do
+          :continue -> :ok
+        end
+
         MessagePort.close(event.target)
         send(test, :closed)
       end)
@@ -583,6 +589,8 @@ defmodule Web.MessagePortTest do
       Enum.each(1..20, &MessagePort.post_message(port1, &1))
 
       assert_receive {:got, 1}
+      eventually(fn -> :queue.len(:sys.get_state(port2.address).queue) == 19 end)
+      send(listener_pid(port2), :continue)
       assert_receive :closed
       refute_receive {:got, _data}, 80
     end

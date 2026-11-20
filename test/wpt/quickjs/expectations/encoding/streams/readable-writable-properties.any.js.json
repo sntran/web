@@ -1,7 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "TextDecoderStream readable and writable properties must pass brand checks": "runner: no streams",
-    "TextEncoderStream readable and writable properties must pass brand checks": "runner: no streams"
-  }
-}

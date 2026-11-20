@@ -644,6 +644,14 @@ library through a port. The layer converts the values as WebIDL specifies,
 and has no other logic: the library does the work. See
 `test/support/quickjs/bridge.ex`.
 
+The library can call a JavaScript function, for example the `pull` of a
+source, and a promise of the library is a promise in JavaScript. JavaScript
+does the steps of a Standard at once: `read()` calls `pull` before it
+returns. The library does them in other processes. Thus the runner answers a
+call only when all the processes of the run are at rest, and sends the
+settled promises in a fixed sequence. The result of each test is the same in
+each run.
+
 QuickJS is a tool of the tests only. The tests download a pinned release of
 its Cosmopolitan build, one file for Linux, macOS, Windows, and the BSD
 systems, and examine its SHA-256 hash.
@@ -651,17 +659,32 @@ systems, and examine its SHA-256 hash.
 | Suite | WPT tests | Pass | The runner lacks a feature | The library differs | The Standard changed the test |
 | --- | --- | --- | --- | --- | --- |
 | `Headers` | 287 | 103 | 184 | 0 | 0 |
-| `TextEncoder` and `TextDecoder` | 12101 | 11705 | 394 | 0 | 2 |
+| `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11882 | 206 | 11 | 2 |
 | `URL` and `URLSearchParams` | 4869 | 4778 | 73 | 18 | 0 |
+| The streams, the readers, the writers, and the strategies | 1157 | 737 | 39 | 381 | 0 |
 
 A test that the runner cannot run needs a feature that the runner does not
-have yet, for example `Request`, `XMLHttpRequest`, the streams of the Encoding
-Standard, or the server of WPT. The runner also does not copy the bytes that
-`encodeInto` writes into the JavaScript buffer (86 tests). The difference
-of the library is:
+have yet, for example `Request`, `XMLHttpRequest`, `EventTarget`,
+`MessageChannel`, the conversion to an async sequence of
+`ReadableStream.from()`, or the server of WPT. A string of Elixir is UTF-8,
+thus a lone surrogate of JavaScript cannot come to the library. The
+differences of the library are:
 
 * A `URLSearchParams` from a URL does not change the URL: the structs of the
   library are immutable (18 tests).
+* `TextEncoderStream` refuses a chunk that is not a string. The Standard
+  converts it to a string.
+* A `ReadableStream` has no async iterator, `values()` (37 tests).
+* A `ReadableStreamBYOBRequest` has no `view` (28 tests), and a BYOB read has
+  no option `min` (12 tests). A byte stream does not transfer the buffer of a
+  chunk.
+* A high water mark must be a finite number, and a strategy has no `size`
+  function of its own: the library counts each chunk as 1 (24 tests and more).
+* In 38 tests, a promise of the library does not settle, for example the
+  pipe to a stream that is closed or errored does not cancel the source.
+* The library calls `pull` more times than the Standard, and the sequence of
+  some steps is different, for example of the promises of a writer after an
+  error.
 
 The pinned commit of WPT has two tests of `TextDecoder` that the current
 Encoding Standard changed: after a fatal error, `decode()` starts a new

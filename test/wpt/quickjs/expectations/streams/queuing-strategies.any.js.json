@@ -1,0 +1,13 @@
+{
+  "harness": "OK",
+  "failures": {
+    "ByteLengthQueuingStrategy: highWaterMark constructor values are converted per the unrestricted double rules": "library: the checks of a high water mark",
+    "ByteLengthQueuingStrategy: size behaves as expected with strange arguments": "library: a different result",
+    "ByteLengthQueuingStrategy: size should not be a constructor": "library: a different result",
+    "ByteLengthQueuingStrategy: size should not have a prototype property": "library: a different result",
+    "CountQueuingStrategy: highWaterMark constructor values are converted per the unrestricted double rules": "library: the checks of a high water mark",
+    "CountQueuingStrategy: size behaves as expected with strange arguments": "library: no Web.CountQueuingStrategy.size/0",
+    "CountQueuingStrategy: size should have the right length": "library: a different result",
+    "CountQueuingStrategy: size should not have a prototype property": "library: a different result"
+  }
+}

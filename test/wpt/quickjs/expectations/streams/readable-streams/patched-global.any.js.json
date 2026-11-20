@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "ReadableStream async iterator should use the original values of getReader() and ReadableStreamDefaultReader methods": "library: no Web.ReadableStream.values/2"
+  }
+}

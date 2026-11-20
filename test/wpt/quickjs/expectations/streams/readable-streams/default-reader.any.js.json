@@ -1,0 +1,12 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Cannot use an already-released reader to unlock a stream again": "library: a different result",
+    "ReadableStreamDefaultReader closed should always return the same promise object": "library: a different result",
+    "cancel() on a reader does not release the reader": "library: a different result",
+    "cancel() on a released reader is a no-op and does not pass through": "library: a different result",
+    "closed is replaced when stream closes and reader releases its lock": "library: a different result",
+    "closed is replaced when stream errors and reader releases its lock": "library: a different result",
+    "closed should be rejected after reader releases its lock (multiple stream locks)": "library: a different result"
+  }
+}

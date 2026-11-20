@@ -1,0 +1,13 @@
+{
+  "harness": "OK",
+  "failures": {
+    "close() on an erroring stream should reject": "library: a different result",
+    "close() should not reject until no sink methods are in flight": "library: a different result",
+    "promises must fulfill/reject in the expected order on aborted and errored closure": "library: a different result",
+    "releaseLock() should not change the result of sync close()": "library: a different result",
+    "when close is called on a WritableStream in waiting state, ready promise should be fulfilled": "library: a promise does not settle",
+    "when close is called on a WritableStream in writable state, ready should return a fulfilled promise": "library: a different result",
+    "when sink calls error asynchronously while sink close is in-flight, the stream should not become errored": "library: a different result",
+    "when sink calls error synchronously while closing, the stream should not become errored": "library: a different result"
+  }
+}

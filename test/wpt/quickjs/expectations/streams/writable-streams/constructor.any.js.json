@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "WritableStream should be writable and ready should fulfill immediately if the strategy does not apply backpressure": "library: the checks of a high water mark",
+    "controller argument should be passed to write method": "library: a different result"
+  }
+}

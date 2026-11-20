@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Writable stream: invalid strategy.size return value": "library: a different result",
+    "Writable stream: throwing strategy.size method": "library: a different result"
+  }
+}

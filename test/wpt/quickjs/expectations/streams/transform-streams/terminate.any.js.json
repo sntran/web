@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "controller.error() after controller.terminate() with queued chunk should error the readable": "library: a different result",
+    "controller.error() after controller.terminate() without queued chunk should do nothing": "library: a different result"
+  }
+}

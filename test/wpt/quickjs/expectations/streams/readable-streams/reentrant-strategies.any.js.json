@@ -1,0 +1,14 @@
+{
+  "harness": "OK",
+  "failures": {
+    "cancel() inside size() should work": "library: the checks of a high water mark",
+    "close request inside size() should work": "library: a promise does not settle",
+    "close() inside size() should not crash": "library: a promise does not settle",
+    "enqueue() inside size() should work": "library: a different result",
+    "error() inside size() should work": "library: a different result",
+    "getReader() inside size() should work": "library: a different result",
+    "pipeTo() inside size() should behave as expected": "library: a different result",
+    "read() inside of size() should behave as expected": "library: a different result",
+    "tee() inside size() should work": "library: a different result"
+  }
+}

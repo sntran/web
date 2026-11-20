@@ -1,0 +1,16 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Errors must be propagated forward: becomes errored after one chunk; dest never desires chunks; preventAbort = false; fulfilled abort promise": "library: a promise does not settle",
+    "Errors must be propagated forward: becomes errored after one chunk; dest never desires chunks; preventAbort = false; rejected abort promise": "library: a promise does not settle",
+    "Errors must be propagated forward: becomes errored after one chunk; dest never desires chunks; preventAbort = true": "library: a promise does not settle",
+    "Errors must be propagated forward: becomes errored after one chunk; preventAbort = false; rejected abort promise": "library: a different result",
+    "Errors must be propagated forward: becomes errored while empty; dest never desires chunks; preventAbort = false; fulfilled abort promise": "library: a promise does not settle",
+    "Errors must be propagated forward: becomes errored while empty; dest never desires chunks; preventAbort = false; rejected abort promise": "library: a promise does not settle",
+    "Errors must be propagated forward: becomes errored while empty; dest never desires chunks; preventAbort = true": "library: a promise does not settle",
+    "Errors must be propagated forward: becomes errored while empty; preventAbort = false; rejected abort promise": "library: a different result",
+    "Errors must be propagated forward: shutdown must not occur until the final write completes; becomes errored after first write": "library: a different result",
+    "Errors must be propagated forward: shutdown must not occur until the final write completes; becomes errored after first write; preventAbort = true": "library: a different result",
+    "Errors must be propagated forward: starts errored; preventAbort = false; rejected abort promise": "library: a different result"
+  }
+}

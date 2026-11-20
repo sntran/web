@@ -113,7 +113,12 @@ connections of an origin, and the reads of a socket.
   converts values as WebIDL specifies, and calls the library. Thus a test
   examines the library, not the layer.
 - A test that fails because the runner has no feature is a `runner:` group.
-  A test that fails because the library differs is a `library:` group.
+  A test that fails because the library differs is a `library:` group. A
+  test of the pinned WPT commit that the current Standard changed is a
+  `standard:` group: name the step of the Standard in the rule.
+- The result of each test must be the same in each run. The bridge answers
+  a call, and sends the settled promises, only when the processes of the
+  run are at rest. A new kind of message to the bridge must keep this rule.
 - When a change of the library corrects a difference, run
   `WPT_UPDATE=1 mix test test/wpt/quickjs`, and examine the change of the
   lists before you commit it.

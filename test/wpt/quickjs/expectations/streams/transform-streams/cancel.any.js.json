@@ -1,0 +1,13 @@
+{
+  "harness": "OK",
+  "failures": {
+    "aborting the writable side should reject if transformer.cancel() throws": "library: a different result",
+    "cancelling the readable side should reject if transformer.cancel() throws": "library: a different result",
+    "closing the writable side should reject if a parallel transformer.cancel() throws": "library: a different result",
+    "readable.cancel() and a parallel writable.close() should reject if a transformer.cancel() calls controller.error()": "library: a different result",
+    "readable.cancel() should not call cancel() when flush() is already called from writable.close()": "library: a different result",
+    "writable.abort() and readable.cancel() should reject if a transformer.cancel() calls controller.error()": "library: a different result",
+    "writable.abort() should not call cancel() again when already called from readable.cancel()": "library: a different result",
+    "writable.close() should not call flush() when cancel() is already called from readable.cancel()": "library: a different result"
+  }
+}

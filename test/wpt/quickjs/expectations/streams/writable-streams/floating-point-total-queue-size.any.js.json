@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Floating point arithmetic must manifest near 0 (total ends up positive, and not clamped)": "library: a different result",
+    "Floating point arithmetic must manifest near 0 (total ends up positive, but clamped)": "library: a different result",
+    "Floating point arithmetic must manifest near 0 (total ends up zero)": "library: a different result",
+    "Floating point arithmetic must manifest near NUMBER.MAX_SAFE_INTEGER (total ends up positive)": "library: a different result"
+  }
+}

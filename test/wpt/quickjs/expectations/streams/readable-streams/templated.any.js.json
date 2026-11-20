@@ -1,0 +1,20 @@
+{
+  "harness": "OK",
+  "failures": {
+    "ReadableStream (empty) reader: canceling via the reader should cause the reader to act closed": "library: a different result",
+    "ReadableStream (empty) reader: releasing the lock should cause closed calls to reject with a TypeError": "library: a different result",
+    "ReadableStream (errored via call in start): cancel() should return a distinct rejected promise each time": "library: a different result",
+    "ReadableStream (errored via call in start): reader cancel() should return a distinct rejected promise each time": "library: a different result",
+    "ReadableStream (errored via returning a rejected promise in start) reader: releasing the lock should cause closed to reject and change identity": "library: a different result",
+    "ReadableStream (two chunks enqueued, still open) reader: cancel() after a read() should still give that single read result": "library: a different result",
+    "ReadableStream (two chunks enqueued, then closed) reader: reader's closed property always returns the same promise": "library: a different result",
+    "ReadableStream reader (closed after getting reader): releasing the lock should cause closed to reject and change identity": "library: a different result",
+    "ReadableStream reader (closed before getting reader): releasing the lock should cause closed to reject and change identity": "library: a different result",
+    "ReadableStream reader (closed via cancel after getting reader): read() multiple times should fulfill with { value: undefined, done: true }": "library: a different result",
+    "ReadableStream reader (closed via cancel after getting reader): read() should fulfill with { value: undefined, done: true }": "library: a different result",
+    "ReadableStream reader (closed via cancel after getting reader): read() should work when used within another read() fulfill callback": "library: a different result",
+    "ReadableStream reader (closed via cancel after getting reader): releasing the lock should cause closed to reject and change identity": "library: a different result",
+    "ReadableStream reader (errored after getting reader): releasing the lock should cause closed to reject and change identity": "library: a different result",
+    "ReadableStream reader (errored before getting reader): releasing the lock should cause closed to reject and change identity": "library: a different result"
+  }
+}

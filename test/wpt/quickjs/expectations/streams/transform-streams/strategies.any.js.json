@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "a RangeError should be thrown for an invalid highWaterMark": "library: a different result",
+    "a bad readableStrategy size function should cause writer.write() to reject on an identity transform": "library: a different result",
+    "a bad readableStrategy size function should error the stream on enqueue even when transformer.transform() catches the exception": "library: a different result",
+    "writable should have the correct size() function": "library: the checks of a high water mark"
+  }
+}

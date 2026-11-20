@@ -17,7 +17,32 @@
   const platform = new WeakMap();
   const definitions = new Map();
   const classes = new Map();
-  let request = null;
+  let io = null;
+
+  // The JavaScript values that go to the library by reference. The same
+  // object comes back as the same object: the library keeps a chunk, a
+  // reason, or an error with no copy.
+  const references = [];
+  const referenceIds = new Map();
+
+  // The JavaScript functions that the library can call, with the `this`
+  // value of each call.
+  const callbacks = [];
+
+  // The calls of the library to JavaScript functions that run now. A
+  // request in such a function gives them to the bridge: see `call`.
+  const running = [];
+
+  // The kinds of the requests that run now, the newest last.
+  const requests = [];
+
+  // The promises of the library that are not settled yet, and the ones
+  // with the type `Promise<undefined>`.
+  const promises = new Map();
+  const undefinedPromises = new Set();
+
+  // One wrapper for each handle of an object of the library.
+  const wrappers = new Map();
 
   // ---------------------------------------------------------------------
   // The definitions
@@ -45,8 +70,8 @@
     }
   }
 
-  function install(requestFunction, idlTexts, exposed) {
-    request = requestFunction;
+  function install(ioFunctions, idlTexts, exposed) {
+    io = ioFunctions;
     const parsed = idlTexts.map((text) => WebIDL2.parse(text));
     // The mixins are complete before an `includes` adds their members.
     for (const list of parsed) for (const d of list) if (d.type !== "includes") add(d);
@@ -57,6 +82,7 @@
         value: cls, writable: true, configurable: true, enumerable: false,
       });
     }
+    return dispatch;
   }
 
   // ---------------------------------------------------------------------
@@ -188,25 +214,67 @@
       (sharedBufferLength !== null && isBuffer(sharedBufferLength, value));
   }
 
+  const dataViewLength = Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
+  const typedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
+
+  function isShared(value) {
+    if (sharedBufferLength === null) return false;
+    return isBuffer(sharedBufferLength, ArrayBuffer.isView(value) ? value.buffer : value);
+  }
+
+  // The checks of WebIDL for a buffer type. A buffer that is shared needs
+  // the extended attribute [AllowShared], or a type that allows it.
+  function bufferMatches(name, value, extAttrs) {
+    const allowShared = extAttrs.some((a) => a.name === "AllowShared") ||
+      name === "AllowSharedBufferSource" || name === "SharedArrayBuffer";
+    if (!isBufferSource(value) || (!allowShared && isShared(value))) return false;
+    switch (name) {
+      case "ArrayBuffer": return isBuffer(arrayBufferLength, value);
+      case "SharedArrayBuffer": return isShared(value) && !ArrayBuffer.isView(value);
+      case "ArrayBufferView": return ArrayBuffer.isView(value);
+      case "DataView": return isBuffer(dataViewLength, value);
+      case "BufferSource":
+      case "AllowSharedBufferSource": return true;
+      default: return typedArrayTag.call(value) === name;
+    }
+  }
+
   // A value of the type `any`.
+  // `undefined` is `nil` in the library, and `null` is the atom `:null`: a
+  // stream can have both as chunks. A buffer goes as its bytes. Each other
+  // object goes by reference.
   function encodeAny(value) {
     if (value === undefined) return { $u: 1 };
-    if (value === null) return null;
+    if (value === null) return { $null: 1 };
     switch (typeof value) {
       case "boolean": return value;
       case "number": return encodeNumber(value);
       case "string": return value;
       case "bigint": return Number(value);
-      case "symbol": throw new TypeError("A symbol cannot go to the library.");
-      case "function": throw new TypeError("A function cannot go to the library.");
     }
-    if (platform.has(value)) return { $h: platform.get(value).handle };
-    if (isBufferSource(value)) return { $lazy: value };
-    if (Array.isArray(value)) return value.map(encodeAny);
-    const object = {};
-    for (const key of Object.keys(value)) object[key] = encodeAny(value[key]);
-    return { $o: object };
+    if (typeof value === "object" && platform.has(value)) return { $h: platform.get(value).handle };
+    if (typeof value === "object" && isBufferSource(value)) return { $lazy: value };
+    return { $js: reference(value) };
   }
+
+  function reference(value) {
+    if (!referenceIds.has(value)) {
+      referenceIds.set(value, references.length);
+      references.push(value);
+    }
+    return referenceIds.get(value);
+  }
+
+  // A JavaScript function that the library can call.
+  function callback(fn, thisArg, arity) {
+    callbacks.push({ fn, thisArg, start: callbackMember === "start" });
+    return { $f: callbacks.length - 1, n: arity };
+  }
+
+  // The `this` value of the callbacks of a dictionary, for example the
+  // underlying source of a stream, and the name of the member.
+  let callbackThis = undefined;
+  let callbackMember = undefined;
 
   function toString(value) {
     if (typeof value === "symbol") throw new TypeError("Cannot convert a Symbol value to a string.");
@@ -221,7 +289,9 @@
       if (unit > 255) throw new TypeError("The value is not a ByteString: a character is above U+00FF.");
       bytes.push(unit);
     }
-    return { $b: bytes };
+    // A ByteString is a binary of Elixir: `$bs`. A buffer source is a
+    // `Web.Uint8Array`: `$b`.
+    return { $bs: bytes };
   }
 
   const integerTypes = {
@@ -323,11 +393,19 @@
     if (integerTypes[name]) return integer(name, value, extAttrs);
 
     if (bufferTypes.has(name)) {
-      if (!isBufferSource(value)) throw new TypeError("The value is not a " + name + ".");
+      if (!bufferMatches(name, value, extAttrs)) throw new TypeError("The value is not a " + name + ".");
       return { $lazy: value };
     }
 
     const d = definitions.get(name);
+    if (d && d.type === "callback") {
+      if (typeof value !== "function") throw new TypeError("The value is not a function: " + name + ".");
+      return callback(value, callbackThis, d.arguments.length);
+    }
+    if (name === "Function") {
+      if (typeof value !== "function") throw new TypeError("The value is not a function.");
+      return callback(value, undefined, value.length);
+    }
     if (d && d.type === "enum") {
       const text = toString(value);
       if (!d.values.some((v) => v.value === text)) throw new TypeError("The value '" + text + "' is not in the enumeration " + name + ".");
@@ -399,6 +477,8 @@
     return members.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 
+  // The default `{}` of a dictionary is the conversion of `undefined`: the
+  // dictionary gets the defaults of its members.
   function defaultValue(member) {
     const v = member.default;
     switch (v.type) {
@@ -407,7 +487,7 @@
       case "string": return v.value;
       case "null": return null;
       case "sequence": return [];
-      case "dictionary": return { $d: {} };
+      case "dictionary": return convert(member.idlType, undefined);
       default: return { $u: 1 };
     }
   }
@@ -417,17 +497,34 @@
       throw new TypeError("The value is not a dictionary " + d.name + ".");
     }
     const result = {};
-    for (const member of dictionaryMembers(d)) {
+    const previousThis = callbackThis;
+    callbackThis = value;
+    try {
+      for (const member of dictionaryMembers(d)) {
+        convertMember(d, member, value, result);
+      }
+    } finally {
+      callbackThis = previousThis;
+    }
+    return { $d: result };
+  }
+
+  function convertMember(d, member, value, result) {
+    {
       const memberValue = value === undefined || value === null ? undefined : value[member.name];
       if (memberValue !== undefined) {
-        result[member.name] = convert(member.idlType, memberValue, member.extAttrs || []);
+        callbackMember = member.name;
+        try {
+          result[member.name] = convert(member.idlType, memberValue, member.extAttrs || []);
+        } finally {
+          callbackMember = undefined;
+        }
       } else if (member.default) {
         result[member.name] = defaultValue(member);
       } else if (member.required) {
         throw new TypeError("The dictionary " + d.name + " needs the member " + member.name + ".");
       }
     }
-    return { $d: result };
   }
 
   function flatten(t) {
@@ -531,20 +628,101 @@
     return text;
   }
 
-  function wrap(handle, className) {
+  // The bridge gives the same handle again only for a struct that refers to
+  // a process (`interned`): the layer keeps only those objects.
+  function wrap(handle, className, interned) {
+    if (wrappers.has(handle)) return wrappers.get(handle);
     const cls = classes.get(className);
     const object = Object.create(cls ? cls.prototype : Object.prototype);
     platform.set(object, { handle, cls: className });
+    if (interned) wrappers.set(handle, object);
     return object;
   }
 
+  // A promise of the library: the bridge settles it later.
+  function libraryPromise(id) {
+    if (!promises.has(id)) {
+      let resolve, reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      promises.set(id, { promise, resolve, reject });
+    }
+    return promises.get(id).promise;
+  }
+
+  // ---------------------------------------------------------------------
+  // The lines of the bridge
+  // ---------------------------------------------------------------------
+
+  // The constructor of a stream calls `start` at once. The Streams Standard
+  // calls the other functions of the source, such as `pull`, after the
+  // promise of `start` is fulfilled: in a microtask, after the constructor
+  // returns. The library calls them when `start` returns. Thus such a call
+  // during a constructor runs in a microtask, and the bridge does not wait
+  // for it.
+  function deferred(message) {
+    return requests[requests.length - 1] === "constructor" && !callbacks[message.f].start;
+  }
+
+  function dispatch(message) {
+    if (message.t === "invoke" && deferred(message)) {
+      io.send({ t: "deferred", ref: message.ref });
+      queueMicrotask(() => invoke(message));
+    } else if (message.t === "settle") {
+      const entry = promises.get(message.p) || (libraryPromise(message.p), promises.get(message.p));
+      if ("ok" in message) entry.resolve(undefinedPromises.has(message.p) ? undefined : decodeAny(message.ok));
+      else entry.reject(decodeAny(message.error));
+    } else if (message.t === "invoke") {
+      invoke(message);
+    } else {
+      throw new Error("The layer does not know the line " + JSON.stringify(message));
+    }
+  }
+
+  // The library calls a JavaScript function. A promise that the function
+  // gives settles a promise of the library later.
+  // A promise that the function returns settles a promise of the library.
+  // The library reacts before the next reaction of JavaScript, as a
+  // promise of JavaScript would do: the line `jsSettled` is a request.
+  function invoke(message) {
+    const entry = callbacks[message.f];
+    let result;
+    running.push(message.ref);
+    try {
+      result = entry.fn.apply(entry.thisArg, message.a.map(decodeAny));
+    } catch (error) {
+      running.pop();
+      io.send({ t: "return", ref: message.ref, throw: readBuffers(encodeAny(error)) });
+      return;
+    }
+    running.pop();
+    if (result !== null && (typeof result === "object" || typeof result === "function") && typeof result.then === "function") {
+      const id = reference(result);
+      io.send({ t: "return", ref: message.ref, jp: id });
+      Promise.resolve(result).then(
+        (value) => io.request({ t: "jsSettled", p: id, w: running.slice(), ok: readBuffers(encodeAny(value)) }),
+        (error) => io.request({ t: "jsSettled", p: id, w: running.slice(), error: readBuffers(encodeAny(error)) }),
+      );
+    } else {
+      io.send({ t: "return", ref: message.ref, ok: readBuffers(encodeAny(result)) });
+    }
+  }
+
   function decodeAny(value) {
-    if (value === null || typeof value !== "object") return value;
+    if (value === null) return undefined;
+    if (typeof value !== "object") return value;
     if (Array.isArray(value)) return value.map(decodeAny);
     if ("$u" in value) return undefined;
+    if ("$null" in value) return null;
+    if ("$js" in value) return references[value.$js];
+    if ("$f" in value) return callbacks[value.$f].fn;
+    if ("$pr" in value) return libraryPromise(value.$pr);
+    if ("$pv" in value) {
+      return "ok" in value.$pv ? Promise.resolve(decodeAny(value.$pv.ok)) : Promise.reject(decodeAny(value.$pv.error));
+    }
+    if ("$err" in value) return makeError(value.$err);
     if ("$n" in value) return Number(value.$n);
     if ("$b" in value) return new Uint8Array(value.$b);
-    if ("$h" in value) return wrap(value.$h, value.$c);
+    if ("$h" in value) return wrap(value.$h, value.$c, value.$i === 1);
     if ("$o" in value) {
       const object = {};
       for (const key of Object.keys(value.$o)) object[key] = decodeAny(value.$o[key]);
@@ -555,7 +733,18 @@
 
   function fromLibrary(idlType, value) {
     const t = resolve(idlType);
-    if (value === null && (t.nullable || t.idlType === "any")) return null;
+    // The value of a `Promise<undefined>` is `undefined`: the library can
+    // give `:ok`, the Elixir value for "nothing".
+    if (t.generic === "Promise" && resolve(t.idlType[0]).idlType === "undefined" && value !== null && typeof value === "object") {
+      if ("$pv" in value) return "ok" in value.$pv ? Promise.resolve(undefined) : Promise.reject(decodeAny(value.$pv.error));
+      if ("$pr" in value) {
+        undefinedPromises.add(value.$pr);
+        return libraryPromise(value.$pr);
+      }
+    }
+    if (t.generic === "Promise") return decodeAny(value);
+    if (value === null && t.nullable) return null;
+    if (t.idlType === "any") return decodeAny(value);
     if (t.generic === "sequence" || t.generic === "FrozenArray") return value.map((item) => fromLibrary(t.idlType[0], item));
     if (t.generic === "record") {
       const object = {};
@@ -595,17 +784,41 @@
     return platform.get(object).handle;
   }
 
+  // The constructors of the streams take an `object`, and convert it to a
+  // dictionary at their first step: "Let underlyingSourceDict be
+  // underlyingSource, converted to an IDL value of type UnderlyingSource."
+  // The callbacks of the dictionary get the object as their `this`.
+  const objectDictionaries = {
+    "ReadableStream.constructor.0": "UnderlyingSource",
+    "WritableStream.constructor.0": "UnderlyingSink",
+    "TransformStream.constructor.0": "Transformer",
+  };
+
+  function argumentType(name, member, index, a) {
+    const dictionary = objectDictionaries[name + "." + member + "." + index];
+    return dictionary ? { idlType: dictionary, nullable: false, union: false, generic: "", extAttrs: [] } : a.idlType;
+  }
+
   // An argument that is not given, after the last given argument, does not
-  // go to the library: the library has its own default.
+  // go to the library: the library has its own default. The call also
+  // gives the number of arguments in WebIDL: see `declared`.
   function convertArguments(name, member, argumentDefinitions, values) {
     const required = argumentDefinitions.filter((a) => !a.optional && !a.variadic).length;
     if (values.length < required) {
       throw new TypeError("Failed to execute '" + member + "' on '" + name + "': " + required + " argument(s) required, but only " + values.length + " present.");
     }
     const result = [];
+    const later = [];
     argumentDefinitions.forEach((a, index) => {
       if (a.variadic) {
         for (const v of values.slice(index)) result.push(convert(a.idlType, v, a.extAttrs || []));
+      } else if (objectDictionaries[name + "." + member + "." + index]) {
+        // The argument is an `object`, as the WebIDL file specifies. The
+        // steps of the constructor convert it to a dictionary later, after
+        // the other arguments.
+        if (values[index] !== undefined && !isObject(values[index])) throw new TypeError("The value is not an object.");
+        later.push([result.length, a, index]);
+        result.push(null);
       } else if (index < values.length && (values[index] !== undefined || !a.optional)) {
         // An argument that is not optional is converted also when it is
         // undefined: a string gets "undefined", as WebIDL specifies.
@@ -618,8 +831,15 @@
         result.push({ $u: 1 });
       }
     });
+    for (const [place, a, index] of later) {
+      result[place] = convert(argumentType(name, member, index, a), values[index] === undefined ? null : values[index]);
+    }
     while (result.length > 0 && result[result.length - 1] && result[result.length - 1].$u === 1) result.pop();
     return result;
+  }
+
+  function declared(argumentDefinitions) {
+    return argumentDefinitions.filter((a) => !a.variadic).length;
   }
 
   // An overloaded operation uses the overload with the most arguments.
@@ -627,9 +847,28 @@
     return overloads.reduce((a, b) => (b.arguments.length > a.arguments.length ? b : a));
   }
 
-  function call(message) {
+  // The library has immutable buffers: an operation that writes into a
+  // buffer argument, such as `encodeInto`, gives the new bytes, and the
+  // layer copies them into the JavaScript buffer.
+  function call(message, originals = []) {
     if (message.a) message.a = readBuffers(message.a);
-    return request(Object.assign({ t: "call" }, message));
+    message.w = running.slice();
+    requests.push(message.k);
+    let reply;
+    try {
+      reply = io.request(Object.assign({ t: "call" }, message));
+    } finally {
+      requests.pop();
+    }
+    if ("error" in reply) throw decodeAny(reply.error);
+    for (const out of reply.out || []) {
+      const target = originals[out.i];
+      const view = ArrayBuffer.isView(target)
+        ? new Uint8Array(target.buffer, target.byteOffset, target.byteLength)
+        : new Uint8Array(target);
+      view.set(out.b.slice(0, view.length));
+    }
+    return reply.ok;
   }
 
   function makeIterator(object, name, keyType, valueType, kind) {
@@ -670,6 +909,20 @@
     return iteratorPrototypes.get(name);
   }
 
+  // An operation or an attribute with a promise type gives a rejected
+  // promise in place of an exception, as WebIDL specifies. This includes the
+  // check of `this` and the conversion of the arguments.
+  function promiseSteps(idlType, fn) {
+    if (resolve(idlType).generic !== "Promise") return fn;
+    return function (...values) {
+      try {
+        return fn.apply(this, values);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    };
+  }
+
   function defineMethod(target, key, length, fn) {
     Object.defineProperty(fn, "name", { value: typeof key === "symbol" ? "[" + key.description + "]" : key });
     Object.defineProperty(fn, "length", { value: length });
@@ -686,9 +939,13 @@
       if (new.target === undefined) throw new TypeError("Failed to construct '" + name + "': please use the 'new' operator.");
       if (constructors.length === 0) throw new TypeError("Illegal constructor.");
       const definition = longest(constructors);
-      const result = call({ i: name, k: "constructor", a: convertArguments(name, "constructor", definition.arguments, values) });
+      const result = call({
+        i: name, k: "constructor", n: declared(definition.arguments),
+        a: convertArguments(name, "constructor", definition.arguments, values),
+      });
       const object = Object.create(new.target.prototype);
       platform.set(object, { handle: result.$h, cls: name });
+      if (result.$i === 1) wrappers.set(result.$h, object);
       return object;
     };
     Object.defineProperty(cls, "name", { value: name });
@@ -717,24 +974,40 @@
       const returnType = definition.idlType;
       const target = isStatic ? cls : cls.prototype;
 
-      defineMethod(target, opName, required, function (...values) {
+      defineMethod(target, opName, required, promiseSteps(returnType, function (...values) {
         const self = isStatic ? null : { $h: handleOf(this, name, opName) };
         const args = convertArguments(name, opName, definition.arguments, values);
         const result = call({
           i: name, k: isStatic ? "static" : "operation", m: opName, self, a: args,
-          mut: resolve(returnType).idlType === "undefined",
-        });
+          n: declared(definition.arguments), mut: resolve(returnType).idlType === "undefined",
+        }, values);
         return fromLibrary(returnType, result);
-      });
+      }));
     }
 
     for (const m of members) {
+      if (m.type === "attribute" && resolve(m.idlType).idlType === "Function") {
+        // One function for the interface, as the Standard of the queuing
+        // strategies specifies: it calls the function of the library with
+        // the same name.
+        const fn = function (...values) {
+          return decodeAny(call({ i: name, k: "static", m: m.name, a: values.map(encodeAny) }));
+        };
+        Object.defineProperty(fn, "name", { value: m.name });
+        Object.defineProperty(fn, "length", { value: 1 });
+        Object.defineProperty(cls.prototype, m.name, {
+          get: function () { handleOf(this, name, m.name); return fn; },
+          enumerable: true,
+          configurable: true,
+        });
+        continue;
+      }
       if (m.type === "attribute") {
         const descriptor = {
-          get: function () {
+          get: promiseSteps(m.idlType, function () {
             const self = m.special === "static" ? null : { $h: handleOf(this, name, m.name) };
             return fromLibrary(m.idlType, call({ i: name, k: "getter", m: m.name, self }));
-          },
+          }),
           enumerable: true,
           configurable: true,
         };
@@ -771,6 +1044,22 @@
         });
         Object.defineProperty(cls.prototype, Symbol.iterator, {
           value: cls.prototype.entries, writable: true, configurable: true,
+        });
+      }
+    }
+
+    // An async iterable: `values()` and `[Symbol.asyncIterator]()` call
+    // the function `values` of the library. The steps of the iterator are
+    // steps of the Standard of the interface, thus of the library.
+    for (const m of members) {
+      if (m.type === "async_iterable") {
+        defineMethod(cls.prototype, "values", 0, function (...values) {
+          const self = { $h: handleOf(this, name, "values") };
+          const args = convertArguments(name, "values", m.arguments || [], values);
+          return decodeAny(call({ i: name, k: "operation", m: "values", self, a: args, n: (m.arguments || []).length }));
+        });
+        Object.defineProperty(cls.prototype, Symbol.asyncIterator, {
+          value: cls.prototype.values, writable: true, configurable: true,
         });
       }
     }

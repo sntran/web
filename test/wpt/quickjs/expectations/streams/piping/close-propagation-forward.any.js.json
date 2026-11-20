@@ -1,0 +1,12 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Closing must be propagated forward: becomes closed after one chunk; preventClose omitted; rejected close promise": "library: a different result",
+    "Closing must be propagated forward: becomes closed asynchronously; dest never desires chunks; preventClose = true": "library: a promise does not settle",
+    "Closing must be propagated forward: becomes closed asynchronously; dest never desires chunks; preventClose omitted; fulfilled close promise": "library: a promise does not settle",
+    "Closing must be propagated forward: becomes closed asynchronously; dest never desires chunks; preventClose omitted; rejected close promise": "library: a promise does not settle",
+    "Closing must be propagated forward: becomes closed asynchronously; preventClose omitted; rejected close promise": "library: a different result",
+    "Closing must be propagated forward: erroring the writable while flushing pending writes should error pipeTo": "library: a different result",
+    "Closing must be propagated forward: starts closed; preventClose omitted; rejected close promise": "library: a different result"
+  }
+}

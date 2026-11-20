@@ -137,21 +137,33 @@ defmodule Web.Test.QuickJS.WPT do
        "EUC-JP JIS0212 state after a fatal streaming error", @newer_standard},
       {:test, "encoding/textdecoder-mistakes.any.js", "fatal stream: iso-2022-jp",
        @newer_standard},
-      # The streams of the Encoding Standard are not in the runner yet.
-      {:path, "encoding/streams/", "runner: no streams"},
-      # The library returns the new destination of `encode_into/3`. The
-      # runner does not copy its bytes into the JavaScript buffer yet.
-      {:path, "encoding/encodeInto", "runner: no copy of the bytes that encodeInto writes"},
+      # The conversion of WebIDL to an async sequence is not in the layer
+      # yet: `ReadableStream.from()` needs it.
+      {:text, ["async_sequence is not in the layer"], "runner: no async sequence"},
+      # A string of Elixir is UTF-8: a lone surrogate of a JavaScript string
+      # becomes U+FFFD before it comes to the library. These tests split a
+      # character between two chunks.
+      {:test, "encoding/streams/encode-utf8.any.js", ~r/surrogate|split/,
+       "runner: no lone surrogate in a string"},
+      # The runner has no `EventTarget`: an `AbortSignal` has no
+      # `addEventListener`.
+      {:text, ["TypeError: not a function"], "runner: no EventTarget"},
+      # The runner times out a test only when the library is at rest, and
+      # JavaScript has nothing to do: a promise of the library does not
+      # settle.
+      {:text, ["Test timed out"], "library: a promise does not settle"},
+      {:text, ["Invalid high water mark"], "library: the checks of a high water mark"},
       {:text, ["'XMLHttpRequest' is not defined"], "runner: no XMLHttpRequest"},
       {:text, ["no server of WPT"], "runner: no server of WPT"},
       {:name, ~r/'(\w+)' is not defined/, "runner: no "},
       {:text, ["structuredClone"], "runner: no structuredClone"},
       {:name, ~r/The library has no ([\w.?]+\/\d)/, "library: no "},
-      {:text, ["ArgumentError", "TypeError"], "library: ArgumentError, not TypeError"},
-      {:text, ["has no decoder for the encoding"], "library: no decoder for the encoding"},
-      {:text, ["decode input must be"], "library: decode() with no input"}
+      {:text, ["ArgumentError", "TypeError"], "library: ArgumentError, not TypeError"}
     ]
   end
+
+  defp match({:test, test_path, %Regex{} = regex, group}, path, name, _message),
+    do: if(path == test_path and Regex.match?(regex, name), do: group)
 
   defp match({:test, test_path, test_name, group}, path, name, _message),
     do: if(path == test_path and name == test_name, do: group)

@@ -1,17 +1,7 @@
 {
   "harness": "OK",
   "failures": {
-    "UTF-8 EOF handling - ArrayBuffer": "runner: no streams",
-    "UTF-8 EOF handling - SharedArrayBuffer": "runner: no streams",
-    "a trailing empty chunk should be ignored - ArrayBuffer": "runner: no streams",
-    "a trailing empty chunk should be ignored - SharedArrayBuffer": "runner: no streams",
-    "an initial empty chunk should be ignored - ArrayBuffer": "runner: no streams",
-    "an initial empty chunk should be ignored - SharedArrayBuffer": "runner: no streams",
-    "decoding a transferred ArrayBuffer chunk should give no output": "runner: no streams",
-    "decoding a transferred Uint8Array chunk should give no output": "runner: no streams",
-    "decoding an empty chunk should give no output chunks - ArrayBuffer": "runner: no streams",
-    "decoding an empty chunk should give no output chunks - SharedArrayBuffer": "runner: no streams",
-    "decoding one UTF-8 chunk should give one output string - ArrayBuffer": "runner: no streams",
-    "decoding one UTF-8 chunk should give one output string - SharedArrayBuffer": "runner: no streams"
+    "decoding a transferred ArrayBuffer chunk should give no output": "runner: no MessageChannel",
+    "decoding a transferred Uint8Array chunk should give no output": "runner: no MessageChannel"
   }
 }

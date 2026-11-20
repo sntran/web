@@ -1,0 +1,10 @@
+{
+  "harness": "OK",
+  "failures": {
+    "closed and ready on a released writer": "library: a different result",
+    "desiredSize on a released writer": "library: a different result",
+    "methods should not not have .apply() or .call() called": "library: a different result",
+    "ready promise should fire before closed on releaseLock": "library: a different result",
+    "redundant releaseLock() is no-op": "library: a different result"
+  }
+}

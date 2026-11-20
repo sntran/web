@@ -1,10 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "chunk of type array should error the stream": "runner: no streams",
-    "chunk of type null should error the stream": "runner: no streams",
-    "chunk of type numeric should error the stream": "runner: no streams",
-    "chunk of type object, not BufferSource should error the stream": "runner: no streams",
-    "chunk of type undefined should error the stream": "runner: no streams"
+    "chunk of type undefined should error the stream": "library: a different result"
   }
 }

@@ -84,11 +84,17 @@ All notable changes to this project are documented in this file.
   second conformance test compares `Web.CountingGovernor` with
   `tla/ConnectionPool.tla`: a governor and the pool count their slots with
   the same rules.
-- The tests run 74 JavaScript files of web-platform-tests with no change, in
-  the JavaScript engine QuickJS, against the library: `Headers`, `URL`,
-  `URLSearchParams`, `TextEncoder`, and `TextDecoder`. A layer makes the
-  JavaScript classes from the WebIDL files of WPT, and calls the library
-  through a port. 16586 of 17257 tests pass. The lists of the tests that do
+- The tests run 136 JavaScript files of web-platform-tests with no change,
+  in the JavaScript engine QuickJS, against the library: `Headers`, `URL`,
+  `URLSearchParams`, `TextEncoder`, `TextDecoder`, `TextEncoderStream`,
+  `TextDecoderStream`, the streams of the Streams Standard with their
+  readers, writers, and controllers, and the queuing strategies. A layer
+  makes the JavaScript classes from the WebIDL files of WPT, and calls the
+  library through a port. The library can call a JavaScript function, such
+  as the `pull` of a source, and a promise of the library is a promise of
+  JavaScript. The runner answers a call when the processes of the run are
+  at rest, thus the result of each test is the same in each run. 17500 of
+  18414 tests pass. The lists of the tests that do
   not pass, with the group of their cause, are in
   `test/wpt/quickjs/expectations/`. QuickJS is a tool of the tests only: the
   tests download a pinned release, and examine its SHA-256 hash.

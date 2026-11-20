@@ -1,24 +1,14 @@
 {
   "harness": "OK",
   "failures": {
-    "a character following one split between chunks should be correctly encoded": "runner: no streams",
-    "a character split between chunks should be correctly encoded": "runner: no streams",
-    "a leading empty chunk should be ignored": "runner: no streams",
-    "a leading surrogate chunk should be carried past empty chunks": "runner: no streams",
-    "a leading surrogate chunk should error when it is clear it didn't form a pair": "runner: no streams",
-    "a non-terminal unpaired leading surrogate should immediately be replaced": "runner: no streams",
-    "a plain ASCII chunk should be converted": "runner: no streams",
-    "a stream ending in a leading surrogate should emit a replacement character as a final chunk": "runner: no streams",
-    "a terminal unpaired trailing surrogate should immediately be replaced": "runner: no streams",
-    "a trailing empty chunk should be ignored": "runner: no streams",
-    "an empty string should result in no output chunk": "runner: no streams",
-    "an unmatched surrogate at the end of a chunk followed by a plane 1 character split into two chunks should result in the encoded plane 1 character appearing in the last output chunk": "runner: no streams",
-    "an unmatched surrogate at the end of a chunk followed by an ascii character in the next chunk should be replaced with the replacement character at the start of the next output chunk": "runner: no streams",
-    "an unmatched surrogate at the end of a chunk followed by an astral character in the next chunk should be replaced with the replacement character at the start of the next output chunk": "runner: no streams",
-    "characters in the ISO-8859-1 range should be encoded correctly": "runner: no streams",
-    "encoding one string of UTF-8 should give one complete chunk": "runner: no streams",
-    "two consecutive astral characters each split down the middle should be correctly reassembled": "runner: no streams",
-    "two consecutive astral characters each split down the middle with an invalid surrogate in the middle should be correctly encoded": "runner: no streams",
-    "two leading chunks should result in two replacement characters": "runner: no streams"
+    "a character following one split between chunks should be correctly encoded": "runner: no lone surrogate in a string",
+    "a character split between chunks should be correctly encoded": "runner: no lone surrogate in a string",
+    "a leading surrogate chunk should be carried past empty chunks": "runner: no lone surrogate in a string",
+    "a non-terminal unpaired leading surrogate should immediately be replaced": "runner: no lone surrogate in a string",
+    "an unmatched surrogate at the end of a chunk followed by a plane 1 character split into two chunks should result in the encoded plane 1 character appearing in the last output chunk": "runner: no lone surrogate in a string",
+    "an unmatched surrogate at the end of a chunk followed by an ascii character in the next chunk should be replaced with the replacement character at the start of the next output chunk": "runner: no lone surrogate in a string",
+    "an unmatched surrogate at the end of a chunk followed by an astral character in the next chunk should be replaced with the replacement character at the start of the next output chunk": "runner: no lone surrogate in a string",
+    "two consecutive astral characters each split down the middle should be correctly reassembled": "runner: no lone surrogate in a string",
+    "two consecutive astral characters each split down the middle with an invalid surrogate in the middle should be correctly encoded": "runner: no lone surrogate in a string"
   }
 }

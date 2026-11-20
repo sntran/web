@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "when start() rejects, writer promises should reject in standard order": "library: a different result"
+  }
+}

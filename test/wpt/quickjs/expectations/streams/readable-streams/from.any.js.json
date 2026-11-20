@@ -2,7 +2,7 @@
   "harness": "OK",
   "failures": {
     "ReadableStream.from accepts a ReadableStream": "runner: no async sequence",
-    "ReadableStream.from accepts a ReadableStream async iterator": "library: no Web.ReadableStream.values/2",
+    "ReadableStream.from accepts a ReadableStream async iterator": "runner: no async sequence",
     "ReadableStream.from accepts a Set": "runner: no async sequence",
     "ReadableStream.from accepts a Set iterator": "runner: no async sequence",
     "ReadableStream.from accepts a sync generator": "runner: no async sequence",

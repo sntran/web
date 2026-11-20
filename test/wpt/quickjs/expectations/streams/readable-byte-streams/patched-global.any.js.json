@@ -1,6 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "Patched then() sees byobRequest after filling all pending pull-into descriptors": "library: a different result"
+    "Patched then() sees byobRequest after filling all pending pull-into descriptors": "runner: a request in a getter of Object.prototype"
   }
 }

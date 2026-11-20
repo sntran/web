@@ -1,5 +1,6 @@
 defmodule Web.ReadableByteStreamTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   import Web, only: [await: 1]
 
@@ -7,683 +8,699 @@ defmodule Web.ReadableByteStreamTest do
   alias Web.ArrayBuffer
   alias Web.AsyncContext
   alias Web.DecompressionStream
-  alias Web.ReadableByteStreamController
+  alias Web.RangeError
+  alias Web.ReadableByteStreamController, as: Controller
   alias Web.ReadableStream
-  alias Web.ReadableStreamBYOBReader
-  alias Web.ReadableStreamBYOBRequest
+  alias Web.ReadableStreamBYOBReader, as: BYOBReader
+  alias Web.ReadableStreamBYOBRequest, as: Request
+  alias Web.ReadableStreamDefaultReader, as: Reader
   alias Web.TextDecoderStream
+  alias Web.TypeError
   alias Web.Uint8Array
+
+  # A byte stream with no callbacks, and its controller.
+  defp byte_stream(source \\ %{}) do
+    test = self()
+    source = Map.merge(%{type: "bytes", start: &send(test, {:controller, &1})}, source)
+    stream = ReadableStream.new(source)
+    assert_receive {:controller, controller}
+    {stream, controller}
+  end
+
+  defp view(length), do: Uint8Array.new(ArrayBuffer.new(length))
+  defp bytes(%Uint8Array{} = view), do: Uint8Array.to_binary(view)
+
+  # The read waits in a different process. The stream has the read when
+  # this function returns: the call of `Web.Stream.call/3` comes after it.
+  defp start_read(fun) do
+    test = self()
+    ref = make_ref()
+
+    spawn(fn ->
+      promise = fun.()
+      send(test, {ref, :sent})
+      send(test, {ref, Web.Promise.wait(promise)})
+    end)
+
+    assert_receive {^ref, :sent}
+    ref
+  end
+
+  defp read_result(ref) do
+    assert_receive {^ref, outcome}, 1_000
+    outcome
+  end
 
   describe "the buffer of a BYOB read" do
     test "moves into the stream: the buffer of the reader becomes detached" do
-      stream = ReadableStream.new(%{type: "bytes"})
+      {stream, controller} = byte_stream()
       reader = ReadableStream.get_reader(stream, mode: "byob")
-      ReadableStream.enqueue(stream.controller_pid, "hello")
+      Controller.enqueue(controller, "hello")
 
-      view = Uint8Array.new(ArrayBuffer.new(8))
-      assert %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
+      view = view(8)
+      assert %{value: value, done: false} = await(BYOBReader.read(reader, view))
 
       assert ArrayBuffer.detached?(view.buffer)
       refute ArrayBuffer.detached?(value.buffer)
-      assert Uint8Array.to_binary(value) == "hello"
+      assert bytes(value) == "hello"
 
       # The new buffer has the length of the first buffer.
-      assert ArrayBuffer.byte_length(value.buffer) == 8
       assert ArrayBuffer.data(value.buffer) == <<"hello", 0, 0, 0>>
     end
 
     test "can be used again for the subsequent read" do
-      stream = ReadableStream.new(%{type: "bytes"})
+      {stream, controller} = byte_stream()
       reader = ReadableStream.get_reader(stream, mode: "byob")
-      ReadableStream.enqueue(stream.controller_pid, "abcdefgh")
-      ReadableStream.close(stream.controller_pid)
+      Controller.enqueue(controller, "abcdefgh")
+      Controller.close(controller)
 
       read_all = fn read_all, view, acc ->
-        case await(ReadableStreamBYOBReader.read(reader, view)) do
+        case await(BYOBReader.read(reader, view)) do
           %{value: value, done: false} ->
-            read_all.(read_all, Uint8Array.new(value.buffer), [Uint8Array.to_binary(value) | acc])
+            read_all.(read_all, Uint8Array.new(value.buffer), [bytes(value) | acc])
 
           %{value: value, done: true} ->
             assert value.byte_length == 0
             assert ArrayBuffer.byte_length(value.buffer) == 3
-            acc |> Enum.reverse()
+            Enum.reverse(acc)
         end
       end
 
-      assert read_all.(read_all, Uint8Array.new(ArrayBuffer.new(3)), []) == ["abc", "def", "gh"]
+      assert read_all.(read_all, view(3), []) == ["abc", "def", "gh"]
     end
 
     test "keeps the bytes that are not in the view" do
-      stream = ReadableStream.new(%{type: "bytes"})
+      {stream, controller} = byte_stream()
       reader = ReadableStream.get_reader(stream, mode: "byob")
-      ReadableStream.enqueue(stream.controller_pid, "XYZ")
+      Controller.enqueue(controller, "XYZ")
 
       view = Uint8Array.new(ArrayBuffer.new("0123456789"), 4, 4)
-      assert %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
+      assert %{value: value, done: false} = await(BYOBReader.read(reader, view))
 
       assert {value.byte_offset, value.byte_length} == {4, 3}
-      assert Uint8Array.to_binary(value) == "XYZ"
+      assert bytes(value) == "XYZ"
       assert ArrayBuffer.data(value.buffer) == "0123XYZ789"
     end
 
-    test "limits each read to the length of the view" do
-      stream = ReadableStream.new(%{type: "bytes"})
+    test "stays attached when the read is refused" do
+      {stream, controller} = byte_stream()
       reader = ReadableStream.get_reader(stream, mode: "byob")
-      ReadableStream.enqueue(stream.controller_pid, String.duplicate("x", 100))
+      Controller.enqueue(controller, "hello")
 
-      view = Uint8Array.new(ArrayBuffer.new(16), 0, 7)
-      assert %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
-      assert value.byte_length == 7
-    end
-
-    test "is refused when it is detached, and the stream continues" do
-      stream = ReadableStream.new(%{type: "bytes"})
-      reader = ReadableStream.get_reader(stream, mode: "byob")
-      ReadableStream.enqueue(stream.controller_pid, "hello")
-
-      view = Uint8Array.new(ArrayBuffer.new(8))
-      assert %{done: false} = await(ReadableStreamBYOBReader.read(reader, view))
-
-      # The first view has a detached buffer after the read.
-      assert %Web.TypeError{message: message} =
-               catch_exit(await(ReadableStreamBYOBReader.read(reader, view)))
-
-      assert message =~ "a buffer that is not detached"
-
-      ReadableStream.enqueue(stream.controller_pid, "again")
-      fresh = Uint8Array.new(ArrayBuffer.new(8))
-      assert %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, fresh))
-      assert Uint8Array.to_binary(value) == "again"
-    end
-
-    test "is refused when the view has zero bytes, and stays attached" do
-      stream = ReadableStream.new(%{type: "bytes"})
-      reader = ReadableStream.get_reader(stream, mode: "byob")
-      ReadableStream.enqueue(stream.controller_pid, "hello")
-
-      view = Uint8Array.new(ArrayBuffer.new(8), 0, 0)
-
-      assert %Web.TypeError{message: message} =
-               catch_exit(await(ReadableStreamBYOBReader.read(reader, view)))
-
-      assert message =~ "byte length above zero"
-      refute ArrayBuffer.detached?(view.buffer)
+      empty_view = Uint8Array.new(ArrayBuffer.new(8), 0, 0)
+      assert %TypeError{} = catch_exit(await(BYOBReader.read(reader, empty_view)))
+      refute ArrayBuffer.detached?(empty_view.buffer)
       refute ReadableStream.disturbed?(stream)
-    end
 
-    test "stays attached when the stream refuses the read" do
-      stream = ReadableStream.new(%{type: "bytes"})
-      reader = ReadableStream.get_reader(stream, mode: "byob")
-      ReadableStreamBYOBReader.release_lock(reader)
-
-      view = Uint8Array.new(ArrayBuffer.new(8))
-      assert %Web.TypeError{} = catch_exit(await(ReadableStreamBYOBReader.read(reader, view)))
+      BYOBReader.release_lock(reader)
+      view = view(8)
+      assert %TypeError{} = catch_exit(await(BYOBReader.read(reader, view)))
       refute ArrayBuffer.detached?(view.buffer)
     end
   end
 
-  test "BYOB readers consume queued bytes and preserve queued remainders" do
-    stream = ReadableStream.new(%{type: "bytes"})
-    reader = ReadableStream.get_reader(stream, mode: "byob")
+  describe "the checks of a BYOB read" do
+    setup do
+      {stream, controller} = byte_stream()
+      Controller.enqueue(controller, "hello")
+      %{reader: ReadableStream.get_reader(stream, mode: "byob")}
+    end
 
-    ReadableStream.enqueue(stream.controller_pid, "hello")
+    test "refuse a view with no bytes, a detached buffer, and a view that is not a view",
+         %{reader: reader} do
+      detached = view(4)
+      ArrayBuffer.transfer(detached.buffer)
 
-    first = Uint8Array.new(ArrayBuffer.new(3))
-    second = Uint8Array.new(ArrayBuffer.new(3))
+      for view <- [Uint8Array.new(ArrayBuffer.new(0)), detached, :view] do
+        assert %TypeError{} = catch_exit(await(BYOBReader.read(reader, view)))
+      end
+    end
 
-    assert %{value: first_chunk, done: false} =
-             await(ReadableStreamBYOBReader.read(reader, first))
+    test "refuse the option min when it is 0, not a number, or larger than the view",
+         %{reader: reader} do
+      assert %TypeError{} = catch_exit(await(BYOBReader.read(reader, view(4), min: 0)))
+      assert %TypeError{} = catch_exit(await(BYOBReader.read(reader, view(4), min: 1.5)))
+      assert %RangeError{} = catch_exit(await(BYOBReader.read(reader, view(4), min: 5)))
+      assert %{value: value} = await(BYOBReader.read(reader, view(4), min: 4))
+      assert bytes(value) == "hell"
+    end
 
-    assert Uint8Array.to_binary(first_chunk) == "hel"
+    test "refuse a view that a different process detached after the checks", %{reader: reader} do
+      view = view(4)
+      pid = reader.controller_pid
 
-    assert %{value: second_chunk, done: false} =
-             await(ReadableStreamBYOBReader.read(reader, second))
+      # The stream gets the read after the detach.
+      :erlang.suspend_process(pid)
+      promise = BYOBReader.read(reader, view)
+      ArrayBuffer.transfer(view.buffer)
+      :erlang.resume_process(pid)
 
-    assert Uint8Array.to_binary(second_chunk) == "lo"
+      assert %TypeError{} = catch_exit(await(promise))
+    end
+
+    test "of a reader struct with no owner use the calling process", %{reader: reader} do
+      reader = %BYOBReader{controller_pid: reader.controller_pid}
+      assert %{value: value} = await(BYOBReader.read(reader, view(5)))
+      assert bytes(value) == "hello"
+      assert :ok = BYOBReader.release_lock(reader)
+    end
+
+    test "lock the stream for BYOB reads only", %{reader: reader} do
+      assert ReadableStream.read(reader.controller_pid) == {:error, :not_locked_by_reader}
+    end
   end
 
-  test "ReadableByteStreamController exposes the current BYOB request" do
-    parent = self()
-
-    stream =
-      ReadableStream.new(%{
-        type: "bytes",
-        pull: fn controller ->
-          send(parent, {:pull, controller, ReadableByteStreamController.byob_request(controller)})
-        end
-      })
-
-    view = Uint8Array.new(ArrayBuffer.new(5))
-
-    spawn(fn ->
+  describe "the option min of a BYOB read" do
+    test "waits for the minimum number of bytes" do
+      {stream, controller} = byte_stream()
       reader = ReadableStream.get_reader(stream, mode: "byob")
-      send(parent, {:read_result, await(ReadableStreamBYOBReader.read(reader, view))})
-    end)
+      ref = start_read(fn -> BYOBReader.read(reader, view(5), min: 3) end)
 
-    assert_receive {:pull, %ReadableByteStreamController{pid: pid},
-                    %ReadableStreamBYOBRequest{} = request},
-                   1_000
+      Controller.enqueue(controller, "a")
+      Controller.enqueue(controller, "b")
+      refute_received {^ref, _outcome}
+      Controller.enqueue(controller, "cdef")
 
-    assert pid == stream.controller_pid
-    assert is_reference(request.address)
-    assert request.view_byte_offset == view.byte_offset
-    assert request.view_byte_length == view.byte_length
-    # The high water mark of a byte stream is 0.
-    assert ReadableByteStreamController.desired_size(%ReadableByteStreamController{pid: pid}) == 0
+      assert {:fulfilled, %{value: value, done: false}} = read_result(ref)
+      assert bytes(value) == "abcde"
+      assert %{value: value} = await(BYOBReader.read(reader, view(5)))
+      assert bytes(value) == "f"
+    end
 
-    assert_raise ArgumentError,
-                 ~r/BYOB requests must respond with a binary payload sent through the request capability/,
-                 fn ->
-                   ReadableStreamBYOBRequest.respond(request, 5)
-                 end
-
-    assert :ok = ReadableStreamBYOBRequest.respond(request, "hello")
-
-    assert_receive {:read_result, %{value: response_view, done: false}}, 1_000
-    assert Uint8Array.to_binary(response_view) == "hello"
-  end
-
-  test "BYOB requests can respond with a replacement view" do
-    parent = self()
-
-    stream =
-      ReadableStream.new(%{
-        type: "bytes",
-        pull: fn controller ->
-          send(parent, ReadableByteStreamController.byob_request(controller))
-        end
-      })
-
-    spawn(fn ->
+    test "gives the bytes that the stream has when it closes" do
+      {stream, controller} = byte_stream()
       reader = ReadableStream.get_reader(stream, mode: "byob")
-
-      send(
-        parent,
-        {:read_result,
-         await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(1))))}
-      )
-    end)
-
-    assert_receive %ReadableStreamBYOBRequest{} = request, 1_000
-    assert :ok = ReadableStreamBYOBRequest.respond_with_new_view(request, "abc")
-
-    assert_receive {:read_result, %{value: chunk_view, done: false}}, 1_000
-    assert Uint8Array.to_binary(chunk_view) == "abc"
-  end
-
-  test "BYOB request aliases are revoked after fulfillment" do
-    parent = self()
-    stream = ReadableStream.new(%{type: "bytes"})
-
-    worker =
-      spawn(fn ->
-        reader = ReadableStream.get_reader(stream, mode: "byob")
-
-        send(
-          parent,
-          {:first_read,
-           await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))}
-        )
-
-        receive do
-          :second_read ->
-            send(
-              parent,
-              {:second_read,
-               await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))}
-            )
-        end
-      end)
-
-    first_request = await_byob_request(stream.controller_pid)
-    first_address = first_request.address
-
-    assert :ok = ReadableStreamBYOBRequest.respond(first_request, "ok")
-
-    assert_receive {:first_read, %{value: first_chunk, done: false}}, 1_000
-    assert Uint8Array.to_binary(first_chunk) == "ok"
-
-    send(worker, :second_read)
-
-    second_request = await_byob_request(stream.controller_pid)
-    assert second_request.address != first_address
-
-    send(first_address, {:web_stream_byob_response, first_address, {:chunk, "zz"}})
-
-    # This call comes after the response from the same process. Thus the
-    # stream handled the response when the call returns.
-    assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request.address ==
-             second_request.address
-
-    refute_receive {:second_read, _result}, 50
-
-    ReadableStream.close(stream.controller_pid)
-    assert_receive {:second_read, %{done: true}}, 1_000
-  end
-
-  test "ReadableByteStreamController wait_for_capacity unblocks when readers drain queued bytes" do
-    # A stream with the limit of 2 bytes wants more bytes when its queue is
-    # empty.
-    stream = ReadableStream.new(%{type: "bytes"}, high_water_mark: 2)
-    controller = %ReadableByteStreamController{pid: stream.controller_pid}
-
-    ReadableStream.enqueue(stream.controller_pid, "ab")
-
-    waiter = Task.async(fn -> ReadableByteStreamController.wait_for_capacity(controller) end)
-    assert Task.yield(waiter, 20) == nil
-
-    # A default read of a byte stream gives a Uint8Array.
-    reader = ReadableStream.get_reader(stream)
-
-    assert %{value: %Uint8Array{} = chunk, done: false} =
-             await(Web.ReadableStreamDefaultReader.read(reader))
-
-    assert Uint8Array.to_binary(chunk) == "ab"
-    assert {:ok, :ok} = Task.yield(waiter, 1_000)
-  end
-
-  test "ReadableByteStreamController wait_for_capacity returns when the stream errors" do
-    stream = ReadableStream.new(%{type: "bytes"})
-    controller = %ReadableByteStreamController{pid: stream.controller_pid}
-
-    ReadableStream.enqueue(stream.controller_pid, "ab")
-
-    waiter = Task.async(fn -> ReadableByteStreamController.wait_for_capacity(controller) end)
-    assert Task.yield(waiter, 20) == nil
-
-    ReadableStream.error(stream.controller_pid, :boom)
-    assert {:ok, :ok} = Task.yield(waiter, 1_000)
-  end
-
-  test "close and error resolve pending BYOB reads" do
-    closed_stream =
-      ReadableStream.new(%{
-        type: "bytes",
-        pull: fn controller ->
-          ReadableByteStreamController.close(controller)
-        end
-      })
-
-    closed_reader = ReadableStream.get_reader(closed_stream, mode: "byob")
-    closed_view = Uint8Array.new(ArrayBuffer.new(2))
-
-    # The result has the buffer of the reader, in a view of zero bytes.
-    assert %{value: %Uint8Array{byte_length: 0, byte_offset: 0} = empty_view, done: true} =
-             await(ReadableStreamBYOBReader.read(closed_reader, closed_view))
-
-    assert ArrayBuffer.byte_length(empty_view.buffer) == 2
-    assert ArrayBuffer.detached?(closed_view.buffer)
-
-    errored_stream =
-      ReadableStream.new(%{
-        type: "bytes",
-        pull: fn controller ->
-          ReadableByteStreamController.error(controller, :boom)
-        end
-      })
-
-    errored_reader = ReadableStream.get_reader(errored_stream, mode: "byob")
-    errored_view = Uint8Array.new(ArrayBuffer.new(2))
-
-    assert :boom = catch_exit(await(ReadableStreamBYOBReader.read(errored_reader, errored_view)))
-  end
-
-  test "BYOB reader release_lock and cancel delegate to the readable stream" do
-    stream = ReadableStream.new(%{type: "bytes"})
-    reader = ReadableStream.get_reader(stream, mode: "byob")
-
-    assert :ok = ReadableStreamBYOBReader.release_lock(reader)
-
-    reader = ReadableStream.get_reader(stream, mode: "byob")
-    assert :ok = await(ReadableStreamBYOBReader.cancel(reader, :stop))
-  end
-
-  test "BYOB readers surface stale locks and protocol validation errors" do
-    stream = ReadableStream.new(%{type: "bytes"})
-    reader = ReadableStream.get_reader(stream, mode: "byob")
-
-    assert %Web.TypeError{message: "BYOB reads require a Uint8Array view."} =
-             catch_exit(await(ReadableStreamBYOBReader.read(reader, :invalid)))
-
-    assert :ok = ReadableStreamBYOBReader.release_lock(reader)
-
-    assert %Web.TypeError{message: "This BYOB reader is no longer locked."} =
-             catch_exit(
-               await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(1))))
-             )
-
-    assert :ok = ReadableStreamBYOBReader.release_lock(reader)
-
-    invalid_pid =
-      start_byob_reader_server(fn {:byob_read, _owner, _view} -> {:error, :invalid_byob_view} end)
-
-    assert %Web.TypeError{message: "BYOB reads require a Uint8Array view."} =
-             catch_exit(
-               await(
-                 ReadableStreamBYOBReader.read(
-                   %ReadableStreamBYOBReader{controller_pid: invalid_pid},
-                   Uint8Array.new(ArrayBuffer.new(1))
-                 )
-               )
-             )
-
-    generic_pid = start_byob_reader_server(fn {:byob_read, _owner, _view} -> {:error, :weird} end)
-
-    assert :weird =
-             catch_exit(
-               await(
-                 ReadableStreamBYOBReader.read(
-                   %ReadableStreamBYOBReader{controller_pid: generic_pid},
-                   Uint8Array.new(ArrayBuffer.new(1))
-                 )
-               )
-             )
-  end
-
-  test "BYOB readers propagate stream errors and default cancel reasons" do
-    parent = self()
-
-    cancel_stream =
-      ReadableStream.new(%{
-        type: "bytes",
-        cancel: fn reason -> send(parent, {:cancelled, reason}) end
-      })
-
-    cancel_reader = ReadableStream.get_reader(cancel_stream, mode: "byob")
-    assert :ok = await(ReadableStreamBYOBReader.cancel(cancel_reader))
-    assert_receive {:cancelled, :cancelled}
-
-    errored_stream = ReadableStream.new(%{type: "bytes"})
-    errored_reader = ReadableStream.get_reader(errored_stream, mode: "byob")
-    ReadableStream.error(errored_stream.controller_pid, :boom)
-
-    assert :boom =
-             catch_exit(
-               await(
-                 ReadableStreamBYOBReader.read(
-                   errored_reader,
-                   Uint8Array.new(ArrayBuffer.new(1))
-                 )
-               )
-             )
-  end
-
-  test "direct enqueue fulfills pending BYOB reads with exact fits and queued overflow" do
-    parent = self()
-    exact_stream = ReadableStream.new(%{type: "bytes"})
-
-    spawn(fn ->
-      reader = ReadableStream.get_reader(exact_stream, mode: "byob")
-
-      send(
-        parent,
-        {:exact_result,
-         await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))}
-      )
-    end)
-
-    _request = await_byob_request(exact_stream.controller_pid)
-    ReadableStream.enqueue(exact_stream.controller_pid, "ok")
-
-    assert_receive {:exact_result, %{value: exact_chunk, done: false}}, 1_000
-    assert Uint8Array.to_binary(exact_chunk) == "ok"
-    assert :queue.is_empty(ReadableStream.__get_slots__(exact_stream.controller_pid).queue)
-
-    overflow_stream = ReadableStream.new(%{type: "bytes"})
-
-    spawn(fn ->
-      reader = ReadableStream.get_reader(overflow_stream, mode: "byob")
-
-      send(
-        parent,
-        {:overflow_first,
-         await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))}
-      )
-
-      send(
-        parent,
-        {:overflow_second,
-         await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(3))))}
-      )
-    end)
-
-    _request = await_byob_request(overflow_stream.controller_pid)
-    ReadableStream.enqueue(overflow_stream.controller_pid, "hello")
-
-    assert_receive {:overflow_first, %{value: first_chunk, done: false}}, 1_000
-    assert Uint8Array.to_binary(first_chunk) == "he"
-
-    assert_receive {:overflow_second, %{value: second_chunk, done: false}}, 1_000
-    assert Uint8Array.to_binary(second_chunk) == "llo"
-  end
-
-  test "raw byte-stream calls validate views, locks, closed reads, and BYOB response state" do
-    stream = ReadableStream.new(%{type: "bytes"})
-    _reader = ReadableStream.get_reader(stream, mode: "byob")
-
-    assert {:error, :invalid_byob_view} =
-             :gen_statem.call(stream.controller_pid, {:byob_read, self(), :invalid})
-
-    assert {:error, :not_locked_by_reader} = ReadableStream.read(stream.controller_pid)
-
-    ReadableStream.close(stream.controller_pid)
-
-    assert {:done, %Uint8Array{byte_length: 0}} =
-             ReadableStream.byob_read(stream.controller_pid, Uint8Array.new(ArrayBuffer.new(1)))
-
-    pending_stream = ReadableStream.new(%{type: "bytes"})
-    parent = self()
-
-    spawn(fn ->
-      reader = ReadableStream.get_reader(pending_stream, mode: "byob")
-
-      send(
-        parent,
-        {:pending_read,
-         await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))}
-      )
-    end)
-
-    _request = await_byob_request(pending_stream.controller_pid)
-
-    assert {:error, :byob_capability_required} =
-             Web.Stream.control_call(pending_stream.controller_pid, {:byob_respond, 3})
-
-    assert {:error, :byob_capability_required} =
-             Web.Stream.control_call(
-               pending_stream.controller_pid,
-               {:byob_respond_with_new_view, :invalid}
-             )
-
-    ReadableStream.close(pending_stream.controller_pid)
-    assert_receive {:pending_read, %{done: true}}, 1_000
-
-    assert {:error, :byob_capability_required} =
-             Web.Stream.control_call(pending_stream.controller_pid, {:byob_respond, 1})
-
-    assert {:error, :byob_capability_required} =
-             Web.Stream.control_call(
-               pending_stream.controller_pid,
-               {:byob_respond_with_new_view, Uint8Array.new(ArrayBuffer.new(1))}
-             )
-  end
-
-  test "errored byte streams reject pending BYOB requests" do
-    stream = ReadableStream.new(%{type: "bytes"})
-    parent = self()
-
-    spawn(fn ->
+      ref = start_read(fn -> BYOBReader.read(reader, view(3), min: 3) end)
+
+      request = Controller.byob_request(controller)
+      :ok = Request.respond(request, "a")
+      Controller.close(controller)
+      :ok = Request.respond(Controller.byob_request(controller), 0)
+
+      assert {:fulfilled, %{value: value, done: true}} = read_result(ref)
+      assert bytes(value) == "a"
+    end
+
+    test "errors a stream that has a close request and not the minimum bytes" do
+      {stream, controller} = byte_stream()
+      Controller.enqueue(controller, "ab")
+      Controller.close(controller)
       reader = ReadableStream.get_reader(stream, mode: "byob")
 
-      send(
-        parent,
-        {:errored_pending_read,
-         catch_exit(
-           await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))
-         )}
-      )
-    end)
-
-    _request = await_byob_request(stream.controller_pid)
-    ReadableStream.error(stream.controller_pid, :boom)
-
-    assert_receive {:errored_pending_read, :boom}, 1_000
+      assert %TypeError{} = catch_exit(await(BYOBReader.read(reader, view(3), min: 3)))
+      assert %TypeError{} = catch_exit(await(BYOBReader.closed(reader)))
+    end
   end
 
-  test "invalid BYOB response payloads error pending reads while unrelated messages are ignored" do
-    stream = ReadableStream.new(%{type: "bytes"})
-    parent = self()
+  describe "a BYOB request" do
+    test "has the view of the read, and a response gives the bytes of the view" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ref = start_read(fn -> BYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new("xyz"))) end)
 
-    spawn(fn ->
+      request = Controller.byob_request(controller)
+      # The getter gives the same request until a response.
+      assert Controller.byob_request(controller) == request
+      view = Request.view(request)
+      assert {view.byte_offset, view.byte_length, bytes(view)} == {0, 3, "xyz"}
+
+      :ok = Request.respond(request, 2)
+      assert Request.view(request) == nil
+      assert Controller.byob_request(controller) == nil
+      assert ArrayBuffer.detached?(view.buffer)
+
+      assert {:fulfilled, %{value: value, done: false}} = read_result(ref)
+      assert bytes(value) == "xy"
+    end
+
+    test "gives the bytes that the source wrote into the buffer of the view" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ref = start_read(fn -> BYOBReader.read(reader, view(4)) end)
+
+      request = Controller.byob_request(controller)
+      written = %{request.view | buffer: ArrayBuffer.replace(request.view.buffer, 0, "ab")}
+      :ok = Request.respond(%{request | view: written}, 2)
+
+      assert {:fulfilled, %{value: value}} = read_result(ref)
+      assert bytes(value) == "ab"
+    end
+
+    test "refuses a second response, a response of 0, and a response that is too large" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      _ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+      request = Controller.byob_request(controller)
+
+      assert_raise TypeError, fn -> Request.respond(request, 0) end
+      assert_raise RangeError, fn -> Request.respond(request, 3) end
+      assert_raise RangeError, fn -> Request.respond(request, "abc") end
+      assert_raise TypeError, fn -> Request.respond(request, -1) end
+      :ok = Request.respond(request, 1)
+      assert_raise TypeError, fn -> Request.respond(request, 1) end
+      assert_raise TypeError, fn -> Request.respond_with_new_view(request, view(1)) end
+    end
+
+    test "refuses a response when the buffer of the view is detached" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      _ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+      request = Controller.byob_request(controller)
+
+      ArrayBuffer.transfer(request.view.buffer)
+      assert_raise TypeError, fn -> Request.respond(request, 1) end
+      assert_raise TypeError, fn -> Controller.enqueue(controller, "a") end
+      assert_raise TypeError, fn -> Request.respond_with_new_view(request, request.view) end
+    end
+
+    test "of a closed stream needs the response 0, and ends the read with its buffer" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+
+      Controller.close(controller)
+      request = Controller.byob_request(controller)
+      assert_raise TypeError, fn -> Request.respond(request, 1) end
+      refute_received {^ref, _outcome}
+      :ok = Request.respond(request, 0)
+
+      assert {:fulfilled, %{value: value, done: true}} = read_result(ref)
+      assert {value.byte_length, ArrayBuffer.byte_length(value.buffer)} == {0, 2}
+    end
+
+    test "takes a new view with the bounds of the request" do
+      {stream, controller} = byte_stream()
       reader = ReadableStream.get_reader(stream, mode: "byob")
 
-      send(
-        parent,
-        {:invalid_payload_read,
-         catch_exit(
-           await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))
-         )}
-      )
-    end)
+      ref =
+        start_read(fn -> BYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(4), 1, 2)) end)
 
-    request = await_byob_request(stream.controller_pid)
+      request = Controller.byob_request(controller)
 
-    send(stream.controller_pid, {:web_stream_byob_response, make_ref(), {:chunk, "ignored"}})
+      other_offset = Uint8Array.new(ArrayBuffer.new(4), 0, 1)
+      other_length = Uint8Array.new(ArrayBuffer.new(5), 1, 1)
+      too_large = Uint8Array.new(ArrayBuffer.new(4), 1, 3)
 
-    # This call comes after the response from the same process. Thus the
-    # stream handled the response when the call returns.
-    assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request.address ==
-             request.address
-
-    send(
-      stream.controller_pid,
-      {:web_stream_byob_response, request.address, {:invalid, :payload}}
-    )
-
-    assert_receive {:invalid_payload_read, :invalid_byob_response}, 1_000
-    assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request == nil
-    assert ReadableStream.__get_slots__(stream.controller_pid).state == :errored
-  end
-
-  test "invalid BYOB replacement views error pending reads" do
-    stream = ReadableStream.new(%{type: "bytes"})
-    parent = self()
-
-    spawn(fn ->
-      reader = ReadableStream.get_reader(stream, mode: "byob")
-
-      send(
-        parent,
-        {:invalid_view_read,
-         catch_exit(
-           await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))
-         )}
-      )
-    end)
-
-    request = await_byob_request(stream.controller_pid)
-
-    send(
-      stream.controller_pid,
-      {:web_stream_byob_response, request.address, {:view, :invalid}}
-    )
-
-    assert_receive {:invalid_view_read, :invalid_byob_response}, 1_000
-    assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request == nil
-    assert ReadableStream.__get_slots__(stream.controller_pid).state == :errored
-  end
-
-  test "raw BYOB stream internals handle non-byte locks and binary replacement views" do
-    {:ok, default_pid} = ReadableStream.start_link()
-    owner = self()
-
-    :sys.replace_state(default_pid, fn {state, data} ->
-      {state, %{data | reader_pid: owner, reader_mode: :byob}}
-    end)
-
-    assert {:error, :not_byte_stream} =
-             ReadableStream.byob_read(default_pid, Uint8Array.new(ArrayBuffer.new(1)))
-
-    binary_stream = ReadableStream.new(%{type: "bytes"})
-    parent = self()
-
-    spawn(fn ->
-      reader = ReadableStream.get_reader(binary_stream, mode: "byob")
-
-      send(
-        parent,
-        {:binary_result,
-         await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))}
-      )
-    end)
-
-    request = await_byob_request(binary_stream.controller_pid)
-
-    send(
-      binary_stream.controller_pid,
-      {:web_stream_byob_response, request.address, {:view, "ok"}}
-    )
-
-    assert_receive {:binary_result, %{value: binary_view, done: false}}, 1_000
-    assert Uint8Array.to_binary(binary_view) == "ok"
-
-    fresh_stream = ReadableStream.new(%{type: "bytes"})
-
-    assert {:error, :byob_capability_required} =
-             Web.Stream.control_call(
-               fresh_stream.controller_pid,
-               {:byob_respond_with_new_view, Uint8Array.new(ArrayBuffer.new(1))}
-             )
-  end
-
-  test "ambient abort tears down pending BYOB aliases before the signal is observed" do
-    controller = AbortController.new()
-    parent = self()
-
-    stream =
-      AsyncContext.with_signal(controller.signal, fn ->
-        ReadableStream.new(%{type: "bytes"})
-      end)
-
-    spawn(fn ->
-      reader = ReadableStream.get_reader(stream, mode: "byob")
-
-      read = ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2)))
-      send(parent, {:aborting_read, catch_exit(await(read))})
-    end)
-
-    request = await_byob_request(stream.controller_pid)
-    address = request.address
-
-    # The read rejects with the abort reason. It does not look like the end
-    # of the stream.
-    assert :ok = AbortController.abort(controller, :byob_abort)
-    assert_receive {:aborting_read, :byob_abort}, 1_000
-    assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request == nil
-
-    send(address, {:web_stream_byob_response, address, {:chunk, "zz"}})
-    # This call comes after the response from the same process. Thus the
-    # stream handled the response when the call returns.
-    assert :queue.is_empty(ReadableStream.__get_slots__(stream.controller_pid).queue)
-
-    exception =
-      assert_raise Web.DOMException, fn ->
-        Web.AbortSignal.throw_if_aborted(controller.signal)
+      for view <- [other_offset, other_length, too_large] do
+        assert_raise RangeError, fn -> Request.respond_with_new_view(request, view) end
       end
 
-    assert exception.name == "AbortError"
-    assert exception.message == ":byob_abort"
+      assert_raise TypeError, fn ->
+        Request.respond_with_new_view(request, Uint8Array.new(ArrayBuffer.new(4), 1, 0))
+      end
+
+      assert_raise TypeError, fn -> Request.respond_with_new_view(request, :view) end
+
+      new_view = Uint8Array.new(ArrayBuffer.new("abcd"), 1, 1)
+      :ok = Request.respond_with_new_view(request, new_view)
+      assert ArrayBuffer.detached?(new_view.buffer)
+
+      assert {:fulfilled, %{value: value}} = read_result(ref)
+      assert {value.byte_offset, bytes(value)} == {1, "b"}
+    end
+
+    test "of a closed stream takes a new view of 0 bytes" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+      Controller.close(controller)
+      request = Controller.byob_request(controller)
+
+      assert_raise TypeError, fn -> Request.respond_with_new_view(request, view(2)) end
+      :ok = Request.respond_with_new_view(request, Uint8Array.new(ArrayBuffer.new(2), 0, 0))
+      assert {:fulfilled, %{done: true}} = read_result(ref)
+    end
+
+    test "with a binary puts the bytes into the view" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ref = start_read(fn -> BYOBReader.read(reader, view(4)) end)
+
+      :ok = Request.respond_with_new_view(Controller.byob_request(controller), "ok")
+      assert {:fulfilled, %{value: value}} = read_result(ref)
+      assert ArrayBuffer.data(value.buffer) == <<"ok", 0, 0>>
+    end
+
+    test "is not valid after the stream stops" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      _ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+      request = Controller.byob_request(controller)
+
+      Web.Stream.stop(stream.controller_pid)
+      assert Request.view(request) == nil
+      assert_raise TypeError, fn -> Request.respond(request, 1) end
+      assert Controller.byob_request(controller) == nil
+      assert_raise TypeError, fn -> Controller.enqueue(controller, "a") end
+    end
   end
 
-  test "byte streams pipe through decompression and text decoding" do
+  describe "a release of the lock of a BYOB reader" do
+    test "keeps the request, and its response goes to the next reader" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      first = start_read(fn -> BYOBReader.read(reader, view(3)) end)
+      request = Controller.byob_request(controller)
+
+      BYOBReader.release_lock(reader)
+      assert {:rejected, %TypeError{}} = read_result(first)
+
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      second = start_read(fn -> BYOBReader.read(reader, view(3)) end)
+      assert Controller.byob_request(controller) == request
+
+      :ok = Request.respond(request, "ab")
+      assert {:fulfilled, %{value: value}} = read_result(second)
+      assert bytes(value) == "ab"
+    end
+
+    test "with no other reader puts the bytes of the response in the queue" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      _first = start_read(fn -> BYOBReader.read(reader, view(3)) end)
+      request = Controller.byob_request(controller)
+      BYOBReader.release_lock(reader)
+
+      :ok = Request.respond(request, "ab")
+      assert Request.view(request) == nil
+      reader = ReadableStream.get_reader(stream)
+      assert %{value: value} = await(Reader.read(reader))
+      assert bytes(value) == "ab"
+    end
+
+    test "and an enqueue discard the request of the reader" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      _first = start_read(fn -> BYOBReader.read(reader, view(3)) end)
+      request = Controller.byob_request(controller)
+      BYOBReader.release_lock(reader)
+
+      Controller.enqueue(controller, "c")
+      assert Request.view(request) == nil
+      assert Controller.byob_request(controller) == nil
+      reader = ReadableStream.get_reader(stream)
+      assert %{value: value} = await(Reader.read(reader))
+      assert bytes(value) == "c"
+    end
+
+    test "of a reader that stops releases the request of the reader" do
+      {stream, controller} = byte_stream()
+      test = self()
+
+      {pid, monitor} =
+        spawn_monitor(fn ->
+          reader = ReadableStream.get_reader(stream, mode: "byob")
+          _read = BYOBReader.read(reader, view(2))
+          send(test, :read_sent)
+          receive do: (:stop -> :ok)
+        end)
+
+      assert_receive :read_sent
+      request = Controller.byob_request(controller)
+      send(pid, :stop)
+      assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+      :ok = Request.respond(request, "zz")
+      assert {:fulfilled, %{value: value}} = read_result(ref)
+      assert bytes(value) == "zz"
+    end
+  end
+
+  describe "auto_allocate_chunk_size" do
+    test "gives a BYOB request to a default read" do
+      {stream, controller} = byte_stream(%{auto_allocate_chunk_size: 4})
+      reader = ReadableStream.get_reader(stream)
+      ref = start_read(fn -> Reader.read(reader) end)
+
+      request = Controller.byob_request(controller)
+      assert Request.view(request).byte_length == 4
+      :ok = Request.respond(request, "abc")
+
+      assert {:fulfilled, %{value: value, done: false}} = read_result(ref)
+      assert {bytes(value), ArrayBuffer.byte_length(value.buffer)} == {"abc", 4}
+    end
+
+    test "gives a request that an enqueue discards" do
+      {stream, controller} = byte_stream(%{auto_allocate_chunk_size: 4})
+      reader = ReadableStream.get_reader(stream)
+      ref = start_read(fn -> Reader.read(reader) end)
+      request = Controller.byob_request(controller)
+
+      Controller.enqueue(controller, "hello")
+      assert Request.view(request) == nil
+      assert {:fulfilled, %{value: value}} = read_result(ref)
+      assert bytes(value) == "hello"
+    end
+
+    test "of a closed stream ends the default read, and the request takes the response 0" do
+      {stream, controller} = byte_stream(%{auto_allocate_chunk_size: 4})
+      reader = ReadableStream.get_reader(stream)
+      ref = start_read(fn -> Reader.read(reader) end)
+      request = Controller.byob_request(controller)
+
+      Controller.close(controller)
+      assert {:fulfilled, %{value: nil, done: true}} = read_result(ref)
+      :ok = Request.respond(request, 0)
+      assert Request.view(request) == nil
+    end
+
+    test "with a default reader that releases its lock puts the response in the queue" do
+      {stream, controller} = byte_stream(%{auto_allocate_chunk_size: 4})
+      reader = ReadableStream.get_reader(stream)
+      _ref = start_read(fn -> Reader.read(reader) end)
+      request = Controller.byob_request(controller)
+      Reader.release_lock(reader)
+
+      :ok = Request.respond(request, "ab")
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      assert %{value: value} = await(BYOBReader.read(reader, view(4)))
+      assert bytes(value) == "ab"
+    end
+
+    test "must be an integer above 0" do
+      for size <- [0, -1, 1.5, "4"] do
+        assert_raise TypeError, fn ->
+          ReadableStream.new(%{type: "bytes", auto_allocate_chunk_size: size})
+        end
+      end
+
+      # A stream that is not a byte stream has no use for it.
+      assert %ReadableStream{} = ReadableStream.new(%{auto_allocate_chunk_size: 0})
+    end
+  end
+
+  describe "the controller" do
+    test "takes the buffer of a chunk, and refuses a chunk with no bytes" do
+      {stream, controller} = byte_stream()
+      chunk = Uint8Array.new(ArrayBuffer.new("abcdef"), 1, 3)
+      :ok = Controller.enqueue(controller, chunk)
+      assert ArrayBuffer.detached?(chunk.buffer)
+
+      assert_raise TypeError, fn -> Controller.enqueue(controller, chunk) end
+      assert_raise TypeError, fn -> Controller.enqueue(controller, "") end
+      assert_raise TypeError, fn -> Controller.enqueue(controller, view(0)) end
+
+      assert_raise TypeError, fn ->
+        Controller.enqueue(controller, Uint8Array.new(ArrayBuffer.new(4), 0, 0))
+      end
+
+      assert_raise TypeError, fn -> Controller.enqueue(controller, :chunk) end
+
+      # A default read gives a view of the buffer of the chunk.
+      reader = ReadableStream.get_reader(stream)
+      assert %{value: value} = await(Reader.read(reader))
+      assert {value.byte_offset, value.byte_length, bytes(value)} == {1, 3, "bcd"}
+      assert ArrayBuffer.byte_length(value.buffer) == 6
+    end
+
+    test "closes the stream after a read takes the last bytes" do
+      {stream, controller} = byte_stream()
+      Controller.enqueue(controller, "ab")
+      :ok = Controller.close(controller)
+
+      assert_raise TypeError, fn -> Controller.close(controller) end
+      assert_raise TypeError, fn -> Controller.enqueue(controller, "c") end
+      assert Controller.desired_size(controller) == -2
+
+      reader = ReadableStream.get_reader(stream)
+      assert %{value: value, done: false} = await(Reader.read(reader))
+      assert bytes(value) == "ab"
+      assert %{done: true} = await(Reader.read(reader))
+      assert Controller.desired_size(controller) == 0
+      assert_raise TypeError, fn -> Controller.close(controller) end
+    end
+
+    test "gives the bytes of one chunk to many BYOB reads, and of many chunks to one read" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      first = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+      second = start_read(fn -> BYOBReader.read(reader, view(3)) end)
+
+      Controller.enqueue(controller, "hello")
+      assert {:fulfilled, %{value: value}} = read_result(first)
+      assert bytes(value) == "he"
+      assert {:fulfilled, %{value: value}} = read_result(second)
+      assert bytes(value) == "llo"
+
+      Controller.enqueue(controller, "a")
+      Controller.enqueue(controller, "b")
+      assert %{value: value} = await(BYOBReader.read(reader, view(4)))
+      assert bytes(value) == "ab"
+    end
+
+    test "gives the bytes in the queue to a default read that waits, at the next chunk" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      _first = start_read(fn -> BYOBReader.read(reader, view(3)) end)
+      request = Controller.byob_request(controller)
+      BYOBReader.release_lock(reader)
+
+      # The response goes to the queue: a default read with no BYOB request
+      # waits for a chunk, as the Streams Standard specifies.
+      reader = ReadableStream.get_reader(stream)
+      ref = start_read(fn -> Reader.read(reader) end)
+      :ok = Request.respond(request, "ab")
+      refute_received {^ref, _outcome}
+
+      Controller.enqueue(controller, "c")
+      assert {:fulfilled, %{value: value}} = read_result(ref)
+      assert bytes(value) == "ab"
+      assert %{value: value} = await(Reader.read(reader))
+      assert bytes(value) == "c"
+    end
+
+    test "pulls one time for a read that takes the bytes of start" do
+      test = self()
+
+      stream =
+        ReadableStream.new(
+          %{
+            type: "bytes",
+            start: &Controller.enqueue(&1, String.duplicate("x", 16)),
+            pull: fn controller -> send(test, {:pull, Controller.desired_size(controller)}) end
+          },
+          high_water_mark: 8
+        )
+
+      reader = ReadableStream.get_reader(stream)
+      assert %{value: value} = await(Reader.read(reader))
+      assert value.byte_length == 16
+
+      # The pull gives no bytes: at its end, the stream does not pull again.
+      assert_receive {:pull, 8}
+      await_end_of_pull(stream.controller_pid)
+      refute_received {:pull, _size}
+    end
+
+    test "refuses a close of an errored stream" do
+      {_stream, controller} = byte_stream()
+      Controller.error(controller, :boom)
+      assert_raise TypeError, fn -> Controller.close(controller) end
+      assert Controller.desired_size(controller) == nil
+    end
+
+    test "waits for capacity until a read takes the bytes of the queue" do
+      {stream, controller} = byte_stream(%{high_water_mark: 2})
+      Controller.enqueue(controller, "ab")
+
+      waiter = Task.async(fn -> Controller.wait_for_capacity(controller) end)
+      assert Task.yield(waiter, 20) == nil
+
+      reader = ReadableStream.get_reader(stream)
+      assert %{value: value} = await(Reader.read(reader))
+      assert bytes(value) == "ab"
+      assert Task.await(waiter) == :ok
+    end
+
+    test "waits for capacity until the stream errors" do
+      {_stream, controller} = byte_stream()
+      Controller.enqueue(controller, "ab")
+
+      waiter = Task.async(fn -> Controller.wait_for_capacity(controller) end)
+      assert Task.yield(waiter, 20) == nil
+      Controller.error(controller, :boom)
+      assert Task.await(waiter) == :ok
+    end
+
+    test "gives the chunks to the default reads that wait" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream)
+      first = start_read(fn -> Reader.read(reader) end)
+      second = start_read(fn -> Reader.read(reader) end)
+
+      Controller.enqueue(controller, "a")
+      Controller.enqueue(controller, "b")
+      assert {:fulfilled, %{value: a}} = read_result(first)
+      assert {:fulfilled, %{value: b}} = read_result(second)
+      assert {bytes(a), bytes(b)} == {"a", "b"}
+    end
+
+    test "of a stream that the code of this library feeds discards a chunk that it refuses" do
+      {stream, _controller} = byte_stream()
+      ReadableStream.enqueue(stream.controller_pid, "a")
+      ReadableStream.close(stream.controller_pid)
+      ReadableStream.enqueue(stream.controller_pid, "late")
+      ReadableStream.enqueue(stream.controller_pid, "")
+
+      assert Enum.map(stream, &bytes/1) == ["a"]
+    end
+  end
+
+  describe "a cancel" do
+    test "ends the BYOB reads that wait with no value" do
+      test = self()
+      {stream, _controller} = byte_stream(%{cancel: &send(test, {:cancelled, &1})})
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+
+      assert :ok = await(BYOBReader.cancel(reader, :stop))
+      assert_receive {:cancelled, :stop}
+      assert {:fulfilled, %{value: nil, done: true}} = read_result(ref)
+    end
+
+    test "of an errored stream rejects with the error" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      Controller.error(controller, :boom)
+
+      assert :boom = catch_exit(await(BYOBReader.cancel(reader, :stop)))
+      assert :boom = catch_exit(await(BYOBReader.read(reader, view(1))))
+    end
+  end
+
+  test "an error rejects the BYOB reads that wait" do
+    {stream, controller} = byte_stream()
+    reader = ReadableStream.get_reader(stream, mode: "byob")
+    ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+
+    Controller.error(controller, :boom)
+    assert {:rejected, :boom} = read_result(ref)
+  end
+
+  test "an ambient abort rejects the BYOB reads that wait" do
+    controller = AbortController.new()
+
+    stream =
+      AsyncContext.with_signal(controller.signal, fn -> ReadableStream.new(%{type: "bytes"}) end)
+
+    reader = ReadableStream.get_reader(stream, mode: "byob")
+    ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+
+    :ok = AbortController.abort(controller, :byob_abort)
+    assert {:rejected, :byob_abort} = read_result(ref)
+  end
+
+  test "a byte stream pipes through decompression and text decoding" do
     compressed = :zlib.gzip("hello byte stream")
 
     stream =
       ReadableStream.new(%{
         type: "bytes",
         start: fn controller ->
-          ReadableByteStreamController.enqueue(controller, compressed)
-          ReadableByteStreamController.close(controller)
+          Controller.enqueue(controller, compressed)
+          Controller.close(controller)
         end
       })
 
@@ -695,27 +712,101 @@ defmodule Web.ReadableByteStreamTest do
     assert Enum.join(decoded, "") == "hello byte stream"
   end
 
-  defp start_byob_reader_server(reply_fun) do
-    spawn(fn ->
-      receive do
-        {:"$gen_call", {from, ref}, request} ->
-          send(from, {ref, reply_fun.(request)})
+  describe "the bytes of a byte stream" do
+    property "go to the BYOB reads in their sequence, with no loss" do
+      check all(
+              chunks <- list_of(binary(min_length: 1, max_length: 8), max_length: 8),
+              sizes <- list_of(integer(1..6), min_length: 1, max_length: 6)
+            ) do
+        {stream, controller} = byte_stream()
+        Enum.each(chunks, &Controller.enqueue(controller, &1))
+        Controller.close(controller)
+        reader = ReadableStream.get_reader(stream, mode: "byob")
+
+        read = fn read, [size | rest], acc ->
+          case await(BYOBReader.read(reader, view(size))) do
+            %{value: value, done: false} ->
+              assert value.byte_length in 1..size
+              read.(read, rest ++ [size], [bytes(value) | acc])
+
+            %{value: value, done: true} ->
+              assert value.byte_length == 0
+              acc |> Enum.reverse() |> IO.iodata_to_binary()
+          end
+        end
+
+        assert read.(read, sizes, []) == IO.iodata_to_binary(chunks)
       end
-    end)
-  end
+    end
 
-  defp await_byob_request(pid, attempts \\ 50)
+    property "go to the reads with a minimum, from the responses and the chunks of the source" do
+      check all(
+              chunks <-
+                list_of(binary(min_length: 1, max_length: 8), min_length: 1, max_length: 6),
+              size <- integer(1..8),
+              min <- integer(1..size)
+            ) do
+        agent = start_supervised!({Agent, fn -> chunks end}, id: make_ref())
 
-  defp await_byob_request(pid, attempts) when attempts > 0 do
-    case Web.Stream.control_call(pid, :get_byob_request) do
-      %ReadableStreamBYOBRequest{} = request ->
-        request
+        stream =
+          ReadableStream.new(%{
+            type: "bytes",
+            pull: fn controller ->
+              case Agent.get_and_update(agent, fn chunks -> Enum.split(chunks, 1) end) do
+                [chunk] -> respond_or_enqueue(controller, chunk)
+                [] -> close_and_respond(controller)
+              end
+            end
+          })
 
-      _other ->
-        Process.sleep(10)
-        await_byob_request(pid, attempts - 1)
+        reader = ReadableStream.get_reader(stream, mode: "byob")
+
+        read = fn read, acc ->
+          case await(BYOBReader.read(reader, view(size), min: min)) do
+            %{value: value, done: false} ->
+              # Each result that is not the end has the minimum.
+              assert value.byte_length in min..size
+              read.(read, [bytes(value) | acc])
+
+            %{value: value, done: true} ->
+              [bytes(value) | acc] |> Enum.reverse() |> IO.iodata_to_binary()
+          end
+        end
+
+        assert read.(read, []) == IO.iodata_to_binary(chunks)
+      end
     end
   end
 
-  defp await_byob_request(_pid, 0), do: flunk("expected a pending BYOB request")
+  # The end of a pull is a message of the worker of the stream. A pull that
+  # follows starts in the same step as the end.
+  defp await_end_of_pull(pid, attempts \\ 200) do
+    case ReadableStream.__get_slots__(pid).pulling do
+      false ->
+        :ok
+
+      true when attempts > 0 ->
+        Process.sleep(5)
+        await_end_of_pull(pid, attempts - 1)
+    end
+  end
+
+  # A chunk that fits into the view of the request is the response. A larger
+  # chunk goes to the queue.
+  defp respond_or_enqueue(controller, chunk) do
+    request = Controller.byob_request(controller)
+
+    if byte_size(chunk) <= Request.view(request).byte_length,
+      do: Request.respond(request, chunk),
+      else: Controller.enqueue(controller, chunk)
+  end
+
+  defp close_and_respond(controller) do
+    Controller.close(controller)
+
+    case Controller.byob_request(controller) do
+      nil -> :ok
+      request -> Request.respond(request, 0)
+    end
+  end
 end

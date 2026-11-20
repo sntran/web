@@ -192,15 +192,18 @@ defmodule Web.StreamTest do
 
       assert Uint8Array.to_binary(first_chunk) == "he"
 
+      # The queue keeps the rest of the chunk: a part of its buffer.
       slots = ReadableStream.__get_slots__(stream.controller_pid)
       assert slots.total_queued_size == 3
-      assert :queue.to_list(slots.queue) == ["llo"]
+      assert [{buffer, 2, 3}] = :queue.to_list(slots.queue)
+      assert binary_part(Web.ArrayBuffer.data(buffer), 2, 3) == "llo"
     end
 
-    test "byte streams clear pending BYOB requests when they close" do
+    test "byte streams keep the BYOB reads that wait at a close, until the response 0" do
       parent = self()
 
       stream = ReadableStream.new(%{type: "bytes"})
+      controller = %Web.ReadableByteStreamController{pid: stream.controller_pid}
 
       spawn(fn ->
         reader = ReadableStream.get_reader(stream, mode: "byob")
@@ -208,7 +211,7 @@ defmodule Web.StreamTest do
 
         # This process sent the read before this call. Thus the stream has
         # the BYOB request when the call returns.
-        request = Web.Stream.control_call(stream.controller_pid, :get_byob_request)
+        request = Web.ReadableByteStreamController.byob_request(controller)
         send(parent, {:byob_request, request})
         send(parent, {:read_result, await(read)})
       end)
@@ -217,8 +220,13 @@ defmodule Web.StreamTest do
       assert %Web.ReadableStreamBYOBRequest{} = request
 
       ReadableStream.close(stream.controller_pid)
+      slots = ReadableStream.__get_slots__(stream.controller_pid)
+      assert slots.state == :closed
+      assert :queue.len(slots.bytes.read_into_requests) == 1
+
+      :ok = Web.ReadableStreamBYOBRequest.respond(request, 0)
       assert_receive {:read_result, %{done: true}}, 1_000
-      assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request == nil
+      assert ReadableStream.__get_slots__(stream.controller_pid).bytes.pull_intos == []
     end
   end
 

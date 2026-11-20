@@ -2,8 +2,6 @@
   "harness": "OK",
   "failures": {
     "ReadableStream: should call pull when trying to read from a started, empty stream": "library: a different result",
-    "ReadableStream: should call underlying source methods as methods": "library: a different result",
-    "ReadableStream: should only call pull once on a non-empty stream read from after start fulfills": "library: a different result",
     "ReadableStream: should only call pull once on a non-empty stream read from before start fulfills": "library: a different result",
     "ReadableStream: should pull after start, and after every read": "library: the checks of a high water mark"
   }

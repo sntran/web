@@ -178,24 +178,124 @@
     return number;
   }
 
-  // A buffer that a test detached has no bytes, as WebIDL specifies.
-  function bytesOf(value) {
-    const buffer = ArrayBuffer.isView(value) ? value.buffer : value;
-    if (buffer.detached) return [];
-    if (!ArrayBuffer.isView(value)) return Array.from(new Uint8Array(value));
-    return Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
-  }
-
   // WebIDL keeps a reference to a buffer, and the operation reads the bytes
   // after the conversion of all its arguments. Thus the layer reads them at
   // the end: a later argument can detach the buffer.
   function readBuffers(value) {
     if (value === null || typeof value !== "object") return value;
     if (Array.isArray(value)) return value.map(readBuffers);
-    if ("$lazy" in value) return { $b: bytesOf(value.$lazy) };
+    if ("$lazy" in value) return { $ab: bufferValue(value.$lazy) };
     const result = {};
     for (const key of Object.keys(value)) result[key] = readBuffers(value[key]);
     return result;
+  }
+
+  // ---------------------------------------------------------------------
+  // Buffers: see "Buffers" in the bridge
+  // ---------------------------------------------------------------------
+
+  // The key of each buffer that went to the library or came from it. The
+  // keys of the layer are above 0, the keys of the bridge below 0.
+  const bufferKeys = new WeakMap();
+  let nextBufferKey = 1;
+
+  // The watched buffers of the library: key => { buffer, copy }. The copy
+  // has the bytes that the library knows. A platform object of the library
+  // holds each watched buffer, thus the layer holds it too.
+  const watched = new Map();
+
+  // One object for each watched view of the library.
+  const views = new Map();
+
+  // The buffers of the layer that the calls that run now gave: one map
+  // (key => buffer) for each call.
+  const callBuffers = [];
+
+  // A buffer goes with all its bytes, and a view with its bounds. A
+  // detached buffer has no bytes (`d`).
+  function bufferValue(value) {
+    const isView = ArrayBuffer.isView(value);
+    const buffer = isView ? value.buffer : value;
+    let key = bufferKeys.get(buffer);
+    if (key === undefined) {
+      key = nextBufferKey++;
+      bufferKeys.set(buffer, key);
+    }
+    if (key > 0 && callBuffers.length > 0) callBuffers[callBuffers.length - 1].set(key, buffer);
+    const entry = { k: key };
+    if (buffer.detached) entry.d = 1;
+    else entry.b = Array.from(new Uint8Array(buffer));
+    if (isView) {
+      entry.o = value.byteOffset;
+      entry.l = value.byteLength;
+    }
+    return entry;
+  }
+
+  // The changes of the watched buffers since the last request: the bytes
+  // that JavaScript wrote, or a detach.
+  function bufferChanges() {
+    const changes = [];
+    for (const [key, entry] of watched) {
+      if (entry.buffer.detached) {
+        watched.delete(key);
+        changes.push([key, "detached"]);
+        continue;
+      }
+      const bytes = new Uint8Array(entry.buffer);
+      if (bytes.length !== entry.copy.length || bytes.some((b, i) => b !== entry.copy[i])) {
+        entry.copy = bytes.slice();
+        changes.push([key, Array.from(bytes)]);
+      }
+    }
+    return changes;
+  }
+
+  function withBufferChanges(message) {
+    const changes = bufferChanges();
+    if (changes.length > 0) message.bs = changes;
+    return message;
+  }
+
+  // The library detached these buffers.
+  function detachBuffers(keys) {
+    for (const key of keys || []) {
+      let buffer;
+      if (watched.has(key)) {
+        buffer = watched.get(key).buffer;
+        watched.delete(key);
+      } else {
+        for (const map of callBuffers) if (map.has(key)) buffer = map.get(key);
+      }
+      if (buffer !== undefined && !buffer.detached) buffer.transfer();
+    }
+  }
+
+  function detachedView() {
+    const buffer = new ArrayBuffer(0);
+    const view = new Uint8Array(buffer);
+    buffer.transfer();
+    return view;
+  }
+
+  // A buffer or a view of the library (`$ab`).
+  function libraryBuffer(entry) {
+    const cached = entry.v === undefined ? undefined : views.get(entry.v);
+    if (cached !== undefined) return cached;
+    let buffer = entry.k === undefined ? undefined : watched.get(entry.k)?.buffer;
+    if (buffer === undefined) {
+      buffer = new ArrayBuffer(entry.d ? 0 : entry.b.length);
+      if (!entry.d) new Uint8Array(buffer).set(entry.b);
+      if (entry.d) buffer.transfer();
+      if (entry.k !== undefined && !entry.d) {
+        watched.set(entry.k, { buffer, copy: new Uint8Array(buffer).slice() });
+        bufferKeys.set(buffer, entry.k);
+      }
+    }
+    if (entry.a) return buffer;
+    const view = buffer.detached ? detachedView() : new Uint8Array(buffer, entry.o, entry.l);
+    if (entry.v !== undefined) views.set(entry.v, view);
+    return view;
   }
 
   const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
@@ -664,6 +764,7 @@
   }
 
   function dispatch(message) {
+    detachBuffers(message.det);
     if (message.t === "invoke" && deferred(message)) {
       io.send({ t: "deferred", ref: message.ref });
       queueMicrotask(() => invoke(message));
@@ -691,19 +792,19 @@
       result = entry.fn.apply(entry.thisArg, message.a.map(decodeAny));
     } catch (error) {
       running.pop();
-      io.send({ t: "return", ref: message.ref, throw: readBuffers(encodeAny(error)) });
+      io.send(withBufferChanges({ t: "return", ref: message.ref, throw: readBuffers(encodeAny(error)) }));
       return;
     }
     running.pop();
     if (result !== null && (typeof result === "object" || typeof result === "function") && typeof result.then === "function") {
       const id = reference(result);
-      io.send({ t: "return", ref: message.ref, jp: id });
+      io.send(withBufferChanges({ t: "return", ref: message.ref, jp: id }));
       Promise.resolve(result).then(
-        (value) => io.request({ t: "jsSettled", p: id, w: running.slice(), ok: readBuffers(encodeAny(value)) }),
-        (error) => io.request({ t: "jsSettled", p: id, w: running.slice(), error: readBuffers(encodeAny(error)) }),
+        (value) => io.request(withBufferChanges({ t: "jsSettled", p: id, w: running.slice(), ok: readBuffers(encodeAny(value)) })),
+        (error) => io.request(withBufferChanges({ t: "jsSettled", p: id, w: running.slice(), error: readBuffers(encodeAny(error)) })),
       );
     } else {
-      io.send({ t: "return", ref: message.ref, ok: readBuffers(encodeAny(result)) });
+      io.send(withBufferChanges({ t: "return", ref: message.ref, ok: readBuffers(encodeAny(result)) }));
     }
   }
 
@@ -721,6 +822,7 @@
     }
     if ("$err" in value) return makeError(value.$err);
     if ("$n" in value) return Number(value.$n);
+    if ("$ab" in value) return libraryBuffer(value.$ab);
     if ("$b" in value) return new Uint8Array(value.$b);
     if ("$h" in value) return wrap(value.$h, value.$c, value.$i === 1);
     if ("$o" in value) {
@@ -851,14 +953,20 @@
   // buffer argument, such as `encodeInto`, gives the new bytes, and the
   // layer copies them into the JavaScript buffer.
   function call(message, originals = []) {
-    if (message.a) message.a = readBuffers(message.a);
-    message.w = running.slice();
-    requests.push(message.k);
+    callBuffers.push(new Map());
     let reply;
     try {
-      reply = io.request(Object.assign({ t: "call" }, message));
+      if (message.a) message.a = readBuffers(message.a);
+      message.w = running.slice();
+      requests.push(message.k);
+      try {
+        reply = io.request(withBufferChanges(Object.assign({ t: "call" }, message)));
+      } finally {
+        requests.pop();
+      }
+      detachBuffers(reply.det);
     } finally {
-      requests.pop();
+      callBuffers.pop();
     }
     if ("error" in reply) throw decodeAny(reply.error);
     for (const out of reply.out || []) {
@@ -907,6 +1015,87 @@
       iteratorPrototypes.set(name, prototype);
     }
     return iteratorPrototypes.get(name);
+  }
+
+  // ---------------------------------------------------------------------
+  // The default asynchronous iterators of WebIDL
+  // ---------------------------------------------------------------------
+
+  // The state of each iterator: the handle of the iterator of the library,
+  // the ongoing promise, and the flag "is finished".
+  const asyncIterators = new WeakMap();
+  const asyncIteratorPrototypes = new Map();
+  const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype);
+
+  function asyncIterator(name, handle) {
+    const iterator = Object.create(asyncIteratorPrototype(name));
+    asyncIterators.set(iterator, { name, handle, ongoing: null, finished: false });
+    return iterator;
+  }
+
+  function iteratorResult(value, done) {
+    return { value, done };
+  }
+
+  // A call of the library that gives a promise.
+  function iteratorCall(state, member, args) {
+    try {
+      const i = state.name + " AsyncIterator";
+      return Promise.resolve(decodeAny(call({ i, k: "operation", m: member, self: { $h: state.handle }, a: args })));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  function asyncIteratorPrototype(name) {
+    if (asyncIteratorPrototypes.has(name)) return asyncIteratorPrototypes.get(name);
+    const prototype = Object.create(AsyncIteratorPrototype);
+    const stateOf = (object) => {
+      const state = isObject(object) ? asyncIterators.get(object) : undefined;
+      if (state === undefined || state.name !== name) throw new TypeError("The value is not a " + name + " async iterator.");
+      return state;
+    };
+
+    defineMethod(prototype, "next", 0, function next() {
+      let state;
+      try { state = stateOf(this); } catch (error) { return Promise.reject(error); }
+      const nextSteps = () => {
+        if (state.finished) return Promise.resolve(iteratorResult(undefined, true));
+        return iteratorCall(state, "next", []).then(
+          (next) => {
+            state.ongoing = null;
+            if (next.done) {
+              state.finished = true;
+              return iteratorResult(undefined, true);
+            }
+            return iteratorResult(next.value, false);
+          },
+          (reason) => {
+            state.ongoing = null;
+            state.finished = true;
+            throw reason;
+          },
+        );
+      };
+      state.ongoing = state.ongoing === null ? nextSteps() : state.ongoing.then(nextSteps, nextSteps);
+      return state.ongoing;
+    });
+
+    defineMethod(prototype, "return", 1, function (value) {
+      let state;
+      try { state = stateOf(this); } catch (error) { return Promise.reject(error); }
+      const returnSteps = () => {
+        if (state.finished) return Promise.resolve(iteratorResult(value, true));
+        state.finished = true;
+        return iteratorCall(state, "return", [encodeAny(value)]);
+      };
+      state.ongoing = state.ongoing === null ? returnSteps() : state.ongoing.then(returnSteps, returnSteps);
+      return state.ongoing.then(() => iteratorResult(value, true));
+    });
+
+    Object.defineProperty(prototype, Symbol.toStringTag, { value: name + " AsyncIterator", configurable: true });
+    asyncIteratorPrototypes.set(name, prototype);
+    return prototype;
   }
 
   // An operation or an attribute with a promise type gives a rejected
@@ -1049,14 +1238,16 @@
     }
 
     // An async iterable: `values()` and `[Symbol.asyncIterator]()` call
-    // the function `values` of the library. The steps of the iterator are
-    // steps of the Standard of the interface, thus of the library.
+    // the function `values` of the library, which gives the iterator. Its
+    // `next()` and `return()` call the library: the steps of the iterator
+    // are steps of the Standard of the interface, thus of the library.
     for (const m of members) {
       if (m.type === "async_iterable") {
         defineMethod(cls.prototype, "values", 0, function (...values) {
           const self = { $h: handleOf(this, name, "values") };
           const args = convertArguments(name, "values", m.arguments || [], values);
-          return decodeAny(call({ i: name, k: "operation", m: "values", self, a: args, n: (m.arguments || []).length }));
+          const result = call({ i: name, k: "operation", m: "values", self, a: args, n: (m.arguments || []).length });
+          return asyncIterator(name, result.$h);
         });
         Object.defineProperty(cls.prototype, Symbol.asyncIterator, {
           value: cls.prototype.values, writable: true, configurable: true,

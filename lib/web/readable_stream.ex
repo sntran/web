@@ -44,6 +44,7 @@ defmodule Web.ReadableStream do
   alias Web.AsyncContext.Snapshot
   alias Web.Blob
   alias Web.Internal.LazyStream
+  alias Web.Internal.ReadableByteStreamTee
   alias Web.Internal.ReadableStreamTee
   alias Web.Promise
   alias Web.ReadableByteStreamController
@@ -179,6 +180,8 @@ defmodule Web.ReadableStream do
     if not is_number(high_water_mark) or high_water_mark < 0 do
       raise Web.RangeError, "Invalid high water mark: #{inspect(high_water_mark)}"
     end
+
+    :ok = validate_auto_allocate_chunk_size!(stream_type, underlying_source)
 
     stream_opts =
       opts
@@ -411,6 +414,21 @@ defmodule Web.ReadableStream do
   end
 
   defp source_stream_type(_underlying_source), do: :default
+
+  # SetUpReadableByteStreamControllerFromUnderlyingSource: the size of the
+  # buffer of a default read of a byte stream is a positive integer.
+  defp validate_auto_allocate_chunk_size!(:bytes, source) do
+    case source_auto_allocate_chunk_size(source) do
+      size when is_nil(size) or (is_integer(size) and size > 0) ->
+        :ok
+
+      size ->
+        raise TypeError,
+              "The option autoAllocateChunkSize must be an integer above 0, got: #{inspect(size)}"
+    end
+  end
+
+  defp validate_auto_allocate_chunk_size!(:default, _source), do: :ok
 
   defp source_auto_allocate_chunk_size(%{} = source) do
     Map.get(source, :auto_allocate_chunk_size)
@@ -700,17 +718,46 @@ defmodule Web.ReadableStream do
     Web.Stream.call(pid, {:read, self()}, {:error, :not_locked_by_reader})
   end
 
+  @doc """
+  Returns an asynchronous iterator of the chunks of the stream, as
+  `values(options)` and `[Symbol.asyncIterator]()` of the Streams Standard.
+
+  The iterator takes a default reader: the stream becomes locked. See
+  `Web.ReadableStreamAsyncIterator` for its functions `next/1` and
+  `return/2`. The lock is released at the end of the stream, at an error,
+  and at `return/2`.
+
+  ## Options
+
+    * `:prevent_cancel` - if `true`, `Web.ReadableStreamAsyncIterator.return/2`
+      releases the lock and does not cancel the stream. The default is
+      `false`.
+
+  Raises `Web.TypeError` if the stream is locked.
+
+  ## Examples
+
+      iex> stream = Web.ReadableStream.from(["a", "b"])
+      iex> iterator = Web.ReadableStream.values(stream)
+      iex> Web.await(Web.ReadableStreamAsyncIterator.next(iterator))
+      %{value: "a", done: false}
+      iex> Web.await(Web.ReadableStreamAsyncIterator.return(iterator))
+      %{value: nil, done: true}
+      iex> Web.ReadableStream.locked?(stream)
+      false
+  """
+  @spec values(t(), keyword()) :: Web.ReadableStreamAsyncIterator.t()
+  def values(%__MODULE__{} = stream, opts \\ []) when is_list(opts) do
+    prevent_cancel = Keyword.get(opts, :prevent_cancel, false) == true
+    Web.ReadableStreamAsyncIterator.__new__(get_reader(stream), prevent_cancel)
+  end
+
   @doc false
   # A batch read of `max` chunks at most, for the lock of `owner`. See the
   # request `:read_batch` of `Web.Stream`. The answer is `{:chunks, list}`,
   # `{:ok, chunk}`, `:done`, or `{:error, reason}`.
   def read_batch(pid, owner, max) when is_pid(pid) and is_integer(max) and max > 0 do
     Web.Stream.request(pid, {:read_batch, owner, max}, {:error, :not_locked_by_reader})
-  end
-
-  @doc false
-  def byob_read(pid, view) when is_pid(pid) do
-    Web.Stream.call(pid, {:byob_read, self(), view}, {:error, :not_locked_by_reader})
   end
 
   def release_lock(pid, owner \\ self()) do
@@ -1218,20 +1265,22 @@ defmodule Web.ReadableStream do
   @no_callback_timeout 4_294_967_295
 
   # The two branches are usual streams of the type of the source. The tee
-  # process reads the source for them.
+  # process reads the source for them: ReadableStreamDefaultTee, or
+  # ReadableByteStreamTee for a byte stream.
   defp do_tee(%__MODULE__{controller_pid: source}) do
-    type = source_type(source)
+    tee_module =
+      if source_type(source) == :bytes, do: ReadableByteStreamTee, else: ReadableStreamTee
 
-    with {:ok, tee} <- ReadableStreamTee.start(source) do
+    with {:ok, tee} <- tee_module.start(source) do
       # The cancel callback of a branch waits until the two branches are
       # cancelled, thus a branch has no time limit for its callbacks.
       [branch1, branch2] =
         for index <- [1, 2] do
-          new(tee_branch_source(tee, index, type), timeout_ms: @no_callback_timeout)
+          new(tee_branch_source(tee_module, tee, index), timeout_ms: @no_callback_timeout)
         end
 
       :ok =
-        ReadableStreamTee.attach(
+        tee_module.attach(
           tee,
           branch1.controller_pid,
           branch2.controller_pid
@@ -1241,13 +1290,24 @@ defmodule Web.ReadableStream do
     end
   end
 
-  defp tee_branch_source(tee, index, type) do
-    source = %{
+  defp tee_branch_source(ReadableStreamTee, tee, index) do
+    %{
       pull: fn _controller -> ReadableStreamTee.pull(tee, index) end,
       cancel: fn reason -> ReadableStreamTee.cancel(tee, index, reason) end
     }
+  end
 
-    if type == :bytes, do: Map.put(source, :type, "bytes"), else: source
+  # The pull of a branch of a byte stream gives the BYOB request of the
+  # branch.
+  defp tee_branch_source(ReadableByteStreamTee, tee, index) do
+    %{
+      type: "bytes",
+      pull: fn controller ->
+        request = ReadableByteStreamController.byob_request(controller)
+        ReadableByteStreamTee.pull(tee, index, request)
+      end,
+      cancel: fn reason -> ReadableByteStreamTee.cancel(tee, index, reason) end
+    }
   end
 
   defp source_type(pid) do

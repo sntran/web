@@ -368,10 +368,18 @@ defmodule Web.TextDecoder do
     %{state | carry: "", bom_seen: false}
   end
 
+  # The Encoding Standard decodes a copy of the bytes of the buffer, as
+  # WebIDL specifies: a detached buffer has no bytes.
   defp normalize_input(nil), do: ""
   defp normalize_input(input) when is_binary(input), do: input
-  defp normalize_input(%Uint8Array{} = input), do: Uint8Array.to_binary(input)
-  defp normalize_input(%Web.ArrayBuffer{} = input), do: Web.ArrayBuffer.data(input)
+
+  defp normalize_input(%Uint8Array{buffer: buffer} = input) do
+    if Web.ArrayBuffer.detached?(buffer), do: "", else: Uint8Array.to_binary(input)
+  end
+
+  defp normalize_input(%Web.ArrayBuffer{} = input) do
+    if Web.ArrayBuffer.detached?(input), do: "", else: Web.ArrayBuffer.data(input)
+  end
 
   defp normalize_input(_input) do
     raise TypeError, "TextDecoder.decode input must be a binary or Uint8Array"

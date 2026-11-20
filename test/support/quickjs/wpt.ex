@@ -127,8 +127,72 @@ defmodule Web.Test.QuickJS.WPT do
     Enum.find_value(causes(), "library: a different result", &match(&1, path, name, message))
   end
 
+  @no_view_type "library: no view type other than Uint8Array"
+  @no_microtask "runner: the library reacts before the microtasks of JavaScript"
+
   # The rules, in their sequence: the first rule that gives a group wins.
   defp causes do
+    [
+      # The views of the library are `Web.Uint8Array` values. A BYOB read
+      # into a view with elements of more than one byte, or into a
+      # `DataView`, needs a view type of that kind.
+      {:test, "streams/readable-byte-streams/general.any.js", ~r/Uint16Array|Uint32Array/,
+       @no_view_type},
+      {:test, "streams/readable-byte-streams/read-min.any.js", ~r/Uint16Array|DataView/,
+       @no_view_type}
+    ] ++ microtask_causes() ++ base_causes()
+  end
+
+  # The Streams Standard reacts to the end of `start` and of `pull`, and to
+  # a chunk of a tee, in a microtask. The library reacts at once, and the
+  # bridge answers when the library is at rest. Thus in these tests the
+  # library pulls before the next statement of JavaScript, or a cancel of
+  # JavaScript comes after a pull that the Standard does later.
+  defp microtask_causes do
+    for {path, names} <- [
+          {"streams/readable-byte-streams/general.any.js",
+           [
+             "Automatic pull() after start() and read()",
+             "Automatic pull() after start() and read(view)",
+             "autoAllocateChunkSize",
+             "Respond to pull() by enqueue() asynchronously",
+             "Respond to multiple pull() by separate enqueue()",
+             "getReader(), read(view), then cancel()",
+             "read() twice, then enqueue() twice",
+             "Multiple read(view), close() and respond()",
+             "Multiple read(view), big enqueue()",
+             "Multiple read(view) and multiple enqueue()"
+           ]},
+          {"streams/readable-byte-streams/read-min.any.js",
+           [
+             "getReader(), read({ min }), then cancel()",
+             "cancel() with partially filled pending read({ min }) request"
+           ]},
+          {"streams/readable-byte-streams/tee.any.js",
+           ["respond() and close() while both branches are pulling"]}
+        ],
+        name <- names do
+      prefix =
+        if String.ends_with?(path, "tee.any.js"),
+          do: "ReadableStream teeing with byte source: ",
+          else: "ReadableStream with byte source: "
+
+      {:test, path, prefix <> name, @no_microtask}
+    end ++
+      [
+        {:test, "streams/readable-byte-streams/respond-after-enqueue.any.js",
+         "byobRequest.respond() after enqueue() with double read should not crash",
+         @no_microtask},
+        {:test, "streams/readable-streams/async-iterator.any.js",
+         ~r/^next\(\) that succeeds; return\(\)|^return\(\); next\(\) with delayed cancel\(\) \[no awaiting\]/,
+         @no_microtask},
+        # A getter `then` on `Object.prototype` runs in a reaction of the
+        # runner, during the answer of a request.
+        {:text, ["came during the request"], "runner: a request in a getter of Object.prototype"}
+      ]
+  end
+
+  defp base_causes do
     [
       # The Encoding Standard now starts a new decoder after a fatal error
       # ("Set this's do not flush to false"). These tests expect the state

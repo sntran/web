@@ -66,7 +66,7 @@ defmodule Web.Internal.Address do
   @spec mint_options(String.t(), keyword()) :: keyword()
   def mint_options(host, options), do: Keyword.put(options, :hostname, hostname(host))
 
-  @doc "The host with no brackets: `\"[::1]\"` is `\"::1\"`."
+  @doc ~S(The host with no brackets: `"[::1]"` is `"::1"`.)
   @spec hostname(String.t()) :: String.t()
   def hostname("[" <> rest), do: String.trim_trailing(rest, "]")
   def hostname(host), do: host

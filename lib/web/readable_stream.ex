@@ -44,6 +44,7 @@ defmodule Web.ReadableStream do
   alias Web.AsyncContext.Snapshot
   alias Web.Blob
   alias Web.Internal.LazyStream
+  alias Web.Internal.QueuingStrategy
   alias Web.Internal.ReadableByteStreamTee
   alias Web.Internal.ReadableStreamTee
   alias Web.Promise
@@ -153,6 +154,26 @@ defmodule Web.ReadableStream do
   @doc """
   Creates a new ReadableStream with the given underlying source.
 
+  ## The queuing strategy
+
+  The options `:high_water_mark` and `:size` are the members of the
+  dictionary `QueuingStrategy` of the Streams Standard:
+
+    * `:high_water_mark` - the limit of the queue: a number that is not
+      below zero, or `:infinity`. The default is 1, and 0 for a byte stream.
+    * `:size` - a function that gives the size of a chunk. The default
+      counts each chunk as 1. The function runs in the process that
+      enqueues the chunk. A size that is not a number, or that is below
+      zero, or `:infinity`, puts the stream in the errored state, and the
+      enqueue raises `Web.RangeError`.
+
+  The option `:strategy` takes a `Web.CountQueuingStrategy` or a
+  `Web.ByteLengthQueuingStrategy` instead.
+
+  Raises `Web.RangeError` for a high water mark that is NaN or below zero,
+  and for a byte stream with a size function. Raises `Web.TypeError` for a
+  size that is not a function.
+
   ## Examples
 
       iex> source = %{
@@ -175,11 +196,7 @@ defmodule Web.ReadableStream do
   def __new__(underlying_source, opts, internal) when is_list(opts) and is_list(internal) do
     :ok = validate_source!(underlying_source)
     stream_type = source_stream_type(underlying_source)
-    {high_water_mark, strategy} = normalize_stream_options(underlying_source, opts)
-
-    if not is_number(high_water_mark) or high_water_mark < 0 do
-      raise Web.RangeError, "Invalid high water mark: #{inspect(high_water_mark)}"
-    end
+    {high_water_mark, strategy, size} = normalize_stream_options(underlying_source, opts)
 
     :ok = validate_auto_allocate_chunk_size!(stream_type, underlying_source)
 
@@ -188,6 +205,7 @@ defmodule Web.ReadableStream do
       |> Keyword.put(:source, underlying_source)
       |> Keyword.put(:high_water_mark, high_water_mark)
       |> Keyword.put(:strategy, strategy)
+      |> Keyword.put(:size, size)
       |> Keyword.put(:stream_type, stream_type)
       |> Keyword.put(
         :auto_allocate_chunk_size,
@@ -346,36 +364,37 @@ defmodule Web.ReadableStream do
     end
   end
 
+  # ExtractSizeAlgorithm and ExtractHighWaterMark of the Streams Standard.
+  # The option `:high_water_mark` and the option `:size` change the values
+  # of the option `:strategy`.
   defp normalize_stream_options(underlying_source, opts) do
     stream_type = source_stream_type(underlying_source)
 
-    # The Streams Standard gives a byte stream the high water mark 0, and
-    # each other stream the high water mark 1.
-    default_hwm =
-      case underlying_source do
-        %{} = source ->
-          Map.get(source, :high_water_mark, if(stream_type == :bytes, do: 0, else: 1))
+    if stream_type == :bytes and not is_nil(Keyword.get(opts, :size)) do
+      raise Web.RangeError, "A byte stream cannot have a size function."
+    end
 
-        _ ->
-          1
-      end
+    strategy = Keyword.get(opts, :strategy) || source_value(underlying_source, :strategy, nil)
 
-    strategy_from_source =
-      case underlying_source do
-        %{} = source -> Map.get(source, :strategy)
-        _ -> nil
-      end
+    {strategy_hwm, strategy_size} =
+      QueuingStrategy.extract!(strategy, source_default_hwm(underlying_source, stream_type))
 
-    strategy =
-      Keyword.get_lazy(opts, :strategy, fn ->
-        strategy_from_source || default_strategy_for(stream_type, default_hwm)
-      end)
+    {high_water_mark, size} =
+      QueuingStrategy.extract!(Keyword.take(opts, [:high_water_mark, :size]), strategy_hwm)
 
-    high_water_mark =
-      Keyword.get(opts, :high_water_mark, Map.get(strategy, :high_water_mark, default_hwm))
-
-    {high_water_mark, strategy}
+    high_water_mark = QueuingStrategy.high_water_mark!(high_water_mark, 1)
+    size = if is_nil(Keyword.get(opts, :size)), do: strategy_size, else: size
+    {high_water_mark, strategy || default_strategy_for(stream_type, high_water_mark), size}
   end
+
+  # The Streams Standard gives a byte stream the high water mark 0, and each
+  # other stream the high water mark 1. A source map can give a different
+  # one.
+  defp source_default_hwm(source, :bytes), do: source_value(source, :high_water_mark, 0)
+  defp source_default_hwm(source, :default), do: source_value(source, :high_water_mark, 1)
+
+  defp source_value(%{} = source, key, default), do: Map.get(source, key, default)
+  defp source_value(_source, _key, default), do: default
 
   @source_callbacks [start: 1, pull: 1, cancel: 1]
 
@@ -683,14 +702,8 @@ defmodule Web.ReadableStream do
   end
 
   def get_reader(pid, opts) when is_pid(pid) and is_list(opts) do
-    request =
-      case reader_mode_from_options(opts) do
-        :default -> {:get_reader, self()}
-        :byob -> {:get_reader, self(), :byob}
-      end
-
-    case Web.Stream.call(pid, request, {:error, :released}) do
-      {:ok, _ref} -> :ok
+    case lock_reader(pid, reader_mode_from_options(opts)) do
+      {:ok, _lock} -> :ok
       {:error, reason} -> {:error, reason}
     end
   end
@@ -701,10 +714,12 @@ defmodule Web.ReadableStream do
     get_reader(%__MODULE__{controller_pid: process!(stream)})
   end
 
+  # The reader keeps the reference of its lock: see
+  # `Web.ReadableStreamDefaultReader`.
   def get_reader(%__MODULE__{controller_pid: pid}) do
-    case get_reader(pid, []) do
-      :ok ->
-        %Web.ReadableStreamDefaultReader{controller_pid: pid, owner_pid: self()}
+    case lock_reader(pid, :default) do
+      {:ok, lock} ->
+        %Web.ReadableStreamDefaultReader{controller_pid: pid, owner_pid: self(), lock: lock}
 
       {:error, :already_locked} ->
         raise TypeError, "ReadableStream is already locked"
@@ -712,6 +727,18 @@ defmodule Web.ReadableStream do
       {:error, :released} ->
         raise TypeError, @released_message
     end
+  end
+
+  # Takes the reader lock for this process. Returns `{:ok, lock}` with the
+  # reference of the lock, or `{:error, reason}`.
+  defp lock_reader(pid, mode) do
+    request =
+      case mode do
+        :default -> {:get_reader, self()}
+        :byob -> {:get_reader, self(), :byob}
+      end
+
+    Web.Stream.call(pid, request, {:error, :released})
   end
 
   def read(pid) do
@@ -800,21 +827,65 @@ defmodule Web.ReadableStream do
   @doc false
   # `enqueue` of a controller, as in the Streams Standard: raises
   # `Web.TypeError` when the stream is closed or errored.
-  def controller_enqueue(pid, chunk) do
-    pid
-    |> Web.Stream.call({:enqueue, chunk}, {:error, :closed})
-    |> controller_result("enqueue a chunk")
+  #
+  # The size function of the user runs in this process, as in the Standard:
+  # thus the function can call the stream. A size that is not valid puts the
+  # stream in the errored state. Then the controller of a readable stream
+  # (`kind` is `:readable`) raises or throws the error of the size, and the
+  # controller of a transform stream (`:transform`) the error of the stream.
+  def controller_enqueue(pid, chunk, kind \\ :readable) do
+    case Web.Stream.call(pid, {:enqueue, chunk}, {:error, :closed}) do
+      {:size, size} -> enqueue_with_size(pid, chunk, size, kind)
+      reply -> controller_result(reply, "enqueue a chunk", kind)
+    end
   end
+
+  defp enqueue_with_size(pid, chunk, size, kind) do
+    result = QueuingStrategy.call(size, chunk)
+
+    case Web.Stream.call(pid, {:enqueue_sized, chunk, result}, :gone) do
+      :ok ->
+        :ok
+
+      {:error, {:size, reason, stored}} ->
+        size_failure(result, reason, stored, kind)
+
+      # The stream stopped. The chunk has no effect, but the error of the
+      # size is still an error of the call.
+      :gone ->
+        case QueuingStrategy.validate(result) do
+          {:ok, _size} -> :ok
+          {:error, reason} -> size_failure(result, reason, reason, kind)
+        end
+    end
+  end
+
+  defp size_failure(_result, _reason, stored, :transform), do: raise_value(stored)
+
+  defp size_failure({:thrown, kind, value, stacktrace}, _reason, _stored, :readable),
+    do: :erlang.raise(kind, value, stacktrace)
+
+  defp size_failure(_result, reason, _stored, :readable), do: raise(reason)
+
+  # The error of a stream: an exception is raised, and each other value is
+  # thrown, as a JavaScript value.
+  defp raise_value(error) when is_exception(error), do: raise(error)
+  defp raise_value(value), do: throw(value)
 
   @doc false
-  # `close` of a controller: see `controller_enqueue/2`.
+  # `close` of a controller: see `controller_enqueue/3`.
   def controller_close(pid) do
-    pid |> Web.Stream.call(:close, {:error, :closed}) |> controller_result("close")
+    pid |> Web.Stream.call(:close, {:error, :closed}) |> controller_result("close", :readable)
   end
 
-  defp controller_result(:ok, _action), do: :ok
+  defp controller_result(:ok, _action, _kind), do: :ok
 
-  defp controller_result({:error, state}, action) do
+  # A size of the strategy of the library that is not valid, for example
+  # the byte length of a chunk with no bytes.
+  defp controller_result({:error, {:size, reason, stored}}, _action, kind),
+    do: size_failure(nil, reason, stored, kind)
+
+  defp controller_result({:error, state}, action, _kind) do
     raise TypeError, "Cannot #{action}: the stream is #{state}."
   end
 
@@ -1371,8 +1442,11 @@ defimpl Enumerable, for: Web.ReadableStream do
   # stops and the stream process can stop.
   defp do_reduce({reader, _chunks, _batch}, {:halt, acc}, _fun) do
     # The stream is cancelled when this call returns. The call does not
-    # wait for the cancel callback of the source.
+    # wait for the cancel callback of the source. A cancel does not release
+    # the lock: the enumeration releases it, as the `return()` of an async
+    # iterator of the Streams Standard does.
     _ = Web.Stream.call(reader.controller_pid, {:terminate_detached, :cancel, :halted}, :ok)
+    ReadableStreamDefaultReader.release_lock(reader)
     {:halted, acc}
   end
 

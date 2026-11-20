@@ -1,8 +1,7 @@
 {
   "harness": "OK",
   "failures": {
-    "it should be possible to call transform() synchronously": "library: the checks of a high water mark",
-    "methods should not not have .apply() or .call() called": "library: a different result",
-    "terminate() should abort writable immediately after readable.cancel()": "library: a different result"
+    "methods should not not have .apply() or .call() called": "runner: the layer calls a callback with apply",
+    "terminate() should abort writable immediately after readable.cancel()": "library: a transform stream has one state for its two sides"
   }
 }

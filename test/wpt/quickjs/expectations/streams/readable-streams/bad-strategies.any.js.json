@@ -1,10 +1,7 @@
 {
   "harness": "OK",
   "failures": {
-    "Readable stream: invalid strategy.size return value": "library: a different result",
-    "Readable stream: invalid strategy.size return value when pulling": "library: a different result",
-    "Readable stream: strategy.size errors the stream and then returns Infinity": "library: a different result",
-    "Readable stream: strategy.size errors the stream and then throws": "library: a different result",
-    "Readable stream: throwing strategy.size method": "library: a different result"
+    "Readable stream: invalid strategy.size return value": "runner: an error of the library is a new object each time",
+    "Readable stream: invalid strategy.size return value when pulling": "runner: an error of the library is a new object each time"
   }
 }

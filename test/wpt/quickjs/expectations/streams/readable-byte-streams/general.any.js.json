@@ -1,7 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "ReadableStream constructor should not accept a strategy with a size defined if type is \"bytes\"": "library: a different result",
     "ReadableStream with byte source: A stream must be errored if close()-d before fulfilling read(view) with Uint16Array": "library: no view type other than Uint8Array",
     "ReadableStream with byte source: Automatic pull() after start() and read()": "runner: the library reacts before the microtasks of JavaScript",
     "ReadableStream with byte source: Automatic pull() after start() and read(view)": "runner: the library reacts before the microtasks of JavaScript",

@@ -5,7 +5,10 @@ defmodule Web.ReadableStreamDefaultReader do
   Follows WHATWG §3.5: `read/1` returns a `%Web.Promise{}` that resolves to a
   `ReadableStreamReadResult` map (`%{value: term(), done: boolean()}`).
   """
-  defstruct [:controller_pid, :owner_pid]
+  defstruct [:controller_pid, :owner_pid, :lock]
+
+  @typedoc "A reader. The fields are private."
+  @type t :: %__MODULE__{controller_pid: pid(), owner_pid: pid() | nil, lock: reference() | nil}
 
   alias Web.ReadableStream
   alias Web.TypeError
@@ -37,7 +40,7 @@ defmodule Web.ReadableStreamDefaultReader do
   def read(%__MODULE__{controller_pid: pid} = reader) do
     Web.Stream.promise_call(
       pid,
-      {:read, owner(reader)},
+      as_reader(reader, {:read, owner(reader)}),
       {:error, :not_locked_by_reader},
       &read_result/1
     )
@@ -53,7 +56,10 @@ defmodule Web.ReadableStreamDefaultReader do
   # that process keeps the chunk for the linger time of a promise.
   def read_now(%__MODULE__{controller_pid: pid} = reader) do
     pid
-    |> Web.Stream.request({:read, owner(reader)}, {:error, :not_locked_by_reader})
+    |> Web.Stream.request(
+      as_reader(reader, {:read, owner(reader)}),
+      {:error, :not_locked_by_reader}
+    )
     |> read_result()
   end
 
@@ -91,27 +97,62 @@ defmodule Web.ReadableStreamDefaultReader do
   defp owner(%__MODULE__{owner_pid: owner}) when is_pid(owner), do: owner
   defp owner(%__MODULE__{}), do: self()
 
+  # A request of this reader. A reader from `Web.ReadableStream.get_reader/1`
+  # has the reference of its lock: a reader that released its lock has no
+  # effect on the stream, also when the same process has a new reader.
+  defp as_reader(%__MODULE__{lock: nil}, message), do: message
+  defp as_reader(%__MODULE__{lock: lock}, message), do: {:as_reader, lock, message}
+
   @doc """
   Releases the reader's lock on the stream.
   """
-  def release_lock(%__MODULE__{controller_pid: pid} = reader) do
+  def release_lock(%__MODULE__{lock: nil, controller_pid: pid} = reader) do
     ReadableStream.release_lock(pid, owner(reader))
+  end
+
+  def release_lock(%__MODULE__{controller_pid: pid} = reader) do
+    Web.Stream.call(pid, as_reader(reader, {:release_lock, :reader, owner(reader)}), :ok)
   end
 
   @doc """
   Returns a promise that fulfils when the stream is closed, as the attribute
   `closed`. It rejects with the error of the stream when the stream is
   errored, and with `Web.TypeError` when the lock of the reader is released.
+
+  Each call gives the same promise, as in the Streams Standard. A release of
+  the lock of a stream that is closed or errored replaces the promise with
+  a promise that is rejected with `Web.TypeError`.
   """
-  def closed(%__MODULE__{controller_pid: pid} = reader) do
+  def closed(%__MODULE__{lock: nil, controller_pid: pid} = reader) do
     ReadableStream.reader_closed(pid, owner(reader))
+  end
+
+  def closed(%__MODULE__{controller_pid: pid, lock: lock}) do
+    case Web.Stream.call(pid, {:reader_closed, lock}, :gone) do
+      %Web.Promise{} = promise -> promise
+      # The stream stopped: it was closed or errored.
+      :gone -> Web.Promise.resolve(:ok)
+    end
   end
 
   @doc """
   Cancels the stream, returning the `%Web.Promise{}` from the underlying
   stream cancellation so callers can await cleanup completion.
+
+  The reader keeps its lock, as in the Streams Standard. A reader that
+  released its lock gives a promise that rejects with `Web.TypeError`.
   """
-  def cancel(%__MODULE__{controller_pid: pid}, reason \\ :cancelled) do
+  def cancel(reader, reason \\ :cancelled)
+
+  def cancel(%__MODULE__{lock: nil, controller_pid: pid}, reason) do
     ReadableStream.cancel(pid, reason)
+  end
+
+  def cancel(%__MODULE__{controller_pid: pid} = reader, reason) do
+    Web.Stream.promise_call(pid, as_reader(reader, {:terminate, :cancel, reason}), :ok, fn
+      :ok -> {:ok, :ok}
+      {:error, :not_locked_by_reader} -> read_result({:error, :not_locked_by_reader})
+      {:error, thrown} -> {:error, thrown}
+    end)
   end
 end

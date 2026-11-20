@@ -3,8 +3,15 @@ defmodule Web.TextEncoderStream do
   A transform stream from text to UTF-8 bytes, as `TextEncoderStream` of the
   Encoding Standard.
 
-  Each chunk that is written must be a string. Each chunk that is read is a
-  `Web.Uint8Array`. An empty string gives no chunk.
+  Each chunk that is read is a `Web.Uint8Array`. An empty string gives no
+  chunk.
+
+  The Standard converts each chunk that is written to a string. A chunk
+  that is not a string becomes a string through the protocol `String.Chars`
+  of Elixir, as with interpolation: for example `3.14` gives `"3.14"`, and
+  `nil` gives `""`. A chunk with no `String.Chars` implementation, such as
+  a map, puts the two sides of the stream in the errored state with
+  `Web.TypeError`.
 
   A string of the BEAM is a binary, and can contain bytes that are not valid
   UTF-8. Such bytes become U+FFFD. A code point that is divided between two
@@ -39,13 +46,9 @@ defmodule Web.TextEncoderStream do
 
     stream =
       TransformStream.new(%{
-        transform: fn
-          chunk, controller when is_binary(chunk) ->
-            enqueue_text(controller, TextDecoder.decode(decoder, chunk, %{stream: true}))
-
-          chunk, _controller ->
-            raise Web.TypeError,
-                  "TextEncoderStream chunk must be a string, got: #{inspect(chunk)}"
+        transform: fn chunk, controller ->
+          text = to_text!(chunk)
+          enqueue_text(controller, TextDecoder.decode(decoder, text, %{stream: true}))
         end,
         flush: fn controller ->
           text = TextDecoder.decode(decoder, <<>>, %{stream: false})
@@ -56,6 +59,18 @@ defmodule Web.TextEncoderStream do
       })
 
     %__MODULE__{readable: stream.readable, writable: stream.writable}
+  end
+
+  # The conversion of a chunk to a string.
+  defp to_text!(chunk) when is_binary(chunk), do: chunk
+
+  defp to_text!(chunk) do
+    String.Chars.to_string(chunk)
+  rescue
+    _error in [Protocol.UndefinedError, ArgumentError] ->
+      reraise Web.TypeError,
+              [message: "TextEncoderStream cannot convert #{inspect(chunk)} to a string."],
+              __STACKTRACE__
   end
 
   defp enqueue_text(_controller, ""), do: :ok

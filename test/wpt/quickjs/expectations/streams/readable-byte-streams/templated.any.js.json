@@ -1,9 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "ReadableStream with byte source (empty) BYOB reader: canceling via the reader should cause the reader to act closed": "library: a different result",
-    "ReadableStream with byte source (empty) BYOB reader: releasing the lock should cause closed calls to reject with a TypeError": "library: a different result",
-    "ReadableStream with byte source (empty) default reader: canceling via the reader should cause the reader to act closed": "library: a different result",
-    "ReadableStream with byte source (empty) default reader: releasing the lock should cause closed calls to reject with a TypeError": "library: a different result"
+    "ReadableStream with byte source (empty) BYOB reader: releasing the lock should cause closed calls to reject with a TypeError": "library: a different result"
   }
 }

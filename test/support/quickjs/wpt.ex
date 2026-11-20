@@ -16,6 +16,9 @@ defmodule Web.Test.QuickJS.WPT do
 
   @root Path.expand("../../wpt/quickjs/expectations", __DIR__)
   @newer_standard "standard: the current Standard changed this test"
+  @microtask "runner: the library does the steps of a later microtask before the call returns"
+  @one_state "library: a transform stream has one state for its two sides"
+  @new_error "runner: an error of the library is a new object each time"
 
   @doc "Runs the WPT file at `path`, and compares the results with the list."
   def check!(path) do
@@ -203,6 +206,62 @@ defmodule Web.Test.QuickJS.WPT do
        "EUC-JP JIS0212 state after a fatal streaming error", @newer_standard},
       {:test, "encoding/textdecoder-mistakes.any.js", "fatal stream: iso-2022-jp",
        @newer_standard},
+      # The library does at once the steps that JavaScript does in a later
+      # microtask, for example the start of a stream or the end of a write.
+      # The bridge answers a call when the library is at rest: thus a test
+      # sees the end of these steps before JavaScript does them.
+      {:test, "streams/readable-streams/general.any.js",
+       ~r/^ReadableStream: should (call pull when trying to read from a started, empty stream|only call pull once on a non-empty stream read from before start fulfills)$/,
+       @microtask},
+      {:test, "streams/readable-streams/tee.any.js",
+       "ReadableStream teeing: errors in the source should propagate to both branches",
+       @microtask},
+      {:test, "streams/readable-streams/reentrant-strategies.any.js",
+       "tee() inside size() should work", @microtask},
+      {:test, "streams/transform-streams/reentrant-strategies.any.js",
+       ~r/^writer\.(write|close)\(\) inside size\(\) should work$/, @microtask},
+      {:test, "streams/writable-streams/floating-point-total-queue-size.any.js", ~r//,
+       @microtask},
+      # The bridge sends the settled promises in the sequence in which
+      # JavaScript made them, not in the sequence in which they settled.
+      {:test, "encoding/streams/backpressure.any.js", ~r//,
+       "runner: the promises settle in the sequence of their creation"},
+      # The size function of a strategy object is a usual JavaScript function
+      # of the layer: it has a prototype, and its length is 1.
+      {:test, "streams/queuing-strategies.any.js",
+       ~r/size should (not have a prototype property|not be a constructor|have the right length)$/,
+       "runner: the size function of a strategy is a usual function"},
+      # An error that the library makes is a new JavaScript object each time
+      # that it goes to JavaScript.
+      {:test, "streams/readable-streams/bad-strategies.any.js",
+       ~r/^Readable stream: invalid strategy\.size return value/, @new_error},
+      {:test, "streams/writable-streams/bad-strategies.any.js",
+       "Writable stream: invalid strategy.size return value", @new_error},
+      {:text, ["apply() should not be called"], "runner: the layer calls a callback with apply"},
+      # The library cannot read a property of a JavaScript object, such as
+      # `byteLength`. A binary of Elixir is bytes: a string has a byte length.
+      {:test, "streams/writable-streams/byte-length-queuing-strategy.any.js", ~r//,
+       "runner: the library cannot read a property of a JavaScript object"},
+      {:test, "streams/queuing-strategies.any.js",
+       "ByteLengthQueuingStrategy: size behaves as expected with strange arguments",
+       "library: a binary has a byte length, and an object is not a map"},
+      # `TextEncoderStream` converts a chunk to a string with `String.Chars`
+      # of Elixir, not with the conversion of JavaScript.
+      {:test, "encoding/streams/encode-bad-chunks.any.js", ~r//,
+       "library: String.Chars converts a chunk, not the rules of JavaScript"},
+      # A transform stream is one process with one state for its two sides.
+      # The Standard has a writable side that can be "erroring" while the
+      # readable side is readable, and one promise for flush and cancel.
+      {:test, "streams/transform-streams/reentrant-strategies.any.js",
+       ~r/^(error|readable cancel|writer\.abort)\(\) inside size\(\) should work$/, @one_state},
+      {:test, "streams/transform-streams/strategies.any.js",
+       ~r/^a bad readableStrategy size function should error the stream on enqueue even when/,
+       @one_state},
+      {:test, "streams/transform-streams/general.any.js",
+       "terminate() should abort writable immediately after readable.cancel()", @one_state},
+      {:path, "streams/transform-streams/cancel.any.js", @one_state},
+      {:path, "streams/transform-streams/errors.any.js", @one_state},
+      {:path, "streams/transform-streams/terminate.any.js", @one_state},
       # The conversion of WebIDL to an async sequence is not in the layer
       # yet: `ReadableStream.from()` needs it.
       {:text, ["async_sequence is not in the layer"], "runner: no async sequence"},

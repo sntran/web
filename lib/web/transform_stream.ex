@@ -37,6 +37,7 @@ defmodule Web.TransformStream do
       "HELLO"
   """
 
+  alias Web.Internal.QueuingStrategy
   alias Web.TransformStreamDefaultController, as: Controller
 
   @enforce_keys [:readable, :writable]
@@ -153,29 +154,41 @@ defmodule Web.TransformStream do
     * `:high_water_mark` - the limit of the writable side, when
       `:writable_strategy` is not given.
 
+  A strategy is a `Web.CountQueuingStrategy`, a
+  `Web.ByteLengthQueuingStrategy`, or the dictionary `QueuingStrategy` of
+  the Streams Standard: a keyword list or a map with the keys
+  `:high_water_mark` and `:size`. See `Web.ReadableStream.new/2` and
+  `Web.WritableStream.new/2`.
+
   Raises `Web.TypeError` for a transformer that is not a map, or for a
   callback that is not a function with the correct number of arguments.
   Raises `Web.RangeError` for a transformer with the key `:readable_type` or
-  `:writable_type`, as the Streams Standard specifies.
+  `:writable_type`, and for a high water mark that is NaN or below zero, as
+  the Streams Standard specifies.
   """
   @spec new(map(), keyword()) :: t()
   def new(transformer \\ %{}, opts \\ []) do
     :ok = validate_transformer!(transformer)
 
-    writable_hwm =
-      case Keyword.get(opts, :writable_strategy) do
-        %{high_water_mark: hwm} when is_number(hwm) -> hwm
-        _ -> Keyword.get(opts, :high_water_mark, 1)
-      end
+    {readable_hwm, readable_size} =
+      QueuingStrategy.extract!(Keyword.get(opts, :readable_strategy), 0)
 
-    readable_strategy = Keyword.get(opts, :readable_strategy, Web.CountQueuingStrategy.new(0))
+    {writable_hwm, writable_size} =
+      QueuingStrategy.extract!(
+        Keyword.get(opts, :writable_strategy),
+        Keyword.get(opts, :high_water_mark, 1)
+      )
+
+    writable_hwm = QueuingStrategy.high_water_mark!(writable_hwm, 1)
 
     opts =
       opts
       |> Keyword.drop([:writable_strategy, :readable_strategy])
       |> Keyword.put(:transformer, transformer)
       |> Keyword.put(:high_water_mark, writable_hwm)
-      |> Keyword.put(:strategy, readable_strategy)
+      |> Keyword.put(:strategy, Web.CountQueuingStrategy.new(readable_hwm))
+      |> Keyword.put(:readable_size, readable_size)
+      |> Keyword.put(:writable_size, writable_size)
 
     start_fn = Map.get(transformer, :start)
     {:ok, pid} = start_link(Keyword.put(opts, :has_start, is_function(start_fn)))

@@ -530,16 +530,23 @@ defmodule Web.StreamTest do
       assert slots.readable_desired_size == 0
     end
 
-    test "TransformStream falls back to writable high water mark for invalid readable strategy hwm" do
-      ts =
+    test "TransformStream refuses a readable strategy with a high water mark that is not a number" do
+      assert_raise Web.RangeError, ~r/Invalid high water mark/, fn ->
         TransformStream.new(%{},
           high_water_mark: 3,
           readable_strategy: %InvalidReadableHwmStrategy{}
         )
+      end
 
-      slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
-      assert slots.readable_hwm == 3
-      assert slots.desired_size == 3
+      # The engine has no check: the readable side gets the high water mark
+      # of the writable side.
+      {:ok, pid} =
+        Web.Stream.start_link(TransformStream,
+          high_water_mark: 3,
+          strategy: %InvalidReadableHwmStrategy{}
+        )
+
+      assert ReadableStream.__get_slots__(pid).readable_hwm == 3
     end
 
     test "ReadableStream falls back to a count strategy for invalid readable strategies" do

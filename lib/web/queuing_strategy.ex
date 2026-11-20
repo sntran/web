@@ -22,27 +22,40 @@ defmodule Web.ByteLengthQueuingStrategy do
   """
   defstruct high_water_mark: 1
 
-  @type t :: %__MODULE__{high_water_mark: number()}
+  @type t :: %__MODULE__{high_water_mark: Web.CountQueuingStrategy.high_water_mark()}
 
   @doc """
-  Makes a strategy with the given limit in bytes. Raises `Web.RangeError` for
-  a limit that is not a number, or that is below zero.
+  Makes a strategy with the given limit in bytes.
+
+  The strategy keeps the limit with no check, as the Streams Standard
+  specifies: `:infinity`, `:neg_infinity`, and `:nan` are the values
+  `Infinity`, `-Infinity`, and `NaN`. The constructor of a stream refuses a
+  limit that is NaN or below zero with `Web.RangeError`. Raises
+  `Web.TypeError` for a value that is not a number.
   """
-  @spec new(number()) :: t()
+  @spec new(Web.CountQueuingStrategy.high_water_mark()) :: t()
   def new(high_water_mark) do
-    %__MODULE__{
-      high_water_mark: Web.CountQueuingStrategy.validate_high_water_mark!(high_water_mark)
-    }
+    %__MODULE__{high_water_mark: Web.CountQueuingStrategy.__number__!(high_water_mark)}
   end
 
   @doc """
-  Returns the number of bytes of a chunk: a binary, a `Web.Uint8Array`, or a
-  `Web.ArrayBuffer`.
+  Returns the number of bytes of a chunk, as the attribute `byteLength`:
+  the size of a binary, or the field `:byte_length` of a map, for example
+  of a `Web.Uint8Array`. A `Web.ArrayBuffer` gives its length.
+
+  A chunk with no byte length gives `nil`, as `undefined` in the Standard.
+  Raises `Web.TypeError` for `nil`.
   """
-  @spec size(binary() | Web.Uint8Array.t() | Web.ArrayBuffer.t()) :: non_neg_integer()
+  @spec size(term()) :: term()
   def size(chunk) when is_binary(chunk), do: byte_size(chunk)
-  def size(%Web.Uint8Array{byte_length: byte_length}), do: byte_length
   def size(%Web.ArrayBuffer{} = buffer), do: Web.ArrayBuffer.byte_length(buffer)
+  def size(%{byte_length: byte_length}), do: byte_length
+
+  def size(nil) do
+    raise Web.TypeError, "Cannot read the byte length of nil."
+  end
+
+  def size(_chunk), do: nil
 end
 
 defmodule Web.CountQueuingStrategy do
@@ -70,16 +83,32 @@ defmodule Web.CountQueuingStrategy do
   """
   defstruct high_water_mark: 1
 
-  @type t :: %__MODULE__{high_water_mark: number()}
+  @typedoc """
+  A high water mark: a number, or `:infinity`, `:neg_infinity`, or `:nan`
+  for the values `Infinity`, `-Infinity`, and `NaN`.
+  """
+  @type high_water_mark :: number() | :infinity | :neg_infinity | :nan
+
+  @type t :: %__MODULE__{high_water_mark: high_water_mark()}
 
   @doc """
-  Makes a strategy with the given limit in chunks. Raises `Web.RangeError`
-  for a limit that is not a number, or that is below zero.
+  Makes a strategy with the given limit in chunks.
+
+  The strategy keeps the limit with no check, as the Streams Standard
+  specifies. The constructor of a stream refuses a limit that is NaN or
+  below zero with `Web.RangeError`. Raises `Web.TypeError` for a value that
+  is not a number.
   """
-  @spec new(number()) :: t()
+  @spec new(high_water_mark()) :: t()
   def new(high_water_mark) do
-    %__MODULE__{high_water_mark: validate_high_water_mark!(high_water_mark)}
+    %__MODULE__{high_water_mark: __number__!(high_water_mark)}
   end
+
+  @doc """
+  Returns 1. The function of the Streams Standard has no argument.
+  """
+  @spec size() :: 1
+  def size, do: 1
 
   @doc """
   Returns 1 for each chunk.
@@ -88,13 +117,13 @@ defmodule Web.CountQueuingStrategy do
   def size(_chunk), do: 1
 
   @doc false
-  # The Streams Standard refuses a limit that is not a number or that is
-  # below zero.
-  def validate_high_water_mark!(high_water_mark)
-      when is_number(high_water_mark) and high_water_mark >= 0,
-      do: high_water_mark
+  # The value of the member `highWaterMark`: an unrestricted double of
+  # WebIDL.
+  def __number__!(value)
+      when is_number(value) or value in [:infinity, :neg_infinity, :nan],
+      do: value
 
-  def validate_high_water_mark!(high_water_mark) do
-    raise Web.RangeError, "Invalid high water mark: #{inspect(high_water_mark)}"
+  def __number__!(value) do
+    raise Web.TypeError, "The high water mark must be a number, got: #{inspect(value)}"
   end
 end

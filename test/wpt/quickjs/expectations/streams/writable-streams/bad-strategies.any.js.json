@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Writable stream: invalid strategy.size return value": "runner: an error of the library is a new object each time"
-  }
-}

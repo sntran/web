@@ -1,7 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "cancelling the readable side of a TransformStream should abort an empty pipe": "library: a promise does not settle",
-    "cancelling the readable side of a TransformStream should abort an empty pipe after startup": "library: a promise does not settle"
-  }
-}

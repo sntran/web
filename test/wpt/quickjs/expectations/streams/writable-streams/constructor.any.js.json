@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "controller argument should be passed to write method": "library: a different result"
-  }
-}

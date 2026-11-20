@@ -92,10 +92,14 @@ defmodule Web.StreamStandardTest do
 
       sink =
         recording_sink(test, %{
-          write: fn chunk, _controller ->
+          write: fn chunk, controller ->
             send(test, {:write, chunk})
-            # The write stays in progress until the abort stops it.
-            Process.sleep(:infinity)
+            # The write stays in progress until the signal aborts. Then it
+            # completes with no failure.
+            signal = WritableStreamDefaultController.signal(controller)
+            {:ok, subscription} = AbortSignal.subscribe(signal)
+            AbortSignal.receive_abort(subscription, :infinity, true)
+            :ok
           end
         })
 
@@ -105,10 +109,12 @@ defmodule Web.StreamStandardTest do
       second = Writer.write(writer, 2)
       abort = Writer.abort(writer, :stop)
 
+      # The write in flight completes. The write that waits rejects with the
+      # reason, and then the abort callback of the sink runs.
+      assert await(first) == :ok
       assert rejection(second) == :stop
       assert await(abort) == :ok
-      assert rejection(first) == :stop
-      assert {:abort, :stop} in events()
+      assert events() == [{:write, 1}, {:abort, :stop}]
     end
   end
 
@@ -801,7 +807,12 @@ defmodule Web.StreamStandardTest do
         write: fn _chunk, controller ->
           signal = WritableStreamDefaultController.signal(controller)
           send(test, {:signal, signal, WritableStreamDefaultController.signal(controller)})
-          Process.sleep(:infinity)
+
+          # The abort does not stop the write: the sink stops it when the
+          # signal aborts.
+          {:ok, subscription} = AbortSignal.subscribe(signal)
+          {:error, :aborted, reason} = AbortSignal.receive_abort(subscription, :infinity, true)
+          throw({:stopped, reason})
         end
       }
 
@@ -815,7 +826,7 @@ defmodule Web.StreamStandardTest do
       assert await(Writer.abort(writer, :stop)) == :ok
       assert AbortSignal.aborted?(signal)
       assert AbortSignal.reason(signal) == :stop
-      assert rejection(write) == :stop
+      assert rejection(write) == {:stopped, :stop}
     end
 
     test "is aborted already when the sink asks for it after the abort" do

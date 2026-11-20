@@ -2,8 +2,6 @@
   "harness": "OK",
   "failures": {
     "Piping from an errored readable stream to a closing writable stream": "library: a different result",
-    "Piping from an errored readable stream to an errored writable stream": "library: a different result",
-    "Piping from an errored readable stream to an errored writable stream; preventAbort = true": "library: a different result",
-    "Piping from an errored readable stream to an erroring writable stream; preventAbort = true": "library: a different result"
+    "Piping from an errored readable stream to an erroring writable stream": "library: a different result"
   }
 }

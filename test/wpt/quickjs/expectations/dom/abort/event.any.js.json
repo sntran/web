@@ -2,8 +2,6 @@
   "harness": "OK",
   "failures": {
     "AbortController abort() should fire event synchronously": "library: a different result",
-    "AbortController.signal.reason returns the same DOMException": "library: a different result",
-    "AbortSignal.reason returns the same DOMException": "library: a different result",
     "controller.abort() should do nothing the second time it is called": "library: no Web.AbortSignal.onabort/2",
     "event handler should not be called if added after controller.abort()": "library: no Web.AbortSignal.onabort/2",
     "the abort event should have the right properties": "library: no Web.AbortSignal.onabort/2",

@@ -39,13 +39,13 @@ defmodule Web.ReadableStream do
 
   @released_message "The stream is not available. It ended, or its owner stopped."
 
-  alias Web.AbortSignal
   alias Web.ArrayBuffer
   alias Web.AsyncContext.Snapshot
   alias Web.Blob
   alias Web.Internal.LazyStream
   alias Web.Internal.QueuingStrategy
   alias Web.Internal.ReadableByteStreamTee
+  alias Web.Internal.ReadableStreamPipe
   alias Web.Internal.ReadableStreamTee
   alias Web.Promise
   alias Web.ReadableByteStreamController
@@ -987,19 +987,29 @@ defmodule Web.ReadableStream do
   end
 
   @doc """
-  Pipes a readable stream into a writable stream.
+  Pipes a readable stream into a writable stream, as `pipeTo()` of the
+  Streams Standard.
 
-  Returns a `%Promise{}` that runs the pump lifecycle asynchronously.
+  Returns a `%Promise{}`. The pipe reads a chunk only when the destination
+  wants a chunk, and it does not wait for a write before the next read.
+  The promise fulfils when the source closed and the close of the
+  destination is complete. It rejects with the error of a stream, with the
+  reason of the signal, or with the failure of the abort, the cancel, or the
+  close that the pipe does. A stream that closes or has an error stops the
+  pipe also while a read or a write waits.
 
   ## Options
 
   - `:prevent_close` - do not close the writable side when the source is done
   - `:prevent_abort` - do not abort the writable side when the source errors
   - `:prevent_cancel` - do not cancel the readable side when the sink errors
+    or closes
 
   The names `:preventClose`, `:preventAbort`, and `:preventCancel` of the
   Streams Standard are accepted also.
-  - `:signal` - optional `%Web.AbortSignal{}` to interrupt piping
+  - `:signal` - optional `%Web.AbortSignal{}` that stops the pipe: the pipe
+    aborts the destination and cancels the source, and rejects with the
+    reason of the signal
   """
   def pipe_to(readable, writable, options \\ []) do
     {ready, wait_for_locks} = pipe_lock_signal()
@@ -1030,6 +1040,9 @@ defmodule Web.ReadableStream do
             run_pipe(readable, writable, options, ignore, ignore, ready)
           end)
         catch
+          # A stream that stops with a failure during a call of the pipe. A
+          # test cannot stop a stream at a known step of the pipe.
+          # coveralls-ignore-next-line
           _kind, _reason -> :ok
         end
       end)
@@ -1058,13 +1071,9 @@ defmodule Web.ReadableStream do
     case acquire_pipe_locks(readable, writable) do
       {:ok, reader, writer} ->
         ready.(:ok)
-        outcome = pipe_outcome(reader, writer, options)
 
         # The pipe releases its locks before its promise settles.
-        release_reader_lock(reader)
-        release_writer_lock(writer)
-
-        case outcome do
+        case ReadableStreamPipe.run(reader.controller_pid, writer.controller_pid, options) do
           :ok -> resolve.(:ok)
           {:error, reason} -> reject.(reason)
         end
@@ -1089,31 +1098,6 @@ defmodule Web.ReadableStream do
     error in TypeError -> {:error, error}
   end
 
-  defp pipe_outcome(reader, writer, options) do
-    case pump(reader, writer, options) do
-      :done ->
-        maybe_close_writer(writer, options)
-        :ok
-
-      # The pipe rejects with the error of the stream, or with the reason
-      # of the signal, as the Streams Standard specifies.
-      {:source_error, reason} ->
-        reason = stored_error(reason)
-        maybe_abort_writer(writer, reason, options)
-        {:error, reason}
-
-      {:sink_error, reason} ->
-        reason = stored_error(reason)
-        maybe_cancel_reader(reader, reason, options)
-        {:error, reason}
-
-      {:aborted, reason} ->
-        maybe_cancel_reader(reader, reason, options)
-        maybe_abort_writer(writer, reason, options)
-        {:error, reason}
-    end
-  end
-
   @doc """
   Pipes this stream through a transform and returns the transform's readable side.
   """
@@ -1132,184 +1116,6 @@ defmodule Web.ReadableStream do
   # ---------------------------------------------------------------------------
   # Private pipe helpers
   # ---------------------------------------------------------------------------
-
-  # The error of a stream that is errored. A stream that is closed, or that
-  # stopped, gives a `TypeError`, as the Streams Standard specifies for a
-  # pipe to a destination that is closed.
-  defp stored_error({:errored, reason}), do: reason
-  defp stored_error(_closed_or_stopped), do: TypeError.exception(@released_message)
-
-  # The pipe reads the chunks in batches. The first batch has one chunk, and
-  # each batch after it two times the chunks, up to 64. A batch is never
-  # larger than the desired size of the destination, thus the pipe reads
-  # no chunk that the destination does not want, as the Streams Standard
-  # specifies.
-  #
-  # Each write waits for its end, and only the pipe writes to the
-  # destination: it has the lock. Thus after a write the desired size of the
-  # destination is its high water mark again, and the pipe asks for it only
-  # one time. A destination that fails, or that closes, makes the next write
-  # fail.
-  defp pump(reader, writer, options) do
-    wanted =
-      case WritableStream.desired_size(writer.controller_pid) do
-        size when is_integer(size) and size > 0 -> size
-        _no_capacity -> :ready
-      end
-
-    pump(reader, writer, options, {1, wanted})
-  catch
-    {:abort, reason} -> {:aborted, reason}
-  end
-
-  # Each step stops when the signal aborts. A signal that aborted before
-  # the step makes the step throw the reason. The read of each batch is a
-  # step, thus the pipe examines the signal before each read.
-  defp pump(reader, writer, options, state) do
-    with {:ok, chunks, state} <- next_pipe_chunks(reader, writer, state, options) do
-      case write_chunks(writer, chunks) do
-        :ok when chunks == [] -> :done
-        :ok -> pump(reader, writer, options, state)
-        {:error, reason} -> {:sink_error, reason}
-      end
-    end
-  end
-
-  defp next_pipe_chunks(reader, writer, {batch, wanted}, options) do
-    with {:ok, size} <- batch_size(writer, batch, wanted, options) do
-      owner_pid = self()
-      read = fn -> read_batch(reader.controller_pid, owner_pid, size) end
-      next_batch = min(batch * 2, 64)
-
-      case await_pipe_step(read, options) do
-        {:chunks, chunks} -> {:ok, chunks, {next_batch, wanted}}
-        {:ok, chunk} -> {:ok, [chunk], {next_batch, wanted}}
-        :done -> {:ok, [], {batch, wanted}}
-        {:error, reason} -> {:source_error, reason}
-      end
-    end
-  end
-
-  # Sends the writes of a batch with no wait between them, and then waits
-  # for their ends, in their sequence. The batch is not larger than the
-  # desired size of the destination, thus the destination wants each write.
-  defp write_chunks(_writer, []), do: :ok
-
-  defp write_chunks(%{controller_pid: pid, owner_pid: owner}, [chunk]) do
-    WritableStream.write(pid, owner, chunk)
-  end
-
-  defp write_chunks(%{controller_pid: pid, owner_pid: owner}, chunks) do
-    monitor = Process.monitor(pid)
-
-    tags =
-      Enum.map(chunks, fn chunk ->
-        tag = make_ref()
-        send(pid, {:"$gen_call", {self(), tag}, {:write, owner, chunk}})
-        tag
-      end)
-
-    result = await_writes(tags, :ok, monitor)
-    Process.demonitor(monitor, [:flush])
-    result
-  end
-
-  # The first failure is the result. The answers after it are also read.
-  defp await_writes([], result, _monitor), do: result
-
-  defp await_writes([tag | tags], result, monitor) do
-    receive do
-      {^tag, reply} ->
-        await_writes(tags, if(result == :ok, do: reply, else: result), monitor)
-
-      # The destination stopped: no more answer comes.
-      {:DOWN, ^monitor, :process, _pid, _reason} ->
-        {:error, :released}
-    end
-  end
-
-  # A destination with no capacity at the start of the pipe makes the pipe
-  # wait for its promise `ready` before each chunk.
-  defp batch_size(writer, _batch, :ready, options) do
-    step = fn -> WritableStream.ready(writer.controller_pid, writer.owner_pid) end
-
-    case await_pipe_step(step, options) do
-      :ok -> {:ok, 1}
-      # The destination is errored, or it is closed.
-      {:error, reason} -> {:sink_error, reason}
-    end
-  end
-
-  defp batch_size(_writer, batch, wanted, _options), do: {:ok, min(batch, wanted)}
-
-  defp await_pipe_step(fun, options) do
-    signal = Keyword.get(options, :signal)
-
-    if signal == nil do
-      fun.()
-    else
-      case AbortSignal.subscribe(signal) do
-        # The signal aborted before this step. The check throws the reason.
-        {:error, :aborted} ->
-          AbortSignal.check!(signal)
-
-        {:ok, subscription} ->
-          task = Task.async(fun)
-
-          try do
-            await_pipe_step_result(task, subscription)
-          after
-            AbortSignal.unsubscribe(subscription)
-            Task.shutdown(task, :brutal_kill)
-          end
-      end
-    end
-  end
-
-  defp await_pipe_step_result(task, subscription) do
-    case Task.yield(task, 10) do
-      {:ok, result} ->
-        result
-
-      # The step waits. Stop it when the signal aborted.
-      nil ->
-        case AbortSignal.receive_abort(subscription, 0, true) do
-          {:error, :aborted, reason} -> throw({:abort, reason})
-          :ok -> await_pipe_step_result(task, subscription)
-        end
-    end
-  end
-
-  defp maybe_close_writer(writer, options) do
-    if pipe_option(options, :prevent_close, :preventClose) do
-      :ok
-    else
-      _ = WritableStream.close(writer.controller_pid, writer.owner_pid)
-      :ok
-    end
-  end
-
-  defp maybe_abort_writer(writer, reason, options) do
-    if pipe_option(options, :prevent_abort, :preventAbort) do
-      :ok
-    else
-      _ = WritableStream.abort(writer.controller_pid, writer.owner_pid, reason)
-      :ok
-    end
-  end
-
-  defp maybe_cancel_reader(reader, reason, options) do
-    if pipe_option(options, :prevent_cancel, :preventCancel) do
-      :ok
-    else
-      cancel_now(reader.controller_pid, reason)
-      :ok
-    end
-  end
-
-  defp cancel_now(pid, reason) do
-    Web.Stream.control_cast(pid, {:terminate, :cancel, reason})
-  end
 
   defp acquire_reader_for_pipe(%__MODULE__{} = readable), do: get_reader(readable)
 
@@ -1389,16 +1195,6 @@ defmodule Web.ReadableStream do
   end
 
   defp release_reader_lock(reader), do: release_lock(reader.controller_pid)
-
-  defp release_writer_lock(writer) do
-    WritableStream.release_lock(writer.controller_pid, writer.owner_pid)
-  end
-
-  # An option of a pipe, with its Elixir name or its name in the Streams
-  # Standard.
-  defp pipe_option(options, name, standard_name) do
-    Keyword.get(options, name, Keyword.get(options, standard_name, false)) == true
-  end
 end
 
 defimpl Enumerable, for: Web.ReadableStream do

@@ -239,6 +239,7 @@ defmodule Web.Test.QuickJS.Bridge do
       function_ids: %{},
       children: %{},
       links: %{},
+      errors: %{},
       promises: %{},
       next_promise: 1,
       js_promises: %{},
@@ -1512,7 +1513,12 @@ defmodule Web.Test.QuickJS.Bridge do
   defp encode(%module{} = struct) when is_map_key(@classes, module),
     do: %{"$h" => new_handle(struct), "$c" => Map.fetch!(@classes, module), "$i" => 1}
 
-  defp encode(error) when is_exception(error), do: encode_error(error)
+  # The same error of the library is the same JavaScript object, for example
+  # the stored error of a stream in each promise that rejects with it.
+  defp encode(error) when is_exception(error) do
+    %{"$err" => fields} = encode_error(error)
+    %{"$err" => Map.put(fields, "id", error_id(error))}
+  end
   defp encode(%_{} = struct), do: struct |> Map.from_struct() |> encode()
 
   defp encode(%{} = map),
@@ -1557,6 +1563,18 @@ defmodule Web.Test.QuickJS.Bridge do
         "message" => text("#{inspect(error.__struct__)}: #{Exception.message(error)}")
       }
     }
+  end
+
+  defp error_id(error) do
+    case Map.fetch(get(:errors), error) do
+      {:ok, id} ->
+        id
+
+      :error ->
+        id = map_size(get(:errors)) + 1
+        put(:errors, Map.put(get(:errors), error, id))
+        id
+    end
   end
 
   # A message or a key can have bytes that are not UTF-8: JSON has only text.

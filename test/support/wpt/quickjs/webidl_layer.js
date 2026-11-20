@@ -164,10 +164,17 @@
 
   // An error of the library becomes the error of JavaScript with the same
   // name.
+  // The same error of the library (`id`) is the same object.
+  const libraryErrors = new Map();
+
   function makeError(error) {
+    if (error.id !== undefined && libraryErrors.has(error.id)) return libraryErrors.get(error.id);
     const constructors = { TypeError, RangeError, SyntaxError, Error };
-    if (error.name === "DOMException") return new globalThis.DOMException(error.message, error.domName);
-    return new (constructors[error.name] || Error)(error.message);
+    const object = error.name === "DOMException"
+      ? new globalThis.DOMException(error.message, error.domName)
+      : new (constructors[error.name] || Error)(error.message);
+    if (error.id !== undefined) libraryErrors.set(error.id, object);
+    return object;
   }
 
   // ---------------------------------------------------------------------

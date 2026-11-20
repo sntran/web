@@ -61,7 +61,7 @@ defmodule Web.FetchContentEncodingTest do
   defp encode("x-gzip", data), do: :zlib.gzip(data)
   defp encode("deflate", data), do: :zlib.compress(data)
   defp encode("raw deflate", data), do: :zlib.zip(data)
-  defp encode("zstd", data), do: IO.iodata_to_binary(:zstd.compress(data))
+  defp encode("zstd", data), do: Web.TestZstd.compress(data)
   defp encode("deflate, gzip", data), do: data |> :zlib.compress() |> :zlib.gzip()
 
   defp header("raw deflate"), do: "deflate"

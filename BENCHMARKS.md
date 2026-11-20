@@ -210,7 +210,8 @@ old and the new code ran in turns, two times each.
 | --- | --- | --- |
 | Processes for each body that no process reads, with a signal | 15 | 1 |
 | Small response (5 bytes, then the server closes) | 1416–1503 µs | 567–654 µs |
-| Stream read of 64 MiB | 119–122 MiB/s | 468–600 MiB/s |
+| Small response to `127.0.0.1` | — | 317 µs, before the change of the address: 451 µs |
+| Stream read of 64 MiB | 119–122 MiB/s | 1685 MiB/s; with the default buffer of `:gen_tcp`, 468–600 MiB/s |
 
 Before, `Web.Dispatcher.TCP` used `Web.connect/2`. A bridge process read the
 socket stream, and gave each chunk to a second stream when it pulled. A
@@ -219,3 +220,31 @@ process of the request is the promise, as for HTTP: it opens the socket,
 writes the request body, and holds the response body. It reads one message
 of the socket at a time, and it gets the abort as a message. The holder of
 the body is the same code as for HTTP: see `Web.Dispatcher.RequestProcess`.
+
+A small response to `127.0.0.1` takes less time than to `localhost`: a
+connection gives an IP address to Erlang as a tuple, with no lookup. A
+lookup of `localhost` takes approximately 90 µs on this machine. The
+default buffer of `:gen_tcp` gives messages of approximately 9 KiB, and
+each message costs messages between processes: the process of the request
+uses a buffer of 64 KiB.
+
+## A `Web.connect/2` socket
+
+`mix run bench/socket.exs` compares a read and a write of 64 MiB on a socket with raw
+`:gen_tcp` in the process that reads, in turns, 5 times each. The numbers
+are the medians of two runs. Other work used the machine at the same time,
+thus compare the numbers of one column with the raw read.
+
+| Test | Before | After | Raw `:gen_tcp` |
+| --- | --- | --- | --- |
+| Read of 64 MiB | 157–172 MiB/s | 1162–1719 MiB/s | 1618–2281 MiB/s |
+| Write of 64 MiB | 737–883 MiB/s | 888–1009 MiB/s | — |
+| Processes for each socket | 7 | 6 | — |
+
+Before, the socket process enqueued each chunk, and then called the stream
+to get its desired size. The pull of the stream ran in a worker, and sent
+a message to the socket process. Now the stream sends its pull to the
+socket process directly, and the socket asks its connection for one
+message for each pull, with a buffer of 64 KiB. The three promises
+`opened`, `closed`, and `upgraded` stay processes: each `Web.Promise` is a
+process.

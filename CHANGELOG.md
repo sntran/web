@@ -68,6 +68,16 @@ All notable changes to this project are documented in this file.
   second conformance test compares `Web.CountingGovernor` with
   `tla/ConnectionPool.tla`: a governor and the pool count their slots with
   the same rules.
+- Ports of five files of web-platform-tests in `test/wpt/`: the default
+  reader and the bad sources of the Streams tests, the basic headers and
+  the header errors of the Fetch tests, and the abort event of the DOM
+  tests. Each test has the name of its WPT test. 73 of the 86 tests pass.
+  The 13 others show a difference of the library from a Standard, with the
+  difference in a comment, and the tag `:wpt_failure`: the gate does not
+  run them, and `mix test --only wpt_failure` does.
+- The tests wait for other processes with a message, a monitor, or a
+  promise, not with a sleep. A sleep stays only where it is a part of the
+  scenario, such as a slow server or a time limit.
 - `CONTRIBUTING.md`, with the rules for a change: the compliance with the
   Web Standards, the TLA+ specifications, the property tests, the tests
   that do not depend on time, the gate, and the benchmarks.
@@ -259,13 +269,25 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- The readable side of a `Web.Socket` reads the connection one message for
+  each pull of the stream. The stream sends its pull to the socket process
+  directly, with no worker, and has one pull at a time, as the Streams
+  Standard specifies. The socket process makes no call to the stream for
+  each chunk. A message of the connection has 64 KiB at most. A read of
+  64 MiB gives approximately 1700 MiB/s, where it gave 157 MiB/s. A socket
+  has 6 processes, where it had 7. A write asks the socket for its
+  transport one time.
+- A connection to an IP address gives the address to Erlang as a tuple.
+  Erlang looks up a host in text as a name, also when it is an IP address:
+  each new connection to an IP address takes approximately 200 µs less.
+  This applies to `Web.fetch/2` and to `Web.connect/2`.
 - `Web.fetch/2` of a `tcp:` URL, and of an rclone remote, has one process:
   the process of the request, which is also the promise, as for HTTP. It
   opens the socket, writes the request body, and holds the response body.
   Before, a body used 15 processes: a bridge, the processes of a
   `Web.Socket`, a second stream, and a process that examined the abort
   signal each 25 ms. A small response takes approximately 600 µs, where it
-  took 1450 µs, and a stream read gives approximately 470 MiB/s, where it
+  took 1450 µs, and a stream read gives approximately 1700 MiB/s, where it
   gave 120 MiB/s. See `BENCHMARKS.md`. The body follows the rules of an HTTP
   body: an abort puts it in the errored state with the reason of the
   signal, where it ended with no error before. A signal that is aborted
@@ -906,6 +928,11 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.fetch/2` and `Web.connect/2` connect to an IPv6 address, such as
+  `http://[::1]:8080/`, `tcp://[::1]:8080`, `Web.connect("[::1]:8080")`, and
+  `Web.connect(%{hostname: "::1", port: 8080})`. Before, Erlang did not try
+  the address, and the result was `:nxdomain`. The text of an address for
+  `Web.connect/2` takes an IPv6 address in brackets, as a URL does.
 - `Web.DecompressionStream` decodes only as the reader takes the chunks.
   Before, one write decoded all its data at once: a gzip write of 20 KiB
   that expands to 20 MB put 20 MB in the queue of the stream. Now the

@@ -94,9 +94,14 @@ defmodule Web.WritableStreamDefaultWriter do
   end
 
   @doc """
-  Returns the stream's desired size.
+  Returns the stream's desired size: `nil` when the stream is erroring or
+  errored, and 0 when it is closed. A writer that released its lock raises
+  `Web.TypeError`, as the Streams Standard specifies.
   """
-  def desired_size(%__MODULE__{controller_pid: pid}) do
-    Web.Stream.call(pid, :desired_size, nil)
+  def desired_size(%__MODULE__{controller_pid: pid, owner_pid: owner_pid}) do
+    case Web.Stream.call(pid, {:desired_size, :writer, owner_pid}, nil) do
+      {:error, :not_locked_by_writer} -> raise map_stream_error(:not_locked_by_writer)
+      size -> size
+    end
   end
 end

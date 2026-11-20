@@ -125,6 +125,9 @@ defmodule Web.Stream do
     pending_close_request: nil,
     # The caller of an abort, until the abort callback of the sink is complete.
     pending_abort_request: nil,
+    # The [[pendingAbortRequest]] of a writable stream that is erroring:
+    # `{callers, reason, was_already_erroring}`. See `writable_abort/4`.
+    abort_request: nil,
     # The abort signal of the controller of a writable stream: `nil`, an
     # `AbortController` after the first request for the signal, or
     # `{:aborted, reason}` after an abort with no controller.
@@ -609,7 +612,7 @@ defmodule Web.Stream do
           handle_close(from, pid, :writable, data)
 
         {{:call, from}, {:abort, pid, reason}} ->
-          handle_abort(from, pid, reason, data)
+          handle_abort(from, pid, reason, :writable, data)
 
         {:internal, {:start_task, fun}} ->
           task =
@@ -660,10 +663,69 @@ defmodule Web.Stream do
   end
 
   defp handle_closing_event({:call, from}, {:abort, pid, reason}, data) do
-    handle_abort(from, pid, reason, data)
+    handle_abort(from, pid, reason, :closing, data)
   end
 
   defp handle_closing_event(_type, _content, _data), do: :keep_state_and_data
+
+  # ---------------------------------------------------------------------------
+  # State: erroring  (consumers only)
+  #
+  # The state "erroring" of a WritableStream in the Streams Standard: an
+  # abort or `error` of the controller started the error, and a write, a
+  # close, or the function `start` of the sink is not complete. The stream
+  # waits for that operation. Then it goes to the state `errored`: see
+  # `finish_erroring/2`. The field `error_reason` holds the stored error.
+  # ---------------------------------------------------------------------------
+
+  @doc false
+  # A state function of `:gen_statem`.
+  def erroring(type, content, data) do
+    type |> do_erroring(content, data) |> with_lifetime(:erroring, data)
+  end
+
+  defp do_erroring(type, content, data) do
+    with :not_handled <- handle_common(type, content, :erroring, data) do
+      handle_erroring_event(type, content, data)
+    end
+  end
+
+  # WritableStreamDefaultWriterWrite: a close that is queued or in flight
+  # gives a `TypeError`, and else the write rejects with the stored error.
+  defp handle_erroring_event({:call, from}, {:write, pid, _chunk}, data)
+       when pid == data.writer_pid do
+    reply =
+      if data.pending_close_request,
+        do: {:error, :closing},
+        else: {:error, {:errored, data.error_reason}}
+
+    {:keep_state_and_data, [{:reply, from, reply}]}
+  end
+
+  # WritableStreamClose: the close request waits. The stream rejects it with
+  # the stored error when the error is complete.
+  defp handle_erroring_event({:call, from}, {:close, pid}, data)
+       when pid == data.writer_pid do
+    if data.pending_close_request do
+      {:keep_state_and_data, [{:reply, from, {:error, :closing}}]}
+    else
+      {:keep_state, %{data | pending_close_request: from}}
+    end
+  end
+
+  defp handle_erroring_event({:call, from}, {:abort, pid, reason}, data) do
+    handle_abort(from, pid, reason, :erroring, data)
+  end
+
+  defp handle_erroring_event({:call, from}, {:write, _pid, _chunk}, _data) do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
+  end
+
+  defp handle_erroring_event({:call, from}, {:close, _pid}, _data) do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
+  end
+
+  defp handle_erroring_event(_type, _content, _data), do: :keep_state_and_data
 
   # ---------------------------------------------------------------------------
   # State: closed
@@ -849,6 +911,10 @@ defmodule Web.Stream do
       type == :close and data.type in [:consumer, :producer_consumer] ->
         {:keep_state_and_data, [{:next_event, {:call, from}, {:close, nil}}]}
 
+      # The abort of a writable stream is the abort of a writer.
+      type == :abort and data.type == :consumer ->
+        {:keep_state_and_data, [{:next_event, {:call, from}, {:abort, nil, reason}}]}
+
       true ->
         handle_common({:call, from}, {:terminate, type, reason}, state, data)
     end
@@ -877,7 +943,7 @@ defmodule Web.Stream do
   defp handle_common({:call, from}, {:ready, pid}, state, data)
        when data.type in [:consumer, :producer_consumer] do
     cond do
-      state == :errored ->
+      state in [:errored, :erroring] ->
         {:keep_state_and_data, [{:reply, from, {:error, {:errored, data.error_reason}}}]}
 
       # The writable side of a transform stream is in the errored state. An
@@ -888,7 +954,8 @@ defmodule Web.Stream do
       pid != data.writer_pid ->
         {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
 
-      state == :closed ->
+      # A close fulfils the promise `ready`, as WritableStreamClose specifies.
+      state in [:closed, :closing] ->
         {:keep_state_and_data, [{:reply, from, :ok}]}
 
       writable_ready?(data) ->
@@ -997,12 +1064,25 @@ defmodule Web.Stream do
     desired =
       case state do
         :errored -> nil
+        :erroring -> nil
         :closed when is_tuple(data.writable_error) -> nil
         :closed -> 0
         _ -> internal_desired_size(data)
       end
 
     {:keep_state_and_data, [{:reply, from, desired}]}
+  end
+
+  # The attribute `desiredSize` of a writer. A writer that released its
+  # lock throws a `TypeError`. An error releases the lock of a transform
+  # stream, thus the lock is not examined in the state `errored`.
+  defp handle_common({:call, from}, {:desired_size, :writer, pid}, state, data)
+       when state != :errored and pid != data.writer_pid do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
+  end
+
+  defp handle_common({:call, from}, {:desired_size, :writer, _pid}, state, data) do
+    handle_common({:call, from}, :desired_size, state, data)
   end
 
   defp handle_common({:call, from}, :get_desired_size, state, data) do
@@ -1047,6 +1127,17 @@ defmodule Web.Stream do
       |> Map.put(:writable_desired_size, writable_desired_size)
 
     {:keep_state_and_data, [{:reply, from, slots}]}
+  end
+
+  # WritableStreamAbort, with no check of the lock.
+  defp handle_common(
+         {:call, from},
+         {:terminate, :abort, reason},
+         state,
+         %{type: :consumer} = data
+       )
+       when state in [:writable, :closing, :erroring] do
+    writable_abort(from, reason, state, data)
   end
 
   # A cancel or an abort from a caller that waits for the result. The stream
@@ -1100,6 +1191,17 @@ defmodule Web.Stream do
 
   defp handle_common(:cast, :terminate_transform, _state, _data), do: :keep_state_and_data
 
+  # `error` of the controller of a writable stream, as
+  # WritableStreamDefaultControllerError specifies: it has an effect only in
+  # the state "writable". A write or a close that is in flight completes.
+  defp handle_common(:cast, {:error, reason}, state, %{type: :consumer} = data) do
+    if state in [:writable, :closing] do
+      start_erroring(reason, data, [])
+    else
+      :keep_state_and_data
+    end
+  end
+
   defp handle_common(:cast, {:error, reason}, state, data) do
     if final?(state, data) do
       :keep_state_and_data
@@ -1128,7 +1230,7 @@ defmodule Web.Stream do
     cond do
       # A pipe to a destination that is errored gets the error of the
       # destination, as the Streams Standard specifies.
-      state == :errored ->
+      state in [:errored, :erroring] ->
         send(waiter_pid, {:stream_error, ref, {:errored, data.error_reason}})
         :keep_state_and_data
 
@@ -1141,7 +1243,7 @@ defmodule Web.Stream do
         send(waiter_pid, {:stream_error, ref, :not_locked_by_writer})
         :keep_state_and_data
 
-      state == :closed ->
+      state in [:closed, :closing] ->
         send(waiter_pid, {:ready, ref})
         :keep_state_and_data
 
@@ -1237,16 +1339,21 @@ defmodule Web.Stream do
   end
 
   # Task timeout handling
-  defp handle_common(:info, {:task_timeout, ref}, _state, data) do
+  defp handle_common(:info, {:task_timeout, ref}, state, data) do
     if ref == data.task_ref and data.active_task do
       operation = timeout_operation(data.active_operation)
       kill_task(data.active_task)
       error = task_timeout_error(operation, data)
 
-      # The caller of an abort gets the timeout as its rejection reason.
-      abort_actions = abort_reply_actions(data, {:error, error})
-      data = clear_active_operation(%{data | pending_abort_request: nil})
-      fail_stream(error, data, abort_actions)
+      if data.type == :consumer and operation != :abort do
+        # A callback of a sink that does not return fails with the timeout.
+        consumer_failure(error, state, data)
+      else
+        # The caller of an abort gets the timeout as its rejection reason.
+        abort_actions = abort_reply_actions(data, {:error, error})
+        data = clear_active_operation(%{data | pending_abort_request: nil})
+        fail_stream(error, data, abort_actions)
+      end
     else
       :keep_state_and_data
     end
@@ -1965,6 +2072,8 @@ defmodule Web.Stream do
 
   defp held_write_can_start?(_data), do: false
 
+  # WritableStreamClose: the close fulfils the promise `ready`, and waits for
+  # the writes before it.
   defp handle_close(from, pid, _state, data) do
     cond do
       pid != data.writer_pid ->
@@ -1974,31 +2083,172 @@ defmodule Web.Stream do
         {:keep_state_and_data, [{:reply, from, {:error, :closing}}]}
 
       active_consumer_operation?(data) or not :queue.is_empty(data.queued_write_requests) ->
-        {:next_state, :closing, %{data | pending_close_request: from}}
+        {:next_state, :closing, %{release_ready_waiters(data) | pending_close_request: from}}
 
       true ->
         data
+        |> release_ready_waiters()
         |> Map.put(:pending_close_request, from)
         |> start_flush_task()
     end
   end
 
-  defp handle_abort(from, pid, reason, data) do
-    if pid != data.writer_pid do
-      {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
-    else
-      if data.active_task && data.active_operation != :abort do
-        kill_task(data.active_task)
-      end
+  # The processes that wait for the promise `ready` get their answer now.
+  defp release_ready_waiters(data) do
+    {data, actions} = maybe_resolve_ready_waiters(data, force?: true)
+    Enum.each(actions, fn {:reply, from, reply} -> :gen_statem.reply(from, reply) end)
+    data
+  end
 
-      # The caller gets its reply when the abort callback is complete.
-      data
-      |> clear_active_operation()
-      |> Map.put(:pending_abort_request, from)
-      |> start_terminal_task(:abort, reason)
-      |> then(&fail_stream(reason, &1))
+  defp handle_abort(from, pid, _reason, _state, data) when pid != data.writer_pid do
+    {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
+  end
+
+  defp handle_abort(from, _pid, reason, state, %{type: :consumer} = data) do
+    writable_abort(from, reason, state, data)
+  end
+
+  # The writable side of a transform stream.
+  defp handle_abort(from, _pid, reason, _state, data) do
+    if data.active_task && data.active_operation != :abort do
+      kill_task(data.active_task)
+    end
+
+    # The caller gets its reply when the abort callback is complete.
+    data
+    |> clear_active_operation()
+    |> Map.put(:pending_abort_request, from)
+    |> start_terminal_task(:abort, reason)
+    |> then(&fail_stream(reason, &1))
+  end
+
+  # ---------------------------------------------------------------------------
+  # The error of a writable stream
+  #
+  # The abort and the error of a WritableStream, as the Streams Standard
+  # specifies. They do not stop a write or a close that is in flight: the
+  # stream is "erroring" until the operation is complete, and then
+  # "errored". The writes that wait reject with the stored error. Then the
+  # abort callback of the sink runs, for an abort.
+  # ---------------------------------------------------------------------------
+
+  # WritableStreamAbort. All the callers of an abort get the same result.
+  defp writable_abort(from, reason, state, data) do
+    data = abort_signal(data, reason)
+
+    cond do
+      data.abort_request ->
+        {callers, abort_reason, was_already_erroring} = data.abort_request
+
+        {:keep_state,
+         %{data | abort_request: {[from | callers], abort_reason, was_already_erroring}}}
+
+      state == :erroring ->
+        {:keep_state, %{data | abort_request: {[from], nil, true}}}
+
+      true ->
+        start_erroring(reason, %{data | abort_request: {[from], reason, false}}, [])
     end
   end
+
+  # WritableStreamStartErroring.
+  defp start_erroring(reason, data, actions) do
+    data = %{data | error_reason: reason}
+    ready_actions = ready_error_actions(data, reason)
+    data = %{data | ready_waiters: :queue.new(), backpressure: false}
+
+    if operation_in_flight?(data) or data.active_operation == :start do
+      {:next_state, :erroring, data, actions ++ ready_actions}
+    else
+      finish_erroring(data, actions ++ ready_actions)
+    end
+  end
+
+  # WritableStreamHasOperationMarkedInFlight.
+  defp operation_in_flight?(data) do
+    not is_nil(data.pending_write_request) or match?({:flush, _from}, data.active_operation)
+  end
+
+  # WritableStreamDefaultControllerAdvanceQueueIfNeeded and
+  # WritableStreamDealWithRejection: a failure in the state "writable" starts
+  # the error. In the state "erroring", the error is complete.
+  defp consumer_failure(reason, state, data) do
+    {data, actions} =
+      case data.active_operation do
+        {:write, from} ->
+          {%{data | pending_write_request: nil}, [{:reply, from, {:error, {:errored, reason}}}]}
+
+        # WritableStreamFinishInFlightCloseWithError: the abort request
+        # rejects with the failure of the close.
+        {:flush, from} ->
+          {data, abort_actions} = settle_abort_request(data, {:error, reason})
+
+          {%{data | pending_close_request: nil},
+           [{:reply, from, {:error, {:errored, reason}}} | abort_actions]}
+
+        :start ->
+          {data, []}
+      end
+
+    data = clear_active_operation(data)
+
+    if state == :erroring,
+      do: finish_erroring(data, actions),
+      else: start_erroring(reason, data, actions)
+  end
+
+  # WritableStreamFinishErroring. The promise `closed` of the writer rejects
+  # in the state `errored` with no abort callback in flight: see
+  # `closed_waiter_actions/2`.
+  defp finish_erroring(data, actions) do
+    reason = data.error_reason
+    write_actions = queued_write_error_actions(data, reason)
+    abort_request = data.abort_request
+
+    data = %{
+      data
+      | queued_write_requests: :queue.new(),
+        queued_write_count: 0,
+        backpressure: false,
+        abort_request: nil
+    }
+
+    case abort_request do
+      # The abort of the sink runs. The callers get its result.
+      {callers, abort_reason, false} ->
+        data =
+          data
+          |> Map.put(:pending_abort_request, callers)
+          |> start_terminal_task(:abort, abort_reason)
+
+        {:next_state, :errored, data, actions ++ write_actions}
+
+      other ->
+        abort_actions =
+          case other do
+            {callers, _reason, true} -> Enum.map(callers, &{:reply, &1, {:error, reason}})
+            nil -> []
+          end
+
+        {data, close_actions} = reject_close_request(data)
+        {:next_state, :errored, data, actions ++ write_actions ++ abort_actions ++ close_actions}
+    end
+  end
+
+  # WritableStreamRejectCloseAndClosedPromiseIfNeeded, for the close request.
+  defp reject_close_request(%{pending_close_request: nil} = data), do: {data, []}
+
+  defp reject_close_request(%{pending_close_request: from} = data) do
+    {%{data | pending_close_request: nil},
+     [{:reply, from, {:error, {:errored, data.error_reason}}}]}
+  end
+
+  # The callers of an abort request get `reply`.
+  defp settle_abort_request(%{abort_request: {callers, _reason, _erroring}} = data, reply) do
+    {%{data | abort_request: nil}, Enum.map(callers, &{:reply, &1, reply})}
+  end
+
+  defp settle_abort_request(data, _reply), do: {data, []}
 
   # ---------------------------------------------------------------------------
   # Consumer task starters
@@ -2123,6 +2373,10 @@ defmodule Web.Stream do
     |> terminate_transform([{:reply, from, {:error, {:errored, reason}}}])
   end
 
+  defp handle_task_result({:error, reason}, state, %{type: :consumer} = data) do
+    consumer_failure(reason, state, data)
+  end
+
   defp handle_task_result({:error, reason}, _state, data) do
     fail_stream(reason, data)
   end
@@ -2174,17 +2428,19 @@ defmodule Web.Stream do
     |> continue_after_consumer_completion(state, [{:reply, from, :ok}])
   end
 
-  # Flush task completed
+  # Flush task completed: WritableStreamFinishInFlightClose. A stream that
+  # is erroring closes, and its abort request fulfils.
   defp handle_task_result(
          {:ok, new_impl_state},
          _state,
          %{active_operation: {:flush, from}} = data
        ) do
+    {data, abort_actions} = settle_abort_request(data, :ok)
+
     data
     |> clear_active_operation()
-    |> Map.put(:pending_close_request, nil)
-    |> Map.put(:impl_state, new_impl_state)
-    |> close_consumer_stream([{:reply, from, :ok}])
+    |> Map.merge(%{pending_close_request: nil, impl_state: new_impl_state, error_reason: nil})
+    |> close_consumer_stream([{:reply, from, :ok} | abort_actions])
   end
 
   defp handle_abort_task_result(result, data) do
@@ -2194,12 +2450,31 @@ defmodule Web.Stream do
     |> clear_abort_request()
   end
 
+  # The callers of an abort. The abort of a writable stream can have more
+  # than one caller: see `writable_abort/4`.
   defp abort_reply_actions(%{pending_abort_request: nil}, _reply), do: []
+
+  defp abort_reply_actions(%{pending_abort_request: callers}, reply) when is_list(callers),
+    do: Enum.map(callers, &{:reply, &1, reply})
+
   defp abort_reply_actions(%{pending_abort_request: from}, reply), do: [{:reply, from, reply}]
+
+  # The abort callback of a writable stream is complete: the close request
+  # rejects with the stored error, as WritableStreamFinishErroring specifies.
+  # Then the promise `closed` rejects: see `closed_waiter_actions/2`.
+  defp clear_abort_request({:keep_state, %{type: :consumer} = data, actions}) do
+    {data, close_actions} = reject_close_request(data)
+    {:keep_state, %{data | pending_abort_request: nil}, actions ++ close_actions}
+  end
 
   defp clear_abort_request({:keep_state, data, actions}) do
     {:keep_state, %{data | pending_abort_request: nil}, actions}
   end
+
+  # WritableStreamDefaultControllerAdvanceQueueIfNeeded: the operation in
+  # flight is complete, thus the error of the stream is complete.
+  defp continue_after_consumer_completion(data, :erroring, actions),
+    do: finish_erroring(data, actions)
 
   defp continue_after_consumer_completion(data, state, actions) do
     cond do
@@ -2212,13 +2487,7 @@ defmodule Web.Stream do
         {:keep_state, data, actions}
 
       not :queue.is_empty(data.queued_write_requests) ->
-        {request, data} = dequeue_write_request(data)
-
-        new_data =
-          data
-          |> start_write_task(request)
-
-        {:keep_state, new_data, actions}
+        start_next_write(data, state, actions)
 
       state == :closing and data.pending_close_request ->
         case start_flush_task(data) do
@@ -2230,6 +2499,18 @@ defmodule Web.Stream do
         {new_data, ready_actions} = maybe_resolve_ready_waiters(data)
         {:keep_state, new_data, actions ++ ready_actions}
     end
+  end
+
+  # The next write starts. The promise `ready` fulfils when the queue is
+  # below its limit, also when it is not empty.
+  defp start_next_write(data, state, actions) do
+    {request, data} = dequeue_write_request(data)
+    new_data = start_write_task(data, request)
+
+    {new_data, ready_actions} =
+      if state == :writable, do: maybe_resolve_ready_waiters(new_data), else: {new_data, []}
+
+    {:keep_state, new_data, actions ++ ready_actions}
   end
 
   # `terminate` of the controller of a transform stream, as in the Streams
@@ -2408,7 +2689,11 @@ defmodule Web.Stream do
   end
 
   # The processes that wait for the promise `closed` get the end of the
-  # stream.
+  # stream. For a writable stream, the promise rejects after the abort
+  # callback of the sink, as WritableStreamFinishErroring specifies.
+  defp closed_waiter_actions(:errored, %{type: :consumer, active_operation: :abort} = data),
+    do: {data, []}
+
   defp closed_waiter_actions(state, %{closed_waiters: [_ | _] = waiters} = data)
        when state in [:closed, :errored] do
     actions =
@@ -2546,16 +2831,20 @@ defmodule Web.Stream do
   # goes to its terminal state, and the caller gets the thrown value.
   defp termination_with_result(type, reason, data) do
     data = data |> clear_owner() |> clear_task()
+    {data, abort_actions} = settle_abort_request(data, :ok)
 
     case {type, signal_terminate(data, type, reason)} do
       # A close callback that throws puts the stream in the errored state.
       {:close, {:error, thrown} = result} ->
-        {result, finalize_termination(data, :error, thrown)}
+        {result, data |> finalize_termination(:error, thrown) |> add_actions(abort_actions)}
 
       {_type, result} ->
-        {result, finalize_termination(data, type, reason)}
+        {result, data |> finalize_termination(type, reason) |> add_actions(abort_actions)}
     end
   end
+
+  defp add_actions({:next_state, state, data, actions}, more),
+    do: {:next_state, state, data, more ++ actions}
 
   defp finalize_termination(data, type, reason) when type in [:cancel, :close] do
     {data, pending_byob_actions} = settle_pending_byob_request(data, :done)

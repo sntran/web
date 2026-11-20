@@ -259,7 +259,7 @@ defmodule Web.Socket do
 
   defp build_state(holder_pid, {host, port}, options, promises) do
     authority = init_authority()
-    {readable, writable} = init_streams(authority, options)
+    {readable, writable} = init_streams(authority, options, promises.closed)
 
     # The streams are parts of the socket. If the socket stops with a
     # failure, the streams stop. If one of the streams stops with a failure,
@@ -302,7 +302,7 @@ defmodule Web.Socket do
   # The pull is complete when the server enqueued the chunk of that
   # message, thus the stream has one pull at a time, as the Streams Standard
   # specifies.
-  defp init_streams(%{address: address, token: token} = handle, options) do
+  defp init_streams(%{address: address, token: token} = handle, options, closed) do
     readable_hwm = Map.get(options, :readable_high_water_mark, @readable_hwm)
 
     readable =
@@ -320,8 +320,8 @@ defmodule Web.Socket do
       WritableStream.new(%{
         high_water_mark: Map.get(options, :writable_high_water_mark, 1),
         write: fn chunk, _controller -> sink_write(handle, chunk) end,
-        close: fn _controller -> sink_close(handle) end,
-        abort: fn _reason -> sink_close(handle) end
+        close: fn _controller -> sink_close(handle, closed) end,
+        abort: fn _reason -> sink_abort(handle) end
       })
 
     {readable, writable}
@@ -539,7 +539,7 @@ defmodule Web.Socket do
     for {ref, stream} <- List.wrap(state.pull), do: send(stream, {ref, :pulled})
 
     authority = init_authority()
-    {readable, writable} = init_streams(authority, state.options)
+    {readable, writable} = init_streams(authority, state.options, promises.closed)
 
     next_state =
       %{
@@ -829,8 +829,22 @@ defmodule Web.Socket do
     rejection
   end
 
-  # A close and an abort of the writable side close the socket.
-  defp sink_close(handle) do
+  # A close of the writable side closes the socket. The socket can stop with
+  # a failure before it gets the close, for example when the connection
+  # fails: the close then rejects with that failure, which is the rejection
+  # of the promise `closed`. An error of the stream during the close does
+  # not change the result of the close, as the Streams Standard specifies.
+  defp sink_close(handle, closed) do
+    with {:error, _stopped} <- MessageTarget.call(handle, :sink_close),
+         {:rejected, reason} <- Promise.peek(closed) do
+      Promise.reject(reason)
+    else
+      _closed -> :ok
+    end
+  end
+
+  # An abort of the writable side closes the socket.
+  defp sink_abort(handle) do
     _reply = MessageTarget.call(handle, :sink_close)
     :ok
   end

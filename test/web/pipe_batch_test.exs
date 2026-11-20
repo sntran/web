@@ -1,8 +1,8 @@
 defmodule Web.PipeBatchTest do
-  # A pipe reads the chunks that the source has in one batch, and sends the
-  # writes of the batch with no wait between them. These tests put the
-  # chunks in the queue of the source before the pipe starts, thus the
-  # batches have more than one chunk at a known time.
+  # A pipe reads a chunk each time the destination wants one, and does not
+  # wait for a write before the next read. These tests put the chunks in the
+  # queue of the source before the pipe starts, thus the destination has
+  # more than one write in its queue at a known time.
   use ExUnit.Case, async: true
 
   import Web, only: [await: 1]
@@ -42,7 +42,7 @@ defmodule Web.PipeBatchTest do
     end
   end
 
-  test "writes each chunk of a batch, in the sequence of the source" do
+  test "writes each chunk in the sequence of the source" do
     test = self()
     source = queued_source(Enum.to_list(1..8))
 
@@ -60,7 +60,7 @@ defmodule Web.PipeBatchTest do
     for chunk <- 1..8, do: assert_received({:written, ^chunk})
   end
 
-  test "rejects with the first failure of a batch" do
+  test "rejects with the first failure of a write" do
     source = queued_source(Enum.to_list(1..8))
 
     destination =

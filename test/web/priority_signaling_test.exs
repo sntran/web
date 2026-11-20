@@ -136,7 +136,7 @@ defmodule Web.PrioritySignalingTest do
     assert ReadableStream.__get_slots__(pid).state == :errored
   end
 
-  test "an abort stops a stream that has a full mailbox in a short time" do
+  test "an abort comes before the writes in a full mailbox" do
     stream = blocked_sink()
     writer = WritableStream.get_writer(stream)
     pid = stream.controller_pid
@@ -144,27 +144,34 @@ defmodule Web.PrioritySignalingTest do
     write = Task.async(fn -> Web.Promise.wait(WritableStreamDefaultWriter.write(writer, 0)) end)
     assert_receive {:write_started, sink, 0}
 
-    {abort, started_at} =
+    {abort, tags} =
       while_suspended(pid, fn ->
-        for index <- 1..100_000 do
-          send(pid, {:"$gen_call", {self(), make_ref()}, {:write, writer.owner_pid, index}})
-        end
+        tags =
+          for index <- 1..100_000 do
+            tag = make_ref()
+            send(pid, {:"$gen_call", {self(), tag}, {:write, writer.owner_pid, index}})
+            tag
+          end
 
-        abort = WritableStreamDefaultWriter.abort(writer, :emergency_stop)
-        {abort, System.monotonic_time(:millisecond)}
+        {WritableStreamDefaultWriter.abort(writer, :emergency_stop), tags}
       end)
 
-    assert_receive {:sink_aborted, :emergency_stop}, 5_000
-    elapsed = System.monotonic_time(:millisecond) - started_at
+    # The stream got the abort first: it is erroring, and each write of the
+    # mailbox rejects immediately, while the first write is still in flight.
+    # A write after the abort would wait for the first write.
+    for tag <- tags do
+      assert_receive {^tag, {:error, {:errored, :emergency_stop}}}, 5_000
+    end
 
-    # The stream does not handle the 100000 requests before the abort. The
-    # limit is large for a machine that is busy.
-    assert elapsed < 1_000
+    refute_received {:sink_aborted, _reason}
+
+    # The abort callback of the sink runs when the write in flight is
+    # complete.
+    send(sink, :release)
+    assert {:fulfilled, :ok} = Task.await(write)
+    assert_receive {:sink_aborted, :emergency_stop}
     assert :ok = await(abort)
     assert WritableStream.__get_slots__(pid).state == :errored
-
-    send(sink, :release)
-    Task.shutdown(write, :brutal_kill)
   end
 
   test "a signal to a stream that stopped, and to a process that is not a stream" do

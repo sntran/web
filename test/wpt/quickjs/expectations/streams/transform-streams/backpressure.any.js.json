@@ -1,8 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "blocking transform() should cause backpressure": "library: the checks of a high water mark",
-    "cancelling the readable side of a TransformStream should abort an empty pipe": "library: a promise does not settle",
-    "cancelling the readable side of a TransformStream should abort an empty pipe after startup": "library: a promise does not settle"
+    "blocking transform() should cause backpressure": "library: the checks of a high water mark"
   }
 }

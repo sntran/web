@@ -1,21 +1,13 @@
 {
   "harness": "OK",
   "failures": {
-    "Closing must be propagated backward: starts closed; preventCancel =  (falsy); fulfilled cancel promise": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = -0 (falsy); fulfilled cancel promise": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = 0 (falsy); fulfilled cancel promise": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = 1 (truthy)": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = NaN (falsy); fulfilled cancel promise": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = Symbol() (truthy)": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = [object Object] (truthy)": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = a (truthy)": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = false (falsy); fulfilled cancel promise": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = null (falsy); fulfilled cancel promise": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = true (truthy)": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = true, preventAbort = true": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = true, preventAbort = true, preventClose = true": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel = undefined (falsy); fulfilled cancel promise": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel omitted; fulfilled cancel promise": "library: a promise does not settle",
-    "Closing must be propagated backward: starts closed; preventCancel omitted; rejected cancel promise": "library: a promise does not settle"
+    "Closing must be propagated backward: starts closed; preventCancel =  (falsy); fulfilled cancel promise": "library: a different result",
+    "Closing must be propagated backward: starts closed; preventCancel = -0 (falsy); fulfilled cancel promise": "library: a different result",
+    "Closing must be propagated backward: starts closed; preventCancel = 0 (falsy); fulfilled cancel promise": "library: a different result",
+    "Closing must be propagated backward: starts closed; preventCancel = NaN (falsy); fulfilled cancel promise": "library: a different result",
+    "Closing must be propagated backward: starts closed; preventCancel = false (falsy); fulfilled cancel promise": "library: a different result",
+    "Closing must be propagated backward: starts closed; preventCancel = null (falsy); fulfilled cancel promise": "library: a different result",
+    "Closing must be propagated backward: starts closed; preventCancel = undefined (falsy); fulfilled cancel promise": "library: a different result",
+    "Closing must be propagated backward: starts closed; preventCancel omitted; fulfilled cancel promise": "library: a different result"
   }
 }

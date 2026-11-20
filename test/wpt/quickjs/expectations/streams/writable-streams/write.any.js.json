@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "writer.write(), ready and closed reject with the error passed to controller.error() made before sink.write rejection": "library: a different result"
-  }
-}

@@ -57,6 +57,7 @@ defmodule Web.StreamTest do
   alias Web.TypeError
   alias Web.Uint8Array
   alias Web.WritableStream
+  alias Web.WritableStreamDefaultController
   alias Web.WritableStreamDefaultWriter
 
   describe "Web.Stream engine basics" do
@@ -283,15 +284,17 @@ defmodule Web.StreamTest do
       assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
     end
 
-    test "abort while write task active: task is killed and terminate called" do
+    test "abort while write task active: the write completes, and then terminate is called" do
       parent = self()
 
       stream =
         WritableStream.new(%{
           write: fn _chunk, _ctrl ->
             send(parent, {:write_started, self()})
-            # A slow write: the abort stops it.
-            Process.sleep(5_000)
+
+            receive do
+              :continue -> :ok
+            end
           end,
           abort: fn reason ->
             send(parent, {:aborted, reason})
@@ -299,15 +302,18 @@ defmodule Web.StreamTest do
         })
 
       writer = WritableStream.get_writer(stream)
-
-      _write_task =
-        Task.async(fn -> catch_exit(await(WritableStreamDefaultWriter.write(writer, "x"))) end)
+      write = WritableStreamDefaultWriter.write(writer, "x")
 
       # The write runs. Thus the stream has an active task.
-      assert_receive {:write_started, _}
+      assert_receive {:write_started, worker}
 
-      await(WritableStreamDefaultWriter.abort(writer, :force_abort))
-      assert_receive {:aborted, :force_abort}
+      abort = WritableStreamDefaultWriter.abort(writer, :force_abort)
+      refute_received {:aborted, _reason}
+      send(worker, :continue)
+
+      assert await(write) == :ok
+      assert await(abort) == :ok
+      assert_received {:aborted, :force_abort}
     end
   end
 
@@ -644,6 +650,9 @@ defmodule Web.StreamTest do
       end)
 
       assert WritableStream.desired_size(errored_stream) == nil
+      # The writer keeps its lock until it releases it.
+      assert WritableStream.locked?(errored_stream.controller_pid) == true
+      assert :ok = WritableStreamDefaultWriter.release_lock(errored_writer)
       assert WritableStream.locked?(errored_stream.controller_pid) == false
     end
 
@@ -665,17 +674,21 @@ defmodule Web.StreamTest do
   end
 
   describe "Web.Stream hardening regressions" do
-    test "abort orphan check kills in-flight write task quickly" do
+    test "an abort waits for the write in flight, and the signal stops a slow write" do
       parent = self()
 
       stream =
         WritableStream.new(%{
-          write: fn _chunk, _controller ->
+          write: fn _chunk, controller ->
+            signal = WritableStreamDefaultController.signal(controller)
+            {:ok, subscription} = Web.AbortSignal.subscribe(signal)
             send(parent, {:write_task_started, self()})
-            # A slow write: the abort stops it.
-            Process.sleep(5_000)
-            :ok
-          end
+
+            # A slow write: it stops when the signal aborts.
+            {:error, :aborted, reason} = Web.AbortSignal.receive_abort(subscription, 5_000, true)
+            throw(reason)
+          end,
+          abort: fn reason -> send(parent, {:sink_abort, reason}) end
         })
 
       writer = WritableStream.get_writer(stream)
@@ -691,13 +704,11 @@ defmodule Web.StreamTest do
       assert_receive {:write_task_started, sink_task_pid}
       assert :ok = await(WritableStreamDefaultWriter.abort(writer, :abort_now))
 
-      # The stream stops the worker of the write before it replies to the
-      # abort.
-      refute Process.alive?(sink_task_pid)
-      # The write rejects with the abort reason, which is the error of the
-      # stream.
-      assert {:ok, result} = Task.yield(write_task, 1_000)
-      assert result in [:abort_now, {:errored, "This writer is no longer locked."}]
+      # The sink stopped its write. Then the abort callback of the sink ran.
+      assert_received {:sink_abort, :abort_now}
+      assert Process.alive?(sink_task_pid)
+      # The write rejects with the value that the sink threw.
+      assert {:ok, :abort_now} = Task.yield(write_task, 1_000)
     end
 
     test "a transform stream gives backpressure to its writer until a process reads" do

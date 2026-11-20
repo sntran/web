@@ -29,6 +29,9 @@ All notable changes to this project are documented in this file.
   two versions.
 - `examples/README.md`, an index of the examples, and a new
   `examples/demo.exs`: a short tour that needs no network.
+- `bench/http_clients.exs`, which compares `Web.fetch/2` with Finch and
+  Req on one server of the machine. Req is a dependency only in the
+  environment `:dev`.
 
 - Time limits for `Web.fetch/2`. `config :web, connect_timeout: ms` is the
   time to open a connection, also for `Web.connect/2`. The default is
@@ -200,20 +203,25 @@ All notable changes to this project are documented in this file.
 
 - The callbacks of a stream run in one worker process for the life of the
   stream. Before, each callback started a new task through one supervisor
-  of the application. A read of a stream with `Enum` takes approximately
-  2.5 µs for each chunk, where it took 26 µs, and many streams use all the
-  cores: 16 streams at the same time read 1.9 million chunks each second,
-  where they read 79000. The supervisor `Web.TaskSupervisor` is removed.
-  A promise and a pipe also start with no supervisor.
+  of the application. A read of `Web.ReadableStream.from/1` with `Enum`
+  takes approximately 14 µs for each element, where it took 26 µs, and
+  many streams use all the cores: 4 streams at the same time read 150000
+  elements each second, where they read 53000. The supervisor
+  `Web.TaskSupervisor` is removed. A promise and a pipe also start with no
+  supervisor.
 - The internal readers of a stream (`Enum`, a pipe, and the body functions
   such as `Web.Response.text/1`) take all the chunks of the queue in one
-  message, as many reads that wait do in the Streams Standard. A stream
-  with the count strategy keeps up to 64 chunks ready for such a reader.
-  `Enum.take/2` starts with one chunk, thus the source does not run ahead.
-  A pipe reads no more chunks at once than the desired size of its
-  destination.
-- `Web.ReadableStream.from/1` of an enumerable gives several elements for
-  one pull. A cancel stops the enumerable between two elements.
+  message, as reads one after the other do. Such a read does not change
+  the pulls: the stream pulls only as the Streams Standard specifies. A
+  source that enqueues many chunks for one pull, such as the body of a
+  `fetch` response, thus gives many chunks in one message. A pipe reads no
+  more chunks at once than the desired size of its destination.
+- **Breaking:** `Web.ReadableStream.from/1` of an enumerable follows
+  `ReadableStream.from()` of the Streams Standard: the high water mark is
+  0, and each pull takes one element. Thus the enumerable advances only
+  for a read, one element for each read. Before, the stream took one
+  element before the first read. A cancel stops the enumerable after the
+  element of the pull that runs.
 - A pull that runs at a cancel is stopped, and the cancel runs in a new
   worker. A callback that fails writes no crash report of a task.
 - The URL parser, the headers, and the MIME parser use binary pattern
@@ -224,9 +232,45 @@ All notable changes to this project are documented in this file.
 - The HTTP dispatcher has no bridge process: its worker enqueues the body
   chunks directly into the body stream. The body stream keeps 64 KiB, thus
   a small body arrives fully, and its connection goes back to the pool,
-  also when no process reads it. A small request with `fetch` and
-  `Web.Response.text/1` takes approximately 410 µs, where it took 680 µs,
-  and 50 processes do 8200 requests each second, where they did 5200.
+  also when no process reads it. The dispatcher gives the parts of the
+  parsed URL to Finch, thus Finch does not parse the URL again with
+  regular expressions. A small request with `fetch` and
+  `Web.Response.text/1` takes approximately 310 µs, where it took 630 to
+  680 µs, and 50 processes do 8300 to 8800 requests each second, where
+  they did 5200. See `BENCHMARKS.md`.
+- **Breaking:** the JSON functions use the module `JSON` of Elixir and the
+  module `:json` of Erlang/OTP. The package does not depend on Jason now.
+  - `Web.Response.json/2` encodes with the protocol `JSON.Encoder`. A
+    struct that has only an implementation of `Jason.Encoder` raises
+    `Web.TypeError`: derive `JSON.Encoder` for it.
+  - `json/1` of a request or a response does the algorithm "parse JSON
+    from bytes" of the Fetch Standard: the UTF-8 decode of the bytes, then
+    `JSON.parse`. A byte order mark at the start is permitted, and bytes
+    that are not valid UTF-8 become U+FFFD. Before, the two gave a
+    rejection.
+  - An object with the same key two times keeps the last value, as in
+    ECMAScript.
+  - `Web.Blob.json/1` returns `{:error, %JSON.DecodeError{}}` for text that
+    is not JSON.
+  - Some differences with ECMAScript stay. A number that is too large for
+    a float, such as `1e400`, and the escape of a lone surrogate, such as
+    `"\uD800"`, give a rejection. `-0` is the integer 0.
+  - `json/1` of a body of 8 MiB takes approximately 171 ms, where it took
+    429 ms. For a large body, the process of the promise gets a large heap
+    at the start.
+- `text/1` of a request or a response makes no copy of a body that has one
+  chunk, and does the fast check of `String.valid?/2` for valid UTF-8.
+  Only text that is not valid gets the scan that replaces each invalid
+  sequence. A body of 8 MiB in one chunk takes approximately 2.2 ms, where
+  it took 87 ms, and a body of 8 MiB in chunks of 64 KiB takes 8 ms, where
+  it took 70 ms.
+- **Breaking:** `Web.Blob.text/1` does the UTF-8 decode of the File API: a
+  byte order mark goes away, and each sequence that is not valid UTF-8
+  becomes U+FFFD. Before, it gave the bytes with no change.
+- The tests load the modules of the package, of Elixir, of Logger, and of
+  ExUnit before they start. Thus the first use of a module does not wait
+  for the code server on a busy machine. Before, a test of the event
+  `messageerror` failed sometimes for this cause.
 - **Breaking:** the promise `closed` of a `Web.Socket` rejects when the
   socket fails, as the Sockets API specifies. It fulfils for a close, for
   a close of the peer, and for a cancel of the readable side. Before, it
@@ -511,8 +555,9 @@ All notable changes to this project are documented in this file.
     header `location`, raises `Web.TypeError` for a URL that is not valid,
     and raises `Web.RangeError` for a status that is not a redirect status.
   - `json/1` of a request or a response rejects with `Web.SyntaxError` when
-    the body is not JSON. Before, the reason was `Jason.DecodeError`, which
-    is now in the field `cause`.
+    the body is not JSON. Before, the reason was `Jason.DecodeError`. The
+    field `cause` has the `JSON.DecodeError` of the decoder, with the
+    position of the error.
   - `blob/1` gets its type only from the header `content-type`. Before, it
     examined the bytes of the body when the header was absent or generic.
     Use `Web.MIME.sniff/1` to examine the bytes.
@@ -546,6 +591,9 @@ All notable changes to this project are documented in this file.
     branch stopped after 16 chunks until a process read the other branch.
     Thus `Response.clone/1` permits a full read of one of the two responses.
   - The branches of a byte stream are byte streams.
+  - A pull of a branch that has its chunk already does not read the
+    source, as the chunk steps of the Standard. Thus the source gives no
+    chunk that no branch asked for.
   - `tee/1` accepts a stream that is disturbed and not locked, and raises
     only for a locked stream. The stream stays locked until it stops.
   - One difference stays: the promise of `cancel/2` on one branch fulfils
@@ -691,7 +739,8 @@ All notable changes to this project are documented in this file.
 - `Web.ReadableStream.new/2` now recognizes `%{type: "bytes"}` sources,
   provisions byte-length queueing defaults, supports `get_reader(..., mode:
   "byob")`, and surfaces pending BYOB requests through
-  `ReadableByteStreamController.byob_request/1`.
+  `ReadableByteStreamController.byob_request/1`. The default high water
+  mark of a byte stream is 0, as the Streams Standard specifies.
 - `Web.Socket` lifecycle promises now use `Web.Promise.with_resolvers/0`
   instead of ad hoc mailbox wiring for external settlement.
 - `Web.ReadableStream.new/2` now accepts explicit queueing options and

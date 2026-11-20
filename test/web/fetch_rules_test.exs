@@ -82,6 +82,22 @@ defmodule Web.FetchRulesTest do
       assert target(url(port, "/target?#")) == {"/target?", "localhost:#{port}"}
     end
 
+    test "has the changes of the URLSearchParams of the URL", %{port: port} do
+      changed = fn path, fun ->
+        url = Web.URL.new(url(port, path))
+        %{url | search_params: fun.(Web.URL.search_params(url))}
+      end
+
+      added = changed.("/target", &Web.URLSearchParams.append(&1, "a", "b c"))
+      assert target(added) == {"/target?a=b+c", "localhost:#{port}"}
+
+      emptied = changed.("/target?x=1", &Web.URLSearchParams.delete(&1, "x"))
+      assert target(emptied) == {"/target", "localhost:#{port}"}
+
+      sorted = changed.("/target?b=1&a=2", &Web.URLSearchParams.sort/1)
+      assert target(sorted) == {"/target?a=2&b=1", "localhost:#{port}"}
+    end
+
     test "has the path in its serialized form", %{port: port} do
       assert target(url(port, "/target/ä b/../c")) == {"/target/c", "localhost:#{port}"}
       assert target(url(port, "/target/ä b")) == {"/target/%C3%A4%20b", "localhost:#{port}"}

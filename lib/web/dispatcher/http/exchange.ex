@@ -989,14 +989,12 @@ defmodule Web.Dispatcher.HTTP.Exchange do
   defp port(%Web.URL{port: port}), do: String.to_integer(port)
 
   # The query of the request target, with its "?". An empty query keeps the
-  # "?": the URL "http://a/?" asks for "/?". The getter of `search` gives ""
-  # for an empty query.
-  defp query(%Web.URL{search: nil}), do: ""
-
+  # "?": the URL "http://a/?" asks for "/?". The query includes the changes
+  # of the URLSearchParams of the URL.
   defp query(url) do
-    case Web.URL.search(url) do
-      "" -> "?"
-      search -> search
+    case Web.URL.__query__(url) do
+      nil -> ""
+      query -> "?" <> query
     end
   end
 

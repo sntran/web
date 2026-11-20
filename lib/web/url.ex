@@ -671,11 +671,18 @@ defmodule Web.URL do
   end
 
   defp serialize_search(%__MODULE__{} = url) do
-    case effective_search(url) do
+    case __query__(url) do
       nil -> ""
       search -> "?" <> search
     end
   end
+
+  # The query of the URL, with no "?": `nil` for no query, and `""` for an
+  # empty query. The getter of `search` gives `""` for the two. The request
+  # target of an HTTP request must know the difference.
+  @doc false
+  @spec __query__(t()) :: String.t() | nil
+  def __query__(%__MODULE__{} = url), do: effective_search(url)
 
   defp serialize_fragment(%__MODULE__{fragment: nil}), do: ""
   defp serialize_fragment(%__MODULE__{fragment: fragment}), do: "#" <> fragment
@@ -715,15 +722,17 @@ defmodule Web.URL do
     Encoding.encode_query_component(search, Parser.special_scheme?(protocol))
   end
 
-  defp effective_search(%__MODULE__{search: nil}), do: nil
-
-  defp effective_search(%__MODULE__{} = url) do
-    derived = Web.URLSearchParams.__parse__(url.search || "")
-
-    if url.search_params == derived do
-      url.search
+  # The query of the URL, after the changes of its URLSearchParams. A change
+  # runs the "update steps" of the URL Standard: the query is the
+  # serialization of the list, and an empty serialization is no query.
+  defp effective_search(%__MODULE__{search: search, search_params: params}) do
+    if params.url_query == (search || "") do
+      search
     else
-      Web.URLSearchParams.to_string(url.search_params)
+      case Web.URLSearchParams.to_string(params) do
+        "" -> nil
+        query -> query
+      end
     end
   end
 

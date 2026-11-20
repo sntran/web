@@ -12,10 +12,14 @@ defmodule Web.URLSearchParams do
   defguardp form_safe?(char)
             when char in ?a..?z or char in ?A..?Z or char in ?0..?9 or char in [?*, ?-, ?., ?_]
 
-  defstruct pairs: []
+  # `url_query` is internal: the query of the URL that the list comes from,
+  # or `nil`. Each change of the list sets it to `nil`. Thus `Web.URL`
+  # knows that the list changed, also when the new list is equal to the old
+  # list, and runs the "update steps" of the URL Standard.
+  defstruct pairs: [], url_query: nil
 
   @type pair :: {String.t(), String.t()}
-  @type t :: %__MODULE__{pairs: [pair()]}
+  @type t :: %__MODULE__{pairs: [pair()], url_query: String.t() | nil}
 
   @doc """
   Creates a URLSearchParams container.
@@ -58,7 +62,8 @@ defmodule Web.URLSearchParams do
   # at the start is a part of the first name, as the URL Standard specifies.
   # Only the constructor removes it.
   @spec __parse__(String.t()) :: t()
-  def __parse__(query) when is_binary(query), do: %__MODULE__{pairs: form_parse(query)}
+  def __parse__(query) when is_binary(query),
+    do: %__MODULE__{pairs: form_parse(query), url_query: query}
 
   @doc """
   Appends a new name/value pair to the end of the query parameters.
@@ -73,7 +78,7 @@ defmodule Web.URLSearchParams do
   """
   @spec append(t(), String.t(), String.t()) :: t()
   def append(%__MODULE__{} = params, name, value) do
-    %{params | pairs: params.pairs ++ [{Kernel.to_string(name), Kernel.to_string(value)}]}
+    update(params, params.pairs ++ [{Kernel.to_string(name), Kernel.to_string(value)}])
   end
 
   @doc """
@@ -94,7 +99,7 @@ defmodule Web.URLSearchParams do
   """
   @spec delete(t(), String.t(), String.t() | nil) :: t()
   def delete(%__MODULE__{} = params, name, value \\ nil) do
-    %{params | pairs: Enum.reject(params.pairs, matcher(name, value))}
+    update(params, Enum.reject(params.pairs, matcher(name, value)))
   end
 
   @doc """
@@ -206,7 +211,7 @@ defmodule Web.URLSearchParams do
       end)
 
     pairs = Enum.reverse(pairs)
-    %{params | pairs: if(seen?, do: pairs, else: pairs ++ [{name, value}])}
+    update(params, if(seen?, do: pairs, else: pairs ++ [{name, value}]))
   end
 
   @doc """
@@ -227,7 +232,7 @@ defmodule Web.URLSearchParams do
   @spec sort(t()) :: t()
   def sort(%__MODULE__{} = params) do
     # The sort of Enum.sort_by/2 is stable.
-    %{params | pairs: Enum.sort_by(params.pairs, fn {name, _value} -> code_units(name) end)}
+    update(params, Enum.sort_by(params.pairs, fn {name, _value} -> code_units(name) end))
   end
 
   @doc """
@@ -285,6 +290,9 @@ defmodule Web.URLSearchParams do
     current = get(params, key)
     {current, delete(params, key)}
   end
+
+  # A change of the list: the list is not the query of its URL now.
+  defp update(params, pairs), do: %{params | pairs: pairs, url_query: nil}
 
   defp normalize_init("?" <> query), do: form_parse(query)
   defp normalize_init(init) when is_binary(init), do: form_parse(init)

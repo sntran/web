@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.TextDecoder` decodes the encodings of Chinese, Japanese, and Korean:
+  gb18030, GBK, Big5, EUC-JP, ISO-2022-JP, Shift_JIS, and EUC-KR. The
+  decoders follow the Encoding Standard, with the modes "replacement" and
+  "fatal", and with `stream: true`. The index data comes from the index
+  files of the Encoding Standard (CC BY 4.0), in
+  `lib/web/encoding/multi_byte_indexes.txt`. The file names its source and
+  the SHA-256 hash of each index file.
+- `Web.TextDecoder.decode/1`, and `nil` as the input of `decode/2,3`: a
+  call with no input ends a stream, as `decode()` in JavaScript.
+- `Web.TextEncoder.encode_into/3`, the method `encodeInto()` of the
+  Encoding Standard. A `Web.Uint8Array` is immutable, thus the function
+  returns `{%{read: read, written: written}, destination}`, with the new
+  destination.
+- `Web.URL.parse/1,2`, `Web.URL.can_parse/1,2`, and `Web.URL.to_json/1`.
+- `Web.URLSearchParams.has/3` and `Web.URLSearchParams.delete/3`, with a
+  value, and `Web.URLSearchParams.size/1`.
 - `Web.fetch/2` decodes a response body with the header
   `Content-Encoding`, as the Fetch Standard specifies: `gzip`, `x-gzip`,
   `deflate` (the zlib format, or raw deflate data), and `zstd`. A list of
@@ -72,7 +88,7 @@ All notable changes to this project are documented in this file.
   the JavaScript engine QuickJS, against the library: `Headers`, `URL`,
   `URLSearchParams`, `TextEncoder`, and `TextDecoder`. A layer makes the
   JavaScript classes from the WebIDL files of WPT, and calls the library
-  through a port. 14585 of 17257 tests pass. The lists of the tests that do
+  through a port. 16586 of 17257 tests pass. The lists of the tests that do
   not pass, with the group of their cause, are in
   `test/wpt/quickjs/expectations/`. QuickJS is a tool of the tests only: the
   tests download a pinned release, and examine its SHA-256 hash.
@@ -277,6 +293,25 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- **Breaking:** `Web.URL.new/2` and the setter `Web.URL.href/2` raise
+  `Web.TypeError` for a URL that is not valid, as the URL Standard
+  specifies. They raised `ArgumentError`. Change a `rescue ArgumentError`
+  for a URL to `rescue Web.TypeError`. `Web.Request.new/2`,
+  `Web.Response.redirect/2`, and `Web.fetch/2` keep their messages.
+- `Web.URL.search/1` and `Web.URL.hash/1` give `""` for an empty query and
+  for an empty fragment, as the URL Standard specifies. They gave `"?"` and
+  `"#"`. `Web.URL.href/1` keeps the `"?"` and the `"#"`. A request for
+  `http://a/?` still asks for `/?`.
+- `Web.URLSearchParams` follows the `application/x-www-form-urlencoded`
+  rules of the URL Standard:
+  - the parser makes no pair for an empty part between two `&`, and a
+    sequence of bytes that is not valid UTF-8 becomes U+FFFD;
+  - the serializer keeps `*`, `-`, `.`, `_`, and the ASCII letters and
+    digits, and encodes `~` as `%7E`;
+  - `sort/1` compares the UTF-16 code units of the names, as JavaScript
+    does, and keeps the sequence of the pairs with the same name;
+  - `new/1` accepts a pair as a list of two items, and raises
+    `Web.TypeError` for an item that does not have two items.
 - `README.md` does not say that the library has 100 % WPT compliance for
   `URL`. The JSON data of WPT for the parse of a URL passes, but the
   JavaScript files of WPT show differences: see "Web Platform Tests in
@@ -940,6 +975,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- An iteration of `Web.Headers` gives each value of `set-cookie` as a pair
+  of its own, as the steps "sort and combine" of the Fetch Standard
+  specify. `Enum.count/1` counts the pairs.
+- `Web.Response.form_data/1` of an `application/x-www-form-urlencoded` body
+  keeps a `"?"` at the start of the body as a part of the first name. Only
+  the constructor of `URLSearchParams` removes it.
 - `Web.fetch/2` and `Web.connect/2` connect to an IPv6 address, such as
   `http://[::1]:8080/`, `tcp://[::1]:8080`, `Web.connect("[::1]:8080")`, and
   `Web.connect(%{hostname: "::1", port: 8080})`. Before, Erlang did not try

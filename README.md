@@ -648,27 +648,24 @@ QuickJS is a tool of the tests only. The tests download a pinned release of
 its Cosmopolitan build, one file for Linux, macOS, Windows, and the BSD
 systems, and examine its SHA-256 hash.
 
-| Suite | WPT tests | Pass | The runner lacks a feature | The library differs |
-| --- | --- | --- | --- | --- |
-| `Headers` | 287 | 94 | 184 | 9 |
-| `TextEncoder` and `TextDecoder` | 12101 | 11169 | 308 | 624 |
-| `URL` and `URLSearchParams` | 4869 | 3322 | 73 | 1474 |
+| Suite | WPT tests | Pass | The runner lacks a feature | The library differs | The Standard changed the test |
+| --- | --- | --- | --- | --- | --- |
+| `Headers` | 287 | 103 | 184 | 0 | 0 |
+| `TextEncoder` and `TextDecoder` | 12101 | 11705 | 394 | 0 | 2 |
+| `URL` and `URLSearchParams` | 4869 | 4778 | 73 | 18 | 0 |
 
 A test that the runner cannot run needs a feature that the runner does not
 have yet, for example `Request`, `XMLHttpRequest`, the streams of the Encoding
-Standard, or the server of WPT. The largest differences of the library are:
+Standard, or the server of WPT. The runner also does not copy the bytes that
+`encodeInto` writes into the JavaScript buffer (86 tests). The difference
+of the library is:
 
-* `Web.URL.new/2` raises `ArgumentError` for a URL that is not valid. The
-  Standard specifies `TypeError`. This fails 1406 tests.
-* The library has no decoders for the encodings of Chinese, Japanese, and
-  Korean (499 tests), and no `encodeInto` (86 tests).
-* `TextDecoder.decode/3` refuses a call with no input, which ends a stream.
-* The getters `search` and `hash` give `"?"` and `"#"` for an empty part, the
-  parser of `URLSearchParams` makes a pair for an empty sequence, `*` is
-  percent-encoded, and `sort/1` uses code points, not UTF-16 code units.
-* The iteration of `Headers` joins the values of `set-cookie`.
 * A `URLSearchParams` from a URL does not change the URL: the structs of the
-  library are immutable.
+  library are immutable (18 tests).
+
+The pinned commit of WPT has two tests of `TextDecoder` that the current
+Encoding Standard changed: after a fatal error, `decode()` starts a new
+decoder. The library follows the current Standard.
 
 `test/wpt/quickjs/expectations/` lists each test that does not pass, with
 the group of its cause. A new failure fails the test, and a listed test that

@@ -1,15 +1,10 @@
 {
   "harness": "OK",
   "failures": {
-    "enqueue() inside size() should work": "library: the checks of a high water mark",
-    "error() inside size() should work": "library: the checks of a high water mark",
-    "pipeTo() inside size() should work": "library: a different result",
-    "read() inside of size() should work": "library: a different result",
-    "readable cancel() inside size() should work": "library: the checks of a high water mark",
-    "synchronous writer.write() inside size() should work": "library: the checks of a high water mark",
-    "terminate() inside size() should work": "library: the checks of a high water mark",
-    "writer.abort() inside size() should work": "library: a promise does not settle",
-    "writer.close() inside size() should work": "library: a promise does not settle",
-    "writer.write() inside size() should work": "library: the checks of a high water mark"
+    "error() inside size() should work": "library: a transform stream has one state for its two sides",
+    "readable cancel() inside size() should work": "library: a transform stream has one state for its two sides",
+    "writer.abort() inside size() should work": "library: a transform stream has one state for its two sides",
+    "writer.close() inside size() should work": "runner: the library does the steps of a later microtask before the call returns",
+    "writer.write() inside size() should work": "runner: the library does the steps of a later microtask before the call returns"
   }
 }

@@ -1,9 +1,9 @@
 {
   "harness": "OK",
   "failures": {
-    "additional writes should wait for backpressure to be relieved for class TextDecoderStream": "library: a different result",
-    "additional writes should wait for backpressure to be relieved for class TextEncoderStream": "library: a different result",
-    "write() should not complete until read relieves backpressure for TextDecoderStream": "library: a different result",
-    "write() should not complete until read relieves backpressure for TextEncoderStream": "library: a different result"
+    "additional writes should wait for backpressure to be relieved for class TextDecoderStream": "runner: the promises settle in the sequence of their creation",
+    "additional writes should wait for backpressure to be relieved for class TextEncoderStream": "runner: the promises settle in the sequence of their creation",
+    "write() should not complete until read relieves backpressure for TextDecoderStream": "runner: the promises settle in the sequence of their creation",
+    "write() should not complete until read relieves backpressure for TextEncoderStream": "runner: the promises settle in the sequence of their creation"
   }
 }

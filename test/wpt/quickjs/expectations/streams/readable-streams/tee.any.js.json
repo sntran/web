@@ -1,8 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "ReadableStream teeing: erroring a teed stream should properly handle canceled branches": "library: a different result",
-    "ReadableStream teeing: errors in the source should propagate to both branches": "library: a different result",
-    "ReadableStream teeing: should be able to read one branch to the end without affecting the other": "library: a different result"
+    "ReadableStream teeing: errors in the source should propagate to both branches": "runner: the library does the steps of a later microtask before the call returns"
   }
 }

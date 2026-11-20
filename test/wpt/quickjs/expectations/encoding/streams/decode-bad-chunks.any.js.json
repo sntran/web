@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "chunk of type undefined should error the stream": "library: a different result"
-  }
-}

@@ -734,8 +734,7 @@ defmodule Web.Test.QuickJS.Bridge do
 
   # The constructors of the streams take the dictionaries of WebIDL. The
   # library takes a map of functions and a keyword list of options. A
-  # strategy gives its high water mark. The library has no `size` function
-  # of a strategy: it counts each chunk as 1.
+  # strategy gives its high water mark and its size function.
   defp adapt("ReadableStream", "constructor", _member, _self, [source | strategy]) do
     {:ok, Web.ReadableStream.new(source, strategy_options(strategy))}
   end
@@ -749,7 +748,7 @@ defmodule Web.Test.QuickJS.Bridge do
         _other -> sink
       end
 
-    {:ok, Web.WritableStream.new(Map.merge(sink, Map.new(strategy_options(strategy))))}
+    {:ok, Web.WritableStream.new(sink, strategy_options(strategy))}
   end
 
   defp adapt("TransformStream", "constructor", _member, _self, [transformer | strategies]) do
@@ -760,13 +759,10 @@ defmodule Web.Test.QuickJS.Bridge do
         [] -> {nil, nil}
       end
 
-    options =
-      Enum.flat_map(strategy_options([writable]), fn {:high_water_mark, hwm} ->
-        [writable_strategy: %{high_water_mark: hwm}]
-      end) ++
-        Enum.flat_map(strategy_options([readable]), fn {:high_water_mark, hwm} ->
-          [readable_strategy: Web.CountQueuingStrategy.new(hwm)]
-        end)
+    options = [
+      writable_strategy: strategy_options([writable]),
+      readable_strategy: strategy_options([readable])
+    ]
 
     {:ok, Web.TransformStream.new(transformer, options)}
   end
@@ -802,7 +798,9 @@ defmodule Web.Test.QuickJS.Bridge do
 
   defp adapt(_interface, _kind, _member, _self, _args), do: :default
 
-  defp strategy_options([%{high_water_mark: hwm} | _rest]), do: [high_water_mark: hwm]
+  defp strategy_options([%{} = strategy | _rest]),
+    do: strategy |> Map.take([:high_water_mark, :size]) |> Map.to_list()
+
   defp strategy_options(_strategy), do: []
 
   # An operation or a setter that changes the object puts the new struct
@@ -902,7 +900,18 @@ defmodule Web.Test.QuickJS.Bridge do
   # Promises of the library
   # ---------------------------------------------------------------------------
 
-  defp encode_promise(%Web.Promise{pid: pid} = promise) do
+  # A promise that JavaScript has already is the same JavaScript object,
+  # also after it settled.
+  defp encode_promise(%Web.Promise{pid: pid} = promise) when is_pid(pid) do
+    case Map.fetch(get(:promises), pid) do
+      {:ok, id} -> %{"$pr" => id}
+      :error -> encode_new_promise(promise)
+    end
+  end
+
+  defp encode_promise(promise), do: encode_new_promise(promise)
+
+  defp encode_new_promise(%Web.Promise{pid: pid} = promise) do
     case Web.Promise.peek(promise) do
       {:fulfilled, value} -> %{"$pv" => %{"ok" => encode(value)}}
       {:rejected, reason} -> %{"$pv" => %{"error" => encode(reason)}}

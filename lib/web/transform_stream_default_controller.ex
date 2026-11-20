@@ -27,7 +27,7 @@ defmodule Web.TransformStreamDefaultController do
   """
   @spec enqueue(t(), term()) :: :ok
   def enqueue(%__MODULE__{pid: pid}, chunk) do
-    Web.ReadableStream.controller_enqueue(pid, chunk)
+    Web.ReadableStream.controller_enqueue(pid, chunk, :transform)
   end
 
   @doc """

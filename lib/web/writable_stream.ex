@@ -14,6 +14,7 @@ defmodule Web.WritableStream do
   @typedoc "A writable stream. The field is private."
   @type t :: %__MODULE__{controller_pid: pid()}
 
+  alias Web.Internal.QueuingStrategy
   alias Web.TypeError
   alias Web.WritableStreamDefaultController
   alias Web.WritableStreamDefaultWriter
@@ -82,17 +83,32 @@ defmodule Web.WritableStream do
 
   @doc """
   Creates a new WritableStream with the given underlying sink.
+
+  ## The queuing strategy
+
+  The strategy is the dictionary `QueuingStrategy` of the Streams Standard:
+  a keyword list or a map with these keys, or a `Web.CountQueuingStrategy`
+  or a `Web.ByteLengthQueuingStrategy`.
+
+    * `:high_water_mark` - the limit of the queue of writes: a number that
+      is not below zero, or `:infinity`. The default is 1.
+    * `:size` - a function that gives the size of a chunk. The default
+      counts each chunk as 1. The function runs in the process that writes
+      the chunk. A size that is not valid puts the stream in the errored
+      state, and the write rejects.
+
+  Raises `Web.RangeError` for a high water mark that is NaN or below zero,
+  and `Web.TypeError` for a size that is not a function.
   """
-  def new(underlying_sink \\ %{})
+  def new(underlying_sink \\ %{}, strategy \\ [])
 
-  def new(underlying_sink) when is_map(underlying_sink) and not is_struct(underlying_sink) do
+  def new(underlying_sink, strategy)
+      when is_map(underlying_sink) and not is_struct(underlying_sink) do
     :ok = validate_sink!(underlying_sink)
-    hwm = Map.get(underlying_sink, :high_water_mark, 1)
-
-    if not is_number(hwm) or hwm < 0 do
-      raise Web.RangeError, "Invalid high water mark: #{inspect(hwm)}"
-    end
-
+    # The key `:high_water_mark` of the sink is the default high water mark.
+    default_hwm = Map.get(underlying_sink, :high_water_mark, 1)
+    {hwm, size} = QueuingStrategy.extract!(strategy, default_hwm)
+    hwm = QueuingStrategy.high_water_mark!(hwm, 1)
     start_fn = Map.get(underlying_sink, :start)
 
     {:ok, pid} =
@@ -100,6 +116,7 @@ defmodule Web.WritableStream do
         underlying_sink: underlying_sink,
         high_water_mark: hwm,
         strategy: Web.CountQueuingStrategy.new(hwm),
+        size: size,
         has_start: is_function(start_fn)
       )
 
@@ -110,7 +127,7 @@ defmodule Web.WritableStream do
     %__MODULE__{controller_pid: pid}
   end
 
-  def new(underlying_sink) do
+  def new(underlying_sink, _strategy) do
     raise Web.TypeError, "The underlying sink must be a map, got: #{inspect(underlying_sink)}"
   end
 

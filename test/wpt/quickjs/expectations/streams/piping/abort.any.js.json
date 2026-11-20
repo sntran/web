@@ -1,10 +1,10 @@
 {
   "harness": "OK",
   "failures": {
-    "(reason: 'error1: error1') all pending writes should complete on abort": "library: the checks of a high water mark",
-    "(reason: 'null') all pending writes should complete on abort": "library: the checks of a high water mark",
+    "(reason: 'error1: error1') all pending writes should complete on abort": "library: a different result",
+    "(reason: 'null') all pending writes should complete on abort": "library: a different result",
     "(reason: 'undefined') abort should prevent further reads": "library: a different result",
-    "(reason: 'undefined') all pending writes should complete on abort": "library: the checks of a high water mark",
+    "(reason: 'undefined') all pending writes should complete on abort": "library: a different result",
     "(reason: 'undefined') all the error objects should be the same object": "library: a different result",
     "a rejection from underlyingSink.abort() should be preferred to one from underlyingSource.cancel()": "library: a different result",
     "a rejection from underlyingSink.abort() should be returned by pipeTo()": "library: a different result",

@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Closing a writable stream with in-flight writes below the high water mark delays the close call properly": "runner: the library cannot read a property of a JavaScript object"
+  }
+}

@@ -1,11 +1,9 @@
 {
   "harness": "OK",
   "failures": {
-    "a chunk that cannot be converted to a string should error the streams": "library: a different result",
-    "input of type array should be converted correctly to string": "library: a different result",
-    "input of type null should be converted correctly to string": "library: a different result",
-    "input of type numeric should be converted correctly to string": "library: a different result",
-    "input of type object should be converted correctly to string": "library: a different result",
-    "input of type undefined should be converted correctly to string": "library: a different result"
+    "a chunk that cannot be converted to a string should error the streams": "library: String.Chars converts a chunk, not the rules of JavaScript",
+    "input of type array should be converted correctly to string": "library: String.Chars converts a chunk, not the rules of JavaScript",
+    "input of type object should be converted correctly to string": "library: String.Chars converts a chunk, not the rules of JavaScript",
+    "input of type undefined should be converted correctly to string": "library: String.Chars converts a chunk, not the rules of JavaScript"
   }
 }

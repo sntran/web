@@ -498,7 +498,9 @@
     }
     const result = {};
     const previousThis = callbackThis;
-    callbackThis = value;
+    // The Streams Standard calls the size function of a strategy with no
+    // `this` value, and the other callbacks with their dictionary.
+    callbackThis = d.name === "QueuingStrategy" ? undefined : value;
     try {
       for (const member of dictionaryMembers(d)) {
         convertMember(d, member, value, result);

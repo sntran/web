@@ -94,14 +94,14 @@ Read(p) ==
     /\ disturbed' = TRUE
     /\ UNCHANGED <<phase, lock, live, running>>
 
-\* Process p cancels the stream. A halt of an enumeration is a cancel.
+\* Process p cancels the stream. A halt of an enumeration is a cancel. A
+\* cancel does not release the lock, as the Streams Standard specifies.
 Cancel(p) ==
     /\ running /\ p \in live /\ lock \in {"none", p} /\ ~Ended
     /\ phase' = "closed"
     /\ queue' = 0
-    /\ lock' = "none"
     /\ disturbed' = TRUE
-    /\ UNCHANGED <<live, running>>
+    /\ UNCHANGED <<lock, live, running>>
 
 \* Process p stops. A lock that it holds is released.
 ProcStop(p) ==

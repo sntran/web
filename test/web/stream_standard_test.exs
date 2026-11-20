@@ -507,8 +507,8 @@ defmodule Web.StreamStandardTest do
       assert %ReadableStream{} = ReadableStream.new(%{type: "bytes"})
     end
 
-    test "refuse a limit that is not a number or that is below zero" do
-      for limit <- [-1, :big, "1"] do
+    test "refuse a limit that is not a number, that is NaN, or that is below zero" do
+      for limit <- [-1, -0.5, :neg_infinity, :nan, :big, "1"] do
         assert_raise Web.RangeError, ~r/Invalid high water mark/, fn ->
           ReadableStream.new(%{}, high_water_mark: limit)
         end
@@ -517,8 +517,9 @@ defmodule Web.StreamStandardTest do
           WritableStream.new(%{high_water_mark: limit})
         end
 
-        assert_raise Web.RangeError, fn -> CountQueuingStrategy.new(limit) end
-        assert_raise Web.RangeError, fn -> ByteLengthQueuingStrategy.new(limit) end
+        assert_raise Web.RangeError, ~r/Invalid high water mark/, fn ->
+          TransformStream.new(%{}, readable_strategy: [high_water_mark: limit])
+        end
       end
 
       assert ReadableStream.get_desired_size(

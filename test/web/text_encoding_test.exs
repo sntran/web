@@ -279,7 +279,7 @@ defmodule Web.TextEncodingTest do
     assert Enum.map(stream.readable, &Uint8Array.to_binary/1) == ["Hi ", "🌍"]
   end
 
-  test "TextEncoderStream errors when a non-string chunk is written" do
+  test "TextEncoderStream errors when a chunk with no String.Chars is written" do
     stream = TextEncoderStream.new()
     writer = WritableStream.get_writer(stream.writable)
 
@@ -288,7 +288,7 @@ defmodule Web.TextEncodingTest do
     read = Web.ReadableStreamDefaultReader.read(reader)
 
     assert %Web.TypeError{} =
-             catch_exit(await(WritableStreamDefaultWriter.write(writer, 123)))
+             catch_exit(await(WritableStreamDefaultWriter.write(writer, {:no, :string})))
 
     assert %Web.TypeError{} = catch_exit(await(read))
   end

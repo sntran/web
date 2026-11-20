@@ -3,7 +3,6 @@
   "failures": {
     "ReadableStream teeing with byte source: chunks for BYOB requests from branch 1 should be cloned to branch 2": "library: a different result",
     "ReadableStream teeing with byte source: close when both branches have pending BYOB reads": "library: a different result",
-    "ReadableStream teeing with byte source: erroring a teed stream should properly handle canceled branches": "library: a different result",
     "ReadableStream teeing with byte source: pull with BYOB reader, then pull with default reader": "library: a different result",
     "ReadableStream teeing with byte source: pull with default reader, then pull with BYOB reader": "library: a different result",
     "ReadableStream teeing with byte source: read from branch1 and branch2, cancel branch1, cancel branch2": "library: a different result",

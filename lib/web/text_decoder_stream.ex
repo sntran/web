@@ -34,7 +34,7 @@ defmodule Web.TextDecoderStream do
     stream =
       TransformStream.new(%{
         transform: fn chunk, controller ->
-          decoded = TextDecoder.decode(decoder, chunk, %{stream: true})
+          decoded = TextDecoder.decode(decoder, buffer_source!(chunk), %{stream: true})
 
           if decoded != "" do
             ReadableStreamDefaultController.enqueue(controller, decoded)
@@ -59,4 +59,13 @@ defmodule Web.TextDecoderStream do
       ignore_bom: decoder.ignore_bom
     }
   end
+
+  # The Standard converts each chunk to a buffer source. `nil` is no
+  # buffer: `Web.TextDecoder.decode/3` takes it as no input, but a chunk of
+  # a stream must have bytes.
+  defp buffer_source!(nil) do
+    raise Web.TypeError, "TextDecoderStream needs a chunk of bytes, got: nil"
+  end
+
+  defp buffer_source!(chunk), do: chunk
 end

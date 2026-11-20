@@ -31,6 +31,7 @@ defmodule Web.Stream do
   alias Web.AbortSignal
   alias Web.AsyncContext.Snapshot
   alias Web.Internal.LazyStream
+  alias Web.Internal.QueuingStrategy
 
   # ---------------------------------------------------------------------------
   # Behavior definition
@@ -98,6 +99,17 @@ defmodule Web.Stream do
     writable_hwm: 1,
     total_queued_size: 0,
     strategy: %Web.CountQueuingStrategy{},
+    # The size algorithms of the two sides: see `Web.Internal.QueuingStrategy`.
+    # The queue of a default stream holds `{chunk, size}`.
+    readable_size: :count,
+    writable_size: :count,
+    # The sizes of the writes that are not complete, in their sequence, and
+    # their total.
+    write_sizes: :queue.new(),
+    write_total: 0,
+    # The reader lock and the promise `closed` of each reader that asked for
+    # it: see `reader_closed/4`.
+    closed_promises: %{},
     stream_type: :default,
     auto_allocate_chunk_size: nil,
     pulling: false,
@@ -116,6 +128,8 @@ defmodule Web.Stream do
     writable_error: nil,
     read_requests: :queue.new(),
     disturbed: false,
+    # The stream was cancelled: see `complete_linger/1`.
+    canceled: false,
     # Consumer (writable) side
     writer_pid: nil,
     writer_ref: nil,
@@ -357,6 +371,26 @@ defmodule Web.Stream do
 
   @priority_alias {__MODULE__, :priority_alias}
 
+  # The size function of the user for the writable side. The process that
+  # writes reads it from the dictionary of the stream, with no message: it
+  # calls the function before it sends the write, as the Streams Standard
+  # specifies. The stream removes it when the writable side is closed or
+  # errored, as ClearAlgorithms does.
+  @writable_size_key {__MODULE__, :writable_size}
+
+  @doc false
+  # The size function of the user for the writable side of the stream, or
+  # `nil`.
+  def __writable_size__(pid) when is_pid(pid) do
+    case :erlang.process_info(pid, {:dictionary, @writable_size_key}) do
+      {_item, size} when is_function(size, 1) -> size
+      _other -> nil
+    end
+  rescue
+    # The process is on a different node.
+    ArgumentError -> nil
+  end
+
   defp deliver(pid, envelope, message) do
     if abortive?(message) do
       send_with_priority(pid, envelope)
@@ -449,6 +483,11 @@ defmodule Web.Stream do
          timeout_ms
        ) do
     {readable_hwm, writable_hwm} = init_capacities(type, hwm, strategy)
+    {readable_size, writable_size} = init_sizes(type, opts, strategy)
+
+    # A writer calls the size function of the user in its own process: see
+    # `__writable_size__/1`.
+    if is_function(writable_size), do: Process.put(@writable_size_key, writable_size)
 
     data = %__MODULE__{
       module: module,
@@ -460,6 +499,8 @@ defmodule Web.Stream do
       writable_hwm: writable_hwm,
       total_queued_size: 0,
       strategy: strategy,
+      readable_size: readable_size,
+      writable_size: writable_size,
       stream_type: Keyword.get(opts, :stream_type, :default),
       auto_allocate_chunk_size: Keyword.get(opts, :auto_allocate_chunk_size),
       timeout_ms: timeout_ms,
@@ -716,6 +757,23 @@ defmodule Web.Stream do
   # handle_common — operations valid in all states
   # ---------------------------------------------------------------------------
 
+  # A request of a reader of `Web.ReadableStreamDefaultReader`. The reader
+  # has the reference of its lock. A reader that released its lock keeps
+  # no effect on the stream, also when the same process has a new reader.
+  defp handle_common({:call, from}, {:as_reader, lock, message}, state, data) do
+    if lock == data.reader_ref and not is_nil(lock) do
+      handle_common({:call, from}, message, state, data)
+    else
+      {:keep_state_and_data, [{:reply, from, released_reader_reply(message)}]}
+    end
+  end
+
+  # The attribute `closed` of a reader: the same promise for each request.
+  defp handle_common({:call, from}, {:reader_closed, lock}, state, data) do
+    {promise, data} = reader_closed(lock, state, data)
+    {:keep_state, data, [{:reply, from, promise}]}
+  end
+
   # Reader lock acquisition
   defp handle_common({:call, from}, {:get_reader, pid}, state, data)
        when data.type in [:producer, :producer_consumer] do
@@ -775,6 +833,7 @@ defmodule Web.Stream do
   defp handle_common({:call, from}, {:release_lock, :reader, pid}, _state, data) do
     if pid == data.reader_pid do
       if(data.reader_ref, do: Process.demonitor(data.reader_ref, [:flush]))
+      data = release_closed_promise(data)
 
       # The read requests of the reader reject, as the Streams Standard
       # specifies.
@@ -854,6 +913,18 @@ defmodule Web.Stream do
     end
   end
 
+  # A write with the result of the size function of the user: the writer
+  # called it. A stream that is not writable handles the write as each
+  # other write.
+  defp handle_common({:call, from}, {:write, pid, chunk, size_result}, state, data)
+       when data.type in [:consumer, :producer_consumer] do
+    if state == :writable do
+      handle_write(from, pid, chunk, size_result, state, data)
+    else
+      {:keep_state_and_data, [{:next_event, {:call, from}, {:write, pid, chunk}}]}
+    end
+  end
+
   # Writer lock acquisition
   defp handle_common(
          {:call, from},
@@ -906,7 +977,7 @@ defmodule Web.Stream do
       state in [:closed, :errored] ->
         {:keep_state_and_data, [{:reply, from, :ok}]}
 
-      readable_capacity(data) > 0 ->
+      QueuingStrategy.positive?(readable_capacity(data)) ->
         {:keep_state_and_data, [{:reply, from, :ok}]}
 
       true ->
@@ -920,13 +991,15 @@ defmodule Web.Stream do
   # they are calls, and the caller gets the refusal.
   defp handle_common({:call, from}, {:enqueue, chunk}, state, data) do
     case controller_refusal(state, data) do
-      nil ->
-        {:keep_state, new_data, actions} = handle_producer_enqueue(chunk, state, data)
-        {:keep_state, new_data, [{:reply, from, :ok} | actions]}
-
-      refusal ->
-        {:keep_state_and_data, [{:reply, from, {:error, refusal}}]}
+      nil -> controller_enqueue(from, chunk, state, data)
+      refusal -> {:keep_state_and_data, [{:reply, from, {:error, refusal}}]}
     end
+  end
+
+  # The second step of an enqueue with the size function of the user: the
+  # process that enqueues called the function. See `controller_enqueue/4`.
+  defp handle_common({:call, from}, {:enqueue_sized, chunk, result}, state, data) do
+    enqueue_sized(from, chunk, result, state, data)
   end
 
   defp handle_common({:call, from}, :close, state, data) do
@@ -1074,6 +1147,15 @@ defmodule Web.Stream do
 
       {:next_state, next_state, new_data, [{:reply, from, :ok} | actions]}
     end
+  end
+
+  # ReadableStreamCancel: the cancel of an errored stream rejects with the
+  # error of the stream. The errored state of a transform stream can come
+  # from its writable side, before the readable side is errored: such a
+  # cancel has no effect.
+  defp handle_common({:call, from}, {:terminate, :cancel, _reason}, :errored, data)
+       when data.type == :producer do
+    {:keep_state_and_data, [{:reply, from, {:error, data.error_reason}}]}
   end
 
   defp handle_common({:call, from}, {:terminate, type, reason}, state, data)
@@ -1374,6 +1456,82 @@ defmodule Web.Stream do
   defp task_down(:normal, _state, _data), do: :keep_state_and_data
   defp task_down(reason, _state, data), do: fail_stream(reason, data)
 
+  # `enqueue` of a controller. The size function of the user must run in the
+  # process that enqueues, as in the Streams Standard: the function can
+  # call the stream, and this process must be free to answer. Thus the
+  # reply `{:size, size}` gives the function to the caller, which calls it
+  # and sends `{:enqueue_sized, chunk, result}`. A read that waits takes the
+  # chunk with no call of the size function.
+  defp controller_enqueue(from, chunk, _state, %{stream_type: :default} = data) do
+    if is_function(data.readable_size) and :queue.is_empty(data.read_requests) do
+      {:keep_state_and_data, [{:reply, from, {:size, data.readable_size}}]}
+    else
+      case enqueue_default(chunk, data) do
+        {:ok, data} ->
+          {:keep_state, data, [{:reply, from, :ok}, {:next_event, :internal, :maybe_pull}]}
+
+        # The size of the chunk is not valid.
+        {:error, reason} ->
+          fail_stream_for_caller(reason, from, data, [size_error_reply(from, reason, reason)])
+      end
+    end
+  end
+
+  defp controller_enqueue(from, chunk, state, data) do
+    {:keep_state, new_data, actions} = handle_producer_enqueue(chunk, state, data)
+    {:keep_state, new_data, [{:reply, from, :ok} | actions]}
+  end
+
+  # The steps of ReadableStreamDefaultControllerEnqueue after the size
+  # function. The function can change the stream. A chunk with a valid size
+  # goes to the end of the queue, also when a read waits. A chunk for a
+  # stream that is closed or errored has no effect. A size that is not valid
+  # puts a readable stream in the errored state. The caller gets the error
+  # of the size and the error of the stream: see `size_error_reply/3`.
+  defp enqueue_sized(from, chunk, result, state, data) do
+    case QueuingStrategy.validate(result) do
+      {:ok, size} ->
+        if readable_side_open?(state, data) do
+          data = data |> put_chunk(chunk, size) |> refresh_backpressure()
+          {:keep_state, data, [{:reply, from, :ok}, {:next_event, :internal, :maybe_pull}]}
+        else
+          {:keep_state_and_data, [{:reply, from, :ok}]}
+        end
+
+      {:error, reason} ->
+        cond do
+          readable_side_open?(state, data) ->
+            fail_stream_for_caller(reason, from, data, [size_error_reply(from, reason, reason)])
+
+          state == :errored ->
+            {:keep_state_and_data, [size_error_reply(from, reason, data.error_reason)]}
+
+          true ->
+            {:keep_state_and_data, [size_error_reply(from, reason, reason)]}
+        end
+    end
+  end
+
+  # The reply for a size that is not valid. The controller of a readable
+  # stream throws the error of the size. The controller of a transform
+  # stream throws the error of the readable side: the size function can put
+  # the stream in the errored state before it fails.
+  defp size_error_reply(from, reason, stored) do
+    {:reply, from, {:error, {:size, reason, stored}}}
+  end
+
+  # The readable side is in the state "readable" of the Streams Standard. A
+  # stream that closed with chunks in its queue is still readable. The
+  # `terminate` of a transformer closes the readable side at once when its
+  # queue is empty, also while a write is in progress.
+  defp readable_side_open?(:readable, _data), do: true
+
+  defp readable_side_open?(state, data) when state in [:writable, :closing],
+    do: not (data.terminated and :queue.is_empty(data.queue))
+
+  defp readable_side_open?(:closed, data), do: not :queue.is_empty(data.queue)
+  defp readable_side_open?(_errored, _data), do: false
+
   # Why the readable side cannot accept an `enqueue` or a `close`, or `nil`.
   defp controller_refusal(_state, %{type: :consumer}), do: :closed
   defp controller_refusal(:errored, _data), do: :errored
@@ -1511,17 +1669,17 @@ defmodule Web.Stream do
   end
 
   defp pop_queued_chunks(from, max, data) do
-    {chunks, queue, size} = take_chunks(data.queue, max, data, [], 0)
-
-    new_data = %{data | queue: queue, total_queued_size: data.total_queued_size - size}
+    {chunks, queue, total} = take_chunks(data.queue, max, data, [], data.total_queued_size)
+    new_data = %{data | queue: queue, total_queued_size: total}
     actions = [{:reply, from, {:chunks, chunks}}]
     {new_data, actions} = maybe_refresh_read_actions(new_data, actions)
     {:keep_state, new_data, maybe_request_pull(new_data, actions)}
   end
 
-  defp take_chunks(queue, 0, _data, chunks, size), do: {Enum.reverse(chunks), queue, size}
+  # Each chunk is one DequeueValue: the total decreases one chunk at a time.
+  defp take_chunks(queue, 0, _data, chunks, total), do: {Enum.reverse(chunks), queue, total}
 
-  defp take_chunks(queue, count, data, chunks, size) do
+  defp take_chunks(queue, count, data, chunks, total) do
     case :queue.out(queue) do
       {{:value, chunk}, rest} ->
         take_chunks(
@@ -1529,11 +1687,11 @@ defmodule Web.Stream do
           count - 1,
           data,
           [default_read_chunk(data, chunk) | chunks],
-          size + queue_chunk_size(data, chunk)
+          QueuingStrategy.subtract(total, queue_chunk_size(data, chunk))
         )
 
       {:empty, queue} ->
-        {Enum.reverse(chunks), queue, size}
+        {Enum.reverse(chunks), queue, total}
     end
   end
 
@@ -1543,7 +1701,8 @@ defmodule Web.Stream do
     new_data = %{
       data
       | queue: new_queue,
-        total_queued_size: data.total_queued_size - queue_chunk_size(data, chunk)
+        total_queued_size:
+          QueuingStrategy.subtract(data.total_queued_size, queue_chunk_size(data, chunk))
     }
 
     actions = [{:reply, from, {:ok, default_read_chunk(data, chunk)}}]
@@ -1558,7 +1717,7 @@ defmodule Web.Stream do
     Web.Uint8Array.from(chunk)
   end
 
-  defp default_read_chunk(_data, chunk), do: chunk
+  defp default_read_chunk(_data, {chunk, _size}), do: chunk
 
   defp handle_byob_read_request(from, _pid, _view, :errored, data) do
     disturbed_data = %{data | disturbed: true}
@@ -1730,14 +1889,20 @@ defmodule Web.Stream do
     fulfill_pending_byob_enqueue(chunk, data)
   end
 
+  # ReadableStreamDefaultControllerEnqueue. A read that waits gets the chunk
+  # with no call of the size algorithm. Each other chunk goes to the end of
+  # the queue with its size. A size that is not valid puts the stream in
+  # the errored state.
+  defp handle_producer_enqueue(chunk, _state, %{stream_type: :default} = data) do
+    case enqueue_default(chunk, data) do
+      {:ok, data} -> {:keep_state, data, [{:next_event, :internal, :maybe_pull}]}
+      {:error, reason} -> fail_stream(reason, data)
+    end
+  end
+
   defp handle_producer_enqueue(chunk, _state, data) do
     chunk_size = queue_chunk_size(data, chunk)
-
-    new_data = %{
-      data
-      | queue: :queue.in(chunk, data.queue),
-        total_queued_size: data.total_queued_size + chunk_size
-    }
+    new_data = put_chunk(data, chunk, chunk_size)
 
     case :queue.out(new_data.read_requests) do
       {{:value, from}, new_requests} ->
@@ -1759,6 +1924,20 @@ defmodule Web.Stream do
       {:empty, _} ->
         new_data = refresh_backpressure(new_data)
         {:keep_state, new_data, [{:next_event, :internal, :maybe_pull}]}
+    end
+  end
+
+  defp enqueue_default(chunk, data) do
+    case :queue.out(data.read_requests) do
+      {{:value, from}, requests} ->
+        :gen_statem.reply(from, {:ok, chunk})
+        {:ok, refresh_backpressure(%{data | read_requests: requests})}
+
+      {:empty, _requests} ->
+        case QueuingStrategy.chunk_size(data.readable_size, chunk) do
+          {:ok, size} -> {:ok, data |> put_chunk(chunk, size) |> refresh_backpressure()}
+          {:error, reason} -> {:error, reason}
+        end
     end
   end
 
@@ -1827,20 +2006,24 @@ defmodule Web.Stream do
   # Maybe pull (producer backpressure)
   # ---------------------------------------------------------------------------
 
-  # The rule of the Streams Standard for a pull: the stream pulls when its
-  # queue is below its limit, or when a read waits. A request during a pull
-  # causes one more pull after it. Thus a source whose pull gives no chunk
-  # immediately is not pulled again and again.
+  # ReadableStreamDefaultControllerCallPullIfNeeded of the Streams Standard:
+  # the stream pulls when its queue is below its limit, or when a read
+  # waits (ShouldCallPull). It does not pull before the function `start` is
+  # complete. A request that comes during a pull, when the stream wants a
+  # chunk, causes one more pull after it. Thus a source whose pull gives no
+  # chunk immediately is not pulled again and again.
   defp handle_maybe_pull(data) do
     cond do
+      data.active_operation == :init -> :keep_state_and_data
+      not readable_wants_chunk?(data) -> :keep_state_and_data
       data.pulling -> {:keep_state, %{data | pull_again: true}}
-      readable_wants_chunk?(data) -> do_trigger_pull(data)
-      true -> :keep_state_and_data
+      true -> do_trigger_pull(data)
     end
   end
 
   defp readable_wants_chunk?(data) do
-    readable_capacity(data) > 0 or not :queue.is_empty(data.read_requests) or
+    QueuingStrategy.positive?(readable_capacity(data)) or
+      not :queue.is_empty(data.read_requests) or
       not is_nil(data.pending_byob_request)
   end
 
@@ -1909,7 +2092,13 @@ defmodule Web.Stream do
   # Consumer write/close/abort handlers
   # ---------------------------------------------------------------------------
 
-  defp handle_write(from, pid, chunk, _state, data) do
+  # A write with no size from the writer: the stream calls the size
+  # algorithm. See `__writable_size__/1`.
+  defp handle_write(from, pid, chunk, state, data) do
+    handle_write(from, pid, chunk, QueuingStrategy.call(data.writable_size, chunk), state, data)
+  end
+
+  defp handle_write(from, pid, chunk, size_result, _state, data) do
     cond do
       pid != data.writer_pid ->
         {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
@@ -1917,18 +2106,32 @@ defmodule Web.Stream do
       data.terminated ->
         {:keep_state_and_data, [{:reply, from, {:error, {:errored, terminated_error()}}}]}
 
-      active_consumer_operation?(data) or not transform_ready?(data) ->
-        new_data =
-          data
-          |> enqueue_write_request({from, pid, chunk})
-          |> refresh_backpressure()
-
-        {:keep_state, new_data}
-
       true ->
+        accept_write(from, pid, chunk, QueuingStrategy.validate(size_result), data)
+    end
+  end
+
+  # WritableStreamDefaultControllerGetChunkSize and EnqueueValueWithSize: a
+  # size that is not valid puts the stream in the errored state, and the
+  # write rejects with that error.
+  defp accept_write(from, _pid, _chunk, {:error, reason}, data) do
+    fail_stream(reason, data, [{:reply, from, {:error, {:errored, reason}}}])
+  end
+
+  defp accept_write(from, pid, chunk, {:ok, size}, data) do
+    data = add_write_size(data, size)
+
+    if active_consumer_operation?(data) or not transform_ready?(data) do
+      new_data =
         data
-        |> start_write_task({from, pid, chunk})
-        |> reply_keep_state()
+        |> enqueue_write_request({from, pid, chunk})
+        |> refresh_backpressure()
+
+      {:keep_state, new_data}
+    else
+      data
+      |> start_write_task({from, pid, chunk})
+      |> reply_keep_state()
     end
   end
 
@@ -2110,17 +2313,25 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   # The transformer called `terminate`, and then its write failed. The
-  # write rejects with the failure. The readable side stays closed, and the
-  # writable side has the error of the terminate.
+  # write rejects with the failure. A readable side with chunks in its queue
+  # is still readable, and goes to the errored state (TransformStreamError).
+  # Each other readable side stays closed, and the writable side has the
+  # error of the terminate.
   defp handle_task_result(
          {:error, reason},
          _state,
          %{terminated: true, active_operation: {:write, from}} = data
        ) do
-    data
-    |> clear_active_operation()
-    |> Map.put(:pending_write_request, nil)
-    |> terminate_transform([{:reply, from, {:error, {:errored, reason}}}])
+    data =
+      data
+      |> clear_active_operation()
+      |> Map.put(:pending_write_request, nil)
+
+    if :queue.is_empty(data.queue) do
+      terminate_transform(data, [{:reply, from, {:error, {:errored, reason}}}])
+    else
+      fail_stream(reason, data, [{:reply, from, {:error, {:errored, reason}}}])
+    end
   end
 
   defp handle_task_result({:error, reason}, _state, data) do
@@ -2168,6 +2379,7 @@ defmodule Web.Stream do
        ) do
     data
     |> clear_active_operation()
+    |> remove_write_size()
     |> Map.put(:pending_write_request, nil)
     |> Map.put(:impl_state, new_impl_state)
     |> refresh_backpressure()
@@ -2190,9 +2402,24 @@ defmodule Web.Stream do
   defp handle_abort_task_result(result, data) do
     reply = if match?({:error, _thrown}, result), do: result, else: :ok
 
-    {:keep_state, clear_active_operation(data), abort_reply_actions(data, reply)}
+    {:keep_state, data |> clear_active_operation() |> transformer_cancel_error(result),
+     abort_reply_actions(data, reply)}
     |> clear_abort_request()
   end
+
+  # The function `cancel` of a transformer failed. The other side of the
+  # stream gets that error, as TransformStreamDefaultSourceCancelAlgorithm
+  # and TransformStreamDefaultSinkAbortAlgorithm specify: the writable side
+  # after a cancel of the readable side, and the readable side after an
+  # abort of the writable side.
+  defp transformer_cancel_error(%{type: :producer_consumer} = data, {:error, thrown}) do
+    case data.writable_error do
+      {:errored, _reason} -> %{data | writable_error: {:errored, thrown}}
+      nil -> %{data | error_reason: thrown}
+    end
+  end
+
+  defp transformer_cancel_error(data, _result), do: data
 
   defp abort_reply_actions(%{pending_abort_request: nil}, _reply), do: []
   defp abort_reply_actions(%{pending_abort_request: from}, reply), do: [{:reply, from, reply}]
@@ -2315,6 +2542,19 @@ defmodule Web.Stream do
      actions ++ error_actions ++ [{:next_event, :internal, :flush_requests}]}
   end
 
+  # An error that the callback that runs causes, for example with a size
+  # that is not valid. The callback continues, as in the Streams Standard,
+  # and gets the reply. Its result has no effect.
+  defp fail_stream_for_caller(reason, {caller, _tag}, data, actions) do
+    case data.active_task do
+      %{pid: ^caller} when data.active_operation != :abort ->
+        fail_stream(reason, clear_active_operation(data), actions)
+
+      _other ->
+        fail_stream(reason, data, actions)
+    end
+  end
+
   defp clear_writer_lock(%{writer_ref: writer_ref} = data) do
     if writer_ref, do: Process.demonitor(writer_ref, [:flush])
     %{data | writer_pid: nil, writer_ref: nil}
@@ -2387,6 +2627,8 @@ defmodule Web.Stream do
   defp with_lifetime(result, state, data) do
     case transition(result, state, data) do
       {next_state, new_data, actions} ->
+        clear_writable_size(next_state, new_data)
+        {new_data, settled?} = settle_closed_promise(next_state, new_data)
         {new_data, closed_actions} = closed_waiter_actions(next_state, new_data)
         timeout = lifetime_timeout(next_state, new_data)
 
@@ -2395,7 +2637,7 @@ defmodule Web.Stream do
             {:next_state, next_state, %{new_data | lifetime_timer: timeout},
              actions ++ closed_actions ++ [lifetime_action(timeout)]}
 
-          closed_actions != [] ->
+          closed_actions != [] or settled? ->
             {:next_state, next_state, new_data, actions ++ closed_actions}
 
           true ->
@@ -2406,6 +2648,105 @@ defmodule Web.Stream do
         result
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # The promise `closed` of a reader
+  #
+  # The attribute `closed` of a reader gives the same promise each time, as
+  # in the Streams Standard. The stream makes the promise at the first
+  # request, thus a reader that does not ask for it costs no process. The
+  # process that holds the lock owns the promise.
+  #
+  #   * The promise fulfils when the stream is closed and its queue is
+  #     empty, and rejects with the error of the stream.
+  #   * A release of the lock of a stream that is readable rejects the
+  #     promise with a `TypeError`. A release of the lock of a stream that
+  #     is closed or errored replaces the promise with a promise that is
+  #     rejected with a `TypeError`.
+  #
+  # `closed_promises` has the promise of the reader that holds the lock,
+  # and the promises of the readers that released their lock of a readable
+  # stream: `{:pending, promise, resolve, reject}` or `{:settled, promise}`.
+  # ---------------------------------------------------------------------------
+
+  defp reader_closed(lock, state, data) do
+    case Map.fetch(data.closed_promises, lock) do
+      {:ok, entry} ->
+        {elem(entry, 1), data}
+
+      :error when lock == data.reader_ref and not is_nil(lock) ->
+        new_reader_closed(lock, state, data)
+
+      :error ->
+        {Web.Promise.reject(released_reader_error()), data}
+    end
+  end
+
+  defp new_reader_closed(lock, state, data) do
+    cond do
+      state == :errored ->
+        {Web.Promise.reject(data.error_reason), data}
+
+      readable_side_open?(state, data) ->
+        {promise, resolve, reject} =
+          Web.Promise.with_owner(data.reader_pid, fn -> Web.Promise.with_resolvers() end)
+
+        entry = {:pending, promise, resolve, reject}
+        {promise, %{data | closed_promises: Map.put(data.closed_promises, lock, entry)}}
+
+      true ->
+        {Web.Promise.resolve(:ok), data}
+    end
+  end
+
+  # ReadableStreamClose and ReadableStreamError settle the promise of the
+  # reader that holds the lock.
+  # Returns the data, and `true` when the promise settled.
+  defp settle_closed_promise(state, %{reader_ref: lock, closed_promises: promises} = data)
+       when is_map_key(promises, lock) do
+    with {:pending, promise, resolve, reject} <- Map.fetch!(promises, lock),
+         false <- readable_side_open?(state, data) do
+      if state == :errored, do: reject.(data.error_reason), else: resolve.(:ok)
+      {%{data | closed_promises: Map.put(promises, lock, {:settled, promise})}, true}
+    else
+      _pending_or_settled -> {data, false}
+    end
+  end
+
+  defp settle_closed_promise(_state, data), do: {data, false}
+
+  # ReadableStreamReaderGenericRelease. A promise that is pending belongs to
+  # a readable stream: it rejects, and keeps its identity. A promise that
+  # settled belongs to a stream that is closed or errored: a request after
+  # the release gets a new promise.
+  defp release_closed_promise(%{reader_ref: lock, closed_promises: promises} = data) do
+    case Map.fetch(promises, lock) do
+      {:ok, {:pending, promise, _resolve, reject}} ->
+        reject.(released_reader_error())
+        %{data | closed_promises: Map.put(promises, lock, {:settled, promise})}
+
+      {:ok, {:settled, _promise}} ->
+        %{data | closed_promises: Map.delete(promises, lock)}
+
+      :error ->
+        data
+    end
+  end
+
+  # The reply to a request of a reader that released its lock.
+  defp released_reader_reply({:release_lock, :reader, _pid}), do: :ok
+  defp released_reader_reply(_message), do: {:error, :not_locked_by_reader}
+
+  defp released_reader_error, do: Web.TypeError.exception("This reader is no longer locked.")
+
+  # The writable side does not call the size function of the user after it
+  # is closed or errored.
+  defp clear_writable_size(state, %{writable_size: size}) when is_function(size) do
+    if state in [:closed, :errored], do: Process.delete(@writable_size_key)
+    :ok
+  end
+
+  defp clear_writable_size(_state, _data), do: :ok
 
   # The processes that wait for the promise `closed` get the end of the
   # stream.
@@ -2477,10 +2818,14 @@ defmodule Web.Stream do
   # The stream is ended and has no chunks. A lock does not keep it. A process
   # that got the stream in a message can still get a reader in the linger
   # time, and read the end of the stream.
+  #
+  # A cancel keeps the reader lock, as in the Streams Standard. That lock does
+  # not keep the stream: the process that cancelled does not wait for the
+  # end of the stream.
   defp complete_linger(data) do
     cond do
       not owner_down?(data) -> data.linger
-      owner_failed?(data) and not locked?(data) -> 0
+      owner_failed?(data) and (data.canceled or not locked?(data)) -> 0
       # The linger time `:infinity` is not applicable after the owner stopped.
       true -> handoff_linger(data.linger)
     end
@@ -2580,6 +2925,7 @@ defmodule Web.Stream do
     new_data = %{
       data
       | disturbed: type == :cancel or data.disturbed,
+        canceled: type == :cancel or data.canceled,
         writable_error:
           if(type == :cancel and data.type == :producer_consumer, do: {:errored, reason}),
         queue: if(type == :cancel, do: :queue.new(), else: data.queue),
@@ -2634,18 +2980,12 @@ defmodule Web.Stream do
     _kind, thrown -> {:error, thrown}
   end
 
-  defp clear_owner(%{reader_ref: reader_ref, writer_ref: writer_ref} = data) do
-    if reader_ref, do: Process.demonitor(reader_ref, [:flush])
+  # A terminal event releases the writer lock. It does not release the
+  # reader lock, as the Streams Standard specifies: the reader reads the
+  # end of the stream, and gets its promise `closed`.
+  defp clear_owner(%{writer_ref: writer_ref} = data) do
     if writer_ref, do: Process.demonitor(writer_ref, [:flush])
-
-    %{
-      data
-      | reader_pid: nil,
-        reader_ref: nil,
-        reader_mode: nil,
-        writer_pid: nil,
-        writer_ref: nil
-    }
+    %{data | writer_pid: nil, writer_ref: nil}
   end
 
   defp clear_task(data) do
@@ -2698,19 +3038,46 @@ defmodule Web.Stream do
   end
 
   defp readable_capacity(data) do
-    data.readable_hwm - data.total_queued_size
+    QueuingStrategy.desired(data.readable_hwm, data.total_queued_size)
   end
 
+  # The writes that are not complete have the sizes in `write_sizes`. A
+  # stream with no such write has an empty queue: an error or a close
+  # discards the writes, and the next write clears the old sizes.
   defp writable_capacity(data) do
-    data.writable_hwm - pending_write_count(data)
+    if pending_write_count(data) == 0 do
+      QueuingStrategy.desired(data.writable_hwm, 0)
+    else
+      QueuingStrategy.desired(data.writable_hwm, data.write_total)
+    end
   end
 
   defp writable_ready?(data) do
-    writable_capacity(data) > 0
+    QueuingStrategy.positive?(writable_capacity(data))
   end
 
   defp pending_write_count(data) do
     data.queued_write_count + if(data.pending_write_request, do: 1, else: 0)
+  end
+
+  # Adds the size of a write that the stream accepts.
+  defp add_write_size(data, size) do
+    data =
+      if pending_write_count(data) == 0,
+        do: %{data | write_sizes: :queue.new(), write_total: 0},
+        else: data
+
+    %{
+      data
+      | write_sizes: :queue.in(size, data.write_sizes),
+        write_total: QueuingStrategy.add(data.write_total, size)
+    }
+  end
+
+  # Removes the size of the write that is complete: the first one.
+  defp remove_write_size(data) do
+    {{:value, size}, sizes} = :queue.out(data.write_sizes)
+    %{data | write_sizes: sizes, write_total: QueuingStrategy.subtract(data.write_total, size)}
   end
 
   defp enqueue_write_request(data, request) do
@@ -2772,20 +3139,22 @@ defmodule Web.Stream do
     end
   end
 
+  # The process that holds the reader lock stopped: the lock is free.
   defp maybe_cancel_on_reader_exit(reason, state, %{cancel_on_reader_exit: true} = data)
        when state not in [:closed, :errored] do
-    handle_termination(:cancel, {:reader_down, reason}, data)
+    handle_termination(:cancel, {:reader_down, reason}, release_stopped_reader(data))
   end
 
   defp maybe_cancel_on_reader_exit(_reason, _state, data) do
-    new_data =
-      data
-      |> drop_pending_byob_request()
-      |> Map.put(:reader_pid, nil)
-      |> Map.put(:reader_ref, nil)
-      |> Map.put(:reader_mode, nil)
+    {:keep_state, release_stopped_reader(data)}
+  end
 
-    {:keep_state, new_data}
+  defp release_stopped_reader(data) do
+    data
+    |> drop_pending_byob_request()
+    |> Map.put(:reader_pid, nil)
+    |> Map.put(:reader_ref, nil)
+    |> Map.put(:reader_mode, nil)
   end
 
   defp handle_terminate_request(type, reason, state, data) do
@@ -2912,11 +3281,34 @@ defmodule Web.Stream do
     {:keep_state, data, []}
   end
 
-  defp queue_chunk_size(%{strategy: strategy}, chunk) do
+  # The size of an entry of the queue. The queue of a byte stream holds
+  # binaries, thus a BYOB read can take a part of a chunk. The queue of a
+  # default stream holds `{chunk, size}`, as the Streams Standard specifies:
+  # the size function of the user runs one time for each chunk.
+  defp queue_chunk_size(%{stream_type: :bytes, strategy: strategy}, chunk) do
     strategy_size(strategy, chunk)
   end
 
+  defp queue_chunk_size(_data, {_chunk, size}), do: size
+
   defp strategy_size(%{__struct__: strategy}, chunk), do: strategy.size(chunk)
+
+  # Puts a chunk of a valid size at the end of the queue.
+  defp put_chunk(%{stream_type: :bytes} = data, chunk, size) do
+    %{
+      data
+      | queue: :queue.in(chunk, data.queue),
+        total_queued_size: data.total_queued_size + size
+    }
+  end
+
+  defp put_chunk(data, chunk, size) do
+    %{
+      data
+      | queue: :queue.in({chunk, size}, data.queue),
+        total_queued_size: QueuingStrategy.add(data.total_queued_size, size)
+    }
+  end
 
   defp normalize_strategy(%{__struct__: _} = strategy), do: strategy
   # A value that is not a strategy gives the default strategy.
@@ -2928,8 +3320,26 @@ defmodule Web.Stream do
 
   defp init_capacities(_type, hwm, _strategy), do: {hwm, hwm}
 
-  defp strategy_high_water_mark(%{high_water_mark: hwm}, _fallback) when is_number(hwm), do: hwm
+  defp strategy_high_water_mark(%{high_water_mark: hwm}, _fallback)
+       when is_number(hwm) or hwm == :infinity,
+       do: hwm
+
   defp strategy_high_water_mark(_strategy, fallback), do: fallback
+
+  # The option `:size` is the size function of the user. A transform stream
+  # has the options `:readable_size` and `:writable_size`.
+  defp init_sizes(:producer_consumer, opts, strategy) do
+    {Keyword.get(opts, :readable_size) || strategy_size_algorithm(strategy),
+     Keyword.get(opts, :writable_size) || :count}
+  end
+
+  defp init_sizes(_type, opts, strategy) do
+    size = Keyword.get(opts, :size) || strategy_size_algorithm(strategy)
+    {size, size}
+  end
+
+  defp strategy_size_algorithm(%Web.ByteLengthQueuingStrategy{}), do: :byte_length
+  defp strategy_size_algorithm(_count), do: :count
 
   defp timeout_operation(operation) do
     case operation do

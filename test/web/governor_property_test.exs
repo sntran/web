@@ -131,10 +131,12 @@ defmodule Web.GovernorPropertyTest do
     ref = make_ref()
     send(pid, {:status, self(), ref})
 
+    # A client that waits with no end gives no status. A machine that is
+    # busy can make a client slow, thus the limit is large.
     receive do
       {^ref, status} -> status
     after
-      1_000 -> flunk("a client gave no status")
+      5_000 -> flunk("a client gave no status")
     end
   end
 

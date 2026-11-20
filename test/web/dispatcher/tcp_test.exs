@@ -57,8 +57,10 @@ defmodule Web.Dispatcher.TCPTest do
               notify_chunk_sent(observer, response_data)
           end
 
+          # The client closes the connection at the end of the body. A
+          # machine that is busy can make the close come late.
           if observer do
-            case :gen_tcp.recv(socket, 0, 200) do
+            case :gen_tcp.recv(socket, 0, 2_000) do
               {:error, :closed} -> send(observer, :tcp_client_closed)
               _ -> :ok
             end

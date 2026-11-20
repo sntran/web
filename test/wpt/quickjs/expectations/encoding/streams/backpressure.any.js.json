@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "additional writes should wait for backpressure to be relieved for class TextDecoderStream": "runner: no streams",
+    "additional writes should wait for backpressure to be relieved for class TextEncoderStream": "runner: no streams",
+    "write() should not complete until read relieves backpressure for TextDecoderStream": "runner: no streams",
+    "write() should not complete until read relieves backpressure for TextEncoderStream": "runner: no streams"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "harness": "OK",
+  "failures": {
+    "a throwing fatal member should cause the constructor to throw": "runner: no streams",
+    "a throwing ignoreBOM member should cause the constructor to throw": "runner: no streams",
+    "constructing with a non-stringifiable encoding should throw": "runner: no streams",
+    "constructing with an invalid encoding should throw": "runner: no streams",
+    "encoding attribute should have correct value for 'ascii'": "runner: no streams",
+    "encoding attribute should have correct value for 'iso-8859-2'": "runner: no streams",
+    "encoding attribute should have correct value for 'unicode-1-1-utf-8'": "runner: no streams",
+    "encoding attribute should have correct value for 'utf-16'": "runner: no streams",
+    "setting fatal to '' should set the attribute to false": "runner: no streams",
+    "setting fatal to '' should set the attribute to true": "runner: no streams",
+    "setting fatal to '0' should set the attribute to false": "runner: no streams",
+    "setting fatal to '1' should set the attribute to true": "runner: no streams",
+    "setting fatal to '[object Object]' should set the attribute to true": "runner: no streams",
+    "setting fatal to 'false' should set the attribute to false": "runner: no streams",
+    "setting fatal to 'null' should set the attribute to false": "runner: no streams",
+    "setting fatal to 'true' should set the attribute to true": "runner: no streams",
+    "setting fatal to 'undefined' should set the attribute to false": "runner: no streams",
+    "setting fatal to 'yes' should set the attribute to true": "runner: no streams",
+    "setting ignoreBOM to '' should set the attribute to false": "runner: no streams",
+    "setting ignoreBOM to '' should set the attribute to true": "runner: no streams",
+    "setting ignoreBOM to '0' should set the attribute to false": "runner: no streams",
+    "setting ignoreBOM to '1' should set the attribute to true": "runner: no streams",
+    "setting ignoreBOM to '[object Object]' should set the attribute to true": "runner: no streams",
+    "setting ignoreBOM to 'false' should set the attribute to false": "runner: no streams",
+    "setting ignoreBOM to 'null' should set the attribute to false": "runner: no streams",
+    "setting ignoreBOM to 'true' should set the attribute to true": "runner: no streams",
+    "setting ignoreBOM to 'undefined' should set the attribute to false": "runner: no streams",
+    "setting ignoreBOM to 'yes' should set the attribute to true": "runner: no streams"
+  }
+}

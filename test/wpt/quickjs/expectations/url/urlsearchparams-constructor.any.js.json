@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Constructor with sequence of sequences of strings": "library: a different result",
+    "URLSearchParams constructor, FormData.": "runner: no FormData"
+  }
+}

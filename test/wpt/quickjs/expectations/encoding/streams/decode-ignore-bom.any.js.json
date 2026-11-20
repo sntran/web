@@ -1,0 +1,17 @@
+{
+  "harness": "OK",
+  "failures": {
+    "ignoreBOM should work for encoding utf-16be, split at character 0": "runner: no streams",
+    "ignoreBOM should work for encoding utf-16be, split at character 1": "runner: no streams",
+    "ignoreBOM should work for encoding utf-16be, split at character 2": "runner: no streams",
+    "ignoreBOM should work for encoding utf-16be, split at character 3": "runner: no streams",
+    "ignoreBOM should work for encoding utf-16le, split at character 0": "runner: no streams",
+    "ignoreBOM should work for encoding utf-16le, split at character 1": "runner: no streams",
+    "ignoreBOM should work for encoding utf-16le, split at character 2": "runner: no streams",
+    "ignoreBOM should work for encoding utf-16le, split at character 3": "runner: no streams",
+    "ignoreBOM should work for encoding utf-8, split at character 0": "runner: no streams",
+    "ignoreBOM should work for encoding utf-8, split at character 1": "runner: no streams",
+    "ignoreBOM should work for encoding utf-8, split at character 2": "runner: no streams",
+    "ignoreBOM should work for encoding utf-8, split at character 3": "runner: no streams"
+  }
+}

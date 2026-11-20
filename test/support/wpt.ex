@@ -100,6 +100,42 @@ defmodule Web.Platform.Test do
     end
   end
 
+  @doc """
+  The local path of a file of WPT at the pinned commit, for example
+  `"resources/testharness.js"`. The file is in a tree of directories under
+  the cache: the QuickJS runner loads a test with its helper files, and many
+  files of WPT have the same name in different directories. A file at a
+  pinned commit does not change, thus a file in the cache is correct.
+  """
+  def tree_file!(path) when is_binary(path) do
+    target = Path.join([@cache_dir, "tree", @wpt_revision, path])
+
+    if Elixir.File.exists?(target) do
+      target
+    else
+      url = "https://raw.githubusercontent.com/web-platform-tests/wpt/#{@wpt_revision}/#{path}"
+      started_at = System.monotonic_time(:millisecond)
+      bytes = governed_fetch(url, fn -> fetch_tree_file(url, started_at) end)
+
+      # A write to a temporary file, then a rename: a different test that
+      # reads the file at the same time sees all of it, or nothing.
+      Elixir.File.mkdir_p!(Path.dirname(target))
+      part = target <> ".#{System.unique_integer([:positive])}.part"
+      Elixir.File.write!(part, bytes)
+      Elixir.File.rename!(part, target)
+      target
+    end
+  end
+
+  defp fetch_tree_file(url, started_at) do
+    response = fetch_with_retry([], url, started_at)
+
+    case response.status do
+      200 -> Web.await(Web.Response.bytes(response)) |> Web.Uint8Array.to_binary()
+      status -> raise "The WPT file #{url} gave the status #{status}."
+    end
+  end
+
   def load_json!(url) when is_binary(url) do
     Elixir.File.mkdir_p!(@cache_dir)
 

@@ -1,0 +1,15 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Adding Set-Cookie headers normalizes their value": "library: a different result",
+    "Headers iterator does not combine set-cookie & set-cookie2 headers": "library: a different result",
+    "Headers iterator does not combine set-cookie headers": "library: a different result",
+    "Headers iterator is correctly updated with set-cookie changes": "library: a different result",
+    "Headers iterator is correctly updated with set-cookie changes #2": "library: a different result",
+    "Headers iterator preserves per header ordering, but sorts keys alphabetically": "library: a different result",
+    "Headers iterator preserves per header ordering, but sorts keys alphabetically (and ignores value ordering)": "library: a different result",
+    "Headers iterator preserves set-cookie ordering": "library: a different result",
+    "Headers.prototype.append works for set-cookie": "library: a different result",
+    "Set-Cookie is a forbidden response header": "runner: no Response"
+  }
+}

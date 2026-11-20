@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "incomplete input with error mode \"fatal\" should error the stream": "runner: no streams",
+    "incomplete input with error mode \"replacement\" should end with a replacement character": "runner: no streams"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Setting URL's href attribute and base URLs": "library: ArgumentError, not TypeError",
+    "URL: no structured serialize/deserialize support": "runner: no structuredClone",
+    "URLSearchParams: no structured serialize/deserialize support": "runner: no structuredClone"
+  }
+}

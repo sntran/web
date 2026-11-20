@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "URL: Setting <https://example.net?lang=en-US#nav>.hash = '#'": "library: a different result",
+    "URL: Setting <https://example.net?lang=en-US#nav>.search = '?'": "library: a different result"
+  }
+}

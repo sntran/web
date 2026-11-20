@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Sorting non-existent params removes ? from URL": "library: a different result"
-  }
-}

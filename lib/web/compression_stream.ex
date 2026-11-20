@@ -5,14 +5,11 @@ defmodule Web.CompressionStream do
   Compresses a stream of binary data using the specified format, backed by
   Erlang's native `:zlib` module.
 
-  ## OTP 26 process-ownership
+  ## The zlib handle
 
-  Since OTP 26 the zlib NIF resource is bound to the process that called
-  `:zlib.open/0`. The `Agent` that owns the z-stream is started inside
-  the engine's `start/2` callback, which runs in the gen_statem's init
-  process. This links the Agent to the stream's lifecycle: if the stream
-  is garbage-collected or crashes, the Agent (and thus the zlib port) is
-  automatically terminated.
+  A zlib handle belongs to the process that opens it. The stream opens its
+  handle in its worker process, which runs each callback, at the first
+  chunk. The handle closes when the stream stops.
 
   ## Supported formats
 
@@ -63,8 +60,7 @@ defmodule Web.CompressionStream do
   """
   @spec new(String.t()) :: t()
   def new(format) when format in @valid_formats do
-    window_bits = window_bits_for(format)
-    {:ok, pid} = start_link(window_bits: window_bits)
+    {:ok, pid} = start_link(window_bits: window_bits_for(format))
 
     %__MODULE__{
       readable: %Web.ReadableStream{controller_pid: pid},
@@ -86,53 +82,58 @@ defmodule Web.CompressionStream do
 
   @impl Web.Stream
   def start(_pid, opts) do
-    window_bits = Keyword.fetch!(opts, :window_bits)
-
-    # Agent.start_link runs in the gen_statem's init process, so the Agent is
-    # linked to the stream process. If the stream terminates, the Agent (and
-    # thus the zlib port) is automatically cleaned up.
-    {:ok, agent} =
-      Agent.start_link(fn ->
-        z = :zlib.open()
-        :zlib.deflateInit(z, :default, :deflated, window_bits, 8, :default)
-        z
-      end)
-
-    {:producer_consumer, %{zlib_agent: agent}}
+    {:producer_consumer, %{window_bits: Keyword.fetch!(opts, :window_bits), zlib: nil}}
   end
 
+  # The callbacks run in the worker process of the stream: the handle opens
+  # at the first chunk, thus it belongs to the worker.
   @impl Web.Stream
-  def write(chunk, ctrl, %{zlib_agent: agent} = state) do
+  def write(chunk, ctrl, state) do
     bin = to_binary!(chunk, "CompressionStream")
     maybe_log_runtime_event("write", byte_size(bin))
+    zlib = zlib(state)
+
     # A deflate of bytes cannot fail.
-    for c <- Agent.get(agent, fn z -> :zlib.deflate(z, bin) end) do
+    for c <- :zlib.deflate(zlib, bin) do
       ReadableStreamDefaultController.wait_for_capacity(ctrl)
       ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
     end
 
-    {:ok, state}
+    {:ok, %{state | zlib: zlib}}
   end
 
   @impl Web.Stream
-  def flush(ctrl, %{zlib_agent: agent} = state) do
+  def flush(ctrl, state) do
     maybe_log_runtime_event("flush", 0)
-    final_chunks = Agent.get(agent, fn z -> :zlib.deflate(z, <<>>, :finish) end)
-    stop_agent(agent)
+    zlib = zlib(state)
+    final_chunks = :zlib.deflate(zlib, <<>>, :finish)
+    :zlib.close(zlib)
 
     # The last chunks do not wait for the reader, thus the close of the
     # writable side does not need a reader, as in the Streams Standard.
     for c <- final_chunks,
         do: ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
 
-    {:ok, state}
+    {:ok, %{state | zlib: nil}}
   end
 
+  # A cancel or an abort runs in the worker too: the handle closes at once.
   @impl Web.Stream
-  def terminate(_event, %{zlib_agent: agent}) do
-    stop_agent(agent)
+  def terminate(_event, %{zlib: zlib}) do
+    if zlib, do: :zlib.close(zlib)
     :ok
+  rescue
+    # The handle of a worker that stopped is closed already.
+    ErlangError -> :ok
   end
+
+  defp zlib(%{zlib: nil, window_bits: window_bits}) do
+    zlib = :zlib.open()
+    :ok = :zlib.deflateInit(zlib, :default, :deflated, window_bits, 8, :default)
+    zlib
+  end
+
+  defp zlib(%{zlib: zlib}), do: zlib
 
   # ---------------------------------------------------------------------------
   # Private helpers
@@ -147,11 +148,6 @@ defmodule Web.CompressionStream do
   end
 
   defp to_binary!(chunk, ctx), do: Bytes.to_binary!(chunk, ctx)
-
-  # Stop the Agent idempotently.
-  defp stop_agent(agent) do
-    if Process.alive?(agent), do: Agent.stop(agent, :normal)
-  end
 
   defp maybe_log_runtime_event(stage, bytes) do
     metadata = runtime_metadata()

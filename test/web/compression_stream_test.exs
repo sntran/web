@@ -383,6 +383,47 @@ defmodule Web.CompressionPBTTest do
   # Flush-error and cancel coverage
   # ---------------------------------------------------------------------------
 
+  describe "DecompressionStream with data that expands much" do
+    test "decodes only as the reader takes the chunks, in small chunks" do
+      # 20 MB of zeros are approximately 20 KB with gzip.
+      size = 20 * 1_048_576
+      compressed = :zlib.gzip(:binary.copy(<<0>>, size))
+      ds = DecompressionStream.new("gzip")
+      writer = WritableStream.get_writer(ds.writable)
+      write = WritableStreamDefaultWriter.write(writer, compressed)
+
+      # With no reader, the stream keeps one small part of the output: the
+      # write waits for space.
+      Process.sleep(100)
+      assert Web.Promise.peek(write) == :pending
+      assert ReadableStream.get_desired_size(ds.readable.controller_pid) > -200_000
+
+      # The worker of the stream, which runs the write, keeps less than 1 MB
+      # of the output: the decoder makes the next piece only when the
+      # readable side has space.
+      {:dictionary, dictionary} = Process.info(ds.readable.controller_pid, :dictionary)
+      worker = :proplists.get_value({Web.Stream, :worker}, dictionary)
+      {:binary, binaries} = Process.info(worker, :binary)
+      assert binaries |> Enum.map(&elem(&1, 1)) |> Enum.sum() < 1_048_576
+
+      reader = ReadableStream.get_reader(ds.readable)
+      close = WritableStreamDefaultWriter.close(writer)
+      sizes = read_sizes(reader, [])
+
+      assert Enum.sum(sizes) == size
+      assert Enum.max(sizes) < 200_000
+      assert :ok = await(write)
+      assert :ok = await(close)
+    end
+
+    defp read_sizes(reader, sizes) do
+      case await(Web.ReadableStreamDefaultReader.read(reader)) do
+        %{done: true} -> sizes
+        %{value: chunk} -> read_sizes(reader, [chunk.byte_length | sizes])
+      end
+    end
+  end
+
   describe "DecompressionStream flush errors and cancel" do
     test "DecompressionStream cancel closes the zlib port without raising" do
       ds = DecompressionStream.new("gzip")
@@ -394,14 +435,30 @@ defmodule Web.CompressionPBTTest do
       :ok
     end
 
-    test "DecompressionStream terminate closes the zlib agent" do
-      ds = DecompressionStream.new("gzip")
-      pid = ds.readable.controller_pid
-      agent = Web.ReadableStream.__get_slots__(pid).impl_state.zlib_agent
+    # The callbacks run in one process, as the worker of a stream runs
+    # them: the handle of the first chunk closes at a cancel.
+    test "the terminate callback closes the zlib handle of each stream" do
+      state = %{format: "gzip", decoder: nil}
+      partial = binary_part(:zlib.gzip(:binary.copy("hello", 1_000)), 0, 10)
+      ctrl = %ReadableStreamDefaultController{pid: self()}
 
-      Web.Stream.terminate(pid, :cancel, :manual)
+      assert {:ok, %{decoder: [%{zlib: zlib}]} = state} =
+               DecompressionStream.write(partial, ctrl, state)
 
-      assert wait_until(2_000, fn -> not Process.alive?(agent) end)
+      assert :ok = DecompressionStream.terminate({:cancel, :manual}, state)
+      assert_raise ErlangError, fn -> :zlib.inflate(zlib, "x") end
+      assert :ok = DecompressionStream.terminate({:cancel, :manual}, %{state | decoder: nil})
+
+      zlib = :zlib.open()
+      :ok = :zlib.deflateInit(zlib)
+      state = %{window_bits: 31, zlib: zlib}
+      assert :ok = CompressionStream.terminate({:cancel, :manual}, state)
+      assert_raise ErlangError, fn -> :zlib.deflate(zlib, "x") end
+
+      # A second close has no effect, as a close of a handle of a worker that
+      # stopped.
+      assert :ok = CompressionStream.terminate({:cancel, :manual}, state)
+      assert :ok = CompressionStream.terminate({:cancel, :manual}, %{state | zlib: nil})
     end
   end
 

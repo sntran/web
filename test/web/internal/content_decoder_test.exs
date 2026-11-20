@@ -155,6 +155,23 @@ defmodule Web.Internal.ContentDecoderTest do
     end
   end
 
+  describe "close/1" do
+    test "closes the zlib handles of a decoder that did not end" do
+      stages = Decoder.push(Decoder.format("gzip"), :zlib.gzip("data"))
+      [%{zlib: zlib}] = stages
+
+      assert Decoder.close(stages) == :ok
+      assert_raise ErlangError, fn -> :zlib.inflateReset(zlib) end
+    end
+
+    test "accepts a decoder that ended, with its handles closed already" do
+      stages = Decoder.push(Decoder.format("deflate"), :zlib.compress("data"))
+      {:done, ["data"], stages} = drain(Decoder.finish(stages), [])
+
+      assert Decoder.close(stages) == :ok
+    end
+  end
+
   describe "data that is not correct" do
     test "data that is not valid raises" do
       assert decode_error("gzip", "not gzip data").message == "The gzip data is not valid."

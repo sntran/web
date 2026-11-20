@@ -23,7 +23,9 @@ defmodule Web.Internal.ContentDecoder do
 
   defmodule Error do
     @moduledoc false
-    defexception [:message, :coding]
+    # The reason is `:invalid` for data that is not valid, and `:incomplete`
+    # for data that ends before the end of its compressed form.
+    defexception [:message, :coding, :reason]
   end
 
   @piece_size 65_536
@@ -69,6 +71,17 @@ defmodule Web.Internal.ContentDecoder do
   # decoder removes the last one first.
   defp stages(codings), do: codings |> Enum.reverse() |> Enum.map(&stage/1)
 
+  @doc """
+  Makes the decoder of a format of the Compression Standard, for
+  `Web.DecompressionStream`: `"gzip"`, `"deflate"` (the zlib format only),
+  or `"deflate-raw"`. The decoder is strict, as the Standard specifies: data
+  after the end of the compressed data, and an empty input, raise.
+  """
+  @spec format(String.t()) :: [map()]
+  def format("gzip"), do: [zlib_stage("gzip", 31, true)]
+  def format("deflate"), do: [zlib_stage("deflate", 15, true)]
+  def format("deflate-raw"), do: [zlib_stage("deflate-raw", -15, true)]
+
   # Each stage has the queue of its input, and `ended?` when its input has
   # no more chunks.
   defp stage(coding) when coding in ["gzip", "x-gzip"], do: zlib_stage(coding, 31)
@@ -93,14 +106,17 @@ defmodule Web.Internal.ContentDecoder do
     }
   end
 
-  defp zlib_stage(coding, window_bits) do
+  # A strict stage refuses data after the end of the compressed data, and an
+  # empty input. An HTTP body has no such rule.
+  defp zlib_stage(coding, window_bits, strict? \\ false) do
     zlib = :zlib.open()
-    :ok = :zlib.inflateInit(zlib, window_bits)
+    :ok = :zlib.inflateInit(zlib, window_bits, if(strict?, do: :error, else: :cut))
 
     %{
       coding: coding,
       kind: :zlib,
       zlib: zlib,
+      strict?: strict?,
       fed?: false,
       continuing?: false,
       input: :queue.new(),
@@ -112,6 +128,23 @@ defmodule Web.Internal.ContentDecoder do
   @doc "Gives a chunk of the body to the decoder."
   @spec push([map()], binary()) :: [map()]
   def push([first | rest], data), do: [add_input(first, data) | rest]
+
+  @doc """
+  Closes the zlib handles of a decoder that stops before its end. A handle
+  that closed at the end of its data is not closed again.
+  """
+  @spec close([map()]) :: :ok
+  def close(stages) do
+    for %{kind: :zlib, zlib: zlib} <- stages do
+      try do
+        :zlib.close(zlib)
+      rescue
+        ErlangError -> :ok
+      end
+    end
+
+    :ok
+  end
 
   @doc "The body has no more chunks."
   @spec finish([map()]) :: [map()]
@@ -276,7 +309,8 @@ defmodule Web.Internal.ContentDecoder do
     ErlangError -> invalid!(stage)
   end
 
-  # A stage that got no data is an empty body.
+  # A stage that got no data is an empty body. A strict stage needs data.
+  defp close_zlib(%{fed?: false, strict?: true} = stage), do: not_complete!(stage)
   defp close_zlib(%{fed?: false, zlib: zlib}), do: :zlib.close(zlib)
 
   defp close_zlib(%{zlib: zlib} = stage) do
@@ -310,7 +344,7 @@ defmodule Web.Internal.ContentDecoder do
         track({:skip_size, <<>>}, rest)
 
       {_other, _rest} ->
-        raise Error, message: "The data is not a zstd frame.", coding: "zstd"
+        raise Error, message: "The data is not a zstd frame.", coding: "zstd", reason: :invalid
     end
   end
 
@@ -325,7 +359,10 @@ defmodule Web.Internal.ContentDecoder do
   # The first byte of the frame header tells the size of the other fields.
   defp track(:descriptor, <<descriptor, rest::binary>>) do
     if (descriptor &&& 0x08) != 0 do
-      raise Error, message: "The zstd frame header is not valid.", coding: "zstd"
+      raise Error,
+        message: "The zstd frame header is not valid.",
+        coding: "zstd",
+        reason: :invalid
     end
 
     single_segment = descriptor >>> 5 &&& 1
@@ -348,9 +385,17 @@ defmodule Web.Internal.ContentDecoder do
         content_size =
           case header >>> 1 &&& 0x03 do
             # A block of one repeated byte has that byte only.
-            1 -> 1
-            3 -> raise Error, message: "The zstd block type is not valid.", coding: "zstd"
-            _raw_or_compressed -> header >>> 3
+            1 ->
+              1
+
+            3 ->
+              raise Error,
+                message: "The zstd block type is not valid.",
+                coding: "zstd",
+                reason: :invalid
+
+            _raw_or_compressed ->
+              header >>> 3
           end
 
         track({:skip, content_size, after_block(last?, checksum?)}, rest)
@@ -378,11 +423,17 @@ defmodule Web.Internal.ContentDecoder do
 
   @spec invalid!(map()) :: no_return()
   defp invalid!(stage) do
-    raise Error, message: "The #{stage.coding} data is not valid.", coding: stage.coding
+    raise Error,
+      message: "The #{stage.coding} data is not valid.",
+      coding: stage.coding,
+      reason: :invalid
   end
 
   @spec not_complete!(map()) :: no_return()
   defp not_complete!(stage) do
-    raise Error, message: "The #{stage.coding} data is not complete.", coding: stage.coding
+    raise Error,
+      message: "The #{stage.coding} data is not complete.",
+      coding: stage.coding,
+      reason: :incomplete
   end
 end

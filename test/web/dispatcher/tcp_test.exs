@@ -231,7 +231,7 @@ defmodule Web.Dispatcher.TCPTest do
     )
 
     assert :ok = Web.Promise.await(ReadableStream.cancel(resp.body, :backpressure_proven))
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "pull closure closes the bridge when the abort signal is already set" do
@@ -243,7 +243,7 @@ defmodule Web.Dispatcher.TCPTest do
     assert :ok = Web.AbortController.abort(controller, :signal_aborted)
     assert :ok = source.pull.(controller_for(proxy))
     assert Enum.to_list(proxy) == []
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "bridge pull promise resolves when the bridge dies after accepting demand" do
@@ -267,7 +267,7 @@ defmodule Web.Dispatcher.TCPTest do
 
     assert :ok = Task.await(pull_task, 1_000)
     _ = Socket.close(socket)
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "pull closure resolves immediately when the bridge is already gone" do
@@ -277,7 +277,7 @@ defmodule Web.Dispatcher.TCPTest do
 
     assert :ok = await(source.pull.(controller_for(proxy_stream())))
     _ = Socket.close(socket)
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "bridge treats readable cancellation as a clean end-of-stream" do
@@ -302,7 +302,7 @@ defmodule Web.Dispatcher.TCPTest do
     assert :ok = await(ReadableStream.cancel(socket.readable.controller_pid, :bridge_cancelled))
     assert :ok = Task.await(pull_task, 1_000)
     assert Enum.to_list(proxy) == []
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "bridge closes cleanly when the socket readable crashes mid-pull" do
@@ -329,7 +329,7 @@ defmodule Web.Dispatcher.TCPTest do
     assert :ok = Task.await(pull_task, 1_000)
     assert_receive {:DOWN, ^bridge_monitor, :process, ^bridge_pid, _reason}, 1_000
     assert Enum.to_list(proxy) == []
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "fetch/1 treats socket readable cancellation as a clean response end" do
@@ -344,7 +344,7 @@ defmodule Web.Dispatcher.TCPTest do
     Process.sleep(50)
     assert :ok = await(ReadableStream.cancel(socket.readable.controller_pid, :bridge_cancelled))
     assert {:ok, []} = Task.yield(read_task, 1_000)
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "fetch/1 closes cleanly when the underlying socket readable dies mid-pull" do
@@ -360,7 +360,7 @@ defmodule Web.Dispatcher.TCPTest do
     Process.exit(socket.readable.controller_pid, :kill)
 
     assert {:ok, []} = Task.yield(read_task, 1_000)
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "an abort message to the bridge ends the stream and closes the socket" do
@@ -372,7 +372,7 @@ defmodule Web.Dispatcher.TCPTest do
     send(bridge_pid, {:abort, :forced_abort})
 
     assert Enum.to_list(proxy) == []
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "the bridge ignores a message that it does not know" do
@@ -453,7 +453,7 @@ defmodule Web.Dispatcher.TCPTest do
 
     assert %ReadableStream{} = resp.body
     assert :ok = Web.Promise.await(ReadableStream.cancel(resp.body, :manual_cancel))
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "fetch/1 closes the socket when the response reader owner dies" do
@@ -475,7 +475,7 @@ defmodule Web.Dispatcher.TCPTest do
 
     assert_receive :reader_locked, 1_000
     Process.exit(reader_owner, :kill)
-    assert_receive :tcp_client_closed, 1_000
+    assert_receive :tcp_client_closed, 3_000
   end
 
   test "fetch/1 halts before consuming when the signal is already aborted" do

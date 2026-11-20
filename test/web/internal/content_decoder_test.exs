@@ -23,31 +23,27 @@ defmodule Web.Internal.ContentDecoderTest do
 
   defp decoder(coding), do: Decoder.new([{"content-encoding", header(coding)}])
 
-  # Decodes the chunks, and returns the output, and the size of each piece.
+  # Decodes the chunks, and returns the output.
   defp decode(stages, chunks) do
-    test = self()
-    emit = fn piece -> emit_to(test, {:piece, piece}) end
+    stages |> pieces(chunks) |> IO.iodata_to_binary()
+  end
 
-    stages =
-      Enum.reduce(chunks, stages, fn chunk, stages ->
-        {:cont, stages} = Decoder.decode(stages, chunk, emit)
-        stages
+  # Gives each chunk, and takes the pieces after each chunk.
+  defp pieces(stages, chunks) do
+    {pieces, stages} =
+      Enum.reduce(chunks, {[], stages}, fn chunk, {pieces, stages} ->
+        {:more, pieces, stages} = drain(Decoder.push(stages, chunk), pieces)
+        {pieces, stages}
       end)
 
-    :cont = Decoder.finish(stages, emit)
-    collect([])
+    {:done, pieces, _stages} = drain(Decoder.finish(stages), pieces)
+    Enum.reverse(pieces)
   end
 
-  defp emit_to(test, message) do
-    send(test, message)
-    :cont
-  end
-
-  defp collect(pieces) do
-    receive do
-      {:piece, piece} -> collect([piece | pieces])
-    after
-      0 -> pieces |> Enum.reverse() |> IO.iodata_to_binary()
+  defp drain(stages, pieces) do
+    case Decoder.pull(stages) do
+      {:piece, piece, stages} -> drain(stages, [piece | pieces])
+      {status, stages} -> {status, pieces, stages}
     end
   end
 
@@ -98,7 +94,7 @@ defmodule Web.Internal.ContentDecoderTest do
     end
   end
 
-  describe "decode/3" do
+  describe "push/2 and pull/1" do
     test "gives the data of each coding" do
       data = :crypto.strong_rand_bytes(20_000) <> :binary.copy("hello ", 50_000)
 
@@ -132,31 +128,29 @@ defmodule Web.Internal.ContentDecoderTest do
     end
 
     test "gives the output in pieces, also for a small chunk that expands much" do
-      encoded = :zlib.gzip(:binary.copy(<<0>>, 2_000_000))
-      test = self()
+      for coding <- @codings do
+        encoded = encode(coding, :binary.copy(<<0>>, 2_000_000))
+        sizes = decoder(coding) |> pieces([encoded]) |> Enum.map(&byte_size/1)
 
-      {:cont, stages} =
-        Decoder.decode(decoder("gzip"), encoded, &emit_to(test, byte_size(&1)))
-
-      :cont = Decoder.finish(stages, fn _piece -> :cont end)
-
-      sizes = Stream.repeatedly(fn -> receive do: (size -> size), after: (0 -> nil) end)
-      sizes = Enum.take_while(sizes, & &1)
-
-      assert Enum.sum(sizes) == 2_000_000
-      assert Enum.max(sizes) < 200_000
+        assert Enum.sum(sizes) == 2_000_000, coding
+        assert Enum.max(sizes) < 200_000, coding
+      end
     end
 
     test "gives an empty body for each coding" do
       for coding <- @codings, do: assert(decode(decoder(coding), [<<>>]) == <<>>)
     end
 
-    test "stops when the function asks" do
+    test "decodes only the piece that a pull takes" do
       data = :binary.copy(<<0>>, 1_000_000)
 
       for coding <- @codings do
-        assert {:halt, _stages} =
-                 Decoder.decode(decoder(coding), encode(coding, data), fn _piece -> :halt end)
+        stages = Decoder.push(decoder(coding), encode(coding, data))
+        assert {:piece, first, stages} = Decoder.pull(stages)
+        assert byte_size(first) < 200_000, coding
+
+        # The rest of the output comes with the subsequent pulls.
+        assert {:piece, _second, _stages} = Decoder.pull(stages)
       end
     end
   end

@@ -27,8 +27,9 @@ defmodule Web.Application do
       {Registry,
        keys: :unique, name: LazyStream.registry(), partitions: System.schedulers_online()},
       Web.URLPattern.Cache,
-      # The function reads the settings each time the pools start.
-      %{id: Web.Finch, start: {__MODULE__, :start_finch, []}, type: :supervisor}
+      # The pools of the HTTP connections. The function reads the setting
+      # `:http_protocols` each time the pools start.
+      %{id: Web.Dispatcher.HTTP, start: {__MODULE__, :start_http, []}, type: :supervisor}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: Web.Supervisor)
@@ -40,32 +41,22 @@ defmodule Web.Application do
   @http_protocols_key {__MODULE__, :http_protocols}
 
   @doc false
-  # Starts the pools of the HTTP connections with the settings of the
-  # application.
-  #
-  # There are two groups of pools: one for connections with no TLS, and one
-  # for TLS connections. The HTTP client gives the transport options of a
-  # pool to each connection of that pool, and a connection with no TLS
-  # refuses the options of TLS. Thus the setting `:tls_options` needs its
-  # own group.
-  def start_finch do
+  # Starts the pools of the HTTP connections with the setting
+  # `:http_protocols`. Each origin gets its pool, or its HTTP/2 connection,
+  # at its first request: see `Web.Dispatcher.HTTP.Pool` and
+  # `Web.Dispatcher.HTTP.Multiplex`. A new connection reads the settings
+  # `:connect_timeout` and `:tls_options`.
+  def start_http do
     protocols = configured_http_protocols()
-    tls_options = configured_tls_options()
     :persistent_term.put(@http_protocols_key, protocols)
 
     children = [
-      {Finch, name: Web.Finch, pools: finch_pools(protocols)},
-      {Finch, name: Web.Finch.TLS, pools: finch_pools(protocols, tls_options)}
+      {Registry, keys: :unique, name: Web.Dispatcher.HTTP.Registry},
+      {DynamicSupervisor, name: Web.Dispatcher.HTTP.Connections, strategy: :one_for_one}
     ]
 
-    Supervisor.start_link(children, strategy: :one_for_one)
+    Supervisor.start_link(children, strategy: :one_for_all)
   end
-
-  @doc false
-  # The name of the group of pools for a URL scheme.
-  @spec finch_name(:http | :https) :: atom()
-  def finch_name(:https), do: Web.Finch.TLS
-  def finch_name(:http), do: Web.Finch
 
   @doc false
   # The TLS options of `Web.fetch/2` and `Web.connect/2`, from the setting
@@ -121,19 +112,5 @@ defmodule Web.Application do
   @spec connect_timeout() :: non_neg_integer() | :infinity
   def connect_timeout do
     Application.get_env(:web, :connect_timeout, @default_connect_timeout)
-  end
-
-  @doc false
-  # The pools of the HTTP connections. Each origin has 25 connections. A
-  # request waits for a connection when all of them are in use.
-  def finch_pools(protocols \\ @default_http_protocols, tls_options \\ []) do
-    %{
-      :default => [
-        protocols: protocols,
-        size: 25,
-        count: 1,
-        conn_opts: [transport_opts: [timeout: connect_timeout()] ++ tls_options]
-      ]
-    }
   end
 end

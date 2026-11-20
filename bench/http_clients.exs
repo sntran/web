@@ -4,11 +4,11 @@ defmodule Web.Benchmarks.HTTPClients do
   @moduledoc false
 
   # Compares `Web.fetch/2` with Finch and Req, with the same server and the
-  # same pool of connections.
+  # same number of connections.
   #
-  #   * Each client uses the HTTP/1.1 pool `Web.Finch` of this library: Req
-  #     gets it with the option `finch: [name: Web.Finch]`. Thus the three
-  #     clients have the same number of connections.
+  #   * Finch and Req use one Finch pool of 25 HTTP/1.1 connections, which
+  #     the script starts: Req gets it with the option `finch: [name: ...]`.
+  #     `Web.fetch/2` has its own pool of 25 connections for the origin.
   #   * The server sends no compressed response, thus each client gets the
   #     same bytes.
   #   * Each pair does the same work: `Req.get!` with its JSON decode and
@@ -65,13 +65,14 @@ defmodule Web.Benchmarks.HTTPClients do
       )
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
+    {:ok, _finch} = Finch.start_link(name: __MODULE__.Finch, pools: %{default: [size: 25]})
     run(port)
   end
 
   def run(port) do
     small = "http://127.0.0.1:#{port}/small"
     big = "http://127.0.0.1:#{port}/big"
-    req = Req.new(retry: false, finch: [name: Web.Finch])
+    req = Req.new(retry: false, finch: [name: __MODULE__.Finch])
 
     clients = [
       {"Finch.request", fn -> finch_body(small) end},
@@ -163,7 +164,7 @@ defmodule Web.Benchmarks.HTTPClients do
   end
 
   defp finch_body(url) do
-    {:ok, response} = Finch.request(Finch.build(:get, url), Web.Finch)
+    {:ok, response} = Finch.request(Finch.build(:get, url), __MODULE__.Finch)
     response.body
   end
 

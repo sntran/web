@@ -150,40 +150,49 @@ mix run bench/http_clients.exs
 ```
 
 The script starts one Bandit server on the machine, and compares
-`Web.fetch/2` with Finch, which `Web.fetch/2` uses, and with Req. The three
-clients use the same HTTP/1.1 pool, and the server sends no compressed
+`Web.fetch/2` with Finch and with Req. Finch and Req use one Finch pool of
+25 HTTP/1.1 connections, which the script starts. `Web.fetch/2` has its own
+pool of 25 connections for the origin. The server sends no compressed
 response. Each pair does the same work: Req with its JSON decode and
 `fetch` with `json/1` give a map, and Req with no decode and `fetch` with
 `text/1` give a binary. The clients run in turns, in 8 rounds, thus a slow
-time of the machine has an effect on each client. Req is a dependency only
-in the environment `:dev`.
+time of the machine has an effect on each client. Req and Finch are
+dependencies only in the environment `:dev`.
 
 | Test | Finch | Req | `Web.fetch` |
 | --- | --- | --- | --- |
-| Small JSON response, one request at a time, as a map | — | 118–121 µs | 148–150 µs |
-| Small JSON response, one request at a time, as a binary | 91–93 µs | 110–111 µs | 135–141 µs |
-| Small JSON response, 50 processes, as a map | — | 21764–21773 req/s | 17907–18461 req/s |
-| Small JSON response, 50 processes, as a binary | 24847–25007 req/s | 22567–22762 req/s | 18244–18313 req/s |
-| 256 MiB body, read as a stream | — | 1348–1408 MiB/s | 1285–1404 MiB/s, +18–31 MiB |
-| 256 MiB body, read into memory | — | 715–763 MiB/s | 691–744 MiB/s |
+| Small JSON response, one request at a time, as a map | — | 116–125 µs | 132–134 µs |
+| Small JSON response, one request at a time, as a binary | 90–93 µs | 108–112 µs | 123–129 µs |
+| Small JSON response, 50 processes, as a map | — | 22073–22392 req/s | 20310–20559 req/s |
+| Small JSON response, 50 processes, as a binary | 26883–27065 req/s | 23363–24118 req/s | 19374–21212 req/s |
+| 256 MiB body, read as a stream | — | 1192–1372 MiB/s | 1538–2240 MiB/s, +10–24 MiB |
+| 256 MiB body, read into memory | — | 764–815 MiB/s | 673–752 MiB/s |
 
 Before version 0.5.0, a small request with `fetch` took 632–678 µs, and 50
 processes did 5209–5252 requests each second. That comparison ran in a
-separate Mix project on the same machine.
+separate Mix project on the same machine. With Finch as its HTTP client,
+`fetch` took 135–141 µs for the small request as a binary.
 
-A request with `fetch` has two processes: the process of the request,
-which is also the promise, and its worker, which runs the HTTP client.
-Req has none: it runs Finch in the process that calls it. A process that
-waits for a message must wake up when the message comes, thus each process
-between the network and the caller adds time. For a small response, the
-worker gives the response directly to the process that awaits it, and the
-body is in the struct: the response has no process, and `text/1` starts
-none. Finch in one process that is not the caller takes approximately
-10 µs more than Finch in the caller, on this machine.
+The HTTP client of `fetch` is in the library, on the connection functions
+of Mint. A request with `fetch` has one process: the process of the
+request, which is also the promise. It gets the connection from the pool
+of its origin, and owns the socket while the response comes. Thus the
+messages of the socket come to it directly. Req has no process: it runs
+Finch in the process that calls it. A process that waits for a message
+must wake up when the message comes, thus each process between the
+network and the caller adds time. For a small response, the body is in the
+struct: the response has no process, and `text/1` starts none.
 
-The process of the request is necessary: the worker waits in the HTTP
-client, and cannot answer while it waits. The process of the request
-answers a reader of a body that comes slowly, the abort signal, and the
-time limits.
+The process of the request is necessary: it answers a reader of a body
+that comes slowly, the abort signal, and the time limits, while the
+response comes. Finch has a blocking request function, and its pool has no
+other public function, thus a process that uses Finch cannot answer while
+it waits. The process of the request costs approximately 15–20 µs more
+than Req for a small request, on this machine.
+
+For a large body, the process of the request reads the socket and gives
+the chunks to the stream. It reads one message of the socket at a time,
+and it stops to read while it has 64 KiB that no reader took. Thus the
+memory of a stream read stays small.
 
 The numbers vary by up to 2 times between runs on this virtual machine.

@@ -5,10 +5,11 @@ defmodule Web.Internal.ContentDecoder do
   # content codings" of the Fetch Standard.
   #
   # The decoder works on one chunk at a time, and it never has the full body
-  # in memory. It gives its output to a function `emit` in pieces of
+  # in memory. The caller gives each chunk of the body with `push/2`, and
+  # takes the output with `pull/1`, one piece at a time: a piece has
   # approximately `@piece_size` bytes. Thus a small compressed chunk that
-  # expands to many bytes does not become one large binary. `emit` returns
-  # `:cont`, or `:halt` to stop the decoding.
+  # expands to many bytes does not become one large binary, and the caller
+  # takes the next piece only when it has space for it: the backpressure.
   #
   # The codings are `gzip`, `x-gzip`, `deflate`, and `zstd`. Erlang/OTP 28
   # and later have the module `:zstd`. A body with a coding that the decoder
@@ -68,71 +69,175 @@ defmodule Web.Internal.ContentDecoder do
   # decoder removes the last one first.
   defp stages(codings), do: codings |> Enum.reverse() |> Enum.map(&stage/1)
 
-  defp stage(coding) when coding in ["gzip", "x-gzip"] do
-    %{coding: coding, kind: :zlib, zlib: open_zlib(31), fed?: false}
-  end
+  # Each stage has the queue of its input, and `ended?` when its input has
+  # no more chunks.
+  defp stage(coding) when coding in ["gzip", "x-gzip"], do: zlib_stage(coding, 31)
 
-  # The zlib format, or raw deflate data: see `detect_deflate/3`.
-  defp stage("deflate"), do: %{coding: "deflate", kind: :deflate, buffer: <<>>}
+  # The zlib format, or raw deflate data: see `detect_deflate/1`.
+  defp stage("deflate") do
+    %{coding: "deflate", kind: :deflate, buffer: <<>>, input: :queue.new(), ended?: false}
+  end
 
   defp stage("zstd") do
     {:ok, context} = :zstd.context(:decompress)
-    %{coding: "zstd", kind: :zstd, context: context, frame: {:magic, <<>>}}
+
+    %{
+      coding: "zstd",
+      kind: :zstd,
+      context: context,
+      frame: {:magic, <<>>},
+      remaining: <<>>,
+      input: :queue.new(),
+      ended?: false,
+      done?: false
+    }
   end
 
-  defp open_zlib(window_bits) do
+  defp zlib_stage(coding, window_bits) do
     zlib = :zlib.open()
     :ok = :zlib.inflateInit(zlib, window_bits)
-    zlib
+
+    %{
+      coding: coding,
+      kind: :zlib,
+      zlib: zlib,
+      fed?: false,
+      continuing?: false,
+      input: :queue.new(),
+      ended?: false,
+      done?: false
+    }
   end
 
-  @doc """
-  Decodes one chunk of the body. Returns `:cont` or `:halt`, and the decoder.
-  """
-  @spec decode([map()], binary(), (binary() -> :cont | :halt)) :: {:cont | :halt, [map()]}
-  def decode(stages, data, emit), do: feed(stages, data, emit)
+  @doc "Gives a chunk of the body to the decoder."
+  @spec push([map()], binary()) :: [map()]
+  def push([first | rest], data), do: [add_input(first, data) | rest]
+
+  @doc "The body has no more chunks."
+  @spec finish([map()]) :: [map()]
+  def finish([first | rest]), do: [%{first | ended?: true} | rest]
 
   @doc """
-  Ends the decoding at the end of the body. Gives the last output, and raises
-  when the compressed data is not complete.
+  Takes the next piece of the output. Returns `{:more, stages}` when the
+  decoder needs the next chunk of the body, and `{:done, stages}` after the
+  last piece of a body that ended. Raises when the data is not valid or not
+  complete.
   """
-  @spec finish([map()], (binary() -> :cont | :halt)) :: :cont | :halt
-  def finish([], _emit), do: :cont
+  @spec pull([map()]) :: {:piece, binary(), [map()]} | {:more, [map()]} | {:done, [map()]}
+  def pull(stages), do: collect(stages, [], 0)
 
-  def finish([stage | rest], emit) do
-    {result, rest} = close_stage(stage, rest, emit)
-    if result == :cont, do: finish(rest, emit), else: result
+  # The output of a stage comes in small parts: zlib gives 16 KiB at most.
+  # The pieces have `@piece_size` bytes when the data has them.
+  defp collect(stages, acc, size) when size >= @piece_size do
+    {:piece, IO.iodata_to_binary(acc), stages}
   end
+
+  defp collect(stages, acc, size) do
+    case pull_chain(stages) do
+      {:piece, piece, stages} -> collect(stages, [acc | piece], size + byte_size(piece))
+      {status, stages} when size == 0 -> {status, stages}
+      {_status, stages} -> {:piece, IO.iodata_to_binary(acc), stages}
+    end
+  end
+
+  defp add_input(stage, <<>>), do: stage
+  defp add_input(stage, data), do: %{stage | input: :queue.in(data, stage.input)}
 
   # ---------------------------------------------------------------------------
   # One stage after the other
   # ---------------------------------------------------------------------------
 
-  defp feed(stages, <<>>, _emit), do: {:cont, stages}
-  defp feed([], data, emit), do: {emit.(data), []}
+  # The last stage gives the output. A stage that needs input takes the
+  # output of the stage before it.
+  defp pull_chain(stages) do
+    {before, [last]} = Enum.split(stages, -1)
 
-  defp feed([stage | rest], data, emit) do
-    {result, stage, rest} = run(stage, data, rest, emit)
-    {result, [stage | rest]}
-  end
+    case pull_stage(last) do
+      {:more, last} when before != [] ->
+        case pull_chain(before) do
+          {:piece, piece, before} -> pull_chain(before ++ [add_input(last, piece)])
+          {:more, before} -> {:more, before ++ [last]}
+          {:done, before} -> pull_chain(before ++ [%{last | ended?: true}])
+        end
 
-  defp run(%{kind: :zlib, zlib: zlib} = stage, data, rest, emit) do
-    {result, rest} = inflate(stage, safe_inflate(stage, zlib, data), [], 0, rest, emit)
-    {result, %{stage | fed?: true}, rest}
-  end
+      {status, last} ->
+        {status, before ++ [last]}
 
-  defp run(%{kind: :deflate, buffer: buffer} = stage, data, rest, emit) do
-    case detect_deflate(buffer <> data) do
-      :more -> {:cont, %{stage | buffer: buffer <> data}, rest}
-      window_bits -> run(deflate_stage(window_bits), buffer <> data, rest, emit)
+      {:piece, piece, last} ->
+        {:piece, piece, before ++ [last]}
     end
   end
 
-  defp run(%{kind: :zstd} = stage, data, rest, emit) do
-    frame = track(stage.frame, data)
-    {result, rest} = decompress(stage, data, rest, emit)
-    {result, %{stage | frame: frame}, rest}
+  # zlib keeps the input that it did not use: a stage that continues gets
+  # more output with no new input.
+  defp pull_stage(%{kind: :zlib, continuing?: true} = stage) do
+    inflated(stage, safe_inflate(stage, stage.zlib, []))
   end
+
+  defp pull_stage(%{kind: :zlib, done?: true} = stage), do: {:done, stage}
+
+  defp pull_stage(%{kind: :zlib} = stage) do
+    case :queue.out(stage.input) do
+      {{:value, data}, input} ->
+        stage = %{stage | input: input, fed?: true}
+        inflated(stage, safe_inflate(stage, stage.zlib, data))
+
+      {:empty, _input} when stage.ended? ->
+        close_zlib(stage)
+        {:done, %{stage | done?: true}}
+
+      {:empty, _input} ->
+        {:more, stage}
+    end
+  end
+
+  # The first two bytes tell the format of the deflate data.
+  defp pull_stage(%{kind: :deflate} = stage) do
+    case :queue.out(stage.input) do
+      {{:value, data}, input} ->
+        buffer = stage.buffer <> data
+
+        case detect_deflate(buffer) do
+          :more ->
+            pull_stage(%{stage | buffer: buffer, input: input})
+
+          window_bits ->
+            zlib = zlib_stage("deflate", window_bits)
+            pull_stage(%{zlib | input: :queue.in_r(buffer, input), ended?: stage.ended?})
+        end
+
+      {:empty, _input} when stage.ended? and stage.buffer == <<>> ->
+        {:done, stage}
+
+      {:empty, _input} when stage.ended? ->
+        not_complete!(stage)
+
+      {:empty, _input} ->
+        {:more, stage}
+    end
+  end
+
+  defp pull_stage(%{kind: :zstd, done?: true} = stage), do: {:done, stage}
+
+  defp pull_stage(%{kind: :zstd, remaining: <<>>} = stage) do
+    case :queue.out(stage.input) do
+      {{:value, data}, input} ->
+        decompress(%{stage | input: input, frame: track(stage.frame, data)}, data)
+
+      # The data must end at the end of a frame.
+      {:empty, _input} when stage.ended? and stage.frame == {:magic, <<>>} ->
+        {:done, out} = :zstd.finish(stage.context, <<>>)
+        {:piece, IO.iodata_to_binary(out), %{stage | done?: true}}
+
+      {:empty, _input} when stage.ended? ->
+        not_complete!(stage)
+
+      {:empty, _input} ->
+        {:more, stage}
+    end
+  end
+
+  defp pull_stage(%{kind: :zstd} = stage), do: decompress(stage, stage.remaining)
 
   # `deflate` in HTTP is the zlib format. Some servers send raw deflate
   # data, and browsers accept it. A zlib stream starts with two bytes: the
@@ -143,29 +248,11 @@ defmodule Web.Internal.ContentDecoder do
     if (cmf &&& 0x0F) == 8 and rem(cmf * 256 + flg, 31) == 0, do: 15, else: -15
   end
 
-  defp deflate_stage(window_bits) do
-    %{coding: "deflate", kind: :zlib, zlib: open_zlib(window_bits), fed?: false}
-  end
+  defp inflated(stage, {:continue, out}),
+    do: {:piece, IO.iodata_to_binary(out), %{stage | continuing?: true}}
 
-  # The output of zlib comes in parts of 16 KiB at most. The stage collects
-  # them into pieces of `@piece_size` bytes.
-  defp inflate(stage, {:continue, out}, acc, size, rest, emit) do
-    acc = [acc | out]
-    size = size + IO.iodata_length(out)
-
-    if size >= @piece_size do
-      case feed(rest, IO.iodata_to_binary(acc), emit) do
-        {:cont, rest} -> inflate(stage, safe_inflate(stage, stage.zlib, []), [], 0, rest, emit)
-        {:halt, rest} -> {:halt, rest}
-      end
-    else
-      inflate(stage, safe_inflate(stage, stage.zlib, []), acc, size, rest, emit)
-    end
-  end
-
-  defp inflate(_stage, {:finished, out}, acc, _size, rest, emit) do
-    feed(rest, IO.iodata_to_binary([acc | out]), emit)
-  end
+  defp inflated(stage, {:finished, out}),
+    do: {:piece, IO.iodata_to_binary(out), %{stage | continuing?: false}}
 
   defp safe_inflate(stage, zlib, data) do
     case :zlib.safeInflate(zlib, data) do
@@ -176,49 +263,28 @@ defmodule Web.Internal.ContentDecoder do
     ErlangError -> invalid!(stage)
   end
 
-  defp decompress(stage, data, rest, emit) do
+  # `:zstd` gives the input that it did not use when its output is full.
+  defp decompress(stage, data) do
     case :zstd.stream(stage.context, data) do
       {:continue, remaining, out} ->
-        case feed(rest, IO.iodata_to_binary(out), emit) do
-          {:cont, rest} -> decompress(stage, remaining, rest, emit)
-          {:halt, rest} -> {:halt, rest}
-        end
+        {:piece, IO.iodata_to_binary(out), %{stage | remaining: remaining}}
 
       {:continue, out} ->
-        feed(rest, IO.iodata_to_binary(out), emit)
+        {:piece, IO.iodata_to_binary(out), %{stage | remaining: <<>>}}
     end
   rescue
     ErlangError -> invalid!(stage)
   end
 
-  # ---------------------------------------------------------------------------
-  # The end of the body
-  # ---------------------------------------------------------------------------
-
   # A stage that got no data is an empty body.
-  defp close_stage(%{kind: :zlib, fed?: false, zlib: zlib}, rest, _emit) do
-    :zlib.close(zlib)
-    {:cont, rest}
-  end
+  defp close_zlib(%{fed?: false, zlib: zlib}), do: :zlib.close(zlib)
 
-  defp close_stage(%{kind: :zlib, zlib: zlib} = stage, rest, _emit) do
+  defp close_zlib(%{zlib: zlib} = stage) do
     :ok = :zlib.inflateEnd(zlib)
     :zlib.close(zlib)
-    {:cont, rest}
   rescue
     ErlangError -> not_complete!(stage)
   end
-
-  defp close_stage(%{kind: :deflate, buffer: <<>>}, rest, _emit), do: {:cont, rest}
-  defp close_stage(%{kind: :deflate} = stage, _rest, _emit), do: not_complete!(stage)
-
-  # The data must end at the end of a frame.
-  defp close_stage(%{kind: :zstd, frame: {:magic, <<>>}} = stage, rest, emit) do
-    {:done, out} = :zstd.finish(stage.context, <<>>)
-    feed(rest, IO.iodata_to_binary(out), emit)
-  end
-
-  defp close_stage(%{kind: :zstd} = stage, _rest, _emit), do: not_complete!(stage)
 
   # ---------------------------------------------------------------------------
   # The frames of zstd

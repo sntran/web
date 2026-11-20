@@ -190,7 +190,7 @@ defmodule Web.Dispatcher.HTTPTest do
       options: [redirect: "follow", signal: nil]
     }
 
-    assert {:error, %BadMapError{}} = HTTP.fetch(req)
+    assert {:error, %FunctionClauseError{}} = HTTP.fetch(req)
   end
 
   test "fetch/1 handles unified packets cleanly routing data remainder payload" do

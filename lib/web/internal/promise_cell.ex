@@ -40,26 +40,16 @@ defmodule Web.Internal.PromiseCell do
   @spec promise(pid()) :: Web.Promise.t()
   def promise(pid), do: %Web.Promise{pid: pid}
 
-  @doc "Tells if the promise has its outcome."
-  @spec settled?() :: boolean()
-  def settled?, do: Process.get(@key).status != :pending
-
-  @doc "The references of the processes that await the promise."
-  @spec waiters() :: [reference()]
-  def waiters, do: Process.get(@key).waiters
-
   @doc """
   Settles the promise, and gives the outcome to each process that awaits.
-  A different process gave the outcome to the references of `delivered`
-  already. A second outcome has no effect.
+  A second outcome has no effect.
   """
-  @spec settle(Web.Promise.outcome(), [reference()]) :: :ok
-  def settle(outcome, delivered \\ []) do
+  @spec settle(Web.Promise.outcome()) :: :ok
+  def settle(outcome) do
     case Process.get(@key) do
       %{status: :pending, waiters: waiters} = cell ->
-        for ref <- waiters, ref not in delivered, do: deliver(ref, outcome)
-        delivered? = waiters != [] or delivered != []
-        Process.put(@key, start_expiry(%{cell | status: outcome, waiters: []}, delivered?))
+        for ref <- waiters, do: deliver(ref, outcome)
+        Process.put(@key, start_expiry(%{cell | status: outcome, waiters: []}, waiters != []))
         :ok
 
       _settled ->

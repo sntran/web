@@ -81,8 +81,8 @@ defmodule Web.FetchHTTPProtocolsTest do
   end
 
   defp restart_pools do
-    :ok = Supervisor.terminate_child(Web.Supervisor, Web.Finch)
-    {:ok, _pid} = Supervisor.restart_child(Web.Supervisor, Web.Finch)
+    :ok = Supervisor.terminate_child(Web.Supervisor, Web.Dispatcher.HTTP)
+    {:ok, _pid} = Supervisor.restart_child(Web.Supervisor, Web.Dispatcher.HTTP)
   end
 
   defp version(response), do: Headers.get(response.headers, "x-http-version", nil)
@@ -148,9 +148,10 @@ defmodule Web.FetchHTTPProtocolsTest do
       assert {response.status, response.status_text, version(response)} == {200, "OK", "HTTP/1.1"}
     end
 
-    test "gives the empty status text for a TLS connection, which can use HTTP/2" do
-      assert HTTP.status_text(200, URL.new("https://example.com/")) == ""
-      assert HTTP.status_text(200, URL.new("http://example.com/")) == "OK"
+    test "gives the status text of the version that the connection uses" do
+      assert HTTP.status_text(200, :http1) == "OK"
+      assert HTTP.status_text(299, :http1) == ""
+      assert HTTP.status_text(200, :http2) == ""
     end
   end
 
@@ -213,7 +214,7 @@ defmodule Web.FetchHTTPProtocolsTest do
         Application.put_env(:web, :http_protocols, value)
 
         assert_raise ArgumentError, ~r/The setting :http_protocols of :web must be/, fn ->
-          Web.Application.start_finch()
+          Web.Application.start_http()
         end
       end
 

@@ -277,19 +277,22 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(SpecModel.check("ResponseBody", bug("no_source_watch")), "ReaderGetsAnEnd")
     end
 
-    test "a reader that waits with no end when the worker stops is found" do
+    test "a reader that waits with no end when the holder ignores a failure is found" do
       assert_violates(
-        SpecModel.check("ResponseBody", bug("worker_exit_ignored")),
+        SpecModel.check("ResponseBody", bug("failure_ignored")),
         "ReaderGetsAnEnd"
       )
     end
 
-    test "a worker that reads with no backpressure is found" do
+    test "a holder that reads with no backpressure is found" do
       assert_violates(SpecModel.check("ResponseBody", bug("no_backpressure")), "BufferBounded")
     end
 
     test "a connection that stays after a cancel is found" do
-      assert_violates(SpecModel.check("ResponseBody", bug("cancel_ignored")), "CancelStopsWorker")
+      assert_violates(
+        SpecModel.check("ResponseBody", bug("cancel_ignored")),
+        "CancelClosesConnection"
+      )
     end
   end
 end

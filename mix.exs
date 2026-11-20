@@ -69,7 +69,7 @@ defmodule Web.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:finch, "~> 0.21"},
+      {:mint, "~> 1.6"},
       {:castore, "~> 1.0"},
       {:idna, "~> 8.0"},
       {:benchee, "~> 1.5", only: [:dev, :test]},

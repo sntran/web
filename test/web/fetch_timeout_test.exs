@@ -5,6 +5,8 @@ defmodule Web.FetchTimeoutTest do
 
   use Web
 
+  alias Web.Dispatcher.HTTP.Exchange
+
   @receive_timeout 150
 
   setup do
@@ -203,12 +205,14 @@ defmodule Web.FetchTimeoutTest do
       set_env(:connect_timeout, 1_234)
       assert Web.Application.connect_timeout() == 1_234
 
-      assert [
-               protocols: [:http1],
-               size: 25,
-               count: 1,
-               conn_opts: [transport_opts: [timeout: 1_234]]
-             ] = Web.Application.finch_pools().default
+      # Each new connection reads the setting.
+      assert Exchange.connect_options(:http, [:http1]) ==
+               [
+                 mode: :passive,
+                 protocols: [:http1],
+                 skip_target_validation: true,
+                 transport_opts: [timeout: 1_234]
+               ]
     end
 
     test "is the connect time of a socket, unless the socket has its own option" do

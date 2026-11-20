@@ -226,6 +226,13 @@ Read or cancel each response body that comes slowly. A body that no
 process starts to read releases its connection after 300 seconds
 (`config :web, unread_body_timeout: ms`), and a later read rejects.
 
+The process of a request stops to read its connection while it has
+64 KiB of the body that no reader took: the backpressure. The content
+decoder also gives its output only as the reader takes it, thus a small
+compressed body that expands much does not fill the memory. A connection
+of HTTP/2 that the requests share does not stop for one request: its
+window of HTTP/2 limits the body of each response.
+
 `fetch` has no time limit for a full request, as in the Fetch Standard. Use
 `AbortSignal.timeout/1` for that limit. Two settings limit the wait for the
 network:
@@ -245,15 +252,25 @@ versions. The connection pools read it when the application starts.
 | Setting                                         | Versions                                                          |
 | ----------------------------------------------- | ----------------------------------------------------------------- |
 | `config :web, http_protocols: [:http1]`         | HTTP/1.1 only. This is the default.                               |
-| `config :web, http_protocols: [:http2]`         | HTTP/2 only. Many requests use one connection.                    |
+| `config :web, http_protocols: [:http2]`         | HTTP/2 only. The requests of an origin share one connection.      |
 | `config :web, http_protocols: [:http1, :http2]` | The server of a TLS connection selects the version (with ALPN).   |
 
-The field `status_text` of a response follows the HTTP version. An HTTP/2
-response has no reason phrase, thus its status text is `""`, as the Fetch
-Standard specifies. For HTTP/1.1, the text is the usual reason phrase of
-the status (for example `"OK"` for 200), because the HTTP client does not
-give the phrase that the server sent. With the two versions, a response
-from a TLS connection has the status text `""`.
+The HTTP client of `fetch` is in the library, on the connection functions
+of Mint. Each origin (a scheme, a host, and a port) has a pool of 25
+connections. A request waits for a free connection with no time limit, as
+in a browser, and its signal stops the wait. The process of the request
+owns the socket while the response comes, thus no other process is
+between the network and the response. With `[:http2]`, one process of the
+origin owns the shared connection. A request on an idle connection that
+the server closed, and a request that an HTTP/2 server did not process,
+go again on a new connection. A request with a body from a stream does not
+go again.
+
+The field `status_text` of a response follows the HTTP version of its
+connection. An HTTP/2 response has no reason phrase, thus its status text
+is `""`, as the Fetch Standard specifies. For HTTP/1.1, the text is the
+usual reason phrase of the status (for example `"OK"` for 200), because
+the HTTP client does not give the phrase that the server sent.
 
 `fetch` decodes the body of a response with the header `Content-Encoding`,
 as the Fetch Standard specifies: `gzip`, `x-gzip`, `deflate`, and `zstd`.
@@ -393,8 +410,9 @@ Uint8Array.to_binary(chunk.value)
 A TLS socket verifies the certificate of the server and its host name,
 with the trust store of the operating system. `fetch` does the same. The
 setting `:tls_options` gives TLS options to the two functions: a keyword
-list of options of the Erlang application `:ssl`. For example, this setting
-names a file of private certificate authorities:
+list of options of the Erlang application `:ssl`. Each new connection
+reads the setting. For example, this setting names a file of private
+certificate authorities:
 
 ```elixir
 config :web, tls_options: [cacertfile: "/etc/ssl/private-ca.pem"]

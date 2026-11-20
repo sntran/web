@@ -31,7 +31,29 @@ All notable changes to this project are documented in this file.
   `examples/demo.exs`: a short tour that needs no network.
 - `bench/http_clients.exs`, which compares `Web.fetch/2` with Finch and
   Req on one server of the machine. The clients run in turns, in 8 rounds.
-  Req is a dependency only in the environment `:dev`.
+  Req and Finch are dependencies only in the environment `:dev`.
+- The HTTP client of `Web.fetch/2` is in the library, on the connection
+  functions of Mint. Finch is not a dependency now. Each origin has a pool
+  of 25 connections. The process of the request owns the socket while the
+  response comes, thus no other process is between the network and the
+  response. A small request takes approximately 10 µs less than with
+  Finch. A stream read of a large body has approximately the same speed and
+  memory, see `BENCHMARKS.md`.
+- With `config :web, http_protocols: [:http2]`, the requests of an origin
+  share one connection, and one process of the origin owns it. A request
+  body goes in the window of HTTP/2: a part that is larger waits until the
+  server makes the window larger. A request waits when the server allows
+  no more streams.
+- A request on an idle connection that the server closed, and a request
+  that an HTTP/2 server did not process (`GOAWAY`, `REFUSED_STREAM`), go
+  again on a new connection. A request with a body from a stream does not
+  go again.
+- The content decoder gives its output only as the reader takes it: the
+  process of the request keeps 64 KiB of decoded data at most, also for a
+  small compressed body that expands much.
+- The path of the URL goes to the server with no change, as in a browser:
+  the HTTP client does not check it again. For example, a path can have
+  `|`.
 - A `Web.ReadableStream` of bytes in memory has no process until a stream
   read: the body of `Web.Response.new/1` and `Web.Request.new/2` for a
   binary, `ReadableStream.from/1` for a binary, a view, a buffer, or
@@ -45,9 +67,6 @@ All notable changes to this project are documented in this file.
   different node does each operation on the node of the array. A stream
   with no process has no owner: a copy in a different process can read it
   after the process that made it stopped.
-- The optional callback `direct_pull/1` of the behaviour `Web.Stream`: the
-  stream process sends the pull to a source that is a process, with no
-  callback in the worker.
 
 - Time limits for `Web.fetch/2`. `config :web, connect_timeout: ms` is the
   time to open a connection, also for `Web.connect/2`. The default is
@@ -68,9 +87,10 @@ All notable changes to this project are documented in this file.
   `[:http1, :http2]`. With the two versions, the server of a TLS connection
   selects the version.
 - The field `status_text` of a `Web.fetch/2` response is `""` for a
-  response that can come from HTTP/2, as the Fetch Standard specifies:
+  response that comes from HTTP/2, as the Fetch Standard specifies:
   HTTP/2 has no reason phrase. For HTTP/1.1, the text stays the usual
-  reason phrase of the status.
+  reason phrase of the status. The text follows the version of the
+  connection of each response.
 - A `Web.FormData` is a body of a request or a response. It is encoded as
   `multipart/form-data`, with the encoding algorithm of the HTML Standard:
   the line ends of a name and of a string become CR LF, and a line feed, a

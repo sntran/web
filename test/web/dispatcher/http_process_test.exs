@@ -1,4 +1,4 @@
-defmodule Web.Dispatcher.HTTPWorkerTest do
+defmodule Web.Dispatcher.HTTPProcessTest do
   # These tests stop the processes of a request at a known time. A stream
   # that loses its source writes an error to the log, thus the tests do not
   # run at the same time as tests that examine the log.
@@ -225,12 +225,13 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
     end
 
     test "stops its process when the stream stops while the process waits for a pull" do
-      # The body is larger than the queue of the stream: the process waits.
+      # The part of the body that came is larger than the queue of the
+      # stream: the process waits. The rest of the body does not come.
       body = :binary.copy("x", 200_000)
 
       port =
         HTTPServer.start_link([
-          "HTTP/1.1 200 OK\r\nContent-Length: #{byte_size(body)}\r\n\r\n",
+          "HTTP/1.1 200 OK\r\nContent-Length: #{2 * byte_size(body)}\r\n\r\n",
           body,
           {:sleep, 2_000}
         ])
@@ -248,11 +249,12 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
     end
   end
 
-  # The worker of the process of a request: the process is linked to it.
-  defp worker_of(request) do
+  # The socket of the process of a request. The process owns the socket
+  # while the response comes, thus the process is linked to its port.
+  defp socket_of(request) do
     case Process.info(request, :links) do
-      {:links, [worker | _]} -> worker
-      _no_worker -> nil
+      {:links, links} -> Enum.find(links, &is_port/1)
+      nil -> nil
     end
   end
 
@@ -351,14 +353,19 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
   end
 
   describe "a body that the process of the request holds, at its end" do
-    test "gives an error to a reader when the worker stops" do
-      {resp, request} = stalled_response()
+    test "gives an error to a reader when the connection closes" do
+      port =
+        HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata", {:sleep, 100}])
+
+      {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
       read = read_until_stalled(resp)
 
-      Process.exit(worker_of(request), :kill)
+      assert %Web.TypeError{
+               message: "The response body is not complete.",
+               cause: %Mint.TransportError{reason: :closed}
+             } = catch_exit(Web.await(read))
 
-      assert %Web.TypeError{cause: {:connection_process_stopped, :killed}} =
-               catch_exit(Web.await(read))
+      eventually(fn -> stopped?([request]) end)
     end
 
     test "gives all its bytes to a read after the end" do
@@ -370,7 +377,8 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
         ])
 
       {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
-      eventually(fn -> worker_of(request) == nil end)
+      # At the end of the body, the socket goes back to the pool.
+      eventually(fn -> socket_of(request) == nil end)
 
       # A message with no use has no effect.
       send(request, :no_use)
@@ -463,14 +471,15 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
   end
 
   describe "the time before the promise settles" do
-    # The process of the request stops while the worker gets the response.
-    # Thus the messages of the worker wait in its mailbox, after the message
-    # of the test.
+    # The process of the request stops after it sent the request, while the
+    # response comes. Thus the messages of the socket wait in its mailbox,
+    # before the message of the test.
     defp suspended_fetch(response, options) do
       port = late_server(response)
       {task, request} = start_fetch(Request.new("http://localhost:#{port}/", options))
-      eventually(fn -> worker_of(request) != nil end)
+      eventually(fn -> socket_of(request) != nil end)
       :erlang.suspend_process(request)
+      Process.sleep(200)
       {task, request}
     end
 
@@ -479,7 +488,6 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
     test "an abort gives a response whose body has the reason" do
       controller = Web.AbortController.new()
       {task, request} = suspended_fetch(@partial, signal: controller.signal)
-      Process.sleep(200)
 
       Web.AbortController.abort(controller, :stop)
       :erlang.resume_process(request)
@@ -490,7 +498,6 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
 
     test "the end of the owner stops the request" do
       {task, request} = suspended_fetch(@partial, [])
-      Process.sleep(200)
 
       Process.exit(task.pid, :kill)
       :erlang.resume_process(request)
@@ -499,14 +506,13 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
 
     test "a message with no use has no effect" do
       {task, request} = suspended_fetch(@partial, [])
-      Process.sleep(200)
 
       send(request, :no_use)
       :erlang.resume_process(request)
       assert {:ok, %Web.Response{status: 200}} = await_fetch(task)
     end
 
-    test "an abort after the worker gave the response keeps the response" do
+    test "an abort after the end of the body keeps the response" do
       controller = Web.AbortController.new()
 
       {task, request} =
@@ -514,13 +520,12 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
           signal: controller.signal
         )
 
-      # The abort comes first. Then the worker gives the response to the
-      # task directly, while the process of the request waits.
+      # The full response is in the mailbox before the abort.
       Web.AbortController.abort(controller, :stop)
-      assert {:ok, resp} = await_fetch(task)
-
       :erlang.resume_process(request)
-      assert {:fulfilled, ^resp} = Web.Promise.wait(%Web.Promise{pid: request})
+
+      assert {:ok, resp} = await_fetch(task)
+      assert {:bytes, "data"} = resp.body.lazy.source
     end
   end
 

@@ -21,6 +21,7 @@ defmodule Web.Dispatcher.HTTPProcessTest do
   end
 
   alias Web.Dispatcher.HTTP
+  alias Web.Dispatcher.HTTP.Exchange
   alias Web.Dispatcher.HTTPTest.HTTPServer
   alias Web.ReadableStream
   alias Web.Request
@@ -73,6 +74,19 @@ defmodule Web.Dispatcher.HTTPProcessTest do
   end
 
   defp stopped?(pids), do: not Enum.any?(pids, &Process.alive?/1)
+
+  # The state of the network side of the process of a request, or `nil`
+  # before the start of the request and after the stop of the process.
+  defp exchange(request) do
+    case Process.info(request, :dictionary) do
+      {:dictionary, dictionary} -> :proplists.get_value({Exchange, :state}, dictionary, nil)
+      nil -> nil
+    end
+  end
+
+  # The process of the request has the head of the response, and waits for
+  # the end of a body that it does not give.
+  defp at_head?(request, kind), do: match?(%{kind: ^kind}, exchange(request))
 
   # A response whose body has one chunk, and then nothing for a long time.
   defp stalled_response(options \\ []) do
@@ -258,9 +272,9 @@ defmodule Web.Dispatcher.HTTPProcessTest do
     end
   end
 
-  # A server that sends the head of a response after some time.
+  # A server that sends the head of a response only when the test lets it.
   defp late_server(response) do
-    HTTPServer.start_link([{:sleep, 100}] ++ response)
+    HTTPServer.start_link([:gate | response])
   end
 
   describe "a response with no body, or a redirect, before its end" do
@@ -276,7 +290,7 @@ defmodule Web.Dispatcher.HTTPProcessTest do
       {task, request} =
         start_fetch(Request.new("http://localhost:#{port}/", signal: controller.signal))
 
-      Process.sleep(100)
+      eventually(fn -> at_head?(request, :null) end)
       Web.AbortController.abort(controller, :stop)
 
       assert await_fetch(task) == {:error, :aborted}
@@ -292,10 +306,10 @@ defmodule Web.Dispatcher.HTTPProcessTest do
           {:sleep, 2_000}
         ])
 
-      {task, _request} =
+      {task, request} =
         start_fetch(Request.new("http://localhost:#{port}/", signal: controller.signal))
 
-      Process.sleep(100)
+      eventually(fn -> at_head?(request, :discard) end)
       Web.AbortController.abort(controller, :stop)
       assert await_fetch(task) == {:error, :aborted}
     end
@@ -304,7 +318,7 @@ defmodule Web.Dispatcher.HTTPProcessTest do
       port = HTTPServer.start_link(@stalled_no_body)
       {task, request} = start_fetch(Request.new("http://localhost:#{port}/"))
 
-      Process.sleep(100)
+      eventually(fn -> at_head?(request, :null) end)
       Process.exit(task.pid, :kill)
       eventually(fn -> stopped?([request]) end)
     end
@@ -313,13 +327,14 @@ defmodule Web.Dispatcher.HTTPProcessTest do
       port = HTTPServer.start_link(@stalled_no_body)
       promise = Web.fetch("http://localhost:#{port}/")
 
-      Process.sleep(100)
+      eventually(fn -> at_head?(promise.pid, :null) end)
       assert inspect(promise) == "#Web.Promise<pending>"
     end
   end
 
   describe "the signal of a request" do
     test "can be a process that sends the abort" do
+      # The process of the signal stays alive during the test.
       signal = spawn(fn -> Process.sleep(2_000) end)
       port = late_server(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
       {task, request} = start_fetch(Request.new("http://localhost:#{port}/", signal: signal))
@@ -343,10 +358,11 @@ defmodule Web.Dispatcher.HTTPProcessTest do
       controller = Web.AbortController.new()
       port = late_server(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
 
-      {task, _request} =
+      {task, request} =
         start_fetch(Request.new("http://localhost:#{port}/", signal: controller.signal))
 
-      Process.sleep(20)
+      # The request starts after the subscription to the signal.
+      eventually(fn -> exchange(request) != nil end)
       Process.exit(controller.signal.pid, :kill)
       assert await_fetch(task) == {:error, :aborted}
     end
@@ -354,11 +370,13 @@ defmodule Web.Dispatcher.HTTPProcessTest do
 
   describe "a body that the process of the request holds, at its end" do
     test "gives an error to a reader when the connection closes" do
-      port =
-        HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata", {:sleep, 100}])
+      # The server closes the connection after the first read.
+      port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata", :gate])
 
       {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
       read = read_until_stalled(resp)
+      assert_receive {:http_server_gate, ^port, server}, 5_000
+      send(server, :go)
 
       assert %Web.TypeError{
                message: "The response body is not complete.",
@@ -396,6 +414,8 @@ defmodule Web.Dispatcher.HTTPProcessTest do
       end)
 
       {resp, _request} = stalled_response()
+      # The read comes some time after the response. The body has no time
+      # limit, thus it stays.
       Process.sleep(50)
 
       assert %{done: false} =
@@ -413,12 +433,14 @@ defmodule Web.Dispatcher.HTTPProcessTest do
 
       test = self()
 
-      owner =
-        spawn(fn ->
+      {owner, monitor} =
+        spawn_monitor(fn ->
           send(test, {:response, Web.await(Web.fetch("http://localhost:#{port}/"))})
         end)
 
       assert_receive {:response, resp}, 2_000
+      # The owner stops after it sent the response.
+      assert_receive {:DOWN, ^monitor, :process, ^owner, :normal}, 1_000
       refute Process.alive?(owner)
       %{source: {:held, request}} = resp.body.lazy
 
@@ -477,10 +499,25 @@ defmodule Web.Dispatcher.HTTPProcessTest do
     defp suspended_fetch(response, options) do
       port = late_server(response)
       {task, request} = start_fetch(Request.new("http://localhost:#{port}/", options))
-      eventually(fn -> socket_of(request) != nil end)
+      assert_receive {:http_server_gate, ^port, server}, 5_000
+      eventually(fn -> listens?(request) end)
       :erlang.suspend_process(request)
-      Process.sleep(200)
+      send(server, :go)
+      eventually(fn -> Enum.any?(mailbox(request), &match?({:tcp, _socket, _data}, &1)) end)
       {task, request}
+    end
+
+    # The socket sends its next message to the process of the request.
+    defp listens?(request) do
+      case socket_of(request) do
+        nil -> false
+        socket -> :inet.getopts(socket, [:active]) == {:ok, [active: :once]}
+      end
+    end
+
+    defp mailbox(pid) do
+      {:messages, messages} = Process.info(pid, :messages)
+      messages
     end
 
     @partial ["HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata", {:sleep, 2_000}]
@@ -546,15 +583,15 @@ defmodule Web.Dispatcher.HTTPProcessTest do
     test "before the response of a HEAD request rejects, and stops the request" do
       controller = Web.AbortController.new()
 
-      port =
-        HTTPServer.start_link([{:sleep, 300}, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"])
+      port = late_server(["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"])
 
       req =
         Request.new("http://localhost:#{port}/head", method: "HEAD", signal: controller.signal)
 
       {task, request} = start_fetch(req)
 
-      Process.sleep(50)
+      # The server has the request.
+      assert_receive {:http_server_gate, ^port, _server}, 5_000
       assert :ok = Web.AbortController.abort(controller, :stop)
 
       assert await_fetch(task) == {:error, :aborted}
@@ -563,10 +600,11 @@ defmodule Web.Dispatcher.HTTPProcessTest do
 
     test "of a fetch rejects with the reason of the signal" do
       controller = Web.AbortController.new()
-      port = HTTPServer.start_link([{:sleep, 300}, "HTTP/1.1 204 No Content\r\n\r\n"])
+      port = late_server(["HTTP/1.1 204 No Content\r\n\r\n"])
       promise = Web.fetch("http://localhost:#{port}/", signal: controller.signal)
 
-      Process.sleep(50)
+      # The server has the request.
+      assert_receive {:http_server_gate, ^port, _server}, 5_000
       assert :ok = Web.AbortController.abort(controller, :stopped)
       assert catch_exit(Web.await(promise)) == :stopped
     end
@@ -594,7 +632,7 @@ defmodule Web.Dispatcher.HTTPProcessTest do
         ])
 
       {task, request} = start_fetch(Request.new("http://localhost:#{port}/"))
-      Process.sleep(100)
+      eventually(fn -> at_head?(request, :null) end)
       Process.exit(request, :kill)
 
       # The process is the promise: the await gets the error of a promise

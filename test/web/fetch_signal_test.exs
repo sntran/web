@@ -5,6 +5,7 @@ defmodule Web.FetchSignalTest do
   defmodule SlowDispatcher do
     @behaviour Web.Dispatcher
 
+    # The pause is a part of the scenario: a slow dispatcher.
     def fetch(%Web.Request{} = req) do
       Process.sleep(50)
       {:ok, Web.Response.new(status: 200, body: ["data"], url: req.url, ok: true)}
@@ -20,8 +21,11 @@ defmodule Web.FetchSignalTest do
     end
   end
 
-  defmodule DelayedHTTPServer do
-    def start_link(delay_ms) do
+  # A server that reads the request, tells the test, and gives no response.
+  # Thus the test can do a step while the client waits for the response
+  # headers.
+  defmodule SilentHTTPServer do
+    def start_link do
       parent = self()
 
       {:ok, pid} =
@@ -33,28 +37,18 @@ defmodule Web.FetchSignalTest do
           send(parent, {:port, port})
 
           {:ok, socket} = :gen_tcp.accept(listen_socket)
-          {:ok, _request} = :gen_tcp.recv(socket, 0, 1000)
-          Process.sleep(delay_ms)
+          {:ok, _request} = :gen_tcp.recv(socket, 0)
+          send(parent, {:request_read, self()})
 
-          case :gen_tcp.send(socket, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata") do
-            :ok -> :ok
-            {:error, :closed} -> :ok
-          end
-
-          case :gen_tcp.recv(socket, 0, 200) do
-            {:error, :closed} -> send(parent, :client_closed)
-            _ -> :ok
-          end
-
-          :gen_tcp.close(socket)
-          :gen_tcp.close(listen_socket)
+          # The server keeps the connection open until the test stops it.
+          Process.sleep(:infinity)
         end)
 
       port =
         receive do
           {:port, port} -> port
         after
-          1000 -> raise "DelayedHTTPServer failed to start"
+          1000 -> raise "SilentHTTPServer failed to start"
         end
 
       %{pid: pid, port: port}
@@ -66,8 +60,11 @@ defmodule Web.FetchSignalTest do
     assert %Web.AbortSignal{} = controller.signal
     assert Process.alive?(controller.signal.pid)
 
+    monitor = Process.monitor(controller.signal.pid)
+
     assert :ok = Web.AbortController.abort(controller, :boom)
-    Process.sleep(10)
+    # The process of the signal stops after its answer to the abort.
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 1_000
     refute Process.alive?(controller.signal.pid)
   end
 
@@ -85,14 +82,16 @@ defmodule Web.FetchSignalTest do
 
   test "fetch stops immediately if signal PID is dead before fetch" do
     dead_pid = spawn(fn -> :ok end)
-    Process.sleep(10)
+    monitor = Process.monitor(dead_pid)
+    assert_receive {:DOWN, ^monitor, :process, ^dead_pid, _reason}, 1_000
 
     req = Web.Request.new("mock://slow", signal: dead_pid, dispatcher: SlowDispatcher)
     assert %Web.DOMException{name: "AbortError"} = catch_exit(await(Web.fetch(req)))
   end
 
   test "fetch aborts when a pid signal dies during http header I/O" do
-    server = DelayedHTTPServer.start_link(200)
+    server = SilentHTTPServer.start_link()
+    server_pid = server.pid
 
     signal_pid =
       spawn(fn ->
@@ -103,7 +102,8 @@ defmodule Web.FetchSignalTest do
 
     promise = Web.fetch("http://localhost:#{server.port}/slow", signal: signal_pid)
 
-    Process.sleep(50)
+    # The client sent the request, and waits for the response headers.
+    assert_receive {:request_read, ^server_pid}, 5_000
     send(signal_pid, :die)
 
     shutdown = catch_exit(await(promise))
@@ -115,7 +115,7 @@ defmodule Web.FetchSignalTest do
   end
 
   test "fetch links and succeeds if signal PID stays alive" do
-    alive_pid = spawn(fn -> Process.sleep(5000) end)
+    alive_pid = spawn(fn -> Process.sleep(:infinity) end)
     req = Web.Request.new("mock://slow", signal: alive_pid, dispatcher: SlowDispatcher)
 
     resp = await(Web.fetch(req))
@@ -149,21 +149,26 @@ defmodule Web.FetchSignalTest do
   end
 
   test "fetch returns aborted when an abort controller triggers before headers arrive" do
-    server = DelayedHTTPServer.start_link(200)
+    server = SilentHTTPServer.start_link()
+    server_pid = server.pid
     controller = Web.AbortController.new()
+    monitor = Process.monitor(controller.signal.pid)
 
     promise = Web.fetch("http://localhost:#{server.port}/slow", signal: controller.signal)
 
-    Process.sleep(50)
+    # The client sent the request, and waits for the response headers.
+    assert_receive {:request_read, ^server_pid}, 5_000
     assert :ok = Web.AbortController.abort(controller, :timeout)
     assert catch_exit(await(promise)) in [:aborted, :timeout]
 
+    # The process of the signal stops after its answer to the abort.
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 1_000
     refute Process.alive?(controller.signal.pid)
     Process.exit(server.pid, :kill)
   end
 
   test "receive_abort/3 returns ok for an alive pid signal with no abort message" do
-    alive_pid = spawn(fn -> Process.sleep(100) end)
+    alive_pid = spawn(fn -> Process.sleep(:infinity) end)
     {:ok, subscription} = Web.AbortSignal.subscribe(alive_pid)
 
     assert :ok = Web.AbortSignal.receive_abort(subscription, 0, true)

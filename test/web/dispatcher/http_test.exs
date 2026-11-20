@@ -5,6 +5,7 @@ defmodule Web.Dispatcher.HTTPTest do
   @moduletag capture_log: true
 
   alias Web.Dispatcher.HTTP
+  alias Web.Internal.LazyStream
   alias Web.Request
 
   defmodule HTTPServer do
@@ -36,8 +37,18 @@ defmodule Web.Dispatcher.HTTPTest do
           end
 
           Enum.each(responses, fn
+            # The pause is a part of the scenario: a slow server.
             {:sleep, ms} ->
               Process.sleep(ms)
+
+            # The server stops until the test lets it continue. Thus the
+            # test can do a step before the next part of the response.
+            :gate ->
+              send(parent, {:http_server_gate, port, self()})
+
+              receive do
+                :go -> :ok
+              end
 
             chunk ->
               case :gen_tcp.send(socket, chunk) do
@@ -46,21 +57,26 @@ defmodule Web.Dispatcher.HTTPTest do
               end
           end)
 
-          if observer do
-            case :gen_tcp.recv(socket, 0, 200) do
-              {:error, :closed} -> send(observer, :http_client_closed)
-              _ -> :ok
-            end
+          cond do
+            # The server tells the observer when the client closes the
+            # connection.
+            observer ->
+              read_until_closed(socket)
+              send(observer, :http_client_closed)
+
+            drop_on_body? ->
+              :ok
+
+            # The server closes its side for writes, and reads until the
+            # client closes the connection. A socket that closes with bytes
+            # that it did not read sends a reset, and the reset can drop the
+            # end of the response.
+            true ->
+              _result = :gen_tcp.shutdown(socket, :write)
+              read_until_closed(socket)
           end
 
-          if drop_on_body? do
-            :gen_tcp.close(socket)
-          else
-            # Give the client enough time to consume the final buffered bytes under suite load.
-            Process.sleep(50)
-            :gen_tcp.close(socket)
-          end
-
+          :gen_tcp.close(socket)
           :gen_tcp.close(listen_socket)
         end
       end)
@@ -69,6 +85,13 @@ defmodule Web.Dispatcher.HTTPTest do
         {:port, port} -> port
       after
         1000 -> raise "HTTPServer failed to start"
+      end
+    end
+
+    defp read_until_closed(socket) do
+      case :gen_tcp.recv(socket, 0) do
+        {:ok, _data} -> read_until_closed(socket)
+        {:error, _reason} -> :ok
       end
     end
   end
@@ -343,9 +366,10 @@ defmodule Web.Dispatcher.HTTPTest do
     controller = Web.AbortController.new()
     parent = self()
 
+    # The server sends the rest of the body only after the abort.
     port =
       HTTPServer.start_link(
-        ["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", {:sleep, 500}, "data"],
+        ["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", :gate, "data"],
         false,
         false,
         self()
@@ -361,11 +385,14 @@ defmodule Web.Dispatcher.HTTPTest do
       end)
 
     assert_receive :http_body_started
-    Process.sleep(20)
+    assert_receive {:http_server_gate, ^port, server}, 2000
+    # The read of the task waits for the body.
+    eventually(fn -> read_waits?(resp) end)
     assert :ok = Web.AbortController.abort(controller, :timeout)
 
     # The time limits are large for a busy machine.
     assert {:ok, %Web.TypeError{message: "The stream is errored."}} = Task.yield(task, 2000)
+    send(server, :go)
     assert_receive :http_client_closed, 2000
   end
 
@@ -448,7 +475,7 @@ defmodule Web.Dispatcher.HTTPTest do
         body_error(resp)
       end)
 
-    assert_receive :http_recv_started, 100
+    assert_receive :http_recv_started, 1000
 
     assert {:ok, error} = Task.yield(task, 1000)
     assert is_exception(error)
@@ -540,20 +567,23 @@ defmodule Web.Dispatcher.HTTPTest do
       HTTPServer.start_link([
         "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n",
         "data",
-        {:sleep, 100},
+        :gate,
         "more"
       ])
 
     req = Request.new("http://localhost:#{port}/abort-next-pull", signal: controller.signal)
     {:ok, resp} = HTTP.fetch(req)
+    assert_receive {:http_server_gate, ^port, server}, 2000
 
     parent = self()
 
-    # An abort after the first chunk stops the body with an error.
+    # An abort after the first chunk stops the body with an error. The
+    # server sends the rest of the body after the abort.
     assert_raise Web.TypeError, "The stream is errored.", fn ->
       Enum.each(resp.body, fn chunk ->
         send(parent, {:chunk, Web.TestBytes.binary(chunk)})
         :ok = Web.AbortController.abort(controller, :timeout)
+        send(server, :go)
       end)
     end
 
@@ -581,6 +611,26 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/500", method: :get)
     {:ok, resp} = HTTP.fetch(req)
     assert resp.status_text == "Internal Server Error"
+  end
+
+  # A read of the body waits in the stream process for a chunk.
+  defp read_waits?(resp) do
+    case LazyStream.state(resp.body.lazy) do
+      {:process, stream} ->
+        {_state, data} = :sys.get_state(stream)
+        not :queue.is_empty(data.read_requests)
+
+      _no_process ->
+        false
+    end
+  end
+
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
   end
 
   # Reads the body and returns the exception that the read raises.

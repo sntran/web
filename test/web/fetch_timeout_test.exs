@@ -119,6 +119,7 @@ defmodule Web.FetchTimeoutTest do
         start_server(fn socket ->
           :gen_tcp.send(socket, "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n")
 
+          # Each pause is shorter than the timeout.
           for byte <- ~w(h e l l o) do
             Process.sleep(div(@receive_timeout, 3))
             :gen_tcp.send(socket, byte)
@@ -133,6 +134,7 @@ defmodule Web.FetchTimeoutTest do
 
       port =
         start_server(fn socket ->
+          # The pause is longer than the timeout that the other tests use.
           Process.sleep(4 * @receive_timeout)
           :gen_tcp.send(socket, "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
         end)
@@ -188,6 +190,7 @@ defmodule Web.FetchTimeoutTest do
 
       spawn(fn ->
         {:ok, socket} = :gen_tcp.accept(listener)
+        # The data comes after the time limit of a body that no process reads.
         Process.sleep(300)
         :gen_tcp.send(socket, "late data")
         :gen_tcp.close(socket)
@@ -255,6 +258,8 @@ defmodule Web.FetchTimeoutTest do
             spawn(fn ->
               serve = fn serve ->
                 case :gen_tcp.recv(socket, 0, 5_000) do
+                  # The server answers slowly, thus the requests wait for a
+                  # connection of the pool.
                   {:ok, _request} ->
                     Process.sleep(20)
                     :gen_tcp.send(socket, "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")

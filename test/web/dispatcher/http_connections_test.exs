@@ -366,12 +366,17 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
 
     test "fails when the socket closes while the request body goes", context do
       test = self()
+      gate = make_ref()
 
+      # The source gives the second chunk when the test lets it.
       chunks =
         Stream.map(1..2, fn index ->
           if index == 2 do
-            send(test, :second)
-            Process.sleep(100)
+            send(test, {:second, gate, self()})
+
+            receive do
+              {^gate, :go} -> :ok
+            end
           end
 
           "chunk"
@@ -384,8 +389,9 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
           duplex: "half"
         )
 
-      assert_receive :second, 2_000
+      assert_receive {:second, ^gate, source}, 2_000
       :erlang.port_close(port_of(promise.pid))
+      send(source, {gate, :go})
 
       assert %TypeError{message: "fetch failed"} = catch_exit(await(promise))
     end
@@ -420,12 +426,22 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
 
         {:ok, second} = :gen_tcp.accept(listener)
         {:ok, _request} = :gen_tcp.recv(second, 0)
-        :ok = :gen_tcp.send(second, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
+        # The message comes before the response, thus the test has it when
+        # it has the response.
         send(test, :answered)
-        Process.sleep(1_000)
+        :ok = :gen_tcp.send(second, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
+        read_until_closed(second)
       end)
 
       "http://localhost:#{port}/"
+    end
+
+    # The server keeps the connection open until the client closes it.
+    defp read_until_closed(socket) do
+      case :gen_tcp.recv(socket, 0) do
+        {:ok, _data} -> read_until_closed(socket)
+        {:error, _reason} -> :ok
+      end
     end
 
     test "gets the request again on a new connection" do
@@ -602,12 +618,17 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
       assert await(fetch(context.base <> "/")).status == 200
       mux = multiplex(context)
       test = self()
+      gate = make_ref()
 
+      # The source gives the second chunk when the test lets it.
       chunks =
         Stream.map(1..2, fn index ->
           if index == 2 do
-            send(test, :second)
-            Process.sleep(100)
+            send(test, {:second, gate, self()})
+
+            receive do
+              {^gate, :go} -> :ok
+            end
           end
 
           "chunk"
@@ -615,7 +636,7 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
 
       body = ReadableStream.from(chunks)
       promise = fetch(context.base <> "/size", method: "POST", body: body, duplex: "half")
-      assert_receive :second, 2_000
+      assert_receive {:second, ^gate, source}, 2_000
 
       # When its handler reads the first chunk, the server makes the window
       # of the stream larger. Then the second chunk is the only message of
@@ -626,6 +647,7 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
       ref = Process.monitor(mux)
       socket = Mint.HTTP.get_socket(:sys.get_state(mux).conn)
       :erlang.suspend_process(mux)
+      send(source, {gate, :go})
 
       eventually(fn ->
         match?({:messages, [{:body, _ref, "chunk"}]}, Process.info(mux, :messages))
@@ -692,7 +714,7 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
       assert catch_exit(await(third)) == :stop
       eventually(fn -> :queue.len(:sys.get_state(mux).queue) == 1 end)
 
-      send(handler, :release)
+      release_stream(handler, mux)
       assert await(first).status == 200
       assert await(Response.text(await(second))) == "0"
     end
@@ -716,7 +738,7 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
         error -> flunk("#{Exception.message(error)}: #{inspect(:sys.get_state(mux))}")
       end
 
-      send(handler, :release)
+      release_stream(handler, mux)
       assert await(first).status == 200
       assert await(Response.text(await(second))) == "6"
     end
@@ -724,6 +746,25 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
     defp queued(mux) do
       state = :sys.get_state(mux)
       for ref <- :queue.to_list(state.queue), do: state.entries[ref]
+    end
+
+    # The server counts a stream until the process of its handler stops.
+    # The client can see the end of the stream before that time. Then a new
+    # stream gets a refusal. Thus the test suspends the process of the
+    # shared connection until the server removed the stream. The process of
+    # the handler is linked to the process of the server connection.
+    defp release_stream(handler, mux) do
+      {:parent, server} = Process.info(handler, :parent)
+      monitor = Process.monitor(handler)
+      :erlang.suspend_process(mux)
+      send(handler, :release)
+      assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, 2_000
+
+      # The server has the exit message of the handler, and then the
+      # message of the test.
+      eventually(fn -> handler not in elem(Process.info(server, :links), 1) end)
+      :sys.get_state(server)
+      :erlang.resume_process(mux)
     end
   end
 

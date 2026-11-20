@@ -31,6 +31,7 @@ defmodule Web.TLA.SharedConnectionPropertyTest do
       {:ok, body, conn} = read_body(conn)
       "/" <> id = conn.request_path
       :ets.update_counter(table, {:runs, id}, 1, {{:runs, id}, 0})
+      # The body of the request gives the time of the work: a random pause.
       Process.sleep(String.to_integer(body))
       :ets.update_counter(table, {:running, client}, -1)
       send_resp(conn, 200, id)

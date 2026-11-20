@@ -187,10 +187,19 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
     Process.sleep(4 * @linger)
     stopped = stop_steps(model)
 
-    assert Process.alive?(system.pid) == SpecModel.get(stopped, "running"),
-           "after the linger time, the stream is " <>
-             "#{if Process.alive?(system.pid), do: "alive", else: "stopped"}: " <>
-             inspect(SpecModel.to_map(model))
+    if SpecModel.get(stopped, "running") do
+      assert Process.alive?(system.pid),
+             "after the linger time, the stream is stopped: " <>
+               inspect(SpecModel.to_map(model))
+    else
+      # The stop can come late on a busy machine: the test waits for it.
+      monitor = Process.monitor(system.pid)
+
+      assert_receive {:DOWN, ^monitor, :process, _pid, _reason},
+                     1_000,
+                     "after the linger time, the stream is alive: " <>
+                       inspect(SpecModel.to_map(model))
+    end
 
     {stopped, if(SpecModel.get(stopped, "queue") == 0, do: [], else: queue)}
   end

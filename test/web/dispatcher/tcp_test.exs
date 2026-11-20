@@ -45,6 +45,7 @@ defmodule Web.Dispatcher.TCPTest do
 
             {false, chunks} when is_list(chunks) ->
               Enum.each(chunks, fn
+                # The pause is a part of the scenario: a slow server.
                 {:sleep, ms} ->
                   Process.sleep(ms)
 
@@ -59,12 +60,11 @@ defmodule Web.Dispatcher.TCPTest do
           end
 
           # The client closes the connection at the end of the body. A
-          # machine that is busy can make the close come late.
+          # machine that is busy can make the close come late: the server
+          # reads until the close.
           if observer do
-            case :gen_tcp.recv(socket, 0, 2_000) do
-              {:error, :closed} -> send(observer, :tcp_client_closed)
-              _ -> :ok
-            end
+            read_until_closed(socket)
+            send(observer, :tcp_client_closed)
           end
 
           :gen_tcp.close(socket)
@@ -76,6 +76,13 @@ defmodule Web.Dispatcher.TCPTest do
         {:port, port} -> port
       after
         1000 -> raise "TCPServer failed to start"
+      end
+    end
+
+    defp read_until_closed(socket) do
+      case :gen_tcp.recv(socket, 0) do
+        {:ok, _data} -> read_until_closed(socket)
+        {:error, _reason} -> :ok
       end
     end
 

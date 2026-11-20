@@ -35,6 +35,7 @@ defmodule Web.FetchContentEncodingTest do
           conn = send_chunked(conn, response.status)
 
           Enum.reduce(chunks, conn, fn
+            # The pause is a part of the scenario: a slow server.
             {:sleep, ms}, conn ->
               Process.sleep(ms)
               conn

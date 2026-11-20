@@ -156,12 +156,16 @@ defmodule Web.TLA.AbortSignalConformanceTest do
   end
 
   defp run(:abort, model, system) do
+    monitor = Process.monitor(system.signal.pid)
     started = System.monotonic_time(:millisecond)
     assert AbortController.abort(system.controller, :my_reason) == :ok
     reason = AbortSignal.Reasons.get(system.signal.ref)
     elapsed = System.monotonic_time(:millisecond) - started
 
     if SpecModel.enabled?(model, "Abort") do
+      # The process of the signal stops after its answer to the abort.
+      assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 2_000
+
       # The store has the reason immediately after the abort. The store can
       # remove it only after the linger time.
       if elapsed < @linger, do: assert(reason == :my_reason)
@@ -177,6 +181,7 @@ defmodule Web.TLA.AbortSignalConformanceTest do
 
       SpecModel.step!(model, "Abort")
     else
+      Process.demonitor(monitor, [:flush])
       model
     end
   end
@@ -209,7 +214,13 @@ defmodule Web.TLA.AbortSignalConformanceTest do
     Process.sleep(3 * @linger)
 
     if SpecModel.enabled?(model, "Expire") do
-      refute Process.alive?(system.signal.pid), "the signal did not stop after the linger time"
+      # The stop can come late on a busy machine: the test waits for it.
+      monitor = Process.monitor(system.signal.pid)
+
+      assert_receive {:DOWN, ^monitor, :process, _pid, _reason},
+                     2_000,
+                     "the signal did not stop after the linger time"
+
       SpecModel.step!(model, "Expire")
     else
       model

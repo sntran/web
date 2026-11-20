@@ -342,6 +342,7 @@ defmodule Web.FetchRulesTest do
     test "is not changed by the time limit when a process reads it", %{port: port} do
       response = await(fetch(url(port, "/echo"), method: "POST", body: "kept"))
       reader = ReadableStream.get_reader(response.body)
+      # The time passes the time limit of a body that no process reads.
       Process.sleep(300)
 
       assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))

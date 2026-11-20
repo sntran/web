@@ -189,6 +189,16 @@ defmodule Web.SocketTest do
     assert {:readable_cancel, :reader_cancelled} = catch_exit(await(socket.upgraded))
   end
 
+  test "a stream of the socket that stops with a failure closes the socket, and closed rejects" do
+    {port, _task} = start_tcp_server(&wait_for_tcp_stop_or_close/1)
+
+    socket = Web.connect("localhost:#{port}")
+    assert_opened_remote(socket, "localhost:#{port}")
+
+    Process.exit(socket.readable.controller_pid, :kill)
+    assert catch_exit(await(socket.closed)) == {:stream_down, :killed}
+  end
+
   test "writer close and abort route through the socket sink" do
     {port, _task} = start_tcp_server(&wait_for_tcp_stop_or_close/1)
 

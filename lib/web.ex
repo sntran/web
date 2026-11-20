@@ -29,6 +29,7 @@ defmodule Web do
   """
 
   alias Web.Dispatcher.HTTP
+  alias Web.Dispatcher.TCP
   alias Web.Internal.StructuredData
   alias Web.TypeError
 
@@ -318,15 +319,12 @@ defmodule Web do
       Web.Promise.reject(reason)
   end
 
-  # The process of an HTTP request is the promise of `fetch`: see
-  # `Web.Dispatcher.HTTP`.
+  # The process of an HTTP or TCP request is the promise of `fetch`: see
+  # `Web.Dispatcher.RequestProcess`.
   defp fetch_request(%Web.Request{dispatcher: dispatcher} = request)
-       when dispatcher in [nil, HTTP] do
-    if (dispatcher || Web.Resolver.resolve(request.url)) == HTTP do
-      HTTP.__start__(request, &fetch_error(&1, request))
-    else
-      fetch_with_executor(request)
-    end
+       when dispatcher in [nil, HTTP, TCP] do
+    module = dispatcher || Web.Resolver.resolve(request.url)
+    module.__start__(request, &fetch_error(&1, request))
   end
 
   defp fetch_request(request), do: fetch_with_executor(request)
@@ -386,13 +384,9 @@ defmodule Web do
     do_fetch(request)
   end
 
-  defp do_fetch(request) do
+  # A dispatcher that the caller gives in the option `:dispatcher`.
+  defp do_fetch(%Web.Request{dispatcher: dispatcher} = request) do
     Web.AbortSignal.check!(request.signal)
-
-    dispatcher =
-      request.dispatcher ||
-        Web.Resolver.resolve(request.url)
-
     dispatcher.fetch(request)
   end
 

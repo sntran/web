@@ -174,8 +174,8 @@ defmodule Web.FetchTimeoutTest do
       response = await(fetch("tcp://localhost:#{port}"))
       assert_receive {:server_recv, {:error, :closed}}, 2_000
 
-      assert %Web.TypeError{message: message} = catch_exit(await(Response.text(response)))
-      assert message =~ "was not read"
+      assert %Web.TypeError{message: "The response body is not complete."} =
+               catch_exit(await(Response.text(response)))
     end
 
     test "does not stop a body that a process reads" do

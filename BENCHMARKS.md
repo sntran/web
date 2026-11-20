@@ -196,3 +196,26 @@ and it stops to read while it has 64 KiB that no reader took. Thus the
 memory of a stream read stays small.
 
 The numbers vary by up to 2 times between runs on this virtual machine.
+
+## A `tcp:` fetch
+
+```shell
+mix run bench/tcp_fetch.exs
+```
+
+The script starts a server on the machine, and fetches `tcp:` URLs. The
+old and the new code ran in turns, two times each.
+
+| Test | Before | After |
+| --- | --- | --- |
+| Processes for each body that no process reads, with a signal | 15 | 1 |
+| Small response (5 bytes, then the server closes) | 1416–1503 µs | 567–654 µs |
+| Stream read of 64 MiB | 119–122 MiB/s | 468–600 MiB/s |
+
+Before, `Web.Dispatcher.TCP` used `Web.connect/2`. A bridge process read the
+socket stream, and gave each chunk to a second stream when it pulled. A
+process watched the abort signal, and examined it each 25 ms. Now the
+process of the request is the promise, as for HTTP: it opens the socket,
+writes the request body, and holds the response body. It reads one message
+of the socket at a time, and it gets the abort as a message. The holder of
+the body is the same code as for HTTP: see `Web.Dispatcher.RequestProcess`.

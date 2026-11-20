@@ -78,6 +78,7 @@ defmodule Web do
       alias Web.Promise
       alias Web.ReadableByteStreamController
       alias Web.ReadableStream
+      alias Web.ReadableStreamAsyncIterator
       alias Web.ReadableStreamBYOBReader
       alias Web.ReadableStreamBYOBRequest
       alias Web.ReadableStreamDefaultController

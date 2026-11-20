@@ -401,6 +401,19 @@ defmodule Web.TextEncodingTest do
     end
   end
 
+  describe "TextDecoder.decode/2 and a detached buffer" do
+    test "decodes no bytes, as for a copy of the bytes of WebIDL" do
+      view = Uint8Array.from("abc")
+      buffer = ArrayBuffer.new("def")
+      _moved = ArrayBuffer.transfer(view.buffer)
+      _moved = ArrayBuffer.transfer(buffer)
+
+      decoder = TextDecoder.new()
+      assert TextDecoder.decode(decoder, view) == ""
+      assert TextDecoder.decode(decoder, buffer) == ""
+    end
+  end
+
   describe "TextDecoder.decode/1 and no input" do
     test "decodes no bytes, and a call with no stream option ends the stream" do
       decoder = TextDecoder.new()

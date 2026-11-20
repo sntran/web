@@ -14,10 +14,7 @@ defmodule SecureByobStreamExample do
   @view_bytes 65_536
 
   def run do
-    {:ok, source_state} =
-      Agent.start_link(fn ->
-        %{capability_sample: [], pulls: 0, sent: 0}
-      end)
+    {:ok, source_state} = Agent.start_link(fn -> %{pulls: 0, sent: 0} end)
 
     controller = AbortController.new()
 
@@ -52,10 +49,7 @@ defmodule SecureByobStreamExample do
 
       IO.puts("completed reads=#{stats.reads} bytes=#{stats.bytes}")
       IO.puts("buffer length kept on every read=#{stats.buffer_length_kept?}")
-
-      IO.puts(
-        "sample capabilities=#{Enum.map_join(source_stats.capability_sample, ", ", &inspect/1)}"
-      )
+      IO.puts("source pulls=#{source_stats.pulls}")
     after
       if Process.alive?(source_state) do
         Agent.stop(source_state)
@@ -63,17 +57,21 @@ defmodule SecureByobStreamExample do
     end
   end
 
+  # The source writes into the view of the BYOB request. At the end, it
+  # closes the stream, and responds with 0 bytes: the read that waits gets
+  # its buffer back.
   defp pump_socket_chunk(controller, source_state) do
     case ReadableByteStreamController.byob_request(controller) do
       %ReadableStreamBYOBRequest{} = request ->
-        remember_capability(source_state, request.address)
+        view = ReadableStreamBYOBRequest.view(request)
 
-        case next_socket_chunk(source_state, request.view_byte_length) do
+        case next_socket_chunk(source_state, view.byte_length) do
           :done ->
             ReadableByteStreamController.close(controller)
+            ReadableStreamBYOBRequest.respond(request, 0)
 
           {:chunk, chunk, pull_number} ->
-            maybe_log_capability(request, pull_number, chunk)
+            maybe_log_request(view, pull_number, chunk)
             ReadableStreamBYOBRequest.respond(request, chunk)
         end
 
@@ -99,26 +97,11 @@ defmodule SecureByobStreamExample do
     end)
   end
 
-  defp remember_capability(source_state, address) do
-    Agent.update(source_state, fn %{capability_sample: capability_sample} = state ->
-      next_sample =
-        cond do
-          address in capability_sample -> capability_sample
-          length(capability_sample) >= 3 -> capability_sample
-          true -> capability_sample ++ [address]
-        end
-
-      %{state | capability_sample: next_sample}
-    end)
+  defp maybe_log_request(view, pull_number, chunk) when pull_number <= 3 do
+    IO.puts("pull=#{pull_number} fill=#{byte_size(chunk)}/#{view.byte_length}")
   end
 
-  defp maybe_log_capability(request, pull_number, chunk) when pull_number <= 3 do
-    IO.puts(
-      "pull=#{pull_number} capability=#{inspect(request.address)} fill=#{byte_size(chunk)}/#{request.view_byte_length}"
-    )
-  end
-
-  defp maybe_log_capability(_request, _pull_number, _chunk), do: :ok
+  defp maybe_log_request(_view, _pull_number, _chunk), do: :ok
 
   defp drain(reader, scratch, stats) do
     case await_promise(ReadableStreamBYOBReader.read(reader, scratch)) do

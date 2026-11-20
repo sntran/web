@@ -120,6 +120,11 @@ defmodule Web.Test.QuickJS.Bridge do
     "WritableStreamDefaultWriter" => Web.WritableStreamDefaultWriter
   }
 
+  # The objects of the library that have no interface in the WebIDL files,
+  # and are not globals: the default asynchronous iterator of WebIDL. Its
+  # name is the class string of its prototype.
+  @iterators %{"ReadableStream AsyncIterator" => Web.ReadableStreamAsyncIterator}
+
   # `testharness.js` makes an `AbortController` for each test when the
   # global has one: two calls of the library for each test. Thus only the
   # tests that use these interfaces get them.
@@ -128,7 +133,7 @@ defmodule Web.Test.QuickJS.Bridge do
     "AbortSignal" => ["streams/", "dom/", "fetch/api/request", "fetch/api/response"]
   }
 
-  @classes Map.new(@interfaces, fn {name, module} -> {module, name} end)
+  @classes Map.new(Map.merge(@interfaces, @iterators), fn {name, module} -> {module, name} end)
 
   # The structs that are values: two equal structs are two objects.
   @values [
@@ -246,6 +251,8 @@ defmodule Web.Test.QuickJS.Bridge do
       deferred: MapSet.new(),
       settles: %{}
     })
+
+    init_buffers()
 
     send_line(start)
 
@@ -442,9 +449,16 @@ defmodule Web.Test.QuickJS.Bridge do
 
   defp type_error(message), do: %{"$err" => %{"name" => "TypeError", "message" => message}}
 
-  defp reply(id, {:ok, value}), do: send_line(%{"id" => id, "ok" => value})
-  defp reply(id, {:ok, value, out}), do: send_line(%{"id" => id, "ok" => value, "out" => out})
-  defp reply(id, {:error, error}), do: send_line(%{"id" => id, "error" => error})
+  defp reply(id, answer, extra \\ %{})
+
+  defp reply(id, {:ok, value}, extra),
+    do: send_line(Map.merge(%{"id" => id, "ok" => value}, extra))
+
+  defp reply(id, {:ok, value, out}, extra),
+    do: send_line(Map.merge(%{"id" => id, "ok" => value, "out" => out}, extra))
+
+  defp reply(id, {:error, error}, extra),
+    do: send_line(Map.merge(%{"id" => id, "error" => error}, extra))
 
   # The runner reads bytes as Latin-1: each other character is an escape
   # of JSON.
@@ -610,7 +624,8 @@ defmodule Web.Test.QuickJS.Bridge do
   end
 
   defp deliver(%{reply: {:outcome, outcome, kind, message, module}} = entry) do
-    reply(entry.id, outcome(outcome, kind, message, module))
+    answer = outcome(outcome, kind, message, module)
+    reply(entry.id, answer, detached_buffers(Map.get(entry, :buffer_keys, [])))
     :sent
   end
 
@@ -623,9 +638,11 @@ defmodule Web.Test.QuickJS.Bridge do
   # ---------------------------------------------------------------------------
 
   defp start_call(id, %{"i" => interface, "k" => kind} = message) do
-    module = Map.fetch!(@interfaces, interface)
-    args = Enum.map(Map.get(message, "a", []), &decode/1)
-    self = with %{"$h" => handle} <- message["self"], do: fetch_handle(handle)
+    module = Map.get(@interfaces, interface) || Map.fetch!(@iterators, interface)
+    sync_buffers(message["bs"])
+    args = message |> Map.get("a", []) |> Enum.map(&decode/1) |> refresh_buffers()
+    self = with %{"$h" => handle} <- message["self"], do: refresh_buffers(fetch_handle(handle))
+    buffer_keys = take_call_buffers()
     count = Map.get(message, "n", length(args))
     member = message["m"]
 
@@ -639,7 +656,12 @@ defmodule Web.Test.QuickJS.Bridge do
 
     put(:executors, Map.put(get(:executors), executor, :busy))
     put(:calls, Map.put(get(:calls), ref, {kind, message, module}))
-    wait(id, Map.get(message, "w", []), nil, %{ref: ref, value?: module in @values})
+
+    wait(id, Map.get(message, "w", []), nil, %{
+      ref: ref,
+      value?: module in @values,
+      buffer_keys: buffer_keys
+    })
   rescue
     error -> reply(id, {:error, encode_error(error)})
   end
@@ -869,9 +891,11 @@ defmodule Web.Test.QuickJS.Bridge do
   defp adapt("ReadableStream", "operation", "pipeThrough", self, [pair, options]),
     do: {:ok, Web.ReadableStream.pipe_through(self, pair, Map.to_list(options))}
 
-  # The library reads at least one byte, as the default `min` of WebIDL.
-  defp adapt("ReadableStreamBYOBReader", "operation", "read", self, [view, %{min: 1}]),
-    do: {:ok, Web.ReadableStreamBYOBReader.read(self, view)}
+  defp adapt("ReadableStreamBYOBReader", "operation", "read", self, [view, %{min: min}]),
+    do: {:ok, Web.ReadableStreamBYOBReader.read(self, view, min: min)}
+
+  defp adapt("ReadableStream", "operation", "values", self, [options]),
+    do: {:ok, Web.ReadableStream.values(self, Map.to_list(options))}
 
   # The init dictionaries of the fetch interfaces are keyword lists in the
   # library.
@@ -1099,13 +1123,15 @@ defmodule Web.Test.QuickJS.Bridge do
     put(:next_invoke, id + 1)
     put(:invokes, Map.put(get(:invokes), id, {pid, ref}))
     note_line()
-    send_line(%{"t" => "invoke", "ref" => id, "f" => function, "a" => Enum.map(args, &encode/1)})
+    line = %{"t" => "invoke", "ref" => id, "f" => function, "a" => Enum.map(args, &encode/1)}
+    send_line(Map.merge(line, detached_buffers([])))
   end
 
   defp js_return(%{"ref" => id} = message) do
     {{pid, ref}, invokes} = Map.pop(get(:invokes), id)
     put(:invokes, invokes)
     put(:deferred, MapSet.delete(get(:deferred), id))
+    sync_buffers(message["bs"])
 
     answer =
       cond do
@@ -1114,6 +1140,7 @@ defmodule Web.Test.QuickJS.Bridge do
         true -> {:ok, js_promise(message["jp"])}
       end
 
+    drop_buffers(take_call_buffers())
     send(pid, {ref, answer})
   end
 
@@ -1129,10 +1156,15 @@ defmodule Web.Test.QuickJS.Bridge do
   defp js_settled(%{"p" => id} = message) do
     {{resolve, reject}, promises} = Map.pop(get(:js_promises), id)
     put(:js_promises, promises)
+    sync_buffers(message["bs"])
 
-    if Map.has_key?(message, "ok"),
-      do: resolve.(decode(message["ok"])),
-      else: reject.(decode(message["error"]))
+    {settle, value} =
+      if Map.has_key?(message, "ok"),
+        do: {resolve, decode(message["ok"])},
+        else: {reject, decode(message["error"])}
+
+    drop_buffers(take_call_buffers())
+    settle.(value)
   end
 
   # ---------------------------------------------------------------------------
@@ -1177,10 +1209,212 @@ defmodule Web.Test.QuickJS.Bridge do
   defp send_settle(id, outcome) do
     note_line()
 
-    case outcome do
-      {:fulfilled, value} -> send_line(%{"t" => "settle", "p" => id, "ok" => encode(value)})
-      {:rejected, reason} -> send_line(%{"t" => "settle", "p" => id, "error" => encode(reason)})
+    line =
+      case outcome do
+        {:fulfilled, value} -> %{"t" => "settle", "p" => id, "ok" => encode(value)}
+        {:rejected, reason} -> %{"t" => "settle", "p" => id, "error" => encode(reason)}
+      end
+
+    send_line(Map.merge(line, detached_buffers([])))
+  end
+
+  # ---------------------------------------------------------------------------
+  # Buffers
+  #
+  # A buffer is a value in the library, and an object in JavaScript. The
+  # layer gives each buffer a key (`k`), and sends all its bytes with the
+  # offset and the length of the view (`$ab`). Thus the library gets a view
+  # with the bounds of the view of JavaScript. Three rules keep the two
+  # sides the same:
+  #
+  #   * A buffer that JavaScript gives in a call has a struct for the time
+  #     of the call. When the library detaches it, for example with a read
+  #     into a view, the answer names its key (`det`), and the layer
+  #     detaches the JavaScript buffer.
+  #   * A buffer that the library gives to JavaScript, and that a struct of
+  #     a handle holds (for example the view of a `ReadableStreamBYOBRequest`),
+  #     is "watched". It has a key of the bridge, and JavaScript keeps one
+  #     object for it. Before each call, the layer sends the bytes that
+  #     JavaScript wrote into it, and tells when JavaScript detached it
+  #     (`bs`). The bridge puts these bytes into each struct that a call gets
+  #     (`refresh_buffers/1`), and detaches the struct for a detach. The
+  #     answers name a watched buffer that the library detached.
+  #   * Each other buffer of the library is a new JavaScript buffer.
+  #
+  # The keys of the layer are above 0, and the keys of the bridge below 0.
+  # ---------------------------------------------------------------------------
+
+  defp init_buffers do
+    put(:buffers, %{})
+    put(:watched, %{})
+    put(:held, MapSet.new())
+    put(:views, %{})
+    put(:next_buffer_key, -1)
+    put(:call_buffers, [])
+  end
+
+  # The bytes that JavaScript wrote into the watched buffers, and the
+  # watched buffers that JavaScript detached.
+  defp sync_buffers(nil), do: :ok
+
+  defp sync_buffers(changes) do
+    for [key, change] <- changes, buffer = Map.get(get(:buffers), key) do
+      case change do
+        "detached" ->
+          _detached = Web.ArrayBuffer.detach(buffer)
+          forget_buffer(key)
+
+        bytes ->
+          put_buffer(key, %{buffer | data: :erlang.list_to_binary(bytes)})
+      end
     end
+
+    :ok
+  end
+
+  defp decode_buffer(%{"k" => key} = entry) do
+    buffer =
+      case {Map.fetch(get(:buffers), key), entry} do
+        {{:ok, known}, %{"d" => 1}} ->
+          Web.ArrayBuffer.detach(known)
+
+        {{:ok, known}, %{"b" => bytes}} ->
+          known = %{known | data: :erlang.list_to_binary(bytes)}
+          put_buffer(key, known)
+          known
+
+        {:error, _entry} ->
+          buffer = new_buffer(entry)
+          put_buffer(key, buffer)
+          put(:call_buffers, [key | get(:call_buffers)])
+          buffer
+      end
+
+    offset = Map.get(entry, "o", 0)
+    length = Map.get(entry, "l", Web.ArrayBuffer.byte_length(buffer))
+    %Web.Uint8Array{id: make_ref(), buffer: buffer, byte_offset: offset, byte_length: length}
+  end
+
+  defp new_buffer(%{"d" => 1}), do: Web.ArrayBuffer.detach(Web.ArrayBuffer.new(0))
+  defp new_buffer(%{"b" => bytes}), do: Web.ArrayBuffer.new(:erlang.list_to_binary(bytes))
+
+  defp put_buffer(key, buffer), do: put(:buffers, Map.put(get(:buffers), key, buffer))
+
+  defp forget_buffer(key) do
+    {buffer, buffers} = Map.pop(get(:buffers), key)
+    put(:buffers, buffers)
+    if buffer, do: put(:watched, Map.delete(get(:watched), buffer.id))
+  end
+
+  # The keys of the buffers that the decode of a call or a return made.
+  defp take_call_buffers do
+    keys = get(:call_buffers)
+    put(:call_buffers, [])
+    keys
+  end
+
+  defp drop_buffers(keys), do: Enum.each(keys, &forget_buffer/1)
+
+  # A struct that a call gets has the bytes that JavaScript wrote into each
+  # watched buffer.
+  defp refresh_buffers(value) do
+    if get(:watched) == %{}, do: value, else: refresh(value, get(:watched), get(:buffers))
+  end
+
+  defp refresh(%Web.ArrayBuffer{id: id} = buffer, watched, buffers) do
+    with {:ok, key} <- Map.fetch(watched, id),
+         {:ok, latest} <- Map.fetch(buffers, key),
+         do: latest,
+         else: (_missing -> buffer)
+  end
+
+  defp refresh(%Ref{} = ref, _watched, _buffers), do: ref
+  defp refresh(%{} = map, w, b), do: :maps.map(fn _key, value -> refresh(value, w, b) end, map)
+  defp refresh(list, w, b) when is_list(list), do: Enum.map(list, &refresh(&1, w, b))
+
+  defp refresh(tuple, w, b) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> refresh(w, b) |> List.to_tuple()
+
+  defp refresh(value, _watched, _buffers), do: value
+
+  # The keys of the buffers that the library detached, for the line `det`.
+  # The keys of the call (`call_keys`) end with its answer.
+  defp detached_buffers(call_keys) do
+    detached = for {key, buffer} <- get(:buffers), Web.ArrayBuffer.detached?(buffer), do: key
+    drop_buffers(Enum.uniq(detached ++ call_keys))
+    if detached == [], do: %{}, else: %{"det" => detached}
+  end
+
+  # The buffers in a struct of a handle are watched when they go to
+  # JavaScript.
+  defp hold_buffers(value) do
+    case buffer_ids(value) do
+      [] -> :ok
+      ids -> put(:held, MapSet.union(get(:held), MapSet.new(ids)))
+    end
+  end
+
+  defp buffer_ids(%Web.ArrayBuffer{id: id}), do: [id]
+  defp buffer_ids(%Ref{}), do: []
+  defp buffer_ids(%{} = map), do: map |> Map.values() |> Enum.flat_map(&buffer_ids/1)
+  defp buffer_ids(list) when is_list(list), do: Enum.flat_map(list, &buffer_ids/1)
+  defp buffer_ids(tuple) when is_tuple(tuple), do: buffer_ids(Tuple.to_list(tuple))
+  defp buffer_ids(_value), do: []
+
+  defp encode_buffer(%Web.ArrayBuffer{} = buffer, view) do
+    bytes =
+      if Web.ArrayBuffer.detached?(buffer),
+        do: %{"d" => 1},
+        else: %{"b" => :binary.bin_to_list(buffer.data)}
+
+    bounds =
+      case view do
+        nil -> %{"a" => 1}
+        %Web.Uint8Array{} -> %{"o" => view.byte_offset, "l" => view.byte_length}
+      end
+
+    bytes |> Map.merge(bounds) |> Map.merge(watch_buffer(buffer, view))
+  end
+
+  defp watch_buffer(%Web.ArrayBuffer{id: id} = buffer, view) do
+    if MapSet.member?(get(:held), id) and not Web.ArrayBuffer.detached?(buffer) do
+      key =
+        case Map.fetch(get(:watched), id) do
+          {:ok, key} ->
+            key
+
+          :error ->
+            key = next_buffer_key()
+            put(:watched, Map.put(get(:watched), id, key))
+            put_buffer(key, buffer)
+            key
+        end
+
+      Map.merge(%{"k" => key}, view_key(view))
+    else
+      %{}
+    end
+  end
+
+  # One JavaScript object for each watched view.
+  defp view_key(nil), do: %{}
+
+  defp view_key(%Web.Uint8Array{id: id}) do
+    case Map.fetch(get(:views), id) do
+      {:ok, key} ->
+        %{"v" => key}
+
+      :error ->
+        key = next_buffer_key()
+        put(:views, Map.put(get(:views), id, key))
+        %{"v" => key}
+    end
+  end
+
+  defp next_buffer_key do
+    key = get(:next_buffer_key)
+    put(:next_buffer_key, key - 1)
+    key
   end
 
   # ---------------------------------------------------------------------------
@@ -1204,12 +1438,13 @@ defmodule Web.Test.QuickJS.Bridge do
         put(:next_handle, handle + 1)
         put(:handles, Map.put(get(:handles), handle, value))
         if module not in @values, do: put(:interned, Map.put(interned, value, handle))
+        hold_buffers(value)
         handle
     end
   end
 
   defp decode(%{"$h" => handle}), do: fetch_handle(handle)
-  defp decode(%{"$b" => bytes}), do: Web.Uint8Array.from(:erlang.list_to_binary(bytes))
+  defp decode(%{"$ab" => entry}), do: decode_buffer(entry)
   defp decode(%{"$bs" => bytes}), do: :erlang.list_to_binary(bytes)
   defp decode(%{"$u" => _}), do: nil
   defp decode(%{"$null" => _}), do: :null
@@ -1256,11 +1491,8 @@ defmodule Web.Test.QuickJS.Bridge do
   defp encode(%Ref{id: id}), do: %{"$js" => id}
   defp encode(%Web.Promise{} = promise), do: encode_promise(promise)
 
-  defp encode(%Web.Uint8Array{} = view),
-    do: %{"$b" => :binary.bin_to_list(Web.Uint8Array.to_binary(view))}
-
-  defp encode(%Web.ArrayBuffer{} = buffer),
-    do: %{"$ab" => :binary.bin_to_list(Web.ArrayBuffer.data(buffer))}
+  defp encode(%Web.Uint8Array{} = view), do: %{"$ab" => encode_buffer(view.buffer, view)}
+  defp encode(%Web.ArrayBuffer{} = buffer), do: %{"$ab" => encode_buffer(buffer, nil)}
 
   # A struct that refers to a process comes back with the same handle: the
   # layer keeps its object (`$i`).

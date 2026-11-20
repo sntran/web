@@ -5,6 +5,10 @@ defmodule Web.StreamDocTest do
   doctest Web.ReadableStream
   doctest Web.ReadableStreamDefaultReader
   doctest Web.ReadableStreamDefaultController
+  doctest Web.ReadableStreamAsyncIterator
+  doctest Web.ReadableByteStreamController
+  doctest Web.ReadableStreamBYOBReader
+  doctest Web.ReadableStreamBYOBRequest
   doctest Web.WritableStream
   doctest Web.WritableStreamDefaultController
   doctest Web.TransformStream

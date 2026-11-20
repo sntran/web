@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "removing a null event listener should succeed": "library: a different result"
+  }
+}

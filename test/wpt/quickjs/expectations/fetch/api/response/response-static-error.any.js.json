@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "the 'guard' of the Headers instance should be immutable": "library: a different result"
+  }
+}

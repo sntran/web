@@ -658,23 +658,42 @@ systems, and examine its SHA-256 hash.
 
 | Suite | WPT tests | Pass | The runner lacks a feature | The library differs | The Standard changed the test | Not in the scope of the library |
 | --- | --- | --- | --- | --- | --- | --- |
-| `Headers` | 287 | 103 | 149 | 0 | 0 | 35 |
+| `Headers` | 287 | 121 | 32 | 99 | 0 | 35 |
 | `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11882 | 12 | 11 | 2 | 194 |
-| `URL` and `URLSearchParams` | 4869 | 4778 | 73 | 18 | 0 | 0 |
-| The streams, the readers, the writers, and the strategies | 1157 | 737 | 39 | 381 | 0 | 0 |
+| `URL` and `URLSearchParams` | 4869 | 4862 | 2 | 5 | 0 | 0 |
+| `URLPattern` | 373 | 252 | 0 | 121 | 0 | 0 |
+| The streams, the readers, the writers, and the strategies | 1157 | 737 | 35 | 385 | 0 | 0 |
+| `CompressionStream` and `DecompressionStream` | 318 | 229 | 1 | 88 | 0 | 0 |
+| `Request`, `Response`, and the body | 697 | 457 | 109 | 131 | 0 | 0 |
+| `Blob`, `File`, and `FormData` | 509 | 321 | 51 | 83 | 0 | 54 |
+| `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 25 | 0 | 51 | 0 | 0 |
 
-The tests that are not in the scope of the library use `XMLHttpRequest`. The
-library will not have it: `Web.fetch/2` replaces it.
+18886 of 20387 tests pass. The tests that are not in the scope of the library
+use `XMLHttpRequest` or `FileReader`. The library will not have them:
+`Web.fetch/2` and the functions of `Web.Blob` replace them.
+
+A structure of the library is a value, and an object of JavaScript is a
+reference. Thus the runner keeps one object for a struct that is a field of
+its parent, such as `request.headers` or `url.searchParams`: a change of it
+changes the field of the parent, as in JavaScript. A relative URL of a test
+is relative to the page of the test: the runner gives the URL of the page,
+as a browser gives the base URL of a document.
 
 A test that the runner cannot run needs a feature that the runner does not
-have yet, for example `Request`, `EventTarget`,
-`MessageChannel`, the conversion to an async sequence of
-`ReadableStream.from()`, or the server of WPT. A string of Elixir is UTF-8,
-thus a lone surrogate of JavaScript cannot come to the library. The
-differences of the library are:
+have yet: the server of WPT (186 tests), the conversion to an async sequence
+of `ReadableStream.from()`, `MessageChannel`, or `structuredClone`. A string
+of Elixir is UTF-8, thus a lone surrogate of JavaScript cannot come to the
+library. The differences of the library are:
 
-* A `URLSearchParams` from a URL does not change the URL: the structs of the
-  library are immutable (18 tests).
+* `URLPattern` raises `ArgumentError`, not `TypeError`, for a pattern that is
+  not valid (45 tests), and the text of a compiled pattern is different from
+  the canonical text of the Standard, for example `/foo/(.*)` for `/foo/*`.
+* `Request` has no `destination`, `referrer`, `mode`, `credentials`, `cache`,
+  and other attributes of the Fetch Standard. The headers of a request have
+  no guard: they accept a forbidden name, such as `Cookie`.
+* There is no `textStream()` of a body or a blob, no `new EventTarget()`, no
+  `onabort` of a signal, no `lastModified` of a file, no
+  `URL.createObjectURL()`, and no `brotli` format of compression.
 * `TextEncoderStream` refuses a chunk that is not a string. The Standard
   converts it to a string.
 * A `ReadableStream` has no async iterator, `values()` (37 tests).

@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Upload file-for-upload-in-form.txt (ASCII) in fetch with FormData": "runner: no server of WPT"
+  }
+}

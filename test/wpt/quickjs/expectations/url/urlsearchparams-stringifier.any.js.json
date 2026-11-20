@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "URLSearchParams connected to URL": "library: a different result"
-  }
-}

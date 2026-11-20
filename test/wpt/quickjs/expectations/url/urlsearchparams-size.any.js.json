@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "URLSearchParams's size when obtained from a URL": "library: a different result"
-  }
-}

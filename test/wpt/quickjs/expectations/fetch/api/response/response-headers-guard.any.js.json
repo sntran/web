@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Ensure response headers are immutable": "library: a different result"
+  }
+}

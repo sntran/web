@@ -1,0 +1,12 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Request with cache mode: only-if-cached and fetch mode cors": "library: a different result",
+    "Request with cache mode: only-if-cached and fetch mode no-cors": "library: a different result",
+    "RequestInit's cache mode is only-if-cached and mode is not same-origin": "library: a different result",
+    "RequestInit's mode is navigate": "library: a different result",
+    "RequestInit's mode is no-cors and method is not simple": "library: a different result",
+    "RequestInit's referrer is invalid": "library: a different result",
+    "RequestInit's window is not null": "library: a different result"
+  }
+}

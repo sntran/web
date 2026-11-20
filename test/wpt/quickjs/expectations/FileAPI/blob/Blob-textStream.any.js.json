@@ -1,0 +1,12 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Blob.textStream() basic functionality": "library: no Web.Blob.text_stream/1",
+    "Blob.textStream() can be called multiple times": "library: no Web.Blob.text_stream/1",
+    "Blob.textStream() ignores invalid type charset (invalid-charset)": "library: no Web.Blob.text_stream/1",
+    "Blob.textStream() ignores type charset (UTF-16LE)": "library: no Web.Blob.text_stream/1",
+    "Blob.textStream() ignores type charset (iso-8859-1)": "library: no Web.Blob.text_stream/1",
+    "Blob.textStream() with empty blob": "library: no Web.Blob.text_stream/1",
+    "Blob.textStream() with multi-part blob": "library: no Web.Blob.text_stream/1"
+  }
+}

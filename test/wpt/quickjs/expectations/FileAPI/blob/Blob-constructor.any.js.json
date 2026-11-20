@@ -1,0 +1,13 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Blob with type \"\\timage/gif\\t\"": "library: a different result",
+    "Blob with type \"image/gif;\"": "library: a different result",
+    "Blob with type \"image/gif\\0\"": "library: a different result",
+    "Blob with type \"å\"": "library: a different result",
+    "Blob with type \"İmage/gif\"": "library: a different result",
+    "Blob with type \"ımage/gif\"": "library: a different result",
+    "Blob with type \"𐑾\"": "library: a different result",
+    "Passing a FrozenArray as the blobParts array should work (FrozenArray<MessagePort>).": "runner: no MessageChannel"
+  }
+}

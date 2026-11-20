@@ -154,7 +154,7 @@ globalThis.GLOBAL = {
   isWorker: () => false,
   isShadowRealm: () => false,
 };
-const page = "http://web-platform.test:8000/" + start.test.split("/tree/")[1].replace(/^[^/]+\//, "").replace(/\.js$/, ".html");
+const page = start.page;
 globalThis.location = {
   href: page, origin: "http://web-platform.test:8000", protocol: "http:",
   host: "web-platform.test:8000", hostname: "web-platform.test", port: "8000",
@@ -173,21 +173,47 @@ globalThis.WebAssembly = {
 
 // A test loads its data files with `fetch`. This `fetch` is part of the
 // runner, not of the library: it reads a file of WPT next to the test.
-globalThis.fetch = (url) => {
-  const path = start.dir + "/" + String(url);
-  // A file that a server program makes, such as `inspect-headers.py`,
-  // needs the server of WPT, which the runner does not have.
-  if (/\.py(\?|$)/.test(path)) {
-    return Promise.reject(new TypeError("The runner has no server of WPT for " + path + "."));
+// The path of a file of WPT for a URL of the page, or null for a URL that
+// needs a server.
+function localPath(input) {
+  const text = String(input).split(/[?#]/)[0];
+  const host = "http://web-platform.test:8000/";
+  let path;
+  if (text.startsWith(host)) path = text.slice(host.length);
+  else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(text)) return null;
+  else if (text.startsWith("/")) path = text.slice(1);
+  else path = start.dir + "/" + text;
+  const segments = [];
+  for (const segment of path.split("/")) {
+    if (segment === "..") segments.pop();
+    else if (segment !== "." && segment !== "") segments.push(segment);
+  }
+  return segments.join("/");
+}
+
+// For a test of the Fetch Standard, the response is a `Response` of the
+// library. The other tests get a plain object: their data can have text
+// that a JSON parser of Elixir refuses, such as a lone surrogate.
+globalThis.fetch = (input) => {
+  const path = localPath(typeof input === "object" && input !== null && "url" in input ? input.url : input);
+  // A file that a server program makes, such as `inspect-headers.py`, and
+  // each other host, need the server of WPT, which the runner does not
+  // have.
+  if (path === null || /\.py$/.test(path)) {
+    return Promise.reject(new TypeError("The runner has no server of WPT for " + String(input) + "."));
   }
   const reply = request({ t: "resource", p: path });
   if ("error" in reply) return Promise.reject(new TypeError(reply.error.$err.message));
-  const text = reply.ok;
+  // A file that is not UTF-8 comes as its bytes.
+  const body = typeof reply.ok === "string" ? reply.ok : new Uint8Array(reply.ok.$b);
+  if (start.libraryResponse) return Promise.resolve(new globalThis.Response(body));
+  const bytes = typeof body === "string" ? null : body;
   return Promise.resolve({
     ok: true,
     status: 200,
-    text: () => Promise.resolve(text),
-    json: () => Promise.resolve(JSON.parse(text)),
+    text: () => Promise.resolve(bytes === null ? body : String.fromCharCode(...bytes)),
+    json: () => Promise.resolve(JSON.parse(body)),
+    arrayBuffer: () => Promise.resolve(bytes === null ? new ArrayBuffer(0) : bytes.buffer),
   });
 };
 
@@ -250,4 +276,13 @@ dispatcher = globalThis.__webidl.install(
 );
 
 for (const script of start.scripts) std.loadScript(script);
-std.loadScript(start.test);
+// An exception at the top level of the file stops the file. In a browser,
+// the harness then has the status ERROR, and the tests that the file made
+// before the exception run.
+try {
+  std.loadScript(start.test);
+} catch (error) {
+  send({ t: "error", message: "The file threw: " + String(error) });
+  // The file makes no more tests.
+  done();
+}

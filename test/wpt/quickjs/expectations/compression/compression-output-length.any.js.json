@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "the length of brotli data should be shorter than that of the original data": "library: a different result"
+  }
+}

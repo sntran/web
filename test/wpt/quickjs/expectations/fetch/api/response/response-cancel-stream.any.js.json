@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Cancelling a loading Response stream": "runner: no server of WPT",
+    "Cancelling a starting Response stream": "runner: no server of WPT"
+  }
+}

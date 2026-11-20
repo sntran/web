@@ -9,6 +9,10 @@ defmodule Web.WPT.QuickJS.StreamsTest do
   # windows, the tentative tests, and `idlharness.any.js`.
   use ExUnit.Case, async: true
 
+  # A file of WPT can have thousands of tests, and WPT gives some files a
+  # long time limit (`META: timeout=long`).
+  @moduletag timeout: 300_000
+
   alias Web.Test.QuickJS.WPT
 
   @files [

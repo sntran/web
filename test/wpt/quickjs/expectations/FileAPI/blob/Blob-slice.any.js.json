@@ -1,0 +1,18 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Invalid contentType (\"te\\0xt/plain\")": "library: a different result",
+    "Invalid contentType (\"te\\txt/plain\")": "library: a different result",
+    "Invalid contentType (\"te\\x1fxt/plain\")": "library: a different result",
+    "Invalid contentType (\"text/plain\")": "library: a different result",
+    "Invalid contentType (\"ÿ\")": "library: a different result",
+    "Slicing test: slice (1,0).": "library: a different result",
+    "Slicing test: slice (1,2).": "library: a different result",
+    "Slicing test: slice (1,4).": "library: a different result",
+    "Slicing test: slice (1,6).": "library: a different result",
+    "Slicing test: slice (1,8).": "library: a different result",
+    "no-argument Blob slice": "library: a different result",
+    "undefined start Blob slice": "library: a different result",
+    "undefined start/end Blob slice": "library: a different result"
+  }
+}

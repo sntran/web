@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Consume JSON from text: '\"null\"'": "library: a different result"
+  }
+}

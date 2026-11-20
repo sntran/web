@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "decompressing brotli input with extra pad should still give the output": "library: a different result",
+    "decompressing deflate input with extra pad should still give the output": "library: a different result",
+    "decompressing deflate-raw input with extra pad should still give the output": "library: a different result",
+    "decompressing gzip input with extra pad should still give the output": "library: a different result"
+  }
+}

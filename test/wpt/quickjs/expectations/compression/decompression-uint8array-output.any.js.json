@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "decompressing brotli output should give Uint8Array chunks": "library: a different result"
+  }
+}

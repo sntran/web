@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Consume empty FormData response body as text": "library: a different result"
+  }
+}

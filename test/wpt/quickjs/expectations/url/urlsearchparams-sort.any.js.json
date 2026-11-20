@@ -1,13 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "Sorting non-existent params removes ? from URL": "library: a different result",
-    "URL parse and sort: bbb&bb&aaa&aa=x&aa=y": "library: a different result",
-    "URL parse and sort: z=b&a=b&z=a&a=a": "library: a different result",
-    "URL parse and sort: z=z&=f&=t&=x": "library: a different result",
-    "URL parse and sort: z=z&a=a&z=y&a=b&z=x&a=c&z=w&a=d&z=v&a=e&z=u&a=f&z=t&a=g": "library: a different result",
-    "URL parse and sort: é&e�&é": "library: a different result",
-    "URL parse and sort: ﬃ&🌈": "library: a different result",
-    "URL parse and sort: �=x&￼&�=a": "library: a different result"
+    "Sorting non-existent params removes ? from URL": "library: a different result"
   }
 }

@@ -87,8 +87,16 @@ defmodule Web.Test.QuickJS.Bridge do
   @interfaces %{
     "AbortController" => Web.AbortController,
     "AbortSignal" => Web.AbortSignal,
+    "Blob" => Web.Blob,
     "ByteLengthQueuingStrategy" => Web.ByteLengthQueuingStrategy,
+    "CompressionStream" => Web.CompressionStream,
     "CountQueuingStrategy" => Web.CountQueuingStrategy,
+    "CustomEvent" => Web.CustomEvent,
+    "DecompressionStream" => Web.DecompressionStream,
+    "Event" => Web.Event,
+    "EventTarget" => Web.EventTarget,
+    "File" => Web.File,
+    "FormData" => Web.FormData,
     "Headers" => Web.Headers,
     "ReadableByteStreamController" => Web.ReadableByteStreamController,
     "ReadableStream" => Web.ReadableStream,
@@ -96,6 +104,8 @@ defmodule Web.Test.QuickJS.Bridge do
     "ReadableStreamBYOBRequest" => Web.ReadableStreamBYOBRequest,
     "ReadableStreamDefaultController" => Web.ReadableStreamDefaultController,
     "ReadableStreamDefaultReader" => Web.ReadableStreamDefaultReader,
+    "Request" => Web.Request,
+    "Response" => Web.Response,
     "TextDecoder" => Web.TextDecoder,
     "TextDecoderStream" => Web.TextDecoderStream,
     "TextEncoder" => Web.TextEncoder,
@@ -103,6 +113,7 @@ defmodule Web.Test.QuickJS.Bridge do
     "TransformStream" => Web.TransformStream,
     "TransformStreamDefaultController" => Web.TransformStreamDefaultController,
     "URL" => Web.URL,
+    "URLPattern" => Web.URLPattern,
     "URLSearchParams" => Web.URLSearchParams,
     "WritableStream" => Web.WritableStream,
     "WritableStreamDefaultController" => Web.WritableStreamDefaultController,
@@ -113,28 +124,45 @@ defmodule Web.Test.QuickJS.Bridge do
   # global has one: two calls of the library for each test. Thus only the
   # tests that use these interfaces get them.
   @scoped %{
-    "AbortController" => ["streams/"],
-    "AbortSignal" => ["streams/"]
+    "AbortController" => ["streams/", "dom/", "fetch/api/request", "fetch/api/response"],
+    "AbortSignal" => ["streams/", "dom/", "fetch/api/request", "fetch/api/response"]
   }
+
+  @classes Map.new(@interfaces, fn {name, module} -> {module, name} end)
 
   # The structs that are values: two equal structs are two objects.
   @values [
+    Web.Blob,
     Web.ByteLengthQueuingStrategy,
     Web.CountQueuingStrategy,
+    Web.CustomEvent,
+    Web.Event,
+    Web.File,
+    Web.FormData,
     Web.Headers,
+    Web.Request,
+    Web.Response,
     Web.TextDecoder,
     Web.TextEncoder,
     Web.URL,
+    Web.URLPattern,
     Web.URLSearchParams
   ]
 
   @idls [
+    "interfaces/FileAPI.idl",
+    "interfaces/compression.idl",
     "interfaces/dom.idl",
     "interfaces/encoding.idl",
     "interfaces/fetch.idl",
     "interfaces/streams.idl",
-    "interfaces/url.idl"
+    "interfaces/url.idl",
+    "interfaces/urlpattern.idl",
+    "interfaces/xhr.idl"
   ]
+
+  # Definitions of other Standards that the files above use.
+  @local_idls [Path.expand("../wpt/quickjs/event_handler.idl", __DIR__)]
 
   # The operations that write into a buffer argument. The library has
   # immutable buffers: the function gives `{result, new_buffer}`, and the
@@ -142,6 +170,7 @@ defmodule Web.Test.QuickJS.Bridge do
   @out_buffers %{{"TextEncoder", "encodeInto"} => 1}
 
   @state {__MODULE__, :state}
+  @page {__MODULE__, :page}
 
   @doc """
   Runs the WPT file at `path`, such as `"url/url-searchparams.any.js"`.
@@ -167,11 +196,13 @@ defmodule Web.Test.QuickJS.Bridge do
       harness: WPT.tree_file!("resources/testharness.js"),
       idlParser: WPT.tree_file!("resources/webidl2/lib/webidl2.js"),
       layer: @layer,
-      idls: Enum.map(@idls, &WPT.tree_file!/1),
+      idls: Enum.map(@idls, &WPT.tree_file!/1) ++ @local_idls,
       exposed: exposed(path),
       scripts: Enum.map(meta_scripts(source, Path.dirname(path)), &WPT.tree_file!/1),
       test: WPT.tree_file!(path),
-      dir: Path.dirname(path)
+      dir: Path.dirname(path),
+      page: page(path),
+      libraryResponse: String.starts_with?(path, "fetch/api/")
     }
 
     port =
@@ -193,12 +224,16 @@ defmodule Web.Test.QuickJS.Bridge do
     Process.flag(:trap_exit, true)
 
     Process.put(@state, %{
+      page: page(path),
       port: port,
       group: group,
       handles: %{},
       interned: %{},
       next_handle: 1,
       functions: %{},
+      function_ids: %{},
+      children: %{},
+      links: %{},
       promises: %{},
       next_promise: 1,
       js_promises: %{},
@@ -215,7 +250,16 @@ defmodule Web.Test.QuickJS.Bridge do
     send_line(start)
 
     try do
-      loop(%{port: port, line: "", results: %{}, order: [], log: [], done: nil, at: now()})
+      loop(%{
+        port: port,
+        line: "",
+        results: %{},
+        order: [],
+        log: [],
+        done: nil,
+        error: nil,
+        at: now()
+      })
     after
       stop_group(group)
       Process.delete(@state)
@@ -229,6 +273,14 @@ defmodule Web.Test.QuickJS.Bridge do
         Enum.any?(prefixes, &String.starts_with?(path, &1)),
         do: name
   end
+
+  # The URL of the page that WPT makes for the file. It is the base URL of a
+  # relative URL, as the API base URL of a document is.
+  defp page(path),
+    do: "http://web-platform.test:8000/" <> String.replace_suffix(path, ".js", ".html")
+
+  defp done(%{error: nil}, status, message), do: {status, message}
+  defp done(%{error: error}, _status, _message), do: {"ERROR", error}
 
   # QuickJS can stop at the same time as the close: the port is closed
   # already.
@@ -323,56 +375,63 @@ defmodule Web.Test.QuickJS.Bridge do
     }
   end
 
-  defp handle_line("{" <> _rest = line, run) do
-    case JSON.decode!(line) do
-      %{"t" => "call", "id" => id} = message ->
-        start_call(id, message)
-        run
-
-      %{"t" => "resource", "id" => id, "p" => path} ->
-        reply(id, resource(path))
-        run
-
-      %{"t" => "quiesce", "id" => id} ->
-        wait(id, [], :quiesce)
-        release()
-        run
-
-      %{"t" => "return"} = message ->
-        js_return(message)
-        run
-
-      %{"t" => "deferred", "ref" => ref} ->
-        put(:deferred, MapSet.put(get(:deferred), ref))
-        run
-
-      %{"t" => "jsSettled", "id" => id} = message ->
-        js_settled(message)
-        wait(id, Map.get(message, "w", []), {:answer, {:ok, true}})
-        release()
-        run
-
-      %{"t" => "result", "name" => name, "status" => status, "message" => message} ->
-        %{
-          run
-          | results: Map.put(run.results, name, {status, message}),
-            order: [name | run.order]
-        }
-
-      %{"t" => "done", "status" => status, "message" => message} ->
-        {:done, %{run | done: {status, message}}}
-    end
-  end
+  defp handle_line("{" <> _rest = line, run), do: handle_json(JSON.decode!(line), run)
 
   # A line that is not JSON is an output of QuickJS, for example an error
   # of a script.
   defp handle_line(line, run), do: %{run | log: [line | run.log]}
 
+  defp handle_json(%{"t" => "call", "id" => id} = message, run) do
+    start_call(id, message)
+    run
+  end
+
+  defp handle_json(%{"t" => "resource", "id" => id, "p" => path}, run) do
+    reply(id, resource(path))
+    run
+  end
+
+  defp handle_json(%{"t" => "quiesce", "id" => id}, run) do
+    wait(id, [], :quiesce)
+    release()
+    run
+  end
+
+  defp handle_json(%{"t" => "return"} = message, run) do
+    js_return(message)
+    run
+  end
+
+  defp handle_json(%{"t" => "deferred", "ref" => ref}, run) do
+    put(:deferred, MapSet.put(get(:deferred), ref))
+    run
+  end
+
+  defp handle_json(%{"t" => "jsSettled", "id" => id} = message, run) do
+    js_settled(message)
+    wait(id, Map.get(message, "w", []), {:answer, {:ok, true}})
+    release()
+    run
+  end
+
+  defp handle_json(%{"t" => "result", "name" => name, "status" => status} = message, run) do
+    %{
+      run
+      | results: Map.put(run.results, name, {status, message["message"]}),
+        order: [name | run.order]
+    }
+  end
+
+  defp handle_json(%{"t" => "error", "message" => message}, run), do: %{run | error: message}
+
+  defp handle_json(%{"t" => "done", "status" => status, "message" => message}, run),
+    do: {:done, %{run | done: done(run, status, message)}}
+
   # A data file of a test. A path that is not a file, for example a
   # directory, gives a `TypeError` to the `fetch` of the test.
   defp resource(path) do
     case File.read(WPT.tree_file!(path)) do
-      {:ok, text} -> {:ok, text}
+      {:ok, text} -> {:ok, encode(text)}
       {:error, reason} -> {:error, type_error("No file #{path}: #{reason}")}
     end
   rescue
@@ -452,8 +511,8 @@ defmodule Web.Test.QuickJS.Bridge do
 
   @at_rest [:group_leader, :status, :message_queue_len, :reductions]
 
-  # The reductions of each process of the run, or `nil` when a process
-  # runs or has a message.
+  # The reductions of each process of the run, or `nil` when a process runs
+  # or has a message.
   defp snapshot(group) do
     Enum.reduce_while(Process.list(), %{}, fn pid, snapshot ->
       case Process.info(pid, @at_rest) do
@@ -592,7 +651,13 @@ defmodule Web.Test.QuickJS.Bridge do
 
       nil ->
         bridge = self()
-        spawn_in_group(fn -> executor_loop(bridge) end)
+        page = get(:page)
+
+        spawn_in_group(fn ->
+          # The adapters run in the executor: see `absolute/1`.
+          Process.put(@page, page)
+          executor_loop(bridge)
+        end)
     end
   end
 
@@ -635,10 +700,18 @@ defmodule Web.Test.QuickJS.Bridge do
   end
 
   defp outcome({:ok, value}, kind, message, module) do
-    case {Map.get(@out_buffers, {message["i"], message["m"]}), value} do
-      {index, {value, %Web.Uint8Array{} = buffer}} when is_integer(index) ->
+    case {Map.get(@out_buffers, {message["i"], message["m"]}), value, message["p"]} do
+      {index, {value, %Web.Uint8Array{} = buffer}, _promise} when is_integer(index) ->
         bytes = :binary.bin_to_list(Web.Uint8Array.to_binary(buffer))
         {:ok, encode(value), [%{"i" => index, "b" => bytes}]}
+
+      # A function of the library can give the outcome of a promise as
+      # `{:ok, value}` or `{:error, reason}`, with no process.
+      {nil, {:ok, value}, true} ->
+        {:ok, %{"$pv" => %{"ok" => encode(value)}}}
+
+      {nil, {:error, reason}, true} ->
+        {:ok, %{"$pv" => %{"error" => encode(reason)}}}
 
       _other ->
         {:ok, result(kind, message, module, value)}
@@ -800,7 +873,101 @@ defmodule Web.Test.QuickJS.Bridge do
   defp adapt("ReadableStreamBYOBReader", "operation", "read", self, [view, %{min: 1}]),
     do: {:ok, Web.ReadableStreamBYOBReader.read(self, view)}
 
+  # The init dictionaries of the fetch interfaces are keyword lists in the
+  # library.
+  defp adapt("Request", "constructor", _member, _self, [input | init]),
+    do: {:ok, Web.Request.new(absolute(input), options(init))}
+
+  defp adapt("Response", "constructor", _member, _self, [body | init]),
+    do: {:ok, Web.Response.new(body, options(init))}
+
+  defp adapt("Response", "constructor", _member, _self, []), do: {:ok, Web.Response.new(nil, [])}
+
+  defp adapt("Response", "static", "redirect", _self, [url | status]),
+    do: {:ok, apply(Web.Response, :redirect, [absolute(url) | status])}
+
+  defp adapt("Response", "static", "json", _self, [data | init]),
+    do: {:ok, Web.Response.json(data, options(init))}
+
+  # The URL of a request is a `Web.URL` in the library, and a string in
+  # WebIDL.
+  defp adapt("Request", "getter", "url", %Web.Request{url: url}, []), do: {:ok, Web.URL.href(url)}
+
+  # `clone/1` gives the two structs: the original struct changes, as its
+  # body is now a branch of a tee.
+  defp adapt("Request", "operation", "clone", self, []),
+    do: {:ok, {:clone, Web.Request.clone(self)}}
+
+  defp adapt("Response", "operation", "clone", self, []),
+    do: {:ok, {:clone, Web.Response.clone(self)}}
+
+  defp adapt("Blob", "constructor", _member, _self, [parts | rest]),
+    do: {:ok, Web.Blob.new(parts || [], options(rest))}
+
+  defp adapt("Blob", "constructor", _member, _self, []), do: {:ok, Web.Blob.new([])}
+
+  # The name of a file is `:filename` in the library: `:name` is the name of
+  # a field of a form.
+  defp adapt("File", "constructor", _member, _self, [bits, name | rest]),
+    do: {:ok, Web.File.new(bits, [filename: name] ++ options(rest))}
+
+  defp adapt("File", "getter", "name", %Web.File{filename: name}, []), do: {:ok, name}
+
+  defp adapt("Event", "constructor", _member, _self, [type | init]),
+    do: {:ok, Web.Event.new(type, options(init))}
+
+  defp adapt("CustomEvent", "constructor", _member, _self, [type | init]),
+    do: {:ok, Web.CustomEvent.new(type, options(init))}
+
+  # A boolean in place of the options is the option `capture`.
+  defp adapt("EventTarget", "operation", "addEventListener", self, [type, callback | rest]) do
+    {:ok, Web.EventTarget.add_event_listener(self, type, callback, listener_options(rest))}
+  end
+
+  defp adapt("EventTarget", "operation", "removeEventListener", self, [type, callback | _rest]),
+    do: {:ok, Web.EventTarget.remove_event_listener(self, type, callback)}
+
+  # The base URL of a pattern is an option of the library. In a map of the
+  # parts of a pattern, the library reads the key `:baseURL`.
+  defp adapt("URLPattern", "constructor", _member, _self, [input, base, options])
+       when is_binary(base) do
+    {:ok, Web.URLPattern.new(pattern_input(input), Map.put(options, :base_url, base))}
+  end
+
+  defp adapt("URLPattern", "constructor", _member, _self, [input | options]),
+    do: {:ok, apply(Web.URLPattern, :new, [pattern_input(input) | options])}
+
+  defp adapt("URLPattern", "operation", operation, self, [input | base])
+       when operation in ["test", "exec"] do
+    {:ok,
+     apply(Web.URLPattern, String.to_existing_atom(operation), [self, pattern_input(input) | base])}
+  end
+
   defp adapt(_interface, _kind, _member, _self, _args), do: :default
+
+  # A relative URL of a test is relative to the page. The library has no
+  # page: it takes an absolute URL. A URL that is not valid goes to the
+  # library with no change, and the library refuses it.
+  defp absolute(input) when is_binary(input) do
+    case Web.URL.parse(input, Process.get(@page)) do
+      %Web.URL{} = url -> Web.URL.href(url)
+      nil -> input
+    end
+  end
+
+  defp absolute(input), do: input
+
+  defp pattern_input(%{base_url: base} = input),
+    do: input |> Map.delete(:base_url) |> Map.put(:baseURL, base)
+
+  defp pattern_input(input), do: input
+
+  defp options([%{} = init | _rest]), do: Map.to_list(init)
+  defp options(_init), do: []
+
+  defp listener_options([capture | _rest]) when is_boolean(capture), do: %{capture: capture}
+  defp listener_options([%{} = options | _rest]), do: options
+  defp listener_options(_options), do: %{}
 
   defp strategy_options([%{high_water_mark: hwm} | _rest]), do: [high_water_mark: hwm]
   defp strategy_options(_strategy), do: []
@@ -812,13 +979,78 @@ defmodule Web.Test.QuickJS.Bridge do
   defp result("operation", %{"mut" => true} = message, module, value),
     do: update(message, module, value)
 
-  defp result("iterate", _message, _module, pairs),
-    do: Enum.map(pairs, fn {key, value} -> [encode(key), encode(value)] end)
+  # A pair is a tuple or a list of two items.
+  defp result("iterate", _message, _module, pairs) do
+    Enum.map(pairs, fn
+      {key, value} -> [encode(key), encode(value)]
+      [key, value] -> [encode(key), encode(value)]
+    end)
+  end
+
+  defp result("operation", %{"self" => %{"$h" => handle}}, _module, {:clone, {original, clone}}) do
+    put_struct(handle, original)
+    encode(clone)
+  end
+
+  # A struct that is a value, from a field of its parent, such as the
+  # `headers` of a request: see `put_struct/2`.
+  defp result("getter", %{"self" => %{"$h" => parent}, "m" => member}, _module, %child{} = value)
+       when child in @values do
+    field = String.to_atom(snake(member))
+    parent_struct = fetch_handle(parent)
+
+    if is_map(parent_struct) and Map.get(parent_struct, field) == value do
+      %{
+        "$h" => linked_handle(parent, field, value),
+        "$c" => Map.fetch!(@classes, child),
+        "$i" => 1
+      }
+    else
+      encode(value)
+    end
+  end
 
   defp result(_kind, _message, _module, value), do: encode(value)
 
-  defp update(%{"self" => %{"$h" => handle}}, module, %module{} = value) do
+  defp linked_handle(parent, field, value) do
+    case Map.fetch(get(:children), {parent, field}) do
+      {:ok, handle} ->
+        put(:handles, Map.put(get(:handles), handle, value))
+        handle
+
+      :error ->
+        handle = get(:next_handle)
+        put(:next_handle, handle + 1)
+        put(:handles, Map.put(get(:handles), handle, value))
+        put(:children, Map.put(get(:children), {parent, field}, handle))
+        put(:links, Map.put(get(:links), handle, {parent, field}))
+        handle
+    end
+  end
+
+  # In JavaScript, an attribute such as `request.headers` or
+  # `url.searchParams` is the same object each time, and a change of it
+  # changes its parent. The structs of the library are values: the bridge
+  # puts the new struct of the child in the field of the parent, and the new
+  # field of a parent in its child.
+  defp put_struct(handle, value) do
     put(:handles, Map.put(get(:handles), handle, value))
+
+    with {:ok, {parent, field}} <- Map.fetch(get(:links), handle),
+         %{} = parent_struct <- fetch_handle(parent),
+         true <- Map.get(parent_struct, field) != value do
+      put_struct(parent, Map.put(parent_struct, field, value))
+    end
+
+    for {{^handle, field}, child} <- get(:children), is_map(value) do
+      put(:handles, Map.put(get(:handles), child, Map.get(value, field)))
+    end
+
+    :ok
+  end
+
+  defp update(%{"self" => %{"$h" => handle}}, module, %module{} = value) do
+    put_struct(handle, value)
     %{"$u" => 1}
   end
 
@@ -830,20 +1062,25 @@ defmodule Web.Test.QuickJS.Bridge do
   # JavaScript functions
   # ---------------------------------------------------------------------------
 
+  # The same JavaScript function is the same Elixir function: for example,
+  # `remove_event_listener/3` finds the listener.
   defp js_function(id, arity) do
-    bridge = self()
+    case Map.fetch(get(:function_ids), id) do
+      {:ok, fun} ->
+        fun
 
-    fun =
-      case arity do
-        0 -> fn -> call_js(bridge, id, []) end
-        1 -> fn a -> call_js(bridge, id, [a]) end
-        2 -> fn a, b -> call_js(bridge, id, [a, b]) end
-        _more -> fn a, b, c -> call_js(bridge, id, [a, b, c]) end
-      end
-
-    put(:functions, Map.put(get(:functions), fun, id))
-    fun
+      :error ->
+        fun = new_js_function(self(), id, arity)
+        put(:functions, Map.put(get(:functions), fun, id))
+        put(:function_ids, Map.put(get(:function_ids), id, fun))
+        fun
+    end
   end
+
+  defp new_js_function(bridge, id, 0), do: fn -> call_js(bridge, id, []) end
+  defp new_js_function(bridge, id, 1), do: fn a -> call_js(bridge, id, [a]) end
+  defp new_js_function(bridge, id, 2), do: fn a, b -> call_js(bridge, id, [a, b]) end
+  defp new_js_function(bridge, id, _more), do: fn a, b, c -> call_js(bridge, id, [a, b, c]) end
 
   # The function returns the value of the JavaScript function, or throws
   # its exception. A promise of JavaScript is a `Web.Promise`.
@@ -1002,8 +1239,6 @@ defmodule Web.Test.QuickJS.Bridge do
   defp decode(list) when is_list(list), do: Enum.map(list, &decode/1)
   defp decode(value), do: value
 
-  @classes Map.new(@interfaces, fn {name, module} -> {module, name} end)
-
   defp encode(nil), do: nil
   defp encode(:null), do: %{"$null" => 1}
   defp encode(value) when is_boolean(value) or is_number(value), do: value
@@ -1025,7 +1260,7 @@ defmodule Web.Test.QuickJS.Bridge do
     do: %{"$b" => :binary.bin_to_list(Web.Uint8Array.to_binary(view))}
 
   defp encode(%Web.ArrayBuffer{} = buffer),
-    do: %{"$b" => :binary.bin_to_list(Web.ArrayBuffer.data(buffer))}
+    do: %{"$ab" => :binary.bin_to_list(Web.ArrayBuffer.data(buffer))}
 
   # A struct that refers to a process comes back with the same handle: the
   # layer keeps its object (`$i`).
@@ -1037,7 +1272,9 @@ defmodule Web.Test.QuickJS.Bridge do
 
   defp encode(error) when is_exception(error), do: encode_error(error)
   defp encode(%_{} = struct), do: struct |> Map.from_struct() |> encode()
-  defp encode(%{} = map), do: %{"$o" => Map.new(map, fn {k, v} -> {to_string(k), encode(v)} end)}
+
+  defp encode(%{} = map),
+    do: %{"$o" => Map.new(map, fn {k, v} -> {text(to_string(k)), encode(v)} end)}
 
   defp encode(fun) when is_function(fun) do
     case Map.fetch(get(:functions), fun) do
@@ -1053,17 +1290,21 @@ defmodule Web.Test.QuickJS.Bridge do
   # keeps its own name: the test then shows that the library raises a
   # different error than the Standard.
   defp encode_error(%Web.TypeError{message: message}),
-    do: %{"$err" => %{"name" => "TypeError", "message" => message}}
+    do: %{"$err" => %{"name" => "TypeError", "message" => text(message)}}
 
   defp encode_error(%Web.RangeError{message: message}),
-    do: %{"$err" => %{"name" => "RangeError", "message" => message}}
+    do: %{"$err" => %{"name" => "RangeError", "message" => text(message)}}
 
   defp encode_error(%Web.SyntaxError{message: message}),
-    do: %{"$err" => %{"name" => "SyntaxError", "message" => message}}
+    do: %{"$err" => %{"name" => "SyntaxError", "message" => text(message)}}
 
   defp encode_error(%Web.DOMException{} = error) do
     %{
-      "$err" => %{"name" => "DOMException", "domName" => error.name, "message" => error.message}
+      "$err" => %{
+        "name" => "DOMException",
+        "domName" => error.name,
+        "message" => text(error.message)
+      }
     }
   end
 
@@ -1071,8 +1312,12 @@ defmodule Web.Test.QuickJS.Bridge do
     %{
       "$err" => %{
         "name" => "Error",
-        "message" => "#{inspect(error.__struct__)}: #{Exception.message(error)}"
+        "message" => text("#{inspect(error.__struct__)}: #{Exception.message(error)}")
       }
     }
   end
+
+  # A message or a key can have bytes that are not UTF-8: JSON has only text.
+  defp text(value) when is_binary(value), do: String.replace_invalid(value)
+  defp text(value), do: inspect(value)
 end

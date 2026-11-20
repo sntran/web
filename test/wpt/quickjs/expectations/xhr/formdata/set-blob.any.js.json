@@ -1,0 +1,11 @@
+{
+  "harness": "OK",
+  "failures": {
+    "append() should create a single File for each Blob": "library: a different result",
+    "blob with custom name": "library: a different result",
+    "blob with type": "library: no Web.File.last_modified/1",
+    "blob without type": "library: a different result",
+    "file with lastModified and custom name": "library: no Web.File.last_modified/1",
+    "file without lastModified or custom name": "library: a different result"
+  }
+}

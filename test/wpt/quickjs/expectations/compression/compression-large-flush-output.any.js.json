@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "brotli compression with large flush output": "library: a different result"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "A constructed EventTarget can be used as expected": "library: no Web.EventTarget.new/0",
+    "A constructed EventTarget implements dispatch correctly": "library: no Web.EventTarget.new/0",
+    "EventTarget can be subclassed": "library: no Web.EventTarget.new/0"
+  }
+}

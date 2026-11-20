@@ -147,16 +147,15 @@ defmodule Web.Test.QuickJS.WPT do
       # character between two chunks.
       {:test, "encoding/streams/encode-utf8.any.js", ~r/surrogate|split/,
        "runner: no lone surrogate in a string"},
-      # The runner has no `EventTarget`: an `AbortSignal` has no
-      # `addEventListener`.
-      {:text, ["TypeError: not a function"], "runner: no EventTarget"},
       # The runner times out a test only when the library is at rest, and
       # JavaScript has nothing to do: a promise of the library does not
       # settle.
       {:text, ["Test timed out"], "library: a promise does not settle"},
       {:text, ["Invalid high water mark"], "library: the checks of a high water mark"},
-      # The library will not have `XMLHttpRequest`: `fetch` replaces it.
+      # The library will not have `XMLHttpRequest` and `FileReader`: `fetch`
+      # and the promises of `Blob` replace them.
       {:text, ["'XMLHttpRequest' is not defined"], "scope: the library has no XMLHttpRequest"},
+      {:text, ["'FileReader' is not defined"], "scope: the library has no FileReader"},
       {:text, ["no server of WPT"], "runner: no server of WPT"},
       {:name, ~r/'(\w+)' is not defined/, "runner: no "},
       {:text, ["structuredClone"], "runner: no structuredClone"},

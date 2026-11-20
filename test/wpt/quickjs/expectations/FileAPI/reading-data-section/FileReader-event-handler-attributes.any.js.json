@@ -1,0 +1,11 @@
+{
+  "harness": "OK",
+  "failures": {
+    "FileReader.onabort: initial value": "scope: the library has no FileReader",
+    "FileReader.onerror: initial value": "scope: the library has no FileReader",
+    "FileReader.onload: initial value": "scope: the library has no FileReader",
+    "FileReader.onloadend: initial value": "scope: the library has no FileReader",
+    "FileReader.onloadstart: initial value": "scope: the library has no FileReader",
+    "FileReader.onprogress: initial value": "scope: the library has no FileReader"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Ensure the correct JSON parser is used": "runner: no server of WPT"
+  }
+}

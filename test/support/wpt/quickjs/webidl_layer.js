@@ -77,6 +77,14 @@
     for (const list of parsed) for (const d of list) if (d.type !== "includes") add(d);
     for (const list of parsed) for (const d of list) if (d.type === "includes") add(d);
     for (const name of exposed) classes.set(name, makeInterface(name));
+    // The parent of an interface can come after it in the list.
+    for (const [name, cls] of classes) {
+      const parent = definitions.get(name).inheritance;
+      if (parent && classes.has(parent)) {
+        Object.setPrototypeOf(cls.prototype, classes.get(parent).prototype);
+        Object.setPrototypeOf(cls, classes.get(parent));
+      }
+    }
     for (const [name, cls] of classes) {
       Object.defineProperty(globalThis, name, {
         value: cls, writable: true, configurable: true, enumerable: false,
@@ -265,10 +273,40 @@
     return referenceIds.get(value);
   }
 
-  // A JavaScript function that the library can call.
+  // A JavaScript function that the library can call. The same function, with
+  // the same `this`, gives the same function to the library: for example,
+  // `removeEventListener` finds the listener that `addEventListener` added.
+  const callbackIds = new Map();
+
   function callback(fn, thisArg, arity) {
-    callbacks.push({ fn, thisArg, start: callbackMember === "start" });
+    const start = callbackMember === "start";
+    const known = callbackIds.get(fn) || [];
+    const found = known.find((e) => e.thisArg === thisArg && e.start === start && e.arity === arity);
+    if (found) return { $f: found.id, n: arity };
+    callbacks.push({ fn, thisArg, start });
+    known.push({ thisArg, start, arity, id: callbacks.length - 1 });
+    callbackIds.set(fn, known);
     return { $f: callbacks.length - 1, n: arity };
+  }
+
+  // A callback interface, such as `EventListener`: a function, or an object
+  // with the operation. WebIDL gets the operation from the object when the
+  // library calls it.
+  const userObjects = new WeakMap();
+
+  function callbackInterface(d, value) {
+    if (!isObject(value)) throw new TypeError("The value is not a " + d.name + ".");
+    const operation = d.members.find((m) => m.type === "operation");
+    const arity = operation.arguments.length;
+    if (typeof value === "function") return callback(value, undefined, arity);
+    if (!userObjects.has(value)) {
+      userObjects.set(value, function (...args) {
+        const method = value[operation.name];
+        if (typeof method !== "function") throw new TypeError("The object has no function " + operation.name + ".");
+        return method.apply(value, args);
+      });
+    }
+    return callback(userObjects.get(value), undefined, arity);
   }
 
   // The `this` value of the callbacks of a dictionary, for example the
@@ -402,6 +440,7 @@
       if (typeof value !== "function") throw new TypeError("The value is not a function: " + name + ".");
       return callback(value, callbackThis, d.arguments.length);
     }
+    if (d && d.type === "callback interface") return callbackInterface(d, value);
     if (name === "Function") {
       if (typeof value !== "function") throw new TypeError("The value is not a function.");
       return callback(value, undefined, value.length);
@@ -722,6 +761,7 @@
     if ("$err" in value) return makeError(value.$err);
     if ("$n" in value) return Number(value.$n);
     if ("$b" in value) return new Uint8Array(value.$b);
+    if ("$ab" in value) return new Uint8Array(value.$ab).buffer;
     if ("$h" in value) return wrap(value.$h, value.$c, value.$i === 1);
     if ("$o" in value) {
       const object = {};
@@ -747,8 +787,10 @@
     if (t.idlType === "any") return decodeAny(value);
     if (t.generic === "sequence" || t.generic === "FrozenArray") return value.map((item) => fromLibrary(t.idlType[0], item));
     if (t.generic === "record") {
+      // A list of pairs, or a map of the library.
+      const pairs = value !== null && typeof value === "object" && "$o" in value ? Object.entries(value.$o) : value;
       const object = {};
-      for (const [k, v] of value) object[fromLibrary(t.idlType[0], k)] = fromLibrary(t.idlType[1], v);
+      for (const [k, v] of pairs) object[fromLibrary(t.idlType[0], k)] = fromLibrary(t.idlType[1], v);
       return object;
     }
     switch (t.idlType) {
@@ -764,11 +806,21 @@
     return decodeAny(value);
   }
 
+  // The keys of a map of the library are in snake_case: `base_url` is the
+  // member `baseURL`.
+  function snakeCase(name) {
+    return name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/([A-Z])([A-Z][a-z])/g, "$1_$2").toLowerCase();
+  }
+
   function decodeDictionary(d, value) {
     const object = decodeAny(value);
-    if (object === null || typeof object !== "object") return object;
+    if (object === null || typeof object !== "object" || !("$o" in value)) return object;
     for (const member of dictionaryMembers(d)) {
-      if (member.name in object) object[member.name] = fromLibrary(member.idlType, value.$o[member.name]);
+      const key = member.name in value.$o ? member.name : snakeCase(member.name);
+      if (key in value.$o) {
+        if (key !== member.name) delete object[key];
+        object[member.name] = fromLibrary(member.idlType, value.$o[key]);
+      }
     }
     return object;
   }
@@ -823,6 +875,9 @@
         // An argument that is not optional is converted also when it is
         // undefined: a string gets "undefined", as WebIDL specifies.
         result.push(convert(a.idlType, values[index], a.extAttrs || []));
+      } else if (a.default && a.default.type === "null") {
+        // The library has its own default for a `null` default.
+        result.push({ $u: 1 });
       } else if (a.default) {
         result.push(defaultValue(a));
       } else if (a.optional && resolve(a.idlType).idlType !== undefined && definitions.get(resolve(a.idlType).idlType)?.type === "dictionary") {
@@ -842,9 +897,52 @@
     return argumentDefinitions.filter((a) => !a.variadic).length;
   }
 
-  // An overloaded operation uses the overload with the most arguments.
   function longest(overloads) {
     return overloads.reduce((a, b) => (b.arguments.length > a.arguments.length ? b : a));
+  }
+
+  // The overload resolution of WebIDL, for the kinds of types of these
+  // interfaces: the overloads that accept the number of arguments, then the
+  // first one whose type accepts the value at the first index where the
+  // types are different.
+  function select(overloads, values) {
+    if (overloads.length === 1) return overloads[0];
+    const n = Math.min(values.length, Math.max(...overloads.map((o) => o.arguments.length)));
+    const fits = (o) => {
+      const required = o.arguments.filter((a) => !a.optional && !a.variadic).length;
+      return required <= n && (n <= o.arguments.length || o.arguments.some((a) => a.variadic));
+    };
+    const candidates = overloads.filter(fits);
+    if (candidates.length === 0) return longest(overloads);
+    for (let i = 0; i < n && candidates.length > 1; i++) {
+      const types = candidates.map((o) => JSON.stringify(o.arguments[i] ? o.arguments[i].idlType : null));
+      if (types.every((t) => t === types[0])) continue;
+      const match = candidates.find((o) => o.arguments[i] && accepts(resolve(o.arguments[i].idlType), values[i]));
+      if (match) return match;
+    }
+    return candidates[0];
+  }
+
+  function accepts(t, value) {
+    if (t.nullable && (value === null || value === undefined)) return true;
+    if (t.union) return flatten(t).some((m) => accepts(m, value));
+    if (t.generic === "sequence" || t.generic === "FrozenArray") return isObject(value) && iteratorMethod(value) !== undefined;
+    if (t.generic === "record") return isObject(value);
+    const name = t.idlType;
+    if (name === "any") return true;
+    if (stringTypes.has(name)) return typeof value === "string";
+    if (numberTypes.has(name)) return typeof value === "number";
+    if (name === "boolean") return typeof value === "boolean";
+    if (name === "object") return isObject(value);
+    if (bufferTypes.has(name)) return isBufferSource(value);
+    const d = definitions.get(name);
+    if (!d) return false;
+    if (d.type === "enum") return typeof value === "string";
+    if (d.type === "dictionary") return value === undefined || value === null || (isObject(value) && !platform.has(value));
+    if (d.type === "callback") return typeof value === "function";
+    if (d.type === "callback interface") return isObject(value);
+    if (d.type === "interface") return isObject(value) && platform.has(value) && inherits(platform.get(value).cls, name);
+    return false;
   }
 
   // The library has immutable buffers: an operation that writes into a
@@ -938,7 +1036,7 @@
     const cls = function (...values) {
       if (new.target === undefined) throw new TypeError("Failed to construct '" + name + "': please use the 'new' operator.");
       if (constructors.length === 0) throw new TypeError("Illegal constructor.");
-      const definition = longest(constructors);
+      const definition = select(constructors, values);
       const result = call({
         i: name, k: "constructor", n: declared(definition.arguments),
         a: convertArguments(name, "constructor", definition.arguments, values),
@@ -953,10 +1051,6 @@
       value: constructors.length ? longest(constructors).arguments.filter((a) => !a.optional).length : 0,
     });
 
-    if (d.inheritance && classes.has(d.inheritance)) {
-      Object.setPrototypeOf(cls.prototype, classes.get(d.inheritance).prototype);
-    }
-
     const operations = new Map();
     for (const m of members) {
       if (m.type === "operation" && m.name) {
@@ -967,19 +1061,23 @@
     }
 
     for (const [key, overloads] of operations) {
-      const definition = longest(overloads);
-      const isStatic = definition.special === "static";
-      const opName = definition.name;
+      const first = longest(overloads);
+      const isStatic = first.special === "static";
+      const opName = first.name;
       const required = Math.min(...overloads.map((o) => o.arguments.filter((a) => !a.optional && !a.variadic).length));
-      const returnType = definition.idlType;
       const target = isStatic ? cls : cls.prototype;
 
-      defineMethod(target, opName, required, promiseSteps(returnType, function (...values) {
+      defineMethod(target, opName, required, promiseSteps(first.idlType, function (...values) {
+        const definition = select(overloads, values);
+        const returnType = definition.idlType;
         const self = isStatic ? null : { $h: handleOf(this, name, opName) };
         const args = convertArguments(name, opName, definition.arguments, values);
+        // `p`: the result is a promise. A library function can give
+        // `{:ok, value}` or `{:error, reason}` in place of a promise.
         const result = call({
           i: name, k: isStatic ? "static" : "operation", m: opName, self, a: args,
           n: declared(definition.arguments), mut: resolve(returnType).idlType === "undefined",
+          p: resolve(returnType).generic === "Promise",
         }, values);
         return fromLibrary(returnType, result);
       }));

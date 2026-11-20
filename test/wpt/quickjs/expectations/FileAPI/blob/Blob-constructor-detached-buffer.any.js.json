@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Blob from a detached ArrayBuffer should be empty": "runner: no MessageChannel",
+    "Blob from a detached ArrayBufferView mixed with string, detached part ignored": "runner: no MessageChannel",
+    "Blob from a detached ArrayBufferView should be empty": "runner: no MessageChannel",
+    "Blob from a detached ArrayBufferView with offset should be empty": "runner: no MessageChannel"
+  }
+}

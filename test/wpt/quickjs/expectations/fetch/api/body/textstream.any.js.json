@@ -1,0 +1,14 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Request.textStream() basic functionality": "library: no Web.Request.text_stream/1",
+    "Request.textStream() ignores Content-Type charset (UTF-16LE)": "library: no Web.Request.text_stream/1",
+    "Request.textStream() with null body": "library: no Web.Request.text_stream/1",
+    "Response.textStream() basic functionality": "library: no Web.Response.text_stream/1",
+    "Response.textStream() ignores Content-Type charset (UTF-16LE)": "library: no Web.Response.text_stream/1",
+    "Response.textStream() ignores invalid Content-Type charset (invalid-charset)": "library: no Web.Response.text_stream/1",
+    "Response.textStream() with empty body": "library: no Web.Response.text_stream/1",
+    "Response.textStream() with null body": "library: no Web.Response.text_stream/1",
+    "textStream() handles chunked byte stream input": "library: no Web.Response.text_stream/1"
+  }
+}

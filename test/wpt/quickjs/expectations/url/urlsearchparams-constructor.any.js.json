@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "URLSearchParams constructor, FormData.": "runner: no FormData"
-  }
-}

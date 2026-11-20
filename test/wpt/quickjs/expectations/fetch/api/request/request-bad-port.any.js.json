@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Request on a port that is not bad should succeed through the proxy.": "runner: no server of WPT"
+  }
+}

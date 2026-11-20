@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "signal returned by AbortSignal.abort() should not fire abort event": "library: a different result"
+  }
+}

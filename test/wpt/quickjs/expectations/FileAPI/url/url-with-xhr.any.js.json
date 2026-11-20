@@ -1,0 +1,11 @@
+{
+  "harness": "ERROR",
+  "failures": {
+    "Appending a path should cause XHR to fail": "library: no Web.URL.create_object_url/1",
+    "Appending a query string should cause XHR to fail": "library: no Web.URL.create_object_url/1",
+    "Blob URLs can be used in XHR": "library: no Web.URL.create_object_url/1",
+    "Only exact matches should revoke URLs, using XHR": "library: no Web.URL.create_object_url/1",
+    "XHR of a revoked URL should fail": "library: no Web.URL.create_object_url/1",
+    "XHR with a fragment should succeed": "library: no Web.URL.create_object_url/1"
+  }
+}

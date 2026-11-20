@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "AbortSignal timeouts fire in order": "library: no Web.AbortSignal.onabort/2",
+    "AbortSignal.timeout() returns a non-aborted signal": "library: a different result",
+    "Signal returned by AbortSignal.timeout() times out": "library: no Web.AbortSignal.onabort/2"
+  }
+}

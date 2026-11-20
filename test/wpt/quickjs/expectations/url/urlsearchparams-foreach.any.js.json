@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "For-of Check": "library: a different result"
-  }
-}

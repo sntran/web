@@ -1,6 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "Set-Cookie is a forbidden response header": "runner: no Response"
+    "Set-Cookie is a forbidden response header": "library: a different result"
   }
 }

@@ -1,8 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "URL.searchParams and URL.search setters, update propagation": "library: a different result",
-    "URL.searchParams getter": "library: a different result",
-    "URL.searchParams updating, clearing": "library: a different result"
-  }
-}

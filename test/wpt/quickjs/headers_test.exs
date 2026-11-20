@@ -4,6 +4,10 @@ defmodule Web.WPT.QuickJS.HeadersTest do
   # `Web.Test.QuickJS.WPT` for the lists of expected results.
   use ExUnit.Case, async: true
 
+  # A file of WPT can have thousands of tests, and WPT gives some files a
+  # long time limit (`META: timeout=long`).
+  @moduletag timeout: 300_000
+
   alias Web.Test.QuickJS.WPT
 
   @files [

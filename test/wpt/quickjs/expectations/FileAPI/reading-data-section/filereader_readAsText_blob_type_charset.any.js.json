@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "readAsText() decodes a windows-1252 Blob body using the type's charset": "scope: the library has no FileReader",
+    "readAsText() encoding argument overrides the Blob type's charset": "scope: the library has no FileReader",
+    "readAsText() uses the charset parameter of the Blob's type (windows-1252)": "scope: the library has no FileReader"
+  }
+}

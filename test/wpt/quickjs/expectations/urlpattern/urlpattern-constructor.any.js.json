@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Test unclosed token": "library: ArgumentError, not TypeError"
+  }
+}

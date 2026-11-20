@@ -420,7 +420,10 @@ defmodule Web.StreamLifetimeTest do
         end)
 
       reader = ReadableStream.get_reader(result)
-      Process.sleep(4 * @linger)
+
+      # This is a negative check on a time limit: the stream must not stop
+      # after the linger time. Thus the test waits for more than that time.
+      refute_down(result.controller_pid, 4 * @linger)
 
       assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "a", done: false}
       ReadableStreamDefaultReader.release_lock(reader)
@@ -434,6 +437,7 @@ defmodule Web.StreamLifetimeTest do
 
       sink =
         WritableStream.new(%{
+          # A slow sink: the pipe continues for more than the linger time.
           write: fn chunk, _controller ->
             Process.sleep(10)
             send(parent, {:written, chunk})

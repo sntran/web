@@ -55,15 +55,16 @@ defmodule Web.StreamPullRulesTest do
   end
 
   # Waits until the stream has no pull that runs and its queue does not
-  # change.
-  defp settle(stream) do
-    Process.sleep(20)
+  # change. The stream starts its first pull before it handles a call, and
+  # it starts the next pull in the same step as the end of a pull. Thus a
+  # stream with no pull that runs has no more work before a read.
+  defp settle(stream, attempts \\ 200) do
     slots = ReadableStream.__get_slots__(stream.controller_pid)
 
-    if slots.pulling do
-      settle(stream)
-    else
-      slots
+    cond do
+      not slots.pulling -> slots
+      attempts == 0 -> flunk("the stream did not stop its pulls")
+      true -> Process.sleep(5) && settle(stream, attempts - 1)
     end
   end
 

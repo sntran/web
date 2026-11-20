@@ -49,6 +49,23 @@ defmodule Web.ReadableStreamTeeTest do
 
   defp read(reader), do: await(ReadableStreamDefaultReader.read(reader))
 
+  # Examines `fun` until it returns true, with a short wait between two
+  # tries.
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
+  end
+
+  # Waits until a read of the branch waits for a chunk.
+  defp await_pending_read(branch) do
+    eventually(fn ->
+      :queue.len(ReadableStream.__get_slots__(branch.controller_pid).read_requests) == 1
+    end)
+  end
+
   # The process that holds the reader lock of the stream: the tee process.
   defp tee_process(stream), do: ReadableStream.__get_slots__(stream.controller_pid).reader_pid
 
@@ -182,6 +199,10 @@ defmodule Web.ReadableStreamTeeTest do
 
       assert read(reader) == %{value: 0, done: false}
       assert read(reader) == %{value: 1, done: false}
+
+      # This is a negative check: the count of the pulls must stay below a
+      # limit. Many processes do the tee, and no message tells when they did
+      # all their work. Thus the test waits for some time before the check.
       Process.sleep(100)
 
       # The source filled its own queue and the queues of the branches. It
@@ -247,7 +268,7 @@ defmodule Web.ReadableStreamTeeTest do
           end
         end)
 
-      Process.sleep(50)
+      await_pending_read(left)
 
       # A message that is not for the tee has no effect.
       send(tee, :not_for_the_tee)
@@ -365,7 +386,7 @@ defmodule Web.ReadableStreamTeeTest do
       [left, right] = ReadableStream.tee(stream)
 
       pending = Task.async(fn -> Enum.to_list(left) end)
-      Process.sleep(50)
+      await_pending_read(left)
 
       first = ReadableStream.cancel(left.controller_pid, :one)
       assert await(ReadableStream.cancel(right, :two)) == :ok

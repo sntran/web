@@ -182,12 +182,13 @@ defmodule Web.StreamWorkerTest do
       assert {:ok, [1, 2, 3, 4]} = ReadableStreamDefaultReader.read_batch_now(reader, 8)
 
       # The stream pulls to its high water mark again, and no more: the
-      # batch of 8 does not make the source fill a queue of 8 chunks.
+      # batch of 8 does not make the source fill a queue of 8 chunks. A
+      # stream with no pull that runs starts no pull before the next read.
       eventually(fn ->
-        ReadableStream.__get_slots__(stream.controller_pid).total_queued_size == 4
+        slots = ReadableStream.__get_slots__(stream.controller_pid)
+        slots.total_queued_size == 4 and not slots.pulling
       end)
 
-      Process.sleep(30)
       assert ReadableStream.__get_slots__(stream.controller_pid).total_queued_size == 4
 
       for {_pid, _index, desired} <- pulls(), do: assert(desired in 1..4)
@@ -219,7 +220,10 @@ defmodule Web.StreamWorkerTest do
 
       reader = ReadableStream.get_reader(stream)
       assert {:ok, ["x"]} = ReadableStreamDefaultReader.read_batch_now(reader, 64)
-      Process.sleep(30)
+
+      # The read starts a pull. Wait for the end of the pulls: a stream with
+      # no pull that runs starts no pull before the next read.
+      eventually(fn -> not ReadableStream.__get_slots__(stream.controller_pid).pulling end)
       assert ReadableStream.__get_slots__(stream.controller_pid).total_queued_size <= 1
     end
   end
@@ -248,6 +252,7 @@ defmodule Web.StreamWorkerTest do
       enumerable =
         Stream.resource(
           fn -> 0 end,
+          # A slow enumerable: each element takes some time.
           fn index ->
             Process.sleep(20)
             {[index], index + 1}
@@ -305,7 +310,13 @@ defmodule Web.StreamWorkerTest do
 
       _pipe = ReadableStream.pipe_to(stream, sink)
       assert_receive {:written, 1}
-      Process.sleep(50)
+
+      # The write of the sink waits. Wait until the source has the chunk for
+      # its own limit and no pull runs: then the source has no more work.
+      eventually(fn ->
+        slots = ReadableStream.__get_slots__(stream.controller_pid)
+        slots.total_queued_size == 1 and not slots.pulling
+      end)
 
       # The pipe has the chunks of one batch at most: two, the limit of the
       # destination. The source has one more chunk for its own limit.

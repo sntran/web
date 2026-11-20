@@ -207,9 +207,13 @@ defmodule Web.StreamRulesTest do
       write = WritableStreamDefaultWriter.write(writer, [1, 2, 3])
       _close = WritableStreamDefaultWriter.close(writer)
 
-      # No process reads: the transform does not fill the queue.
-      Process.sleep(30)
-      assert ReadableStream.__get_slots__(stream.readable.controller_pid).total_queued_size == 0
+      # No process reads: the transform does not fill the queue. This call
+      # comes after the write and the close from the same process. Thus the
+      # stream handled them when the call returns. It holds the write, and
+      # no transform runs.
+      slots = ReadableStream.__get_slots__(stream.readable.controller_pid)
+      assert slots.total_queued_size == 0
+      assert slots.active_operation == nil
 
       assert Enum.to_list(stream.readable) == [1, 2, 3]
       assert :ok = await(write)
@@ -415,7 +419,8 @@ defmodule Web.StreamRulesTest do
         :queue.len(data.read_requests) == 1
       end)
 
-      # Longer than the time between two checks of the signal.
+      # Longer than the time between two checks of the signal. Thus the
+      # pipe examines the signal while the read waits.
       Process.sleep(40)
       AbortController.abort(controller, :stop)
 
@@ -445,13 +450,21 @@ defmodule Web.StreamRulesTest do
           _readable = ReadableStream.pipe_through(source, destination)
           assert_receive {:write_started, write_process}
 
+          # The process of the pipe holds the reader lock of the source.
+          pipe = ReadableStream.__get_slots__(source.controller_pid).reader_pid
+          pipe_monitor = Process.monitor(pipe)
+
           # The pipe waits for the write. The destination stops with a
           # failure that is not a usual stop.
           Process.exit(sink.controller_pid, :the_destination_failed)
           Process.exit(write_process, :kill)
 
           eventually(fn -> not ReadableStream.locked?(source) end)
-          Process.sleep(30)
+
+          # Wait for the end of the pipe. Then a call makes the source
+          # handle the messages of the pipe.
+          assert_receive {:DOWN, ^pipe_monitor, :process, ^pipe, _reason}
+          _slots = ReadableStream.__get_slots__(source.controller_pid)
         end)
 
       refute log =~ "terminating"

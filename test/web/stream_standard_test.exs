@@ -94,7 +94,8 @@ defmodule Web.StreamStandardTest do
         recording_sink(test, %{
           write: fn chunk, _controller ->
             send(test, {:write, chunk})
-            Process.sleep(50)
+            # The write stays in progress until the abort stops it.
+            Process.sleep(:infinity)
           end
         })
 
@@ -322,18 +323,23 @@ defmodule Web.StreamStandardTest do
     test "settles an abort after the abort callback of the sink" do
       test = self()
 
+      # The abort callback waits until the test lets it continue.
       sink = %{
         abort: fn reason ->
-          Process.sleep(100)
-          send(test, {:abort_complete, reason})
+          send(test, {:abort_started, self()})
+
+          receive do
+            :continue -> send(test, {:abort_complete, reason})
+          end
         end
       }
 
       writer = WritableStream.get_writer(WritableStream.new(sink))
       abort = Writer.abort(writer, :stop)
 
-      Process.sleep(30)
+      assert_receive {:abort_started, callback}
       assert Promise.peek(abort) == :pending
+      send(callback, :continue)
       assert await(abort) == :ok
       assert_received {:abort_complete, :stop}
     end
@@ -418,6 +424,7 @@ defmodule Web.StreamStandardTest do
       stream =
         WritableStream.new(%{
           write: fn chunk, _controller ->
+            # A slow write: the close comes while the writes wait.
             Process.sleep(20)
             send(test, {:written, chunk})
           end,
@@ -439,7 +446,9 @@ defmodule Web.StreamStandardTest do
       assert_received {:written, 2}
       assert Enum.map(writes, &await/1) == [:ok, :ok]
 
-      # The close waits for the promise of the sink.
+      # The close waits for the promise of the sink. This is a negative
+      # check, and no message tells when the stream did all its work. Thus
+      # the test waits for some time before the check.
       Process.sleep(30)
       assert Promise.peek(close) == :pending
       resolve.(:ok)
@@ -454,6 +463,7 @@ defmodule Web.StreamStandardTest do
     end
 
     test "rejects with a TypeError for a stream that closes, is closed, or is errored" do
+      # A slow close callback: the second close comes while the stream closes.
       slow = WritableStream.new(%{close: fn _controller -> Process.sleep(50) end})
       first = WritableStream.close(slow)
       assert %TypeError{} = rejection(WritableStream.close(slow))
@@ -653,15 +663,20 @@ defmodule Web.StreamStandardTest do
     test "settles after the cancel callback of the source, also when it returns a promise" do
       test = self()
 
+      # Each callback waits until the test lets it continue.
+      wait_for_test = fn reason ->
+        send(test, {:cancel_started, self()})
+
+        receive do
+          :continue -> send(test, {:cancel_complete, reason})
+        end
+      end
+
       for callback <- [
-            fn reason ->
-              Process.sleep(80)
-              send(test, {:cancel_complete, reason})
-            end,
+            wait_for_test,
             fn reason ->
               Promise.new(fn resolve, _reject ->
-                Process.sleep(80)
-                send(test, {:cancel_complete, reason})
+                wait_for_test.(reason)
                 resolve.(:ok)
               end)
             end
@@ -671,7 +686,9 @@ defmodule Web.StreamStandardTest do
 
         # The stream is closed immediately. The promise waits for the callback.
         assert await(Reader.read(ReadableStream.get_reader(stream))) == %{value: nil, done: true}
+        assert_receive {:cancel_started, callback_process}
         assert Promise.peek(cancel) == :pending
+        send(callback_process, :continue)
         assert await(cancel) == :ok
         assert_received {:cancel_complete, :enough}
       end
@@ -724,35 +741,52 @@ defmodule Web.StreamStandardTest do
             :counters.add(counter, 1, 1)
             ReadableStreamDefaultController.enqueue(controller, :counters.get(counter, 1))
           end,
+          # The cancel callback waits until the test lets it continue. The
+          # enumeration must end while the callback waits.
           cancel: fn reason ->
-            Process.sleep(200)
-            send(test, {:cancel_complete, reason})
+            send(test, {:cancel_started, self()})
+
+            receive do
+              :continue -> send(test, {:cancel_complete, reason})
+            end
           end
         })
 
-      {time, taken} = :timer.tc(fn -> Enum.take(stream, 2) end)
-      assert taken == [1, 2]
-      assert time < 150_000
+      # An enumeration that waits for the callback does not end: the yield
+      # then gives `nil`.
+      enumeration = Task.async(fn -> Enum.take(stream, 2) end)
+      assert Task.yield(enumeration, 5_000) == {:ok, [1, 2]}
+
+      assert_receive {:cancel_started, callback}, 1_000
+      refute_received {:cancel_complete, _reason}
+      send(callback, :continue)
       assert_receive {:cancel_complete, :halted}, 1_000
     end
 
     test "of a writable stream object settles after the abort callback of the sink" do
       test = self()
 
+      # The promise of the abort callback waits until the test lets it
+      # continue.
       stream =
         WritableStream.new(%{
           abort: fn reason ->
             Promise.new(fn resolve, _reject ->
-              Process.sleep(80)
-              send(test, {:abort_complete, reason})
+              send(test, {:abort_started, self()})
+
+              receive do
+                :continue -> send(test, {:abort_complete, reason})
+              end
+
               resolve.(:ok)
             end)
           end
         })
 
       abort = WritableStream.abort(stream, :stop)
-      Process.sleep(20)
+      assert_receive {:abort_started, callback}
       assert Promise.peek(abort) == :pending
+      send(callback, :continue)
       assert await(abort) == :ok
       assert_received {:abort_complete, :stop}
     end
@@ -811,8 +845,11 @@ defmodule Web.StreamStandardTest do
     end
 
     test "is an aborted signal for a stream that stopped" do
-      controller = %WritableStreamDefaultController{pid: spawn(fn -> :ok end)}
-      Process.sleep(20)
+      pid = spawn(fn -> :ok end)
+      monitor = Process.monitor(pid)
+      assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}
+
+      controller = %WritableStreamDefaultController{pid: pid}
       assert AbortSignal.aborted?(WritableStreamDefaultController.signal(controller))
     end
   end

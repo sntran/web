@@ -173,9 +173,12 @@ defmodule Web.TransformStreamTest do
       writes = for index <- 1..50, do: Writer.write(writer, index)
       ready = Writer.ready(writer)
 
-      Process.sleep(100)
+      # This call comes after the writes from the same process. Thus the
+      # stream handled the writes when the call returns. No transform runs.
+      slots = slots(transform)
+      assert slots.active_operation == nil
       assert Enum.all?([ready | writes], &(Promise.peek(&1) == :pending))
-      assert :queue.len(slots(transform).queue) == 0
+      assert :queue.len(slots.queue) == 0
       refute_received {:transformed, _chunk}
       assert Writer.desired_size(writer) < 0
 
@@ -184,7 +187,9 @@ defmodule Web.TransformStreamTest do
       assert await(Reader.read(reader)) == %{value: 1, done: false}
       assert await(hd(writes)) == :ok
       assert_receive {:transformed, 1}
-      Process.sleep(50)
+      # The stream replied to the first write before this call. It holds the
+      # second write, and no transform runs.
+      assert slots(transform).active_operation == nil
       refute_received {:transformed, 2}
       assert Promise.peek(Enum.at(writes, 1)) == :pending
     end
@@ -194,12 +199,16 @@ defmodule Web.TransformStreamTest do
       writer = WritableStream.get_writer(transform.writable)
       writes = for index <- 1..5, do: Writer.write(writer, index)
 
-      Process.sleep(100)
+      # The first three transforms fill the readable queue. Then the stream
+      # holds the writes, and no transform runs.
+      for write <- Enum.take(writes, 3), do: assert(await(write) == :ok)
+      slots = slots(transform)
+      assert slots.active_operation == nil
 
       assert Enum.map(writes, &Promise.peek/1) ==
                [{:fulfilled, :ok}, {:fulfilled, :ok}, {:fulfilled, :ok}, :pending, :pending]
 
-      assert :queue.len(slots(transform).queue) == 3
+      assert :queue.len(slots.queue) == 3
     end
 
     test "does not hold the close: the function flush runs with no reader" do
@@ -251,6 +260,10 @@ defmodule Web.TransformStreamTest do
         |> ReadableStream.pipe_through(TransformStream.new())
         |> ReadableStream.pipe_through(TransformStream.new())
 
+      # These are negative checks: the count of the pulls must stay below a
+      # limit. Many processes do the pipes, and no message tells when they
+      # did all their work. Thus the test waits for some time before each
+      # check.
       Process.sleep(150)
       pulled_with_no_reader = :counters.get(counter, 1)
       assert pulled_with_no_reader <= 6
@@ -570,6 +583,8 @@ defmodule Web.TransformStreamTest do
           %{
             transform: fn chunk, controller ->
               send(test, {:start, chunk})
+              # A slow transform: a second transform that starts too early
+              # comes before the end of this transform.
               Process.sleep(10)
               send(test, {:end, chunk})
               Controller.enqueue(controller, chunk)

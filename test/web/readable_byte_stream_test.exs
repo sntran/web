@@ -249,8 +249,9 @@ defmodule Web.ReadableByteStreamTest do
     assert second_request.address != first_address
 
     send(first_address, {:web_stream_byob_response, first_address, {:chunk, "zz"}})
-    Process.sleep(25)
 
+    # This call comes after the response from the same process. Thus the
+    # stream handled the response when the call returns.
     assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request.address ==
              second_request.address
 
@@ -548,8 +549,9 @@ defmodule Web.ReadableByteStreamTest do
     request = await_byob_request(stream.controller_pid)
 
     send(stream.controller_pid, {:web_stream_byob_response, make_ref(), {:chunk, "ignored"}})
-    Process.sleep(25)
 
+    # This call comes after the response from the same process. Thus the
+    # stream handled the response when the call returns.
     assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request.address ==
              request.address
 
@@ -660,7 +662,8 @@ defmodule Web.ReadableByteStreamTest do
     assert ReadableStream.__get_slots__(stream.controller_pid).pending_byob_request == nil
 
     send(address, {:web_stream_byob_response, address, {:chunk, "zz"}})
-    Process.sleep(25)
+    # This call comes after the response from the same process. Thus the
+    # stream handled the response when the call returns.
     assert :queue.is_empty(ReadableStream.__get_slots__(stream.controller_pid).queue)
 
     exception =

@@ -43,10 +43,15 @@ The streams follow the pull rules of the Streams Standard:
   * The pulls of one stream run one after the other. A larger high water
     mark thus does not make `from/1` faster: it only lets the source work
     before a read.
-  * The internal readers (`Enum`, a pipe, and the body functions) take all
-    the chunks of the queue in one message. A source that enqueues many
-    chunks for one pull, such as the body of a `fetch` response, thus gives
-    many chunks for each message.
+  * The internal readers (`Enum` and the body functions) take all the
+    chunks of the queue in one message. A source that enqueues many chunks
+    for one pull, such as the body of a `fetch` response, thus gives many
+    chunks for each message. A pipe reads one chunk each time the
+    destination is ready, as the Streams Standard specifies. With 20000
+    small chunks, a pipe through a `TransformStream` takes 32–35 µs for each
+    chunk, where the reads in batches took 32–41 µs, and `pipe_to/3` takes
+    21–27 µs in the two versions: the difference is not larger than the
+    noise of the measurement.
 
 Version 0.5.0 runs the callbacks of a stream in one worker process for the
 life of the stream. Before, each callback started a task through one

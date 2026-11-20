@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.ReadableStream.values/2` and `Web.ReadableStreamAsyncIterator`, the
+  async iterator of the Streams Standard: `next/1` and `return/2` return
+  promises of `%{value: value, done: done}`. The option `prevent_cancel:`
+  keeps the stream open after a `return/2`.
+- `Web.ReadableStreamBYOBRequest.view/1`, and the option `min:` of
+  `Web.ReadableStreamBYOBReader.read/3`.
+- A queuing strategy can have its own `size` function: the option `:size`
+  of `Web.ReadableStream.new/2`, `Web.WritableStream.new/2` with a
+  strategy, and the strategies of `Web.TransformStream.new/2`. The size
+  function runs in the process that enqueues or writes, thus it can call
+  the controller again. A high water mark can be `:infinity`. New:
+  `Web.CountQueuingStrategy.size/0`.
 - `Web.TextDecoder` decodes the encodings of Chinese, Japanese, and Korean:
   gb18030, GBK, Big5, EUC-JP, ISO-2022-JP, Shift_JIS, and EUC-KR. The
   decoders follow the Encoding Standard, with the modes "replacement" and
@@ -96,7 +108,7 @@ All notable changes to this project are documented in this file.
   library through a port. The library can call a JavaScript function, such
   as the `pull` of a source, and a promise of the library is a promise of
   JavaScript. The runner answers a call when the processes of the run are
-  at rest, thus the result of each test is the same in each run. 18886 of
+  at rest, thus the result of each test is the same in each run. 19168 of
   20387 tests pass. The lists of the tests that do
   not pass, with the group of their cause, are in
   `test/wpt/quickjs/expectations/`. QuickJS is a tool of the tests only: the
@@ -302,6 +314,32 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- The streams follow more steps of the Streams Standard. In the WPT runner,
+  1012 of 1157 stream tests pass, where 737 passed:
+  - A byte stream transfers the buffer of a chunk, of a view that a BYOB
+    read gives, and of a new view of a response. `respond/2` and
+    `respond_with_new_view/2` raise `Web.TypeError` or `Web.RangeError` as
+    the Standard specifies. A close with bytes in the queue waits until a
+    read takes them. `autoAllocateChunkSize` and the tee of a byte stream
+    follow the Standard.
+  - A stream does not pull before `start` is complete, and pulls one time
+    for each need. The `closed` promise of a reader is the same promise at
+    each read. A cancel does not release the lock of the reader. A cancel
+    of an errored stream rejects with its error.
+  - A `WritableStream` has the state "erroring": an abort or an error waits
+    for the write or the close that runs. A `write` fulfils when the sink
+    calls `controller.error/2` and returns normally. All the callers of an
+    abort get the same result.
+  - A pipe propagates a close and an error forward and backward, also while
+    a read or a write waits, and rejects with the reason of its signal. A
+    pipe reads one chunk each time the destination is ready.
+  - `Web.CountQueuingStrategy.new/1` and `Web.ByteLengthQueuingStrategy.new/1`
+    keep the value: the stream checks it. They raise `Web.TypeError` for a
+    value that is not a number. They raised `Web.RangeError` for a value
+    below zero.
+  - `Web.TextEncoderStream` converts a chunk that is not a string with
+    `String.Chars`. `Web.TextDecoderStream` refuses `nil`. A detached
+    buffer gives no bytes to `Web.TextDecoder.decode/3`.
 - **Breaking:** `Web.URL.new/2` and the setter `Web.URL.href/2` raise
   `Web.TypeError` for a URL that is not valid, as the URL Standard
   specifies. They raised `ArgumentError`. Change a `rescue ArgumentError`
@@ -984,6 +1022,10 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A pipe to a stream that is closed or errored cancels the source. Before,
+  the promise of the pipe did not settle.
+- The last chunk of a pipe is not lost when the source closes during a
+  read.
 - An iteration of `Web.Headers` gives each value of `set-cookie` as a pair
   of its own, as the steps "sort and combine" of the Fetch Standard
   specify. `Enum.count/1` counts the pairs.

@@ -386,6 +386,24 @@ For a full buffer-reuse example, run:
 mix run examples/secure_byob_stream.exs
 ```
 
+A stream also has the async iterator of the Streams Standard, and a queuing
+strategy can have its own `size` function. The function runs in the
+process that enqueues the chunk:
+
+```elixir
+iterator = ReadableStream.values(ReadableStream.from(["a", "b"]))
+await(ReadableStreamAsyncIterator.next(iterator))
+# => %{value: "a", done: false}
+
+# The limit is 10 bytes, and each chunk counts its bytes.
+stream =
+  ReadableStream.new(
+    %{start: fn c -> ReadableStreamDefaultController.enqueue(c, "abc") end},
+    high_water_mark: 10,
+    size: &byte_size/1
+  )
+```
+
 ### 🔌 Capability Sockets
 
 WINTERCG-style sockets expose a capability-safe handle plus WHATWG
@@ -659,16 +677,16 @@ systems, and examine its SHA-256 hash.
 | Suite | WPT tests | Pass | The runner lacks a feature | The library differs | The Standard changed the test | Not in the scope of the library |
 | --- | --- | --- | --- | --- | --- | --- |
 | `Headers` | 287 | 121 | 32 | 99 | 0 | 35 |
-| `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11882 | 12 | 11 | 2 | 194 |
+| `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11885 | 16 | 4 | 2 | 194 |
 | `URL` and `URLSearchParams` | 4869 | 4862 | 2 | 5 | 0 | 0 |
 | `URLPattern` | 373 | 252 | 0 | 121 | 0 | 0 |
-| The streams, the readers, the writers, and the strategies | 1157 | 737 | 35 | 385 | 0 | 0 |
+| The streams, the readers, the writers, and the strategies | 1157 | 1012 | 79 | 66 | 0 | 0 |
 | `CompressionStream` and `DecompressionStream` | 318 | 229 | 1 | 88 | 0 | 0 |
 | `Request`, `Response`, and the body | 697 | 457 | 109 | 131 | 0 | 0 |
 | `Blob`, `File`, and `FormData` | 509 | 321 | 51 | 83 | 0 | 54 |
-| `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 25 | 0 | 51 | 0 | 0 |
+| `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 29 | 0 | 47 | 0 | 0 |
 
-18886 of 20387 tests pass. The tests that are not in the scope of the library
+19168 of 20387 tests pass. The tests that are not in the scope of the library
 use `XMLHttpRequest` or `FileReader`. The library will not have them:
 `Web.fetch/2` and the functions of `Web.Blob` replace them.
 
@@ -683,7 +701,9 @@ A test that the runner cannot run needs a feature that the runner does not
 have yet: the server of WPT (186 tests), the conversion to an async sequence
 of `ReadableStream.from()`, `MessageChannel`, or `structuredClone`. A string
 of Elixir is UTF-8, thus a lone surrogate of JavaScript cannot come to the
-library. The differences of the library are:
+library. The runner answers a call when the library is at rest. Thus the
+library can do a step before the call returns, where JavaScript does it in a
+later microtask (27 stream tests). The differences of the library are:
 
 * `URLPattern` raises `ArgumentError`, not `TypeError`, for a pattern that is
   not valid (45 tests), and the text of a compiled pattern is different from
@@ -694,19 +714,15 @@ library. The differences of the library are:
 * There is no `textStream()` of a body or a blob, no `new EventTarget()`, no
   `onabort` of a signal, no `lastModified` of a file, no
   `URL.createObjectURL()`, and no `brotli` format of compression.
-* `TextEncoderStream` refuses a chunk that is not a string. The Standard
-  converts it to a string.
-* A `ReadableStream` has no async iterator, `values()` (37 tests).
-* A `ReadableStreamBYOBRequest` has no `view` (28 tests), and a BYOB read has
-  no option `min` (12 tests). A byte stream does not transfer the buffer of a
-  chunk.
-* A high water mark must be a finite number, and a strategy has no `size`
-  function of its own: the library counts each chunk as 1 (24 tests and more).
-* In 38 tests, a promise of the library does not settle, for example the
-  pipe to a stream that is closed or errored does not cancel the source.
-* The library calls `pull` more times than the Standard, and the sequence of
-  some steps is different, for example of the promises of a writer after an
-  error.
+* A `TransformStream` has one state for its two sides. The Standard has a
+  writable side that can be "erroring" while the readable side is readable
+  (16 tests).
+* A view of a byte stream is a `Web.Uint8Array`: the library has no other
+  typed array and no `DataView` (15 tests).
+* `TextEncoderStream` converts a chunk with `String.Chars`, not with the
+  rules of JavaScript: `nil` becomes `""`, not `"undefined"` (4 tests).
+* The lock of a writer belongs to a process, not to the writer, and some
+  promises of a writer are a new promise at each read.
 
 The pinned commit of WPT has two tests of `TextDecoder` that the current
 Encoding Standard changed: after a fatal error, `decode()` starts a new

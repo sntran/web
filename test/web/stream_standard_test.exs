@@ -96,9 +96,14 @@ defmodule Web.StreamStandardTest do
             send(test, {:write, chunk})
             # The write stays in progress until the signal aborts. Then it
             # completes with no failure.
+            # The signal can abort before the subscription.
             signal = WritableStreamDefaultController.signal(controller)
-            {:ok, subscription} = AbortSignal.subscribe(signal)
-            AbortSignal.receive_abort(subscription, :infinity, true)
+
+            case AbortSignal.subscribe(signal) do
+              {:ok, subscription} -> AbortSignal.receive_abort(subscription, :infinity, true)
+              {:error, :aborted} -> :ok
+            end
+
             :ok
           end
         })
@@ -107,6 +112,9 @@ defmodule Web.StreamStandardTest do
 
       first = Writer.write(writer, 1)
       second = Writer.write(writer, 2)
+      # The first write is in flight before the abort. An abort before it
+      # would reject the two writes, as the Streams Standard specifies.
+      assert_receive {:write, 1}
       abort = Writer.abort(writer, :stop)
 
       # The write in flight completes. The write that waits rejects with the
@@ -114,7 +122,7 @@ defmodule Web.StreamStandardTest do
       assert await(first) == :ok
       assert rejection(second) == :stop
       assert await(abort) == :ok
-      assert events() == [{:write, 1}, {:abort, :stop}]
+      assert events() == [{:abort, :stop}]
     end
   end
 

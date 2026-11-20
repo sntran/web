@@ -85,13 +85,26 @@ let nextId = 1;
 // A request to the bridge. The other lines that come before the answer are
 // done at once: the library can call a JavaScript function while it does
 // the request.
+//
+// A request can start while the runner does a line of the bridge, for
+// example in a getter that a test puts on `Object.prototype`. The answer of
+// an earlier request can then come first: the runner keeps it until its
+// request asks for it.
+const earlyAnswers = new Map();
+
 function request(message) {
   const id = nextId++;
   send(Object.assign({ id }, message));
   for (;;) {
+    if (earlyAnswers.has(id)) {
+      const answer = earlyAnswers.get(id);
+      earlyAnswers.delete(id);
+      return answer;
+    }
     const reply = nextLine();
     if (reply.id !== undefined && reply.id !== id) {
-      throw new Error("The answer " + reply.id + " came during the request " + id + ".");
+      earlyAnswers.set(reply.id, reply);
+      continue;
     }
     if (reply.id === id) {
       // The lines after the answer go in a new task.

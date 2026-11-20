@@ -990,7 +990,6 @@ defmodule Web.Test.QuickJS.Bridge do
   defp listener_options([%{} = options | _rest]), do: options
   defp listener_options(_options), do: %{}
 
-
   defp strategy_options([%{} = strategy | _rest]),
     do: strategy |> Map.take([:high_water_mark, :size]) |> Map.to_list()
 
@@ -1519,6 +1518,7 @@ defmodule Web.Test.QuickJS.Bridge do
     %{"$err" => fields} = encode_error(error)
     %{"$err" => Map.put(fields, "id", error_id(error))}
   end
+
   defp encode(%_{} = struct), do: struct |> Map.from_struct() |> encode()
 
   defp encode(%{} = map),

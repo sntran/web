@@ -57,23 +57,7 @@ defmodule Web.Stream do
   @doc "Called by the engine when the stream terminates."
   @callback terminate(event :: term(), state :: term()) :: :ok
 
-  @doc """
-  Tells the engine how to pull from a source that is a process, with no
-  callback in the worker. The engine calls it in the stream process at
-  each pull.
-
-  - `{:message, pid, message}` — the engine sends `message` to `pid`, and
-    the pull is complete at once. The source enqueues its chunks later.
-  - `{:process, pid}` — the engine sends `{:web_stream_pull, ref, stream}`
-    to `pid` and monitors it. The pull is complete when `pid` sends
-    `{ref, :pulled}`, and it fails with `{ref, {:error, reason}}`. A cancel
-    does not stop `pid`: the cancel callback must stop it.
-  - `nil` — the engine calls `pull/2` in the worker.
-  """
-  @callback direct_pull(state :: term()) ::
-              {:message, pid(), term()} | {:process, pid()} | nil
-
-  @optional_callbacks [pull: 2, write: 3, flush: 2, terminate: 2, direct_pull: 1]
+  @optional_callbacks [pull: 2, write: 3, flush: 2, terminate: 2]
 
   @doc """
   Sets up an implementing stream module with the `Web.Stream` behaviour and
@@ -165,6 +149,8 @@ defmodule Web.Stream do
     # gives the chunks. A stop of that process before the end of the stream
     # puts the stream in the errored state.
     source_watch: nil,
+    # The pull of a source that is a process: see `__start__/3`.
+    direct_pull: nil,
     unread_timeout: nil,
     owner_ref: nil,
     owner_down_reason: nil,
@@ -184,10 +170,31 @@ defmodule Web.Stream do
   owner stops with an error, also when a different process holds the lock.
   The name of the function stays for compatibility.
   """
-  def start_link(module, opts) when is_atom(module) do
+  def start_link(module, opts) when is_atom(module), do: __start__(module, opts, [])
+
+  @doc false
+  # Starts a stream with options of this library that are not part of any
+  # public function:
+  #
+  #   * `:direct_pull` — the engine pulls from a source that is a process,
+  #     with no callback in the worker:
+  #       - `{:message, pid, message}`: the engine sends `message` to `pid`,
+  #         and the pull is complete at once. The source enqueues later;
+  #       - `{:pid_source, pid}`: the same, with the message
+  #         `{:pull, stream}` of a source that is a process;
+  #       - `{:process, pid}`: the engine sends
+  #         `{:web_stream_pull, ref, stream}` to `pid` and monitors it. The
+  #         pull is complete when `pid` sends `{ref, :pulled}`. A cancel does
+  #         not stop `pid`: the cancel callback must stop it.
+  #   * `:watch_source` — `{pid, error_fun}`: a stop of `pid` before the end
+  #     of the stream puts the stream in the errored state.
+  #   * `:registry_key` — the stream registers itself with this key: see
+  #     `Web.Internal.LazyStream`.
+  #   * `:disturbed` — the stream starts disturbed.
+  def __start__(module, opts, internal) when is_atom(module) and is_list(internal) do
     snapshot = Snapshot.take()
     owner = Keyword.get_lazy(opts, :owner, &Web.Promise.owner/0)
-    :gen_statem.start(__MODULE__, {module, opts, snapshot, owner}, [])
+    :gen_statem.start(__MODULE__, {module, opts, internal, snapshot, owner}, [])
   end
 
   @doc false
@@ -410,7 +417,9 @@ defmodule Web.Stream do
   def callback_mode, do: :state_functions
 
   @impl true
-  def init({module, opts, snapshot, owner}) do
+  def init({module, opts, snapshot, owner}), do: init({module, opts, [], snapshot, owner})
+
+  def init({module, opts, internal, snapshot, owner}) do
     Process.flag(:message_queue_data, :off_heap)
     Process.put(@priority_alias, :erlang.alias([:priority]))
     # The callbacks of this stream run in tasks. The promises and streams that
@@ -426,13 +435,13 @@ defmodule Web.Stream do
         {type, state, actions} -> {type, state, actions}
       end
 
-    init_data(started, module, opts, snapshot, owner, hwm, strategy, timeout_ms)
+    init_data(started, module, {opts, internal}, snapshot, owner, hwm, strategy, timeout_ms)
   end
 
   defp init_data(
          {type, impl_state, extra_actions},
          module,
-         opts,
+         {opts, internal},
          snapshot,
          owner,
          hwm,
@@ -460,11 +469,12 @@ defmodule Web.Stream do
       unread_timeout: Keyword.get(opts, :unread_timeout),
       # A stream that replaces a stream with no process that a read used
       # already: see `Web.Internal.LazyStream`.
-      disturbed: Keyword.get(opts, :disturbed, false),
-      source_watch: watch_source(Keyword.get(opts, :watch_source))
+      disturbed: Keyword.get(internal, :disturbed, false),
+      source_watch: watch_source(Keyword.get(internal, :watch_source)),
+      direct_pull: Keyword.get(internal, :direct_pull)
     }
 
-    register(Keyword.get(opts, :registry_key))
+    register(Keyword.get(internal, :registry_key))
 
     {initial_state, default_actions} =
       case type do
@@ -1839,9 +1849,13 @@ defmodule Web.Stream do
   defp after_pull_actions(_data), do: []
 
   defp do_trigger_pull(%{module: module, impl_state: impl_state} = data) do
-    case direct_pull(module, impl_state) do
+    case data.direct_pull do
       {:message, pid, message} ->
         send(pid, message)
+        :keep_state_and_data
+
+      {:pid_source, pid} ->
+        send(pid, {:pull, self()})
         :keep_state_and_data
 
       # The source process answers this process directly: the pull costs
@@ -1857,10 +1871,6 @@ defmodule Web.Stream do
       nil ->
         trigger_pull_task(module, impl_state, data)
     end
-  end
-
-  defp direct_pull(module, impl_state) do
-    if function_exported?(module, :direct_pull, 1), do: module.direct_pull(impl_state)
   end
 
   defp trigger_pull_task(module, impl_state, data) do
@@ -2132,7 +2142,7 @@ defmodule Web.Stream do
     {:keep_state, new_data, after_pull_actions(data) ++ hibernate}
   end
 
-  # The source process of a direct pull answered: see `direct_pull/1`.
+  # The source process of a direct pull answered: see `__start__/3`.
   defp handle_task_result(:pulled, state, %{active_operation: :pull} = data) do
     handle_task_result({:ok, data.impl_state}, state, data)
   end

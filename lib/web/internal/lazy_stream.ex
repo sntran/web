@@ -230,23 +230,23 @@ defmodule Web.Internal.LazyStream do
        when kind in [:bytes, :chunk, :view] do
     {:ok, chunks} = chunks(lazy.source)
 
-    Web.ReadableStream.new(
+    Web.ReadableStream.__new__(
       %{
         start: fn controller ->
           for chunk <- chunks, do: Web.ReadableStream.enqueue(controller.pid, chunk)
           Web.ReadableStream.close(controller.pid)
         end
       },
-      registry_key: lazy.ref,
-      owner: owner
+      [owner: owner],
+      registry_key: lazy.ref
     )
   end
 
   defp start_stream(%{source: {:error, error}} = lazy, :readable, owner) do
-    Web.ReadableStream.new(
+    Web.ReadableStream.__new__(
       %{start: &Web.ReadableStream.error(&1.pid, error)},
-      registry_key: lazy.ref,
-      owner: owner
+      [owner: owner],
+      registry_key: lazy.ref
     )
   end
 
@@ -255,15 +255,17 @@ defmodule Web.Internal.LazyStream do
   # state. A cancel stops the holder, thus its connection does not stay.
   defp start_stream(%{source: {:held, holder}} = lazy, :readable, owner) do
     stream =
-      Web.ReadableStream.new(
+      Web.ReadableStream.__new__(
         %{cancel: fn _reason -> Process.exit(holder, :kill) end},
-        high_water_mark: @held_high_water_mark,
-        strategy: Web.ByteLengthQueuingStrategy.new(@held_high_water_mark),
-        pull_message: {holder, {:web_body, lazy.ref, :pull}},
+        [
+          high_water_mark: @held_high_water_mark,
+          strategy: Web.ByteLengthQueuingStrategy.new(@held_high_water_mark),
+          cancel_on_reader_exit: true,
+          owner: owner
+        ],
+        direct_pull: {:message, holder, {:web_body, lazy.ref, :pull}},
         watch_source: {holder, &incomplete_error/1},
-        cancel_on_reader_exit: true,
-        registry_key: lazy.ref,
-        owner: owner
+        registry_key: lazy.ref
       )
 
     send(holder, {:web_body, lazy.ref, {:stream, stream.controller_pid}})
@@ -273,11 +275,11 @@ defmodule Web.Internal.LazyStream do
   # A read used the bytes, or a cancel came: the new process is a closed
   # stream that a read used.
   defp start_stream(lazy, :closed, owner) do
-    Web.ReadableStream.new(
+    Web.ReadableStream.__new__(
       %{start: &Web.ReadableStream.close(&1.pid)},
+      [owner: owner],
       registry_key: lazy.ref,
-      disturbed: true,
-      owner: owner
+      disturbed: true
     )
   end
 

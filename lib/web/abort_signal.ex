@@ -347,7 +347,6 @@ defmodule Web.AbortSignal do
 
   defp remembered_reason(ref) when is_reference(ref), do: Reasons.get(ref)
 
-  @doc false
   def receive_abort(nil, _timeout, _with_reason?), do: :ok
 
   def receive_abort(

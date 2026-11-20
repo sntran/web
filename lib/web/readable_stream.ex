@@ -66,9 +66,7 @@ defmodule Web.ReadableStream do
       source: source,
       pid: pid,
       started: false,
-      stream_type: stream_type,
-      pull_process: Keyword.get(opts, :pull_process),
-      pull_message: Keyword.get(opts, :pull_message)
+      stream_type: stream_type
     }
 
     # The function `start` of the source runs in the process that makes the
@@ -83,6 +81,13 @@ defmodule Web.ReadableStream do
     |> await_pull_result()
 
     {:ok, %{state | started: true}}
+  end
+
+  # A source that is a process. A stream from `new/2` sends this message
+  # from the stream process, with no callback: see `pid_source/1`.
+  def pull(_ctrl, %{source: source, pid: pid} = state) when is_pid(source) do
+    send(source, {:pull, pid})
+    {:ok, %{state | started: true}, :pause}
   end
 
   def pull(ctrl, %{source: {module, function, args}} = state) when is_list(args) do
@@ -104,18 +109,6 @@ defmodule Web.ReadableStream do
     # No pull source — pause to avoid a busy-loop
     {:ok, state, :pause}
   end
-
-  # The process of an enumerable gives one chunk for each pull, and a source
-  # that is a process gets the message `{:pull, stream}`. The stream sends
-  # these messages itself: see `Web.Stream.direct_pull/1`.
-  @impl Web.Stream
-  def direct_pull(%{pull_process: pid}) when is_pid(pid), do: {:process, pid}
-  def direct_pull(%{pull_message: {pid, message}}) when is_pid(pid), do: {:message, pid, message}
-
-  def direct_pull(%{source: source, pid: pid}) when is_pid(source),
-    do: {:message, source, {:pull, pid}}
-
-  def direct_pull(_state), do: nil
 
   @impl Web.Stream
   def terminate({type, reason}, %{source: source, pid: pid}) when type in [:cancel, :abort] do
@@ -172,6 +165,13 @@ defmodule Web.ReadableStream do
       ["hello"]
   """
   def new(underlying_source \\ %{}, opts \\ []) when is_list(opts) do
+    __new__(underlying_source, opts, [])
+  end
+
+  @doc false
+  # `new/2` with the options of the engine that no public function has: see
+  # `Web.Stream.__start__/3`.
+  def __new__(underlying_source, opts, internal) when is_list(opts) and is_list(internal) do
     :ok = validate_source!(underlying_source)
     stream_type = source_stream_type(underlying_source)
     {high_water_mark, strategy} = normalize_stream_options(underlying_source, opts)
@@ -192,7 +192,10 @@ defmodule Web.ReadableStream do
       )
 
     start_fn = source_start(underlying_source)
-    {:ok, pid} = start_link(Keyword.put(stream_opts, :has_start, is_function(start_fn)))
+    stream_opts = Keyword.put(stream_opts, :has_start, is_function(start_fn))
+
+    {:ok, pid} =
+      Web.Stream.__start__(__MODULE__, stream_opts, pid_source(underlying_source) ++ internal)
 
     if start_fn do
       Web.Stream.run_start(pid, start_fn, controller_for(stream_type, pid))
@@ -200,6 +203,11 @@ defmodule Web.ReadableStream do
 
     %__MODULE__{controller_pid: pid}
   end
+
+  # A source that is a process gets the message `{:pull, stream}` from the
+  # stream process directly.
+  defp pid_source(source) when is_pid(source), do: [direct_pull: {:pid_source, source}]
+  defp pid_source(_source), do: []
 
   defp source_start(%{start: start}) when is_function(start, 1), do: start
   defp source_start(_source), do: nil
@@ -323,12 +331,12 @@ defmodule Web.ReadableStream do
 
       # The stream asks the enumerator for each chunk directly, and the
       # enumerator answers the stream: see `enumerator_loop/1`.
-      new(
+      __new__(
         %{cancel: fn _reason -> send(enumerator, :stop) end},
         opts
         |> Keyword.put_new(:high_water_mark, 0)
-        |> Keyword.put(:cancel_on_reader_exit, true)
-        |> Keyword.put(:pull_process, enumerator)
+        |> Keyword.put(:cancel_on_reader_exit, true),
+        direct_pull: {:process, enumerator}
       )
     else
       raise TypeError, "Cannot make a ReadableStream from #{inspect(enumerable)}"

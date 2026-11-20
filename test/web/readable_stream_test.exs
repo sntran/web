@@ -109,6 +109,18 @@ defmodule Web.ReadableStreamTest do
   end
 
   describe "ReadableStream process" do
+    test "a source that is a process gets each pull from new/2" do
+      stream = ReadableStream.new(self())
+      pid = stream.controller_pid
+      assert_receive {:pull, ^pid}
+
+      # The queue is full with one chunk: the next pull comes after a read.
+      ReadableStream.enqueue(pid, "a")
+      reader = ReadableStream.get_reader(stream)
+      assert %{value: "a"} = Web.await(Web.ReadableStreamDefaultReader.read(reader))
+      assert_receive {:pull, ^pid}
+    end
+
     test "various sources" do
       parent = self()
 

@@ -620,6 +620,11 @@ defmodule Web.SocketTest do
     assert_raise TypeError, ~r/SocketError: invalid address/, fn ->
       Web.connect(1234)
     end
+
+    # An IPv6 address needs its brackets, and the port after them.
+    for address <- ["[::1", "[::1]8080", "::1:8080"] do
+      assert_raise TypeError, ~r/SocketError: invalid address/, fn -> Web.connect(address) end
+    end
   end
 
   test "connect raises for invalid option types" do

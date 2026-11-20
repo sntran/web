@@ -168,7 +168,7 @@ defmodule Web.Socket do
           |> Map.put(:socket, socket)
           |> Map.put(:transport, transport)
           |> settle_opened({:ok, socket_info(state)})
-          |> maybe_resume_transport()
+          |> listen()
 
         {:noreply, next_state}
 
@@ -199,6 +199,11 @@ defmodule Web.Socket do
       when holder_monitor == state.holder_monitor and holder_pid == state.holder_pid do
     next_state = shutdown_state(state, {:holder_down, reason}, :holder_down)
     {:stop, :normal, next_state}
+  end
+
+  # A pull of the readable stream: see `init_streams/2`.
+  def handle_info({:web_stream_pull, ref, stream}, %{readable_pid: stream} = state) do
+    {:noreply, listen(%{state | pull: {ref, stream}})}
   end
 
   def handle_info({:tcp, socket, data}, %{transport: :tcp, socket: socket} = state) do
@@ -286,23 +291,29 @@ defmodule Web.Socket do
       transport: :tcp,
       socket: nil,
       active: false,
+      pull: nil,
       close_reason: nil,
       failed?: false
     }
   end
 
+  # The readable stream sends each pull to the server directly, with no
+  # callback in a worker: the server then asks its socket for one message.
+  # The pull is complete when the server enqueued the chunk of that
+  # message, thus the stream has one pull at a time, as the Streams Standard
+  # specifies.
   defp init_streams(%{address: address, token: token} = handle, options) do
     readable_hwm = Map.get(options, :readable_high_water_mark, @readable_hwm)
 
     readable =
-      ReadableStream.new(
-        %{
-          pull: fn _controller -> GenServer.cast(address, {token, :readable_pull}) end,
-          cancel: fn reason -> GenServer.cast(address, {token, {:readable_cancel, reason}}) end
-        },
-        high_water_mark: readable_hwm,
-        strategy: ByteLengthQueuingStrategy.new(readable_hwm),
-        cancel_on_reader_exit: true
+      ReadableStream.__new__(
+        %{cancel: fn reason -> GenServer.cast(address, {token, {:readable_cancel, reason}}) end},
+        [
+          high_water_mark: readable_hwm,
+          strategy: ByteLengthQueuingStrategy.new(readable_hwm),
+          cancel_on_reader_exit: true
+        ],
+        direct_pull: {:process, address}
       )
 
     writable =
@@ -386,10 +397,6 @@ defmodule Web.Socket do
     {:reply, {:error, :unsupported_operation}, state}
   end
 
-  defp do_handle_cast(:readable_pull, state) do
-    {:noreply, maybe_resume_transport(state)}
-  end
-
   # A write failed in the process of the sink. The write rejects with its
   # error, thus the writable side has that error already.
   defp do_handle_cast({:write_failed, reason}, state) do
@@ -406,23 +413,31 @@ defmodule Web.Socket do
     {:noreply, state}
   end
 
-  # Each chunk of the readable side is a `Web.Uint8Array`.
+  # Each chunk of the readable side is a `Web.Uint8Array`. The socket sent
+  # one message, and waits: the next pull of the stream asks for the next
+  # message. Thus the server does not wait for the stream, and the stream
+  # keeps its limit: it pulls only while it has space.
   defp handle_transport_data(data, state) do
     ReadableStream.enqueue(state.readable_pid, Web.Uint8Array.from(data))
-    maybe_resume_transport(state)
+    %{complete_pull(state) | active: false}
   end
 
-  defp maybe_resume_transport(state) do
-    case ReadableStream.get_desired_size(state.readable_pid) do
-      desired when is_integer(desired) and desired > 0 ->
-        _ = transport_set_active_safe(state.transport, state.socket, :once)
-        %{state | active: :once}
-
-      _ ->
-        _ = transport_set_active_safe(state.transport, state.socket, false)
-        %{state | active: false}
-    end
+  # The enqueue and the end of the pull go from this process to the stream,
+  # thus the stream gets them in their sequence.
+  defp complete_pull(%{pull: {ref, stream}} = state) do
+    send(stream, {ref, :pulled})
+    %{state | pull: nil}
   end
+
+  # The socket gives one message for a pull of the stream, when the
+  # connection is open.
+  defp listen(%{pull: {_ref, _stream}, active: false, socket: socket} = state)
+       when socket != nil do
+    _ = transport_set_active_safe(state.transport, socket, :once)
+    %{state | active: :once}
+  end
+
+  defp listen(state), do: state
 
   # The modes of a close that is not a failure. For each other mode, the
   # promise `closed` rejects, as the Sockets API specifies.
@@ -519,6 +534,9 @@ defmodule Web.Socket do
   defp upgrade_generation(state, ssl_socket, promises) do
     old_readable_pid = state.readable_pid
     old_writable_pid = state.writable_pid
+    # The old stream gets the end of its pull, if it has one: it then
+    # closes.
+    for {ref, stream} <- List.wrap(state.pull), do: send(stream, {ref, :pulled})
 
     authority = init_authority()
     {readable, writable} = init_streams(authority, state.options)
@@ -531,6 +549,7 @@ defmodule Web.Socket do
           transport: :ssl,
           socket: ssl_socket,
           active: false,
+          pull: nil,
           readable: readable,
           readable_pid: readable.controller_pid,
           writable: writable,
@@ -553,7 +572,7 @@ defmodule Web.Socket do
     next_state =
       next_state
       |> settle_upgraded({:ok, tls_socket})
-      |> maybe_resume_transport()
+      |> listen()
 
     ReadableStream.close(old_readable_pid)
     WritableStream.error(old_writable_pid, :upgraded)
@@ -650,8 +669,12 @@ defmodule Web.Socket do
     %{remoteAddress: Address.format(state.host, state.port), localAddress: nil, alpn: nil}
   end
 
+  # A message of the socket has 64 KiB at most. The default buffer of
+  # `:gen_tcp` gives messages of approximately 9 KiB, and each message costs
+  # messages between the server and the stream: a read of 64 MiB gave
+  # 426 MiB/s with the default, and 1466 MiB/s with this buffer.
   defp tcp_connect_options(options) do
-    [:binary, packet: :raw, active: false] ++
+    [:binary, packet: :raw, active: false, buffer: 65_536] ++
       normalize_list_options(Map.get(options, :tcp_options, []))
   end
 
@@ -767,7 +790,7 @@ defmodule Web.Socket do
   # data from the peer.
   defp sink_write(handle, chunk) do
     with {:ok, payload} <- normalize_payload(chunk),
-         {:ok, transport, socket} <- MessageTarget.call(handle, :transport),
+         {:ok, transport, socket} <- transport_of(handle),
          :ok <- transport_send(transport, socket, payload) do
       :ok
     else
@@ -776,6 +799,24 @@ defmodule Web.Socket do
       {:error, %TypeError{} = error} -> fail_write(handle, error, error)
       # The transport failed, or the socket closed during the write.
       {:error, reason} -> fail_write(handle, {:transport_error, reason}, reason)
+    end
+  end
+
+  # The worker of the sink asks the server for the transport one time: the
+  # transport of a writable stream does not change. A TLS upgrade makes a
+  # new writable stream, with a new worker.
+  defp transport_of(handle) do
+    key = {__MODULE__, :transport, handle.token}
+
+    case Process.get(key) do
+      nil ->
+        with {:ok, _transport, _socket} = found <- MessageTarget.call(handle, :transport) do
+          Process.put(key, found)
+          found
+        end
+
+      found ->
+        found
     end
   end
 

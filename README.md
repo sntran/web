@@ -407,6 +407,13 @@ chunk = await(ReadableStreamDefaultReader.read(reader))
 Uint8Array.to_binary(chunk.value)
 ```
 
+An IPv6 address has brackets, as in a URL: `Web.connect("[::1]:8080")`, or
+`Web.connect(%{hostname: "::1", port: 8080})`. The socket reads its
+connection only when the readable side wants data: it asks for one message
+of the connection for each pull of the stream. Thus the readable side keeps
+the bytes of its high water mark at most (64 KiB, or the option
+`:readable_high_water_mark`), and one message more.
+
 A TLS socket verifies the certificate of the server and its host name,
 with the trust store of the operating system. `fetch` does the same. The
 setting `:tls_options` gives TLS options to the two functions: a keyword

@@ -261,7 +261,8 @@ defmodule Web.Dispatcher.TCPTest do
       end)
 
       {_state, inflight} = connection(holder)
-      assert inflight < 65_536 + 8_192 * 2
+      # One message can come after the limit: a message has 64 KiB at most.
+      assert inflight < 65_536 + 65_536
       refute Enum.any?(mailbox(holder), &match?({:tcp, _socket, _data}, &1))
 
       # A reader gets each byte that the server sent. The server waits for

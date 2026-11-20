@@ -100,7 +100,7 @@ defmodule Web.BodyTest do
     # json/1 returns {:error, reason} when JSON parsing fails
     response = Response.new(body: "invalid json {{")
 
-    assert %Web.SyntaxError{cause: %Jason.DecodeError{}} =
+    assert %Web.SyntaxError{cause: %JSON.DecodeError{}} =
              catch_exit(await(Response.json(response)))
   end
 

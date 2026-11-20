@@ -312,7 +312,7 @@ defmodule Web.ResponseTest do
 
     test "rejects with SyntaxError when it is not JSON" do
       for body <- ["{bad", "", "[1,", "undefined"] do
-        assert %Web.SyntaxError{message: message, cause: %Jason.DecodeError{}} =
+        assert %Web.SyntaxError{message: message, cause: %JSON.DecodeError{}} =
                  catch_exit(await(Response.json(Response.new(body, []))))
 
         assert message =~ "not valid JSON"

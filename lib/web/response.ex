@@ -8,6 +8,7 @@ defmodule Web.Response do
   use Web.Body
 
   alias Web.AsyncContext
+  alias Web.Internal.JSON, as: JSONText
 
   defstruct [
     :body,
@@ -204,7 +205,7 @@ defmodule Web.Response do
   end
 
   defp encode_json!(data) do
-    Jason.encode!(data)
+    JSONText.stringify!(data)
   rescue
     error ->
       reraise Web.TypeError,

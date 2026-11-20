@@ -17,7 +17,7 @@ defmodule Web.FetchContentEncodingTest do
 
     # Gives the headers of the request.
     def respond(%{request_path: "/headers"} = conn, _options) do
-      send_resp(conn, 200, Jason.encode!(Map.new(conn.req_headers)))
+      send_resp(conn, 200, JSON.encode!(Map.new(conn.req_headers)))
     end
 
     # Gives a response that the test stored in the table: its status, its

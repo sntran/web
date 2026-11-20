@@ -9,6 +9,8 @@ defmodule Web.Blob do
       {11, "text/plain"}
   """
 
+  alias Web.Internal.JSON, as: JSONText
+
   @enforce_keys [:id, :parts, :size, :type]
   defstruct [:id, :parts, :size, :type]
 
@@ -109,12 +111,14 @@ defmodule Web.Blob do
   end
 
   @doc """
-  Reads Blob contents and decodes JSON.
+  Reads the contents of the blob as text, and parses it as JSON, as
+  `JSON.parse` of ECMAScript. Returns `{:ok, value}`, or
+  `{:error, %JSON.DecodeError{}}`.
   """
   @spec json(t()) :: {:ok, any()} | {:error, any()}
   def json(%__MODULE__{} = blob) do
-    with {:ok, binary} <- text(blob) do
-      Jason.decode(binary)
+    with {:ok, text} <- text(blob) do
+      JSONText.parse(text)
     end
   end
 

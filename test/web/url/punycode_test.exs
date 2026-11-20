@@ -114,7 +114,7 @@ defmodule Web.URL.PunycodeTest do
 
     File.write!(
       Path.join(fixture_dir, "toascii.json"),
-      Jason.encode!([%{"input" => "fixture.example", "output" => "mapped.example"}])
+      JSON.encode!([%{"input" => "fixture.example", "output" => "mapped.example"}])
     )
 
     try do

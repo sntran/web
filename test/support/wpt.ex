@@ -473,7 +473,7 @@ defmodule Web.Platform.Test do
       last_modified: Web.Headers.get(response.headers, "last-modified")
     }
 
-    Elixir.File.write!(meta_path, Jason.encode!(meta))
+    Elixir.File.write!(meta_path, JSON.encode!(meta))
     raw
   end
 
@@ -490,7 +490,7 @@ defmodule Web.Platform.Test do
       last_modified: Web.Headers.get(response.headers, "last-modified")
     }
 
-    Elixir.File.write!(meta_path, Jason.encode!(meta))
+    Elixir.File.write!(meta_path, JSON.encode!(meta))
     decoded
   end
 
@@ -507,7 +507,7 @@ defmodule Web.Platform.Test do
   defp decode_fallback_payload(raw) do
     raw
     |> repair_surrogates()
-    |> Jason.decode!()
+    |> JSON.decode!()
   end
 
   defp fallback_to_cache_source_or_raise(cache_path, url, reason) do
@@ -534,7 +534,7 @@ defmodule Web.Platform.Test do
     cache_path
     |> Elixir.File.read!()
     |> repair_surrogates()
-    |> Jason.decode!()
+    |> JSON.decode!()
   end
 
   defp conditional_headers(meta) do
@@ -556,7 +556,7 @@ defmodule Web.Platform.Test do
     if Elixir.File.exists?(path) do
       path
       |> Elixir.File.read!()
-      |> Jason.decode!()
+      |> JSON.decode!()
     else
       %{}
     end
@@ -695,7 +695,7 @@ defmodule Web.Platform.Test do
 
   defp normalize_cases(url, payload) when is_binary(url) and is_map(payload), do: [payload]
 
-  # Jason decodes a correct surrogate pair, but fails on a surrogate that is
+  # The JSON decoder decodes a correct surrogate pair, but fails on a surrogate that is
   # alone. A browser changes such a surrogate to U+FFFD when it reads the
   # string, thus do the same here. Do not change a correct pair.
   defp repair_surrogates(text) do

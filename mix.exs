@@ -72,7 +72,6 @@ defmodule Web.MixProject do
       {:finch, "~> 0.21"},
       {:castore, "~> 1.0"},
       {:idna, "~> 8.0"},
-      {:jason, "~> 1.4"},
       {:benchee, "~> 1.5", only: [:dev, :test]},
       {:stream_data, "~> 1.3", only: :test},
       # An HTTP server for the tests, and for the benchmark of the HTTP

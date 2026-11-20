@@ -5,7 +5,8 @@ defmodule Web.Body do
   `use Web.Body` injects convenience functions:
 
   - `text/1` reads the body as a binary.
-  - `json/1` reads the body as text and decodes it with `Jason`.
+  - `json/1` reads the body as text and parses it as JSON, as the Fetch
+    Standard specifies, with the JSON decoder of Erlang/OTP.
   - `array_buffer/1` reads the body as `%Web.ArrayBuffer{}`.
   - `bytes/1` reads the body as `%Web.Uint8Array{}`.
   - `blob/1` reads the body as `%Web.Blob{}`.
@@ -49,6 +50,7 @@ defmodule Web.Body do
 
   alias Web.FormData.Encoder
   alias Web.Internal.Bytes
+  alias Web.Internal.JSON, as: JSONText
 
   @callback text(struct()) :: Web.Promise.t()
   @callback json(struct()) :: Web.Promise.t()
@@ -70,7 +72,11 @@ defmodule Web.Body do
       end
 
       @doc """
-      Reads the body to completion and resolves with decoded JSON via `Jason`.
+      Reads the body to completion, decodes it as UTF-8 text, and resolves
+      with the value of the JSON text, as `JSON.parse` of ECMAScript does.
+
+      An object becomes a map with string keys, and `null` becomes `nil`.
+      Text that is not JSON rejects with `Web.SyntaxError`.
       """
       @impl Web.Body
       def json(%{body: _} = struct) do
@@ -173,13 +179,16 @@ defmodule Web.Body do
   end
 
   @doc false
+  # The algorithm "parse JSON from bytes" of the Fetch Standard: the UTF-8
+  # decode of the bytes, then `JSON.parse`.
   def json(%{body: body}) do
-    consume_body(body, &parse_json/1)
+    consume_body(body, fn bytes -> bytes |> Web.TextDecoder.decode_utf8() |> parse_json() end)
   end
 
   # Text that is not JSON gives `SyntaxError`, as `JSON.parse` of ECMAScript.
-  defp parse_json(binary) do
-    case Jason.decode(binary) do
+  # The parse runs in the process of the promise, which stops after it.
+  defp parse_json(text) do
+    case JSONText.parse(text, reserve_heap: true) do
       {:ok, value} ->
         {:ok, value}
 

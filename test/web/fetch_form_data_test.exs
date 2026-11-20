@@ -33,7 +33,7 @@ defmodule Web.FetchFormDataTest do
         end)
 
       body =
-        Jason.encode!(%{"length" => get_req_header(conn, "content-length"), "parts" => parts})
+        JSON.encode!(%{"length" => get_req_header(conn, "content-length"), "parts" => parts})
 
       send_resp(conn, 200, body)
     end

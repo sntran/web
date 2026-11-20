@@ -132,8 +132,11 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
 
   defp run({:lock, proc}, model, queue, system) do
     if SpecModel.enabled?(model, "Lock", [to_string(proc)]) do
-      assert call(system, proc, fn -> ReadableStream.get_reader(system.pid) end) == :ok
-      {SpecModel.step!(model, "Lock", [to_string(proc)]), queue}
+      result = call(system, proc, fn -> ReadableStream.get_reader(system.pid) end)
+
+      checked(result, :ok, model, queue, system, fn ->
+        {SpecModel.step!(model, "Lock", [to_string(proc)]), queue}
+      end)
     else
       {model, queue}
     end
@@ -141,8 +144,11 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
 
   defp run({:unlock, proc}, model, queue, system) do
     if SpecModel.enabled?(model, "Unlock", [to_string(proc)]) do
-      assert call(system, proc, fn -> ReadableStream.release_lock(system.pid) end) == :ok
-      {SpecModel.step!(model, "Unlock", [to_string(proc)]), queue}
+      result = call(system, proc, fn -> ReadableStream.release_lock(system.pid) end)
+
+      checked(result, :ok, model, queue, system, fn ->
+        {SpecModel.step!(model, "Unlock", [to_string(proc)]), queue}
+      end)
     else
       {model, queue}
     end
@@ -152,8 +158,11 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
   defp run({:read, proc}, model, queue, system) do
     if SpecModel.enabled?(model, "Read", [to_string(proc)]) do
       [chunk | rest] = queue
-      assert call(system, proc, fn -> ReadableStream.read(system.pid) end) == {:ok, chunk}
-      {SpecModel.step!(model, "Read", [to_string(proc)]), rest}
+      result = call(system, proc, fn -> ReadableStream.read(system.pid) end)
+
+      checked(result, {:ok, chunk}, model, queue, system, fn ->
+        {SpecModel.step!(model, "Read", [to_string(proc)]), rest}
+      end)
     else
       {model, queue}
     end
@@ -162,8 +171,11 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
   defp run({:cancel, proc}, model, queue, system) do
     if SpecModel.enabled?(model, "Cancel", [to_string(proc)]) do
       cancel = fn -> Web.Stream.terminate_and_wait(system.pid, :cancel, :not_necessary) end
-      assert call(system, proc, cancel) == :ok
-      {SpecModel.step!(model, "Cancel", [to_string(proc)]), []}
+      result = call(system, proc, cancel)
+
+      checked(result, :ok, model, queue, system, fn ->
+        {SpecModel.step!(model, "Cancel", [to_string(proc)]), []}
+      end)
     else
       {model, queue}
     end
@@ -201,6 +213,25 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
                        inspect(SpecModel.to_map(model))
     end
 
+    {stopped, if(SpecModel.get(stopped, "queue") == 0, do: [], else: queue)}
+  end
+
+  # The result of an operation. The specification permits a stop step at
+  # each time when it is possible: on a busy machine, the linger time can end
+  # before the operation, and the operation then finds no stream. Only then
+  # a different result is correct: the test waits for the stop, and the model
+  # does the stop steps. Each other different result is an error.
+  defp checked(result, result, _model, _queue, _system, step), do: step.()
+
+  defp checked(result, expected, model, queue, system, _step) do
+    stopped = stop_steps(model)
+
+    assert not SpecModel.get(stopped, "running"),
+           "the result is #{inspect(result)}, not #{inspect(expected)}: " <>
+             inspect(SpecModel.to_map(model))
+
+    monitor = Process.monitor(system.pid)
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 1_000
     {stopped, if(SpecModel.get(stopped, "queue") == 0, do: [], else: queue)}
   end
 

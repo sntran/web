@@ -94,11 +94,18 @@ defmodule Web.Blob do
   end
 
   @doc """
-  Reads Blob contents as text.
+  Reads the contents of the blob as text, as `text()` of the File API: the
+  UTF-8 decode of the bytes. A byte order mark goes away, and each byte
+  sequence that is not valid UTF-8 becomes U+FFFD.
+
+  ## Examples
+
+      iex> Web.Blob.text(Web.Blob.new([<<0xEF, 0xBB, 0xBF>>, "caf", <<0xC3, 0xA9>>, <<0xFF>>]))
+      {:ok, "café\uFFFD"}
   """
-  @spec text(t()) :: {:ok, binary()}
+  @spec text(t()) :: {:ok, String.t()}
   def text(%__MODULE__{} = blob) do
-    {:ok, to_binary(blob)}
+    {:ok, blob |> to_binary() |> Web.TextDecoder.decode_utf8()}
   end
 
   @doc """
@@ -116,9 +123,7 @@ defmodule Web.Blob do
   """
   @spec array_buffer(t()) :: {:ok, Web.ArrayBuffer.t()}
   def array_buffer(%__MODULE__{} = blob) do
-    with {:ok, binary} <- text(blob) do
-      {:ok, Web.ArrayBuffer.new(binary)}
-    end
+    {:ok, blob |> to_binary() |> Web.ArrayBuffer.new()}
   end
 
   @doc """

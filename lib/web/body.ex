@@ -322,7 +322,7 @@ defmodule Web.Body do
 
   defp finish_chunks(pid, :done, acc) do
     Web.ReadableStream.release_lock(pid)
-    {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary()}
+    {:ok, join_chunks(acc)}
   end
 
   defp finish_chunks(pid, {:error, reason}, _acc) do
@@ -330,14 +330,17 @@ defmodule Web.Body do
     {:error, stream_error(reason)}
   end
 
+  # The chunks are in the sequence from the last to the first. A body with
+  # one chunk is that chunk, with no copy.
+  defp join_chunks([]), do: ""
+  defp join_chunks([chunk]), do: chunk
+  defp join_chunks(chunks), do: chunks |> :lists.reverse() |> IO.iodata_to_binary()
+
   # The text of a body is the UTF-8 decode of its bytes, with no byte order
   # mark, as the Fetch Standard specifies.
   defp read_body_to_text(body) do
     with {:ok, binary} <- read_body_to_binary(body) do
-      {text, _decoder_state} =
-        Web.TextDecoder.decode_step(Web.TextDecoder.initial_state(), binary, false)
-
-      {:ok, text}
+      {:ok, Web.TextDecoder.decode_utf8(binary)}
     end
   end
 

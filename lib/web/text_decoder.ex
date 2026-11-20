@@ -172,18 +172,18 @@ defmodule Web.TextDecoder do
   def dispose(%__MODULE__{state_pid: state_pid}), do: State.stop(state_pid)
 
   @doc false
-  # The state of a decoder as data. `Web.Body` uses `initial_state/0` and
-  # `decode_step/3`, thus a body read starts no state process.
+  # The state of a decoder as data.
   @spec initial_state() :: map()
   def initial_state, do: %{carry: "", bom_seen: false}
 
   @doc false
-  @spec decode_step(map(), binary(), boolean()) :: {String.t(), map()}
-  def decode_step(state, chunk, stream?) when is_binary(chunk) do
-    decoder = %__MODULE__{encoding: "utf-8", fatal: false, ignore_bom: false}
-    {{:ok, text}, new_state} = decode_chunk(state, chunk, decoder, stream?)
-    {text, new_state}
-  end
+  # The algorithm "UTF-8 decode" of the Encoding Standard for all the bytes
+  # of a body: the byte order mark goes away, and each invalid sequence
+  # becomes U+FFFD. Valid UTF-8 is the text with no copy. `Web.Body` uses
+  # this function, thus a body read starts no state process.
+  @spec decode_utf8(binary()) :: String.t()
+  def decode_utf8(<<@bom, rest::binary>>), do: replace_invalid(rest)
+  def decode_utf8(bytes) when is_binary(bytes), do: replace_invalid(bytes)
 
   defp decode_chunk(%{carry: carry, bom_seen: bom_seen} = state, chunk, decoder, stream) do
     data = IO.iodata_to_binary([carry, chunk])
@@ -345,8 +345,16 @@ defmodule Web.TextDecoder do
     end
   end
 
-  defp decode_complete_bytes(binary, false) do
-    {:ok, String.replace_invalid(binary, @replacement_char)}
+  defp decode_complete_bytes(binary, false), do: {:ok, replace_invalid(binary)}
+
+  # The check of valid UTF-8 is fast for ASCII text. Only text that is not
+  # valid needs the scan that replaces each invalid sequence.
+  defp replace_invalid(binary) do
+    if String.valid?(binary, :fast_ascii) do
+      binary
+    else
+      String.replace_invalid(binary, @replacement_char)
+    end
   end
 
   defp finish_decode(decoded), do: [decoded]

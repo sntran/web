@@ -549,6 +549,19 @@ defmodule Web.StreamRulesTest do
       assert catch_exit(await(ReadableStreamDefaultReader.read(reader))) == :stop
     end
 
+    test "errors the stream when the process of the signal stops with no abort" do
+      controller = AbortController.new()
+      stream = ambient_stream(controller)
+      assert_receive {:controller, _stream_controller}
+
+      Process.exit(controller.signal.pid, :kill)
+
+      reader = ReadableStream.get_reader(stream)
+
+      assert %Web.DOMException{name: "AbortError"} =
+               catch_exit(await(ReadableStreamDefaultReader.read(reader)))
+    end
+
     test "has no effect on a stream that closed and gave its last chunk" do
       controller = AbortController.new()
       stream = ambient_stream(controller)

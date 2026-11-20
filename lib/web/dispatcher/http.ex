@@ -48,8 +48,9 @@ defmodule Web.Dispatcher.HTTP do
   # headers, as the Fetch Standard specifies.
   @complete_wait 1_000
 
-  # A process of a request starts with a heap for the work of one request:
-  # a heap that grows step by step needs garbage collections.
+  # The process of a request and its worker start with a heap for the work
+  # of one request: a heap that grows step by step needs garbage
+  # collections.
   @heap_words 4_096
 
   @null_body_statuses [101, 103, 204, 205, 304]
@@ -57,6 +58,7 @@ defmodule Web.Dispatcher.HTTP do
   # The keys of the state of the worker in its process dictionary. The
   # content decoder gives each piece to a function with no other argument.
   @inflight_key {__MODULE__, :inflight}
+  @kept_key {__MODULE__, :kept}
   @decoder_key {__MODULE__, :decoder}
   @owner_key {__MODULE__, :owner}
 
@@ -177,36 +179,42 @@ defmodule Web.Dispatcher.HTTP do
     Process.flag(:trap_exit, true)
     Web.Promise.put_owner(context.owner)
 
-    case Web.AbortSignal.subscribe(request.signal) do
-      {:ok, subscription} ->
-        context = Map.put(context, :subscription, subscription)
-        with_request_signal(request.signal, fn -> run_request(request, 0, context) end)
+    subscription =
+      case Web.AbortSignal.subscribe(request.signal) do
+        {:ok, subscription} ->
+          context = Map.put(context, :subscription, subscription)
+          with_request_signal(request.signal, fn -> run_request(request, 0, context) end)
+          subscription
 
-      {:error, :aborted} ->
-        reject(context, :aborted)
-    end
+        {:error, :aborted} ->
+          reject(context, :aborted)
+          nil
+      end
 
-    # The work is complete. The data of the work goes away, and the process
-    # keeps the outcome for the linger time.
-    Process.delete(__MODULE__)
+    # The work is complete: the exit of the worker and the signal have no
+    # more use. The process keeps the outcome for the linger time.
+    Web.AbortSignal.unsubscribe(subscription)
+    Process.flag(:trap_exit, false)
+    flush_exits()
     PromiseCell.linger()
+  end
+
+  defp flush_exits do
+    receive do
+      {:EXIT, _pid, _reason} -> flush_exits()
+    after
+      0 -> :ok
+    end
   end
 
   defp run_request(request, redirect_count, context) do
     case build_finch_request(request) do
       {:ok, finch_request} ->
-        worker = start_worker(finch_request, request)
+        worker = start_worker(finch_request, request, redirect_count)
         head = await_head(worker, context)
         release_request_body(request)
 
-        try do
-          handle_head(head, worker, request, redirect_count, context)
-        rescue
-          # A header value that the Fetch Standard refuses is a network error.
-          error in Web.TypeError ->
-            stop_worker(worker)
-            reject(context, error)
-        end
+        handle_head(head, worker, request, redirect_count, context)
 
       {:error, reason} ->
         reject(context, reason)
@@ -227,20 +235,33 @@ defmodule Web.Dispatcher.HTTP do
       {^ref, :error, reason} -> {:error, reason}
       {:EXIT, ^pid, :normal} -> :worker_stopped
       {:EXIT, ^pid, reason} -> {:error, {:connection_process_stopped, reason}}
-      message -> other_event(message, context)
+      message -> other_event(message, worker, context)
     after
       timeout -> :timeout
     end
   end
 
   # A message of the promise: an await, or the end of the owner. Then an
-  # abort, a message of a reader, or a message with no use.
-  defp other_event(message, context) do
+  # abort, a message of a reader, or a message with no use. An await of a
+  # pending promise goes to the worker also: the worker can give it a
+  # complete response directly.
+  defp other_event(message, worker, context) do
     case PromiseCell.handle(message) do
-      :handled -> :promise_message
-      {:owner_down, reason} -> {:owner_down, reason}
-      :expired -> :promise_message
-      :unknown -> abort_or_message(message, context)
+      :handled ->
+        with {:subscribe, ref} <- message,
+             false <- PromiseCell.settled?(),
+             do: send(worker.pid, {worker.ref, :waiter, ref})
+
+        :promise_message
+
+      {:owner_down, reason} ->
+        {:owner_down, reason}
+
+      :expired ->
+        :promise_message
+
+      :unknown ->
+        abort_or_message(message, context)
     end
   end
 
@@ -277,7 +298,6 @@ defmodule Web.Dispatcher.HTTP do
     case next_event(worker, context, :infinity) do
       {:head, _phase, _status, _headers, _location} = head -> head
       {:error, reason} -> {:error, reason}
-      :worker_stopped -> {:error, :closed}
       {:aborted, _reason} -> :aborted
       {:owner_down, _reason} -> :owner_down
       _promise_or_other_message -> await_head(worker, context)
@@ -285,9 +305,7 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp handle_head({:head, :body, status, headers, _location}, worker, request, count, context) do
-    lazy = LazyStream.new({:held, self()}, request.signal)
-    response = response(request, count, status, headers, %ReadableStream{lazy: lazy})
-    start_body(worker, response, lazy, context)
+    start_body(worker, {request, count, status, headers}, context)
   end
 
   defp handle_head({:head, :null, status, headers, _location}, worker, request, count, context) do
@@ -327,8 +345,10 @@ defmodule Web.Dispatcher.HTTP do
   defp handle_head({:error, reason}, _worker, _request, _count, context),
     do: reject(context, reason)
 
+  # The worker can give a complete response before this process gets the
+  # abort: the flag tells which outcome the promise has.
   defp handle_head(:aborted, worker, _request, _count, context),
-    do: abort_request(worker, context)
+    do: claim(worker, context, fn -> abort_request(worker, context) end)
 
   # A pending promise stops when its owner stops, and its work stops.
   defp handle_head(:owner_down, worker, _request, _count, _context), do: stop_request(worker)
@@ -349,21 +369,21 @@ defmodule Web.Dispatcher.HTTP do
     case next_event(worker, context, :infinity) do
       :done -> :done
       {:error, reason} -> {:error, reason}
-      :worker_stopped -> :done
       {:aborted, _reason} -> :aborted
       {:owner_down, _reason} -> stop_request(worker)
       _promise_or_other_message -> await_end(worker, context)
     end
   end
 
-  defp response(request, redirect_count, status, headers, body) do
+  defp response(request, redirect_count, status, headers, body, snapshot \\ Snapshot.take()) do
     Web.Response.__network__(
       status: status,
       status_text: status_text(status, request.url),
       headers: Headers.__network__(headers),
       body: body,
       url: Web.URL.href(request.url),
-      redirected: redirect_count > 0
+      redirected: redirect_count > 0,
+      snapshot: snapshot
     )
   end
 
@@ -400,12 +420,17 @@ defmodule Web.Dispatcher.HTTP do
   # The body of the response
   # ---------------------------------------------------------------------------
 
-  defp start_body(worker, response, lazy, context) do
+  # The response of a body that this process holds is made only when the
+  # promise settles with it: on the fast path, the worker gives the
+  # response.
+  defp start_body(worker, head, context) do
+    {request, _count, _status, _headers} = head
+
     body = %{
       worker: worker,
       context: context,
-      lazy: lazy,
-      response: response,
+      lazy: LazyStream.new({:held, self()}, request.signal),
+      head: head,
       pieces: [],
       size: 0,
       ended: nil,
@@ -421,53 +446,89 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   # Before the promise settles: the process collects the body for a short
-  # time.
+  # time. The worker and this process share a flag: the first of the two
+  # that sets it gives the outcome of the promise. The worker sets it for a
+  # body that is complete, and gives the response directly to the processes
+  # that await it. This process sets it at the end of the time, at the
+  # limit of the queue, at a failure, or at an abort.
   defp collect(body, until) do
-    wait = max(div(until - System.monotonic_time(:microsecond) + 999, 1_000), 0)
+    body.worker
+    |> next_event(body.context, collect_wait(until))
+    |> collect_event(body, until)
+  end
 
-    case next_event(body.worker, body.context, wait) do
-      {:data, piece} ->
-        body = add_piece(body, piece)
-        if body.size >= @held_high_water_mark, do: settle_held(body), else: collect(body, until)
+  defp collect_wait(until) do
+    max(div(until - System.monotonic_time(:microsecond) + 999, 1_000), 0)
+  end
 
-      :done ->
-        complete(body, {:ok, bytes(body)})
+  defp collect_event({:data, piece}, body, until) do
+    body = add_piece(body, piece)
 
-      {:error, reason} ->
-        complete(body, {:error, body_error(reason)})
+    if body.size >= @held_high_water_mark,
+      do: claim(body, fn -> settle_held(body) end),
+      else: collect(body, until)
+  end
 
-      :worker_stopped ->
-        collect(body, until)
+  defp collect_event({:delivered, response, refs}, _body, _until) do
+    PromiseCell.settle({:fulfilled, response}, refs)
+  end
 
-      {:aborted, reason} ->
-        stop_worker(body.worker)
-        complete(body, {:error, reason})
+  # The end of the body does not come in this time: the worker gives the
+  # response of a body that ends while the promise is pending, and a body
+  # that is larger than the queue makes this process settle the promise
+  # first. A failure, or an abort, gives a response whose body has the
+  # error.
+  defp collect_event({:error, reason}, body, _until) do
+    claim(body, fn -> fail(body, body_error(reason)) end)
+  end
 
-      {:owner_down, _reason} ->
-        stop_request(body.worker)
+  defp collect_event({:aborted, reason}, body, _until) do
+    claim(body, fn ->
+      stop_worker(body.worker)
+      fail(body, reason)
+    end)
+  end
 
-      :timeout ->
-        settle_held(body)
+  defp collect_event({:owner_down, _reason}, body, _until), do: stop_request(body.worker)
+  defp collect_event(:timeout, body, _until), do: claim(body, fn -> settle_held(body) end)
 
-      _promise_or_other_message ->
-        collect(body, until)
+  # The exit of the worker after its last message, a message of the promise,
+  # or a message with no use.
+  defp collect_event(_other, body, until), do: collect(body, until)
+
+  defp claim(body, fun), do: claim(body.worker, body.context, fun)
+
+  # This process gives the outcome, or the worker gave it already: then the
+  # message of the worker comes, and it is the outcome.
+  defp claim(worker, context, fun) do
+    case :atomics.compare_exchange(worker.flag, 1, 0, 1) do
+      :ok -> fun.()
+      _worker_gave_it -> await_delivered(worker, context)
     end
   end
 
-  # The body is complete, or failed, before the promise settled: the
-  # response has the result in its struct, and this process stops.
-  defp complete(body, result) do
-    lazy = %{body.lazy | source: final_source(result)}
-    resolve(body.context, %{body.response | body: %ReadableStream{lazy: lazy}})
+  defp await_delivered(worker, context) do
+    case next_event(worker, context, :infinity) do
+      {:delivered, response, refs} -> PromiseCell.settle({:fulfilled, response}, refs)
+      _other -> await_delivered(worker, context)
+    end
   end
 
-  defp final_source({:ok, binary}), do: {:bytes, binary}
-  defp final_source({:error, error}), do: {:error, error}
+  # The body failed before the promise settled: the response has the error
+  # in its struct, and this process stops.
+  defp fail(body, error) do
+    lazy = %{body.lazy | source: {:error, error}}
+    resolve(body.context, head_response(body.head, %ReadableStream{lazy: lazy}))
+  end
+
+  defp head_response({request, count, status, headers}, stream_body) do
+    response(request, count, status, headers, stream_body)
+  end
 
   # The promise settles with the response, and this process holds its body
   # until a read.
   defp settle_held(body) do
-    resolve(body.context, body.response)
+    resolve(body.context, head_response(body.head, %ReadableStream{lazy: body.lazy}))
     hold(body)
   end
 
@@ -480,21 +541,31 @@ defmodule Web.Dispatcher.HTTP do
   # The process holds the body. It answers the readers, and applies the
   # lifetime rules of a stream to a body that no process reads.
   defp hold(body) do
-    ref = body.lazy.ref
-
-    case next_event(body.worker, body.context, hold_timeout(body)) do
-      {:data, piece} -> body |> add_piece(piece) |> take_piece(piece) |> hold()
-      :done -> body |> end_body({:ok, :done}) |> hold_or_stop()
-      {:error, reason} -> body |> end_body({:error, body_error(reason)}) |> hold_or_stop()
-      :worker_stopped -> hold(body)
-      {:aborted, reason} -> abort(body, reason)
-      {:owner_down, reason} -> body |> owner_down(reason) |> hold_or_stop()
-      {:message, {:web_body, ^ref, request}} -> body |> reader_request(request) |> hold_or_stop()
-      {:message, message} -> body |> other_message(message) |> hold_or_stop()
-      :promise_message -> hold(body)
-      :timeout -> stop_body(body)
-    end
+    body.worker
+    |> next_event(body.context, hold_timeout(body))
+    |> hold_event(body)
   end
+
+  defp hold_event({:data, piece}, body),
+    do: body |> add_piece(piece) |> take_piece(piece) |> hold()
+
+  defp hold_event(:done, body), do: body |> end_body({:ok, :done}) |> hold_or_stop()
+
+  defp hold_event({:error, reason}, body),
+    do: body |> end_body({:error, body_error(reason)}) |> hold_or_stop()
+
+  defp hold_event({:aborted, reason}, body), do: abort(body, reason)
+  defp hold_event({:owner_down, reason}, body), do: body |> owner_down(reason) |> hold_or_stop()
+
+  defp hold_event({:message, {:web_body, ref, request}}, %{lazy: %{ref: ref}} = body),
+    do: body |> reader_request(request) |> hold_or_stop()
+
+  defp hold_event({:message, message}, body), do: body |> other_message(message) |> hold_or_stop()
+  defp hold_event(:timeout, body), do: stop_body(body)
+
+  # The exit of the worker after its last message, or a message of the
+  # promise.
+  defp hold_event(_other, body), do: hold(body)
 
   defp hold_or_stop(:stop), do: :ok
   defp hold_or_stop(body), do: hold(body)
@@ -635,8 +706,6 @@ defmodule Web.Dispatcher.HTTP do
     %Web.TypeError{message: "The response body cannot be decoded.", cause: error}
   end
 
-  defp body_error(%Web.TypeError{} = error), do: error
-
   defp body_error(reason) do
     %Web.TypeError{message: "The response body is not complete.", cause: reason}
   end
@@ -649,8 +718,9 @@ defmodule Web.Dispatcher.HTTP do
   # the process of the request. It decodes the body, and it stops to read
   # the connection while the process has 64 KiB with no credit: the
   # backpressure.
-  defp start_worker(finch_request, request) do
+  defp start_worker(finch_request, request, redirect_count) do
     ref = make_ref()
+    flag = :atomics.new(1, signed: false)
 
     state = %{
       owner: self(),
@@ -658,8 +728,16 @@ defmodule Web.Dispatcher.HTTP do
       method: request.method,
       redirect: redirect_mode(request),
       status: nil,
+      headers: nil,
       phase: :head,
-      discarded: 0
+      discarded: 0,
+      # The data for a response that the worker gives to the processes
+      # that await the promise: see `deliver_complete/1`.
+      request: request,
+      redirect_count: redirect_count,
+      flag: flag,
+      waiters: PromiseCell.waiters(),
+      snapshot: Snapshot.take()
     }
 
     pid =
@@ -668,11 +746,12 @@ defmodule Web.Dispatcher.HTTP do
         min_heap_size: @heap_words
       ])
 
-    %{pid: pid, ref: ref}
+    %{pid: pid, ref: ref, flag: flag}
   end
 
   defp run_worker(finch_request, state) do
     Process.put(@inflight_key, 0)
+    Process.put(@kept_key, {[], 0})
 
     result =
       try do
@@ -701,16 +780,54 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp finish_worker({:ok, %{phase: :body} = state}) do
-    case finish_decoder(Process.get(@decoder_key)) do
-      :cont -> send(state.owner, {state.ref, :done})
-      :halt -> :ok
-    end
+    # The pieces of the end go to the process of the request: the worker
+    # does not stop for them.
+    :cont = finish_decoder(Process.get(@decoder_key))
+    deliver_complete(state)
   rescue
     error in ContentDecoder.Error -> send(state.owner, {state.ref, :error, error})
   end
 
   defp finish_worker({:ok, state}), do: send(state.owner, {state.ref, :done})
   defp finish_worker({:error, reason, state}), do: send(state.owner, {state.ref, :error, reason})
+
+  # A body that is complete while the promise is pending: the worker gives
+  # the response directly to the processes that await the promise, and then
+  # to the process of the request. Thus the response needs no other process
+  # on its way. The flag lets one of the two processes only give the
+  # outcome: see `collect/2`.
+  defp deliver_complete(state) do
+    with {pieces, _size} <- Process.get(@kept_key),
+         :ok <- :atomics.compare_exchange(state.flag, 1, 0, 1) do
+      binary = pieces |> :lists.reverse() |> IO.iodata_to_binary()
+      lazy = LazyStream.new({:bytes, binary}, state.request.signal)
+      body = %ReadableStream{lazy: lazy}
+
+      response =
+        response(
+          state.request,
+          state.redirect_count,
+          state.status,
+          state.headers,
+          body,
+          state.snapshot
+        )
+
+      refs = forwarded_waiters(state.ref, state.waiters)
+      for ref <- refs, do: send(ref, {:web_promise, ref, {:fulfilled, response}})
+      send(state.owner, {state.ref, {:delivered, response, refs}})
+    else
+      _no -> send(state.owner, {state.ref, :done})
+    end
+  end
+
+  defp forwarded_waiters(ref, waiters) do
+    receive do
+      {^ref, :waiter, waiter} -> forwarded_waiters(ref, [waiter | waiters])
+    after
+      0 -> waiters
+    end
+  end
 
   defp finish_decoder(nil), do: :cont
   defp finish_decoder(decoder), do: ContentDecoder.finish(decoder, &worker_send/1)
@@ -734,6 +851,7 @@ defmodule Web.Dispatcher.HTTP do
 
     phase = response_phase(state, location)
     send(state.owner, {state.ref, {:head, phase, state.status, headers, location}})
+    state = %{state | headers: headers}
 
     if phase == :body do
       Process.put(@owner_key, {state.owner, state.ref})
@@ -778,10 +896,19 @@ defmodule Web.Dispatcher.HTTP do
   defp worker_send(piece) do
     {owner, ref} = Process.get(@owner_key)
     send(owner, {ref, :data, piece})
+    keep_piece(Process.get(@kept_key), piece)
     inflight = Process.get(@inflight_key) + byte_size(piece)
     Process.put(@inflight_key, await_credit(ref, inflight))
     :cont
   end
+
+  # The worker keeps the pieces of a body up to the limit of the queue: a
+  # body that is larger goes to the process of the request.
+  defp keep_piece({pieces, size}, piece) when size + byte_size(piece) <= @held_high_water_mark do
+    Process.put(@kept_key, {[piece | pieces], size + byte_size(piece)})
+  end
+
+  defp keep_piece(_kept, _piece), do: Process.put(@kept_key, :none)
 
   defp await_credit(ref, inflight) when inflight >= @held_high_water_mark do
     receive do
@@ -793,21 +920,19 @@ defmodule Web.Dispatcher.HTTP do
 
   # The kind of the response: a body, no body, a redirect to follow, or a
   # redirect that the redirect mode refuses.
-  defp response_phase(%{status: status, method: method, redirect: redirect}, location) do
-    cond do
-      status in @redirect_statuses and is_binary(location) and redirect == "error" ->
-        :redirect_error
+  defp response_phase(%{status: status, redirect: redirect}, location)
+       when status in @redirect_statuses and is_binary(location) and redirect == "error",
+       do: :redirect_error
 
-      status in @redirect_statuses and is_binary(location) and redirect == "follow" ->
-        :discard
+  defp response_phase(%{status: status, redirect: redirect}, location)
+       when status in @redirect_statuses and is_binary(location) and redirect == "follow",
+       do: :discard
 
-      method == "HEAD" or status in @null_body_statuses ->
-        :null
+  defp response_phase(%{status: status, method: method}, _location)
+       when method == "HEAD" or status in @null_body_statuses,
+       do: :null
 
-      true ->
-        :body
-    end
-  end
+  defp response_phase(_state, _location), do: :body
 
   defp redirect_mode(request), do: request.options[:redirect] || request.redirect || "follow"
 

@@ -30,6 +30,7 @@ defmodule Web.Stream do
 
   alias Web.AbortSignal
   alias Web.AsyncContext.Snapshot
+  alias Web.Internal.LazyStream
 
   # ---------------------------------------------------------------------------
   # Behavior definition
@@ -507,7 +508,7 @@ defmodule Web.Stream do
   defp register(nil), do: :ok
 
   defp register(key) do
-    {:ok, _owner} = Registry.register(Web.Internal.LazyStream.registry(), key, nil)
+    {:ok, _owner} = Registry.register(LazyStream.registry(), key, nil)
     :ok
   end
 
@@ -1043,15 +1044,19 @@ defmodule Web.Stream do
   # sink runs in a task, and the caller gets its reply when the callback is
   # complete: `:ok`, or the value that the callback threw. A promise from
   # the callback is awaited. This is the rule of the Streams Standard.
+  # A stream that closed with chunks in its queue is still readable, as in
+  # the Streams Standard: a cancel discards the chunks, and calls the cancel
+  # callback of the source.
   defp handle_common({:call, from}, {:terminate, type, reason}, state, data)
-       when type in [:cancel, :abort] and state not in [:closed, :errored] do
+       when type in [:cancel, :abort] and state != :errored and
+              (state != :closed or data.queue != {[], []}) do
     terminate_with_task(type, reason, from, data)
   end
 
   # The same, for a caller that does not wait for the callback: the halt of
   # an enumeration.
   defp handle_common({:call, from}, {:terminate_detached, :cancel, reason}, state, data) do
-    if state in [:closed, :errored] do
+    if final?(state, data) do
       {:keep_state_and_data, [{:reply, from, :ok}]}
     else
       {:next_state, next_state, new_data, actions} =
@@ -1284,24 +1289,8 @@ defmodule Web.Stream do
       ref == data.writer_ref ->
         {:keep_state, %{data | writer_pid: nil, writer_ref: nil}}
 
-      # The process of the abort callback stopped with no result.
-      ref == data.task_ref and data.active_operation == :abort ->
-        {:keep_state, clear_active_operation(data), abort_reply_actions(data, :ok)}
-        |> clear_abort_request()
-
-      # The source process of a direct pull stopped with no failure before
-      # its answer, for example an enumerator that got `:stop`: the source
-      # has no more chunks.
-      ref == data.task_ref and is_map_key(data.active_task, :external) and
-          reason in [:normal, :noproc] ->
-        data = data |> clear_active_operation() |> Map.put(:pulling, false)
-        if state == :readable, do: handle_producer_close(data), else: {:keep_state, data}
-
-      ref == data.task_ref and reason == :normal ->
-        :keep_state_and_data
-
       ref == data.task_ref ->
-        fail_stream(reason, data)
+        task_down(reason, state, data)
 
       true ->
         :keep_state_and_data
@@ -1356,6 +1345,24 @@ defmodule Web.Stream do
   end
 
   defp handle_common(_type, _content, _state, _data), do: :not_handled
+
+  # The process of a callback stopped with no result.
+  defp task_down(_reason, _state, %{active_operation: :abort} = data) do
+    {:keep_state, clear_active_operation(data), abort_reply_actions(data, :ok)}
+    |> clear_abort_request()
+  end
+
+  # The source process of a direct pull stopped with no failure before its
+  # answer, for example an enumerator that got `:stop`: the source has no
+  # more chunks.
+  defp task_down(reason, state, %{active_task: %{external: true}} = data)
+       when reason in [:normal, :noproc] do
+    data = data |> clear_active_operation() |> Map.put(:pulling, false)
+    if state == :readable, do: handle_producer_close(data), else: {:keep_state, data}
+  end
+
+  defp task_down(:normal, _state, _data), do: :keep_state_and_data
+  defp task_down(reason, _state, data), do: fail_stream(reason, data)
 
   # Why the readable side cannot accept an `enqueue` or a `close`, or `nil`.
   defp controller_refusal(_state, %{type: :consumer}), do: :closed
@@ -2566,6 +2573,7 @@ defmodule Web.Stream do
         writable_error:
           if(type == :cancel and data.type == :producer_consumer, do: {:errored, reason}),
         queue: if(type == :cancel, do: :queue.new(), else: data.queue),
+        total_queued_size: if(type == :cancel, do: 0, else: data.total_queued_size),
         pulling: false,
         pending_write_request: nil,
         pending_close_request: nil,
@@ -2787,7 +2795,7 @@ defmodule Web.Stream do
   # A terminal event for a stream that is closed or errored has no effect,
   # and calls no callback, as in the Streams Standard.
   defp terminate_request_with_result(type, reason, state, data) do
-    if state in [:closed, :errored] do
+    if final?(state, data) do
       {:ok, :keep_state_and_data}
     else
       termination_with_result(type, reason, data)

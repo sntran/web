@@ -47,6 +47,7 @@ defmodule Web.Internal.LazyStream do
   #      stopped.
 
   alias Web.AbortSignal
+  alias Web.AsyncContext.Snapshot
 
   @enforce_keys [:ref, :source]
   defstruct [:ref, :source, :signal]
@@ -107,7 +108,7 @@ defmodule Web.Internal.LazyStream do
   defp abort_signal(%AbortSignal{} = signal), do: signal
   defp abort_signal(_other), do: nil
 
-  defp ambient_signal, do: Web.AsyncContext.Snapshot.take().ambient_signal
+  defp ambient_signal, do: Snapshot.take().ambient_signal
 
   # ---------------------------------------------------------------------------
   # The state
@@ -165,9 +166,11 @@ defmodule Web.Internal.LazyStream do
   # coveralls-ignore-next-line
   defp await_process(_lazy, _step), do: :gone
 
+  # The registry removes the key of a process that stopped some time after
+  # the stop, thus the process must be alive.
   defp lookup(%__MODULE__{ref: ref}) do
     case Registry.lookup(@registry, ref) do
-      [{pid, _value}] -> {:process, pid}
+      [{pid, _value}] -> if Process.alive?(pid), do: {:process, pid}, else: :gone
       [] -> :gone
     end
   end
@@ -189,19 +192,13 @@ defmodule Web.Internal.LazyStream do
       else: remote(lazy, :process, [owner], {:error, :released})
   end
 
-  defp local_process(lazy, owner) do
-    case :atomics.compare_exchange(lazy.ref, 1, @readable, @starting) do
-      :ok -> start(lazy, :readable, owner)
-      @consumed -> start_closed(lazy, @consumed, owner)
-      @canceled -> start_closed(lazy, @canceled, owner)
-      other -> existing_process(decode(lazy, other))
-    end
-  end
-
-  defp start_closed(lazy, from, owner) do
-    case :atomics.compare_exchange(lazy.ref, 1, from, @starting) do
-      :ok -> start(lazy, :closed, owner)
-      other -> existing_process(decode(lazy, other))
+  # One compare-exchange from the state that the stream has: a stream that
+  # a read used, or that a cancel closed, gets a closed stream process.
+  defp local_process(lazy, owner, expected \\ @readable) do
+    case :atomics.compare_exchange(lazy.ref, 1, expected, @starting) do
+      :ok -> start(lazy, if(expected == @readable, do: :readable, else: :closed), owner)
+      current when current in [@consumed, @canceled] -> local_process(lazy, owner, current)
+      current -> existing_process(decode(lazy, current))
     end
   end
 

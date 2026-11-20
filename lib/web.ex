@@ -28,6 +28,7 @@ defmodule Web do
       :boom
   """
 
+  alias Web.Dispatcher.HTTP
   alias Web.Internal.StructuredData
   alias Web.TypeError
 
@@ -320,9 +321,9 @@ defmodule Web do
   # The process of an HTTP request is the promise of `fetch`: see
   # `Web.Dispatcher.HTTP`.
   defp fetch_request(%Web.Request{dispatcher: dispatcher} = request)
-       when dispatcher in [nil, Web.Dispatcher.HTTP] do
-    if (dispatcher || Web.Resolver.resolve(request.url)) == Web.Dispatcher.HTTP do
-      Web.Dispatcher.HTTP.__start__(request, &fetch_error(&1, request))
+       when dispatcher in [nil, HTTP] do
+    if (dispatcher || Web.Resolver.resolve(request.url)) == HTTP do
+      HTTP.__start__(request, &fetch_error(&1, request))
     else
       fetch_with_executor(request)
     end

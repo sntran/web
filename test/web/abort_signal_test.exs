@@ -6,17 +6,19 @@ defmodule Web.AbortSignalTest do
   end
 
   test "token subscriptions handle abort messages and idle checks" do
-    assert :ok = Web.AbortSignal.receive_abort(%{type: :token, token: :token}, 0)
+    assert :ok = Web.AbortSignal.receive_abort(%{type: :token, token: :token}, 0, true)
 
     send(self(), {:abort, :token, :boom})
-    assert {:error, :aborted} = Web.AbortSignal.receive_abort(%{type: :token, token: :token}, 0)
+
+    assert {:error, :aborted, :boom} =
+             Web.AbortSignal.receive_abort(%{type: :token, token: :token}, 0, true)
   end
 
   test "pid subscriptions handle direct abort messages" do
     {:ok, subscription} = Web.AbortSignal.subscribe(self())
 
     send(self(), {:abort, self(), :boom})
-    assert {:error, :aborted} = Web.AbortSignal.receive_abort(subscription, 0)
+    assert {:error, :aborted, :boom} = Web.AbortSignal.receive_abort(subscription, 0, true)
 
     assert :ok = Web.AbortSignal.unsubscribe(subscription)
   end
@@ -63,8 +65,8 @@ defmodule Web.AbortSignalTest do
     {:ok, subscription} = Web.AbortSignal.subscribe(controller.signal)
 
     assert :ok = Web.AbortController.abort(controller, :boom)
-    assert {:error, :aborted} = Web.AbortSignal.receive_abort(subscription, 100)
-    assert {:error, :aborted} = Web.AbortSignal.receive_abort(subscription, 100)
+    assert {:error, :aborted, _reason} = Web.AbortSignal.receive_abort(subscription, 100, true)
+    assert {:error, :aborted, _reason} = Web.AbortSignal.receive_abort(subscription, 100, true)
     assert :ok = Web.AbortSignal.unsubscribe(subscription)
   end
 
@@ -142,7 +144,7 @@ defmodule Web.AbortSignalTest do
   test "timeout/1 aborts the signal after the requested delay" do
     signal = Web.AbortSignal.timeout(10)
 
-    assert :ok = Web.AbortSignal.receive_abort(nil, 0)
+    assert :ok = Web.AbortSignal.receive_abort(nil, 0, true)
     assert {:error, :aborted} = Web.AbortSignal.subscribe(signal) |> wait_for_abort()
   end
 
@@ -213,11 +215,11 @@ defmodule Web.AbortSignalTest do
     assert_receive {:abort, ^ref, :timeout}
   end
 
-  test "receive_abort/2 normalizes reason-aware aborts" do
+  test "receive_abort/3 gives the reason of a token abort" do
     token_subscription = %{type: :token, token: :token}
     send(self(), {:abort, :token, :boom})
 
-    assert {:error, :aborted} = Web.AbortSignal.receive_abort(token_subscription, 0)
+    assert {:error, :aborted, :boom} = Web.AbortSignal.receive_abort(token_subscription, 0, true)
   end
 
   test "receive_abort/3 handles nil and timeout paths" do
@@ -488,9 +490,9 @@ defmodule Web.AbortSignalTest do
 
   defp wait_for_abort({:ok, subscription}) do
     Enum.reduce_while(1..20, :ok, fn _, _ ->
-      case Web.AbortSignal.receive_abort(subscription, 25) do
+      case Web.AbortSignal.receive_abort(subscription, 25, true) do
         :ok -> {:cont, :ok}
-        result -> {:halt, result}
+        {:error, :aborted, _reason} -> {:halt, {:error, :aborted}}
       end
     end)
   after

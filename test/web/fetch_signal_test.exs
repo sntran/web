@@ -124,6 +124,16 @@ defmodule Web.FetchSignalTest do
     Process.exit(alive_pid, :kill)
   end
 
+  test "a dispatcher of the caller runs with the signal of the request as the ambient signal" do
+    controller = Web.AbortController.new()
+
+    response =
+      await(Web.fetch("mock://slow", signal: controller.signal, dispatcher: SlowDispatcher))
+
+    assert response.status == 200
+    assert response.snapshot.ambient_signal == controller.signal
+  end
+
   test "fetch returns aborted immediately when given an already-aborted signal" do
     assert :manual_cancel =
              catch_exit(
@@ -152,11 +162,11 @@ defmodule Web.FetchSignalTest do
     Process.exit(server.pid, :kill)
   end
 
-  test "receive_abort/2 returns ok for an alive pid signal with no abort message" do
+  test "receive_abort/3 returns ok for an alive pid signal with no abort message" do
     alive_pid = spawn(fn -> Process.sleep(100) end)
     {:ok, subscription} = Web.AbortSignal.subscribe(alive_pid)
 
-    assert :ok = Web.AbortSignal.receive_abort(subscription, 0)
+    assert :ok = Web.AbortSignal.receive_abort(subscription, 0, true)
 
     Web.AbortSignal.unsubscribe(subscription)
     Process.exit(alive_pid, :kill)

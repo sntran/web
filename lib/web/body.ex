@@ -50,8 +50,8 @@ defmodule Web.Body do
 
   alias Web.FormData.Encoder
   alias Web.Internal.Bytes
-  alias Web.Internal.LazyStream
   alias Web.Internal.JSON, as: JSONText
+  alias Web.Internal.LazyStream
 
   @callback text(struct()) :: Web.Promise.t()
   @callback json(struct()) :: Web.Promise.t()
@@ -178,15 +178,14 @@ defmodule Web.Body do
 
       :later ->
         Web.Promise.new(fn resolve, reject ->
-          ensure_usable!(body)
-
-          case read_body_to_text(body) do
-            {:ok, text} -> resolve.(text)
-            {:error, reason} -> reject.(reason)
-          end
+          ensure_usable_stream!(body)
+          settle_with(read_body_to_text(body), resolve, reject)
         end)
     end
   end
+
+  defp settle_with({:ok, value}, resolve, _reject), do: resolve.(value)
+  defp settle_with({:error, reason}, _resolve, reject), do: reject.(reason)
 
   @doc false
   # The algorithm "parse JSON from bytes" of the Fetch Standard: the UTF-8
@@ -279,18 +278,16 @@ defmodule Web.Body do
 
       :later ->
         Web.Promise.new(fn resolve, reject ->
-          ensure_usable!(body)
-
-          case read_body_to_binary(body) do
-            {:ok, binary} ->
-              handle_consumed_body(mapper.(binary), resolve, reject)
-
-            {:error, reason} ->
-              reject.(reason)
-          end
+          ensure_usable_stream!(body)
+          consume_read(read_body_to_binary(body), mapper, resolve, reject)
         end)
     end
   end
+
+  defp consume_read({:ok, binary}, mapper, resolve, reject),
+    do: handle_consumed_body(mapper.(binary), resolve, reject)
+
+  defp consume_read({:error, reason}, _mapper, _resolve, reject), do: reject.(reason)
 
   defp handle_consumed_body({:ok, value}, resolve, _reject), do: resolve.(value)
   defp handle_consumed_body({:error, reason}, _resolve, reject), do: reject.(reason)
@@ -418,6 +415,11 @@ defmodule Web.Body do
           else: Web.Headers.__set_lower__(headers, "content-type", inferred)
     end
   end
+
+  # A stream with no process gives its own errors at the read: the change
+  # of its state and the check are one operation.
+  defp ensure_usable_stream!(%Web.ReadableStream{controller_pid: nil}), do: :ok
+  defp ensure_usable_stream!(body), do: ensure_usable!(body)
 
   defp ensure_usable!(body) do
     if Web.ReadableStream.disturbed?(body) do

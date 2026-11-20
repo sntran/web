@@ -51,16 +51,13 @@ defmodule Web.Headers do
 
   @doc false
   # The headers of a response from the HTTP client. The client gives each
-  # name in lower case, and it parsed each name and each value, thus only
-  # the bytes that a value must not have are examined.
+  # name in lower case, and it refuses a response with a name or a value
+  # that is not valid, for example a value with a NUL byte. Thus the names
+  # and the values need no second check.
   @spec __network__([{String.t(), String.t()}]) :: t()
   def __network__(list) when is_list(list) do
     data =
       Enum.reduce(list, %{}, fn {name, value}, data ->
-        if forbidden_value_byte?(value) do
-          raise Web.TypeError, "Invalid header value: #{inspect(value)}"
-        end
-
         Map.update(data, name, [value], &(&1 ++ [value]))
       end)
 

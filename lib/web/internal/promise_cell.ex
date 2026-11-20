@@ -44,16 +44,22 @@ defmodule Web.Internal.PromiseCell do
   @spec settled?() :: boolean()
   def settled?, do: Process.get(@key).status != :pending
 
+  @doc "The references of the processes that await the promise."
+  @spec waiters() :: [reference()]
+  def waiters, do: Process.get(@key).waiters
+
   @doc """
   Settles the promise, and gives the outcome to each process that awaits.
-  A second outcome has no effect.
+  A different process gave the outcome to the references of `delivered`
+  already. A second outcome has no effect.
   """
-  @spec settle(Web.Promise.outcome()) :: :ok
-  def settle(outcome) do
+  @spec settle(Web.Promise.outcome(), [reference()]) :: :ok
+  def settle(outcome, delivered \\ []) do
     case Process.get(@key) do
       %{status: :pending, waiters: waiters} = cell ->
-        Enum.each(waiters, &deliver(&1, outcome))
-        Process.put(@key, start_expiry(%{cell | status: outcome, waiters: []}, waiters != []))
+        for ref <- waiters, ref not in delivered, do: deliver(ref, outcome)
+        delivered? = waiters != [] or delivered != []
+        Process.put(@key, start_expiry(%{cell | status: outcome, waiters: []}, delivered?))
         :ok
 
       _settled ->
@@ -94,22 +100,23 @@ defmodule Web.Internal.PromiseCell do
 
   @doc """
   Keeps the outcome for the processes that await it, until the end of the
-  linger time or the end of the owner, and then the process stops. The
-  process hibernates while it waits: the VM makes its memory as small as
-  its data, thus a process that had a large heap for its work does not keep
-  it for the linger time.
+  linger time or the end of the owner, and then the process stops.
+
+  The process first lets the other processes run: a process that awaits
+  the outcome gets it at once. Then it hibernates: the VM makes its memory
+  as small as its data. Thus a process that had a large heap for its work
+  does not keep that heap for the linger time.
   """
   @spec linger() :: no_return()
   def linger do
     if Process.get(@key).done?, do: exit(:normal)
+    :erlang.yield()
     Process.flag(:min_heap_size, 233)
     wait()
   end
 
   @doc false
-  def wait do
-    :erlang.hibernate(__MODULE__, :wake, [])
-  end
+  def wait, do: :erlang.hibernate(__MODULE__, :wake, [])
 
   @doc false
   def wake do

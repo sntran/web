@@ -348,33 +348,6 @@ defmodule Web.AbortSignal do
   defp remembered_reason(ref) when is_reference(ref), do: Reasons.get(ref)
 
   @doc false
-  def receive_abort(nil, _timeout), do: :ok
-
-  def receive_abort(%{type: :abort_signal, pid: pid, ref: ref, monitor_ref: monitor_ref}, timeout) do
-    case receive_abort(
-           %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: monitor_ref},
-           timeout,
-           true
-         ) do
-      :ok -> :ok
-      {:error, :aborted, _reason} -> {:error, :aborted}
-    end
-  end
-
-  def receive_abort(%{type: :pid, pid: pid, monitor_ref: monitor_ref}, timeout) do
-    case receive_abort(%{type: :pid, pid: pid, monitor_ref: monitor_ref}, timeout, true) do
-      :ok -> :ok
-      {:error, :aborted, _reason} -> {:error, :aborted}
-    end
-  end
-
-  def receive_abort(%{type: :token, token: token}, timeout) do
-    case receive_abort(%{type: :token, token: token}, timeout, true) do
-      :ok -> :ok
-      {:error, :aborted, _reason} -> {:error, :aborted}
-    end
-  end
-
   def receive_abort(nil, _timeout, _with_reason?), do: :ok
 
   def receive_abort(

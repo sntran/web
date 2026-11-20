@@ -854,6 +854,26 @@ defmodule Web.StreamStandardTest do
       assert catch_exit(Web.await(ReadableStreamDefaultReader.read(reader))) == :failed
     end
 
+    test "a cancel after a close discards the chunks and calls the cancel callback" do
+      # The stream is readable, with a close request, until a read takes the
+      # last chunk. A cancel at that time discards the chunks, and the
+      # source gets the cancel.
+      test = self()
+
+      stream =
+        ReadableStream.new(%{
+          start: fn controller ->
+            ReadableStreamDefaultController.enqueue(controller, :chunk)
+            ReadableStreamDefaultController.close(controller)
+          end,
+          cancel: fn reason -> send(test, {:canceled, reason}) end
+        })
+
+      assert Web.await(ReadableStream.cancel(stream, :no_more)) == :ok
+      assert_receive {:canceled, :no_more}
+      assert Enum.to_list(stream) == []
+    end
+
     test "an error after a close and the last read has no effect" do
       {stream, controller} = controller_of()
       assert ReadableStreamDefaultController.enqueue(controller, :chunk) == :ok

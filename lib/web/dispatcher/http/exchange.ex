@@ -34,6 +34,7 @@ defmodule Web.Dispatcher.HTTP.Exchange do
 
   alias Web.Dispatcher.HTTP.Multiplex
   alias Web.Dispatcher.HTTP.Pool
+  alias Web.Internal.Address
   alias Web.Internal.Bytes
   alias Web.Internal.ContentDecoder
 
@@ -228,6 +229,15 @@ defmodule Web.Dispatcher.HTTP.Exchange do
       skip_target_validation: true,
       transport_opts: [timeout: Web.Application.connect_timeout()] ++ tls
     ]
+  end
+
+  @doc false
+  # Opens a connection of the HTTP client. An IP address goes as a tuple:
+  # see `Web.Internal.Address`.
+  @spec mint_connect(:http | :https, String.t(), :inet.port_number(), keyword()) ::
+          {:ok, Mint.HTTP.t()} | {:error, term()}
+  def mint_connect(scheme, host, port, options) do
+    Mint.HTTP.connect(scheme, Address.mint(host), port, Address.mint_options(host, options))
   end
 
   @doc false
@@ -446,7 +456,7 @@ defmodule Web.Dispatcher.HTTP.Exchange do
     pid =
       spawn_link(fn ->
         result =
-          with {:ok, conn} <- Mint.HTTP.connect(scheme, host, port, options),
+          with {:ok, conn} <- mint_connect(scheme, host, port, options),
                do: Mint.HTTP.controlling_process(conn, owner)
 
         send(owner, {ref, result})

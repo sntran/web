@@ -94,7 +94,7 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
       |> Exchange.connect_options([:http2])
       |> Keyword.merge(mode: :active, client_settings: [enable_push: false])
 
-    case Mint.HTTP.connect(scheme, host, port, options) do
+    case Exchange.mint_connect(scheme, host, port, options) do
       {:ok, conn} ->
         {:noreply, %{state | conn: conn}}
 

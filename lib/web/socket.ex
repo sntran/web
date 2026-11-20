@@ -51,6 +51,7 @@ defmodule Web.Socket do
   use GenServer, restart: :temporary
 
   alias Web.ByteLengthQueuingStrategy
+  alias Web.Internal.Address
   alias Web.Internal.Bytes
   alias Web.Internal.MessageTarget
   alias Web.Promise
@@ -278,7 +279,7 @@ defmodule Web.Socket do
       holder_pid: holder_pid,
       holder_monitor: Process.monitor(holder_pid),
       host: host,
-      endpoint: String.to_charlist(host),
+      endpoint: Address.endpoint(host),
       port: port,
       options: options,
       secure_transport: Map.get(options, :secure_transport, "off"),
@@ -646,7 +647,7 @@ defmodule Web.Socket do
   end
 
   defp socket_info(state) do
-    %{remoteAddress: "#{state.host}:#{state.port}", localAddress: nil, alpn: nil}
+    %{remoteAddress: Address.format(state.host, state.port), localAddress: nil, alpn: nil}
   end
 
   defp tcp_connect_options(options) do
@@ -672,7 +673,7 @@ defmodule Web.Socket do
     |> Keyword.put_new(:mode, :binary)
     |> Keyword.put_new(:packet, :raw)
     |> Keyword.put_new(:verify, :verify_peer)
-    |> Keyword.put_new(:server_name_indication, String.to_charlist(host))
+    |> Keyword.put_new(:server_name_indication, String.to_charlist(Address.hostname(host)))
     |> add_trust_options()
   end
 
@@ -798,16 +799,14 @@ defmodule Web.Socket do
     :ok
   end
 
+  # An IPv6 address in the text of an address has brackets, as in a URL:
+  # `"[::1]:8080"`.
   defp normalize_address!(address) when is_binary(address) do
-    case String.split(address, ":", parts: 2) do
-      [host, port_text] when host != "" and port_text != "" ->
-        case Integer.parse(port_text) do
-          {port, ""} when port in 0..65_535 -> {host, port}
-          _ -> raise(TypeError.exception("SocketError: invalid address"))
-        end
-
-      _ ->
-        raise(TypeError.exception("SocketError: invalid address"))
+    with {host, port_text} when host != "" and port_text != "" <- split_address(address),
+         {port, ""} when port in 0..65_535 <- Integer.parse(port_text) do
+      {host, port}
+    else
+      _invalid -> raise(TypeError.exception("SocketError: invalid address"))
     end
   end
 
@@ -837,6 +836,20 @@ defmodule Web.Socket do
 
   defp normalize_address!(_address) do
     raise(TypeError.exception("SocketError: invalid address"))
+  end
+
+  defp split_address("[" <> rest) do
+    case String.split(rest, "]:", parts: 2) do
+      [host, port_text] -> {"[" <> host <> "]", port_text}
+      _other -> :error
+    end
+  end
+
+  defp split_address(address) do
+    case String.split(address, ":", parts: 2) do
+      [host, port_text] -> {host, port_text}
+      _other -> :error
+    end
   end
 
   defp normalize_options(options) when is_list(options),

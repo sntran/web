@@ -18,6 +18,7 @@ defmodule Web.Dispatcher.TCP.Connection do
 
   @behaviour Web.Dispatcher.RequestProcess
 
+  alias Web.Internal.Address
   alias Web.Internal.Bytes
 
   @state {__MODULE__, :state}
@@ -111,7 +112,7 @@ defmodule Web.Dispatcher.TCP.Connection do
     pid =
       spawn_link(fn ->
         result =
-          with {:ok, socket} <- :gen_tcp.connect(String.to_charlist(host), port, options, timeout),
+          with {:ok, socket} <- :gen_tcp.connect(Address.endpoint(host), port, options, timeout),
                :ok <- :gen_tcp.controlling_process(socket, owner),
                do: {:ok, socket}
 

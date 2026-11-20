@@ -1558,11 +1558,6 @@ defmodule Web.Stream do
     end
   end
 
-  defp controller_enqueue(from, chunk, state, data) do
-    {:keep_state, new_data, actions} = handle_producer_enqueue(chunk, state, data)
-    {:keep_state, new_data, [{:reply, from, :ok} | actions]}
-  end
-
   # The steps of ReadableStreamDefaultControllerEnqueue after the size
   # function. The function can change the stream. A chunk with a valid size
   # goes to the end of the queue, also when a read waits. A chunk for a
@@ -1939,33 +1934,6 @@ defmodule Web.Stream do
     case enqueue_default(chunk, data) do
       {:ok, data} -> {:keep_state, data, [{:next_event, :internal, :maybe_pull}]}
       {:error, reason} -> fail_stream(reason, data)
-    end
-  end
-
-  defp handle_producer_enqueue(chunk, _state, data) do
-    chunk_size = queue_chunk_size(data, chunk)
-    new_data = put_chunk(data, chunk, chunk_size)
-
-    case :queue.out(new_data.read_requests) do
-      {{:value, from}, new_requests} ->
-        {{:value, c}, new_queue} = :queue.out(new_data.queue)
-        # The chunk is consumed immediately — undo the size increment so
-        # total_queued_size stays accurate (chunk never resided in the queue).
-        new_data = %{
-          new_data
-          | read_requests: new_requests,
-            queue: new_queue,
-            total_queued_size: new_data.total_queued_size - chunk_size
-        }
-
-        new_data = refresh_backpressure(new_data)
-        :gen_statem.reply(from, {:ok, default_read_chunk(data, c)})
-
-        {:keep_state, new_data, [{:next_event, :internal, :maybe_pull}]}
-
-      {:empty, _} ->
-        new_data = refresh_backpressure(new_data)
-        {:keep_state, new_data, [{:next_event, :internal, :maybe_pull}]}
     end
   end
 
@@ -3410,27 +3378,13 @@ defmodule Web.Stream do
     {:keep_state, data, []}
   end
 
-  # The size of an entry of the queue. The queue of a byte stream holds
-  # binaries, thus a BYOB read can take a part of a chunk. The queue of a
-  # default stream holds `{chunk, size}`, as the Streams Standard specifies:
-  # the size function of the user runs one time for each chunk.
-  defp queue_chunk_size(%{stream_type: :bytes, strategy: strategy}, chunk) do
-    strategy_size(strategy, chunk)
-  end
-
+  # The size of an entry of the queue. The queue of a default stream holds
+  # `{chunk, size}`, as the Streams Standard specifies: the size function of
+  # the user runs one time for each chunk. A byte stream has its own queue:
+  # see `Web.Internal.ByteStreamController`.
   defp queue_chunk_size(_data, {_chunk, size}), do: size
 
-  defp strategy_size(%{__struct__: strategy}, chunk), do: strategy.size(chunk)
-
   # Puts a chunk of a valid size at the end of the queue.
-  defp put_chunk(%{stream_type: :bytes} = data, chunk, size) do
-    %{
-      data
-      | queue: :queue.in(chunk, data.queue),
-        total_queued_size: data.total_queued_size + size
-    }
-  end
-
   defp put_chunk(data, chunk, size) do
     %{
       data

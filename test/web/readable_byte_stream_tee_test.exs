@@ -79,11 +79,14 @@ defmodule Web.ReadableByteStreamTeeTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 2_000
   end
 
+  # A pull that comes during a read of the other branch is rare: about one
+  # case in 300 had it, thus the property has many runs.
   property "gives all the bytes to the two branches, for each kind and size of the reads" do
     check all(
             chunks <- list_of(binary(min_length: 1, max_length: 6), max_length: 6),
             left_size <- one_of([constant(:default), integer(1..4)]),
-            right_size <- one_of([constant(:default), integer(1..4)])
+            right_size <- one_of([constant(:default), integer(1..4)]),
+            max_runs: 500
           ) do
       {_stream, controller, left, right} = tee()
       Enum.each(chunks, &Controller.enqueue(controller, &1))

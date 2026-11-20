@@ -16,10 +16,10 @@ defmodule Web.Internal.ReadableByteStreamTee do
   #     response of that branch, and the other branch gets a copy.
   #   * The process changes the reader of the source when the kind of the
   #     read changes.
-  #   * A pull during a read has no effect. The read gives bytes to the two
-  #     branches, and each branch pulls again if it wants more bytes: this
-  #     has the effect of the flags `readAgainForBranch1` and
-  #     `readAgainForBranch2`.
+  #   * A pull during a read is done after the read, if the branch still
+  #     wants bytes: the flags `readAgainForBranch1` and
+  #     `readAgainForBranch2`. The pull callback of a branch does not wait,
+  #     thus the branch does not pull again by itself.
   #   * When the source ends or has an error, the two branches end or get
   #     the error. When the two branches are cancelled, the source is
   #     cancelled with the list of the two reasons.
@@ -94,7 +94,9 @@ defmodule Web.Internal.ReadableByteStreamTee do
           canceled: %{},
           complete_waiters: [],
           result: :ok,
-          source_monitor: nil
+          source_monitor: nil,
+          # The branches that pulled during the read that is in progress.
+          read_again: MapSet.new()
         }
 
         {:ok, state}
@@ -135,8 +137,8 @@ defmodule Web.Internal.ReadableByteStreamTee do
     {:noreply, state}
   end
 
-  def handle_cast({:pull, _index, _request}, %{read: {_id, _kind}} = state) do
-    {:noreply, state}
+  def handle_cast({:pull, index, _request}, %{read: {_id, _kind}} = state) do
+    {:noreply, %{state | read_again: MapSet.put(state.read_again, index)}}
   end
 
   # A pull is a message, thus it can come after a read that gave the branch
@@ -217,7 +219,8 @@ defmodule Web.Internal.ReadableByteStreamTee do
     case {read, closed} do
       {{:reply, reply}, _closed} ->
         {_id, kind} = state.read
-        handle_read(kind, reply, %{state | read: nil})
+        {:noreply, state} = handle_read(kind, reply, %{state | read: nil})
+        {:noreply, read_again(state)}
 
       {_read, {:reply, {:error, {:errored, reason}}}} ->
         {:noreply, fail_branches(reason, %{state | closed_request: nil})}
@@ -279,6 +282,24 @@ defmodule Web.Internal.ReadableByteStreamTee do
   # The error steps. The reply to the request for the end of the reader
   # gives the error to the branches.
   defp handle_read(_kind, {:error, _reason}, state), do: {:noreply, state}
+
+  # readAgainForBranch1, then readAgainForBranch2: the first branch that
+  # pulled during the read, and still wants bytes, pulls now with its BYOB
+  # request of now. The flag of the other branch stays for the next read.
+  defp read_again(%{read: nil, source_monitor: nil} = state) do
+    wants? = &(active?(state, &1) and branch_wants_chunk?(state, &1))
+
+    case Enum.find(Enum.sort(state.read_again), wants?) do
+      nil ->
+        %{state | read_again: MapSet.new()}
+
+      index ->
+        request = ReadableByteStreamController.byob_request(controller(state, index))
+        pull_branch(index, request, %{state | read_again: MapSet.delete(state.read_again, index)})
+    end
+  end
+
+  defp read_again(state), do: state
 
   # ReadableByteStreamControllerRespond(controller, 0) for a branch with
   # pending pull-into descriptors, after its close.

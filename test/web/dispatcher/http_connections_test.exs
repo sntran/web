@@ -439,9 +439,13 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
       url = closing_server()
       assert await(Response.text(await(fetch(url)))) == "first"
 
+      # The reason of the error depends on the time of the close: the client
+      # can see it when it sends the body (for example `:einval`), or when it
+      # reads the response (`:closed`). A request that goes again gets the
+      # answer "second" and does not fail.
       body = ReadableStream.from(["one", "two"])
       error = catch_exit(await(fetch(url, method: "POST", body: body, duplex: "half")))
-      assert %TypeError{cause: %Mint.TransportError{reason: :closed}} = error
+      assert %TypeError{cause: %Mint.TransportError{}} = error
     end
   end
 

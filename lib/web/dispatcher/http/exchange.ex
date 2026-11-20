@@ -563,15 +563,17 @@ defmodule Web.Dispatcher.HTTP.Exchange do
 
   defp done(state), do: put(%{state | phase: :done, deadline: :infinity})
 
+  # The process asks for no message after the end of the response, thus
+  # the socket is in its passive mode already: see `next_message/1`.
   defp checkin(state) do
     conn = state.conn
 
     message =
-      with {:ok, conn} <- Mint.HTTP.set_mode(conn, :passive),
-           {:ok, conn} <- Mint.HTTP.controlling_process(conn, state.pool) do
-        {:checkin, state.slot, conn}
-      else
-        _error ->
+      case Mint.HTTP.controlling_process(conn, state.pool) do
+        {:ok, conn} ->
+          {:checkin, state.slot, conn}
+
+        {:error, _reason} ->
           Mint.HTTP.close(conn)
           {:checkin, state.slot, :closed}
       end

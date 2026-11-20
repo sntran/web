@@ -637,6 +637,9 @@ easy to make and hard to find with an example test:
 | `StreamLifetime.tla` | When a stream process stops, and when it must stay.        |
 | `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
 | `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |
+| `ConnectionPool.tla` | The connections of an origin: the limit, the queue, and the stops. |
+| `SocketFlow.tla`     | A request reads its socket one message at a time, at the limit. |
+| `SharedConnection.tla` | HTTP/2 streams: one run of each request, the limit, GOAWAY. |
 | `MessagePort.tla`    | The port message queue, the start, the transfer, and the close. |
 | `BroadcastChannel.tla` | The channels of one name, with a channel that is slow.   |
 | `Disposal.tla`       | The blocks of `using`: each resource is released one time. |
@@ -647,7 +650,9 @@ easy to make and hard to find with an example test:
 [`accord`](https://github.com/sntran/accord), which is written in Elixir and
 needs no Java. The tests in `test/tla/` also do random operations on the
 real code and on the specification together, and compare the two states
-after each step.
+after each step. Where the real system has steps that a test cannot
+control, such as the frames of an HTTP/2 server, a property test checks the
+properties of the specification on the real code.
 
 Each specification has a constant `Bug`. Each of its values removes one
 rule of the design, and a test makes sure that the checker finds it.

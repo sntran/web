@@ -47,6 +47,14 @@ defmodule Web.Internal.LazyStreamTest do
       assert ReadableStream.get_reader(stream) |> read_all() == []
     end
 
+    test "a cancel of a stream that was read to its end has no effect" do
+      stream = ReadableStream.from("hello")
+      assert Enum.map(stream, &Uint8Array.to_binary/1) == ["hello"]
+
+      assert :ok = Web.await(ReadableStream.cancel(stream))
+      assert LazyStream.state(stream.lazy) == :consumed
+    end
+
     test "a cancel after the start of the process cancels the process" do
       stream = ReadableStream.from("hello")
       reader = ReadableStream.get_reader(stream)

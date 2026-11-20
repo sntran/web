@@ -1,7 +1,8 @@
 defmodule Web.FetchContentEncodingTest do
   # `fetch` decodes the content codings of a response body, as the Fetch
-  # Standard specifies. The server is Bandit.
-  use ExUnit.Case, async: true
+  # Standard specifies. The server is Bandit. A test measures the memory of
+  # the VM, thus the tests do not run at the same time as other tests.
+  use ExUnit.Case, async: false
   use ExUnitProperties
   use Web
 

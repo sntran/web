@@ -707,13 +707,25 @@ defmodule Web.Dispatcher.HTTP.Exchange do
     state
   end
 
+  # The request does not read its body to the end: the stream of the body
+  # stops. The response can come before the end of the body, thus the
+  # stream stops only when the request stops to send it.
   defp kill_pump(%{pump: {pid, _ref}} = state) do
     Process.unlink(pid)
     Process.exit(pid, :kill)
+    release_body(state.body)
     %{state | pump: nil}
   end
 
   defp kill_pump(state), do: state
+
+  # A body of `Web.Request.new/2` is a stream, and the stream has a process
+  # after the start of its read.
+  defp release_body({:stream, stream}) do
+    with %Web.ReadableStream{} <- stream,
+         {:ok, pid} <- Web.ReadableStream.__process__(stream),
+         do: Web.Stream.terminate_and_wait(pid, :cancel, :request_complete)
+  end
 
   # ---------------------------------------------------------------------------
   # The end of the request

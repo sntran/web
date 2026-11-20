@@ -186,7 +186,6 @@ defmodule Web.Dispatcher.HTTP do
     case Exchange.start(request) do
       :ok ->
         head = await_head(context)
-        release_request_body(request)
         handle_head(head, request, redirect_count, context)
 
       {:error, reason} ->
@@ -705,23 +704,4 @@ defmodule Web.Dispatcher.HTTP do
       |> Keyword.put(:dispatcher, request.dispatcher)
     )
   end
-
-  # ---------------------------------------------------------------------------
-  # Request body
-  # ---------------------------------------------------------------------------
-
-  # The request is complete or it failed. Cancel a body stream that the
-  # request did not read to its end, thus the stream stops.
-  defp release_request_body(%Web.Request{body: %Web.ReadableStream{controller_pid: pid}})
-       when is_pid(pid) do
-    Web.Stream.terminate_and_wait(pid, :cancel, :request_complete)
-  end
-
-  # A body with no process holds nothing.
-  defp release_request_body(%Web.Request{body: %Web.ReadableStream{} = body}) do
-    _promise = ReadableStream.cancel(body, :request_complete)
-    :ok
-  end
-
-  defp release_request_body(_request), do: :ok
 end

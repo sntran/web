@@ -51,6 +51,20 @@ All notable changes to this project are documented in this file.
 - The content decoder gives its output only as the reader takes it: the
   process of the request keeps 64 KiB of decoded data at most, also for a
   small compressed body that expands much.
+- With `[:http2]`, a request in the queue of a connection that closes did
+  not go to the server: it goes again on a new connection. A new
+  connection has one stream until the settings of the server come, thus
+  the client does not open more streams than the server allows. After an
+  error of a frame, the connection still sees the close of the server: a
+  request does not wait until the receive timeout.
+- A response that comes before the end of a request body from a stream
+  does not fail: the request stops to read the body stream only when it
+  stops to send the body.
+- The TLA+ specifications `tla/ConnectionPool.tla`, `tla/SocketFlow.tla`,
+  and `tla/SharedConnection.tla`, with a conformance test of the pool, a
+  conformance test of the reads of the socket, and property tests of the
+  shared HTTP/2 connection and of the content decoder. A property test
+  checks the properties of `tla/ResponseBody.tla` on the real body.
 - The path of the URL goes to the server with no change, as in a browser:
   the HTTP client does not check it again. For example, a path can have
   `|`.

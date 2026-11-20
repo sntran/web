@@ -14,10 +14,12 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
   #     waits for the server to make the window larger.
   #   * The process monitors each process of a request. A request whose
   #     process stops is cancelled.
-  #   * When the connection fails, each request gets the error, and the
-  #     process stops. When the server closes the connection for new
+  #   * When the connection fails, each request on it gets the error, and
+  #     the process stops. When the server closes the connection for new
   #     streams, the next requests use a new process. Thus a connection
-  #     that closes never takes new requests.
+  #     that closes never takes new requests. A request in the queue did not
+  #     go to the server: it gets `:unprocessed`, and goes again on a new
+  #     connection. See `tla/SharedConnection.tla`.
   #
   # The messages of a request: `{:request, pid, ref, {method, path,
   # headers, body}}`, then `{:body, ref, chunk}` and `{:body, ref, :eof}`
@@ -31,6 +33,8 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
 
   @registry Web.Dispatcher.HTTP.Registry
   @supervisor Web.Dispatcher.HTTP.Connections
+
+  @unprocessed %Mint.HTTPError{module: Mint.HTTP2, reason: :unprocessed}
 
   @doc false
   def child_spec(origin) do
@@ -68,6 +72,8 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
       origin: origin,
       conn: nil,
       failed: nil,
+      # The settings of the server came: they come in its first frame.
+      ready?: false,
       # The requests by the reference of the process of the request, the
       # references of the HTTP client, the monitors, and the queue.
       entries: %{},
@@ -171,11 +177,20 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
         state
 
       {:ok, conn, responses} ->
-        %{state | conn: conn} |> deliver(responses) |> write_all() |> check()
+        %{state | conn: conn, ready?: true} |> deliver(responses) |> write_all() |> check()
 
+      # The client does not ask the socket for the next message after an
+      # error, for example a GOAWAY with an error code: the process asks
+      # for it, thus it sees the close of the server.
       {:error, conn, reason, responses} ->
-        state = %{state | conn: conn} |> deliver(responses)
-        if Mint.HTTP.open?(conn, :read), do: check(state), else: fail_all(state, reason)
+        state = %{state | conn: conn, ready?: true} |> deliver(responses)
+
+        with true <- Mint.HTTP.open?(conn, :read),
+             {:ok, conn} <- Mint.HTTP.set_mode(conn, :active) do
+          check(%{state | conn: conn})
+        else
+          _closed -> fail_all(state, reason)
+        end
     end
     |> noreply()
   end
@@ -186,17 +201,18 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
   # The requests in the queue start while the server allows more streams.
   defp start_queued(state) do
     with {{:value, ref}, queue} <- :queue.out(state.queue),
-         true <- stream_allowed?(state.conn) do
+         true <- stream_allowed?(state) do
       %{state | queue: queue} |> open_stream(Map.fetch!(state.entries, ref)) |> start_queued()
     else
       _no -> state
     end
   end
 
-  defp stream_allowed?(conn) do
-    Mint.HTTP.open?(conn) and
-      Mint.HTTP.open_request_count(conn) <
-        Mint.HTTP2.get_server_setting(conn, :max_concurrent_streams)
+  # Before the settings of the server, the client does not know its limit:
+  # the connection has one stream.
+  defp stream_allowed?(%{conn: conn, ready?: ready?}) do
+    limit = if ready?, do: Mint.HTTP2.get_server_setting(conn, :max_concurrent_streams), else: 1
+    Mint.HTTP.open?(conn) and Mint.HTTP.open_request_count(conn) < limit
   end
 
   defp open_stream(state, entry) do
@@ -324,7 +340,7 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
 
   # After each change: the queue gets the free streams. A connection that
   # does not take new streams stops when no stream of it runs: the requests
-  # in the queue get an error.
+  # in the queue go again on a new connection.
   defp check(state) do
     cond do
       not Mint.HTTP.open?(state.conn, :read) ->
@@ -337,14 +353,17 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
         Registry.unregister(@registry, key(state.origin))
 
         if Enum.all?(Map.values(state.entries), &(&1.request_ref == nil)),
-          do: fail_all(state, %Mint.HTTPError{module: Mint.HTTP2, reason: :closed_for_writing}),
+          do: fail_all(state, @unprocessed),
           else: state
     end
   end
 
+  # A request in the queue did not go to the server: it gets the error
+  # `:unprocessed`, and goes again on a new connection.
   defp fail_all(state, reason) do
     for {_ref, entry} <- state.entries do
-      send(entry.pid, {entry.ref, :events, [{:error, reason}]})
+      error = if entry.request_ref == nil, do: @unprocessed, else: reason
+      send(entry.pid, {entry.ref, :events, [{:error, error}]})
     end
 
     {:stop, :normal, state}

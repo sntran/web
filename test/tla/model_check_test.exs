@@ -295,4 +295,75 @@ defmodule Web.TLA.ModelCheckTest do
       )
     end
   end
+
+  describe "ConnectionPool" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("ConnectionPool"))
+    end
+
+    test "a pool with no limit is found" do
+      assert_violates(SpecModel.check("ConnectionPool", bug("no_limit")), "SlotsBounded")
+    end
+
+    test "a slot that stays after its process stopped is found" do
+      assert_violates(SpecModel.check("ConnectionPool", bug("no_down_cleanup")), "SlotsMatch")
+    end
+
+    test "a connection that goes idle while a process waits is found" do
+      assert_violates(
+        SpecModel.check("ConnectionPool", bug("serve_ignored")),
+        "WaitOnlyWhenFull"
+      )
+    end
+  end
+
+  describe "SocketFlow" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("SocketFlow"))
+    end
+
+    test "the design has all its properties with a larger limit" do
+      assert_holds(SpecModel.check("SocketFlow", [{"Limit = 2", "Limit = 3"}]))
+    end
+
+    test "a process that asks while a message is in its mailbox is found" do
+      assert_violates(SpecModel.check("SocketFlow", bug("ask_with_message")), "MailboxBounded")
+    end
+
+    test "a process that reads with no limit is found" do
+      assert_violates(SpecModel.check("SocketFlow", bug("no_backpressure")), "BufferBounded")
+    end
+
+    test "a process that reads its socket after the end of the response is found" do
+      assert_violates(SpecModel.check("SocketFlow", bug("ask_after_end")), "NoReadAfterEnd")
+    end
+  end
+
+  describe "SharedConnection" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("SharedConnection"))
+    end
+
+    test "the design has all its properties with two streams" do
+      assert_holds(SpecModel.check("SharedConnection", [{"MaxStreams = 1", "MaxStreams = 2"}]))
+    end
+
+    test "a request that goes again after the server processed it is found" do
+      assert_violates(
+        SpecModel.check("SharedConnection", bug("retry_processed")),
+        "AtMostOnce"
+      )
+    end
+
+    test "a connection with more streams than the server allows is found" do
+      assert_violates(SpecModel.check("SharedConnection", bug("no_limit")), "StreamsBounded")
+    end
+
+    test "a request in the queue that fails at a GOAWAY is found" do
+      assert_violates(
+        SpecModel.check("SharedConnection", bug("fail_queued")),
+        "ErrorOnlyAfterFailure"
+      )
+    end
+  end
 end

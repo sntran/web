@@ -252,4 +252,50 @@ defmodule Web.Internal.ContentDecoderTest do
       assert decode(decoder(coding), split(encoded, sizes)) == data
     end
   end
+
+  # The process of a request pulls only while its reader has space: the
+  # pulls come at random times between the chunks. See
+  # `tla/SocketFlow.tla`.
+  property "each sequence of pushes and pulls gives the input, in small pieces" do
+    check all(
+            parts <-
+              list_of(
+                one_of([
+                  binary(max_length: 3_000),
+                  map(integer(1..200_000), &:binary.copy(<<0>>, &1))
+                ]),
+                max_length: 6
+              ),
+            coding <- member_of(@codings),
+            sizes <- list_of(integer(1..8_192), max_length: 20),
+            pulls <- list_of(integer(0..3), min_length: 1, max_length: 20),
+            max_runs: 150
+          ) do
+      data = IO.iodata_to_binary(parts)
+      chunks = split(encode(coding, data), sizes)
+
+      {pieces, stages} =
+        chunks
+        |> Enum.zip(Stream.cycle(pulls))
+        |> Enum.reduce({[], decoder(coding)}, fn {chunk, count}, {pieces, stages} ->
+          pull_times(Decoder.push(stages, chunk), pieces, count)
+        end)
+
+      {:done, pieces, _stages} = drain(Decoder.finish(stages), pieces)
+      pieces = Enum.reverse(pieces)
+
+      assert IO.iodata_to_binary(pieces) == data
+      assert Enum.all?(pieces, &(byte_size(&1) < 200_000))
+    end
+  end
+
+  # Pulls at most `count` pieces. The decoder keeps the rest.
+  defp pull_times(stages, pieces, 0), do: {pieces, stages}
+
+  defp pull_times(stages, pieces, count) do
+    case Decoder.pull(stages) do
+      {:piece, piece, stages} -> pull_times(stages, [piece | pieces], count - 1)
+      {:more, stages} -> {pieces, stages}
+    end
+  end
 end

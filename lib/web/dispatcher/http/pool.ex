@@ -37,10 +37,10 @@ defmodule Web.Dispatcher.HTTP.Pool do
   end
 
   @doc false
-  def start_link(origin) do
-    GenServer.start_link(__MODULE__, origin,
-      name: {:via, Registry, {@registry, {__MODULE__, origin}}}
-    )
+  # A test gives a smaller size: see `test/tla/connection_pool_conformance_test.exs`.
+  def start_link(origin, size \\ @size) do
+    name = {:via, Registry, {@registry, {__MODULE__, origin}}}
+    GenServer.start_link(__MODULE__, {origin, size}, name: name)
   end
 
   @doc "The pool of an origin. The pool starts at the first request."
@@ -62,8 +62,8 @@ defmodule Web.Dispatcher.HTTP.Pool do
   end
 
   @impl true
-  def init(origin) do
-    {:ok, %{origin: origin, idle: [], slots: %{}, owners: %{}, waiting: :queue.new()}}
+  def init({origin, size}) do
+    {:ok, %{origin: origin, size: size, idle: [], slots: %{}, owners: %{}, waiting: :queue.new()}}
   end
 
   @impl true
@@ -139,7 +139,7 @@ defmodule Web.Dispatcher.HTTP.Pool do
       {:none, idle} ->
         state = %{state | idle: idle}
 
-        if length(idle) + map_size(state.slots) < @size do
+        if length(idle) + map_size(state.slots) < state.size do
           send(pid, {slot, :connect})
           borrow(state, waiter)
         else
@@ -189,7 +189,7 @@ defmodule Web.Dispatcher.HTTP.Pool do
   defp serve(state) do
     case :queue.out(state.waiting) do
       {{:value, waiter}, waiting} ->
-        if state.idle != [] or length(state.idle) + map_size(state.slots) < @size,
+        if state.idle != [] or length(state.idle) + map_size(state.slots) < state.size,
           do: %{state | waiting: waiting} |> grant(waiter) |> serve(),
           else: state
 

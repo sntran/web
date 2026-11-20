@@ -594,6 +594,9 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
     end
 
     test "gives an error to a request whose body cannot go on the connection", context do
+      # The frames of the start of the connection come before the request.
+      assert await(fetch(context.base <> "/")).status == 200
+      mux = multiplex(context)
       test = self()
 
       chunks =
@@ -610,12 +613,31 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
       promise = fetch(context.base <> "/size", method: "POST", body: body, duplex: "half")
       assert_receive :second, 2_000
 
-      mux = multiplex(context)
+      # When its handler reads the first chunk, the server makes the window
+      # of the stream larger. Then the second chunk is the only message of
+      # the process of the connection when the socket closes: the process
+      # writes it.
+      eventually(fn -> stream_window(mux, promise.pid) > 65_535 end)
+
       ref = Process.monitor(mux)
-      :erlang.port_close(Mint.HTTP.get_socket(:sys.get_state(mux).conn))
+      socket = Mint.HTTP.get_socket(:sys.get_state(mux).conn)
+      :erlang.suspend_process(mux)
+
+      eventually(fn ->
+        match?({:messages, [{:body, _ref, "chunk"}]}, Process.info(mux, :messages))
+      end)
+
+      :erlang.port_close(socket)
+      :erlang.resume_process(mux)
 
       assert %TypeError{} = catch_exit(await(promise))
       assert_receive {:DOWN, ^ref, :process, ^mux, :normal}, 2_000
+    end
+
+    defp stream_window(mux, pid) do
+      state = :sys.get_state(mux)
+      [entry] = for {_ref, %{pid: ^pid} = entry} <- state.entries, do: entry
+      Mint.HTTP2.get_window_size(state.conn, {:request, entry.request_ref})
     end
 
     test "stops when the server closes it for new streams, and the request goes on a new one" do
@@ -711,7 +733,7 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
       {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
       {:ok, port} = :inet.port(listener)
       server = spawn_link(fn -> silent_server(listener) end)
-      %{base: "https://localhost:#{port}", server: server}
+      %{base: "https://localhost:#{port}", server: server, origin: origin(port, :https)}
     end
 
     defp silent_server(listener) do
@@ -723,6 +745,15 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
       controller = AbortController.new()
       aborted = fetch(context.base <> "/", signal: controller.signal)
       waiting = fetch(context.base <> "/")
+
+      # The two requests wait in the mailbox while the process connects.
+      # Then the cancel of the abort waits there too.
+      eventually(fn ->
+        case Registry.lookup(Web.Dispatcher.HTTP.Registry, {Multiplex, context.origin}) do
+          [{mux, _value}] -> queue_length(mux) == 2
+          [] -> false
+        end
+      end)
 
       AbortController.abort(controller, :stop)
       assert catch_exit(await(aborted)) == :stop

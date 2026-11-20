@@ -1,19 +1,19 @@
 {
   "harness": "OK",
   "failures": {
-    "UTF-32 with BOM should decode as UTF-16LE": "runner: no XMLHttpRequest",
-    "UTF-32 with no BOM should decode as UTF-8": "runner: no XMLHttpRequest",
-    "UTF-32LE with BOM should decode as UTF-16LE": "runner: no XMLHttpRequest",
-    "UTF-32LE with no BOM should decode as UTF-8": "runner: no XMLHttpRequest",
-    "UTF-32be with BOM should decode as UTF-8": "runner: no XMLHttpRequest",
-    "UTF-32be with no BOM should decode as UTF-8": "runner: no XMLHttpRequest",
-    "UTF-7 should not be supported": "runner: no XMLHttpRequest",
-    "utf-32 with BOM should decode as UTF-16LE": "runner: no XMLHttpRequest",
-    "utf-32 with no BOM should decode as UTF-8": "runner: no XMLHttpRequest",
-    "utf-32be with BOM should decode as UTF-8": "runner: no XMLHttpRequest",
-    "utf-32be with no BOM should decode as UTF-8": "runner: no XMLHttpRequest",
-    "utf-32le with BOM should decode as UTF-16LE": "runner: no XMLHttpRequest",
-    "utf-32le with no BOM should decode as UTF-8": "runner: no XMLHttpRequest",
-    "utf-7 should not be supported": "runner: no XMLHttpRequest"
+    "UTF-32 with BOM should decode as UTF-16LE": "scope: the library has no XMLHttpRequest",
+    "UTF-32 with no BOM should decode as UTF-8": "scope: the library has no XMLHttpRequest",
+    "UTF-32LE with BOM should decode as UTF-16LE": "scope: the library has no XMLHttpRequest",
+    "UTF-32LE with no BOM should decode as UTF-8": "scope: the library has no XMLHttpRequest",
+    "UTF-32be with BOM should decode as UTF-8": "scope: the library has no XMLHttpRequest",
+    "UTF-32be with no BOM should decode as UTF-8": "scope: the library has no XMLHttpRequest",
+    "UTF-7 should not be supported": "scope: the library has no XMLHttpRequest",
+    "utf-32 with BOM should decode as UTF-16LE": "scope: the library has no XMLHttpRequest",
+    "utf-32 with no BOM should decode as UTF-8": "scope: the library has no XMLHttpRequest",
+    "utf-32be with BOM should decode as UTF-8": "scope: the library has no XMLHttpRequest",
+    "utf-32be with no BOM should decode as UTF-8": "scope: the library has no XMLHttpRequest",
+    "utf-32le with BOM should decode as UTF-16LE": "scope: the library has no XMLHttpRequest",
+    "utf-32le with no BOM should decode as UTF-8": "scope: the library has no XMLHttpRequest",
+    "utf-7 should not be supported": "scope: the library has no XMLHttpRequest"
   }
 }

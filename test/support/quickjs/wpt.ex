@@ -121,6 +121,8 @@ defmodule Web.Test.QuickJS.WPT do
   runner does not have yet. The groups that start with `library:` are
   differences of the library from the Standard. The group `standard:` is
   for a test of the pinned WPT commit that the current Standard changed.
+  The group `scope:` is for a test of an API that the library will not
+  have.
   """
   def cause(path, name, message) do
     message = message || ""
@@ -153,7 +155,8 @@ defmodule Web.Test.QuickJS.WPT do
       # settle.
       {:text, ["Test timed out"], "library: a promise does not settle"},
       {:text, ["Invalid high water mark"], "library: the checks of a high water mark"},
-      {:text, ["'XMLHttpRequest' is not defined"], "runner: no XMLHttpRequest"},
+      # The library will not have `XMLHttpRequest`: `fetch` replaces it.
+      {:text, ["'XMLHttpRequest' is not defined"], "scope: the library has no XMLHttpRequest"},
       {:text, ["no server of WPT"], "runner: no server of WPT"},
       {:name, ~r/'(\w+)' is not defined/, "runner: no "},
       {:text, ["structuredClone"], "runner: no structuredClone"},

@@ -656,15 +656,18 @@ QuickJS is a tool of the tests only. The tests download a pinned release of
 its Cosmopolitan build, one file for Linux, macOS, Windows, and the BSD
 systems, and examine its SHA-256 hash.
 
-| Suite | WPT tests | Pass | The runner lacks a feature | The library differs | The Standard changed the test |
-| --- | --- | --- | --- | --- | --- |
-| `Headers` | 287 | 103 | 184 | 0 | 0 |
-| `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11882 | 206 | 11 | 2 |
-| `URL` and `URLSearchParams` | 4869 | 4778 | 73 | 18 | 0 |
-| The streams, the readers, the writers, and the strategies | 1157 | 737 | 39 | 381 | 0 |
+| Suite | WPT tests | Pass | The runner lacks a feature | The library differs | The Standard changed the test | Not in the scope of the library |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Headers` | 287 | 103 | 149 | 0 | 0 | 35 |
+| `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11882 | 12 | 11 | 2 | 194 |
+| `URL` and `URLSearchParams` | 4869 | 4778 | 73 | 18 | 0 | 0 |
+| The streams, the readers, the writers, and the strategies | 1157 | 737 | 39 | 381 | 0 | 0 |
+
+The tests that are not in the scope of the library use `XMLHttpRequest`. The
+library will not have it: `Web.fetch/2` replaces it.
 
 A test that the runner cannot run needs a feature that the runner does not
-have yet, for example `Request`, `XMLHttpRequest`, `EventTarget`,
+have yet, for example `Request`, `EventTarget`,
 `MessageChannel`, the conversion to an async sequence of
 `ReadableStream.from()`, or the server of WPT. A string of Elixir is UTF-8,
 thus a lone surrogate of JavaScript cannot come to the library. The

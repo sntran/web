@@ -115,7 +115,9 @@ connections of an origin, and the reads of a socket.
 - A test that fails because the runner has no feature is a `runner:` group.
   A test that fails because the library differs is a `library:` group. A
   test of the pinned WPT commit that the current Standard changed is a
-  `standard:` group: name the step of the Standard in the rule.
+  `standard:` group: name the step of the Standard in the rule. A test of an
+  API that the library will not have, such as `XMLHttpRequest`, is a
+  `scope:` group.
 - The result of each test must be the same in each run. The bridge answers
   a call, and sends the settled promises, only when the processes of the
   run are at rest. A new kind of message to the bridge must keep this rule.

@@ -1,7 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "TextDecoder end-of-queue handling": "library: no decoder for the encoding",
-    "TextDecoder end-of-queue handling using stream: true": "library: no decoder for the encoding"
-  }
-}

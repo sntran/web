@@ -1,8 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "TextDecoder decode() with explicit undefined": "library: decode() with no input",
-    "TextDecoder decode() with undefined and options": "library: decode() with no input",
-    "TextDecoder decode() with undefined and undefined": "library: decode() with no input"
-  }
-}

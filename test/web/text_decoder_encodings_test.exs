@@ -1,6 +1,7 @@
 defmodule Web.TextDecoderEncodingsTest do
   # The encodings of `Web.TextDecoder` other than UTF-8: UTF-16, the
-  # single-byte encodings, and x-user-defined.
+  # single-byte encodings, and x-user-defined. See also
+  # `Web.TextDecoderMultiByteTest`.
   use ExUnit.Case, async: true
   use ExUnitProperties
   use Web
@@ -66,8 +67,9 @@ defmodule Web.TextDecoderEncodingsTest do
       end
     end
 
-    test "has a decoder for UTF-8, UTF-16, x-user-defined, and the 28 single-byte encodings" do
-      expected = ["utf-8", "utf-16le", "utf-16be", "x-user-defined"] ++ @single_byte
+    test "has a decoder for each encoding of the Standard other than replacement" do
+      multi_byte = ~w[gbk gb18030 big5 euc-jp iso-2022-jp shift_jis euc-kr]
+      expected = ["utf-8", "utf-16le", "utf-16be", "x-user-defined"] ++ @single_byte ++ multi_byte
       assert Enum.sort(Encoding.supported()) == Enum.sort(expected)
 
       for encoding <- expected do
@@ -102,15 +104,9 @@ defmodule Web.TextDecoderEncodingsTest do
       end
     end
 
-    test "give RangeError for replacement, and for an encoding with no decoder" do
-      for label <- ["replacement", "csiso2022kr", "hz-gb-2312", "iso-2022-cn"] do
+    test "give RangeError for each label of replacement" do
+      for label <- ~w[replacement csiso2022kr hz-gb-2312 iso-2022-cn iso-2022-cn-ext iso-2022-kr] do
         assert_raise Web.RangeError, ~r/is not valid/, fn -> TextDecoder.new(label) end
-      end
-
-      for label <- ~w[gbk gb2312 gb18030 big5 euc-jp iso-2022-jp shift_jis sjis euc-kr] do
-        assert_raise Web.RangeError, ~r/This library has no decoder for the encoding/, fn ->
-          TextDecoder.new(label)
-        end
       end
     end
   end

@@ -1,6 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "encodeInto() leaves the destination beyond written unmodified": "library: no Web.TextEncoder.encode_into/3"
+    "encodeInto() leaves the destination beyond written unmodified": "runner: no copy of the bytes that encodeInto writes"
   }
 }

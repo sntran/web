@@ -15,6 +15,7 @@ defmodule Web.Test.QuickJS.WPT do
   alias Web.Test.QuickJS.Bridge
 
   @root Path.expand("../../wpt/quickjs/expectations", __DIR__)
+  @newer_standard "standard: the current Standard changed this test"
 
   @doc "Runs the WPT file at `path`, and compares the results with the list."
   def check!(path) do
@@ -80,7 +81,7 @@ defmodule Web.Test.QuickJS.WPT do
   defp write!(path, run) do
     failures =
       for name <- run.order, {status, message} = run.results[name], status != "PASS" do
-        {name, cause(path, message)}
+        {name, cause(path, name, message)}
       end
 
     target = file(path)
@@ -115,21 +116,32 @@ defmodule Web.Test.QuickJS.WPT do
   defp relative(path), do: Path.relative_to(path, File.cwd!())
 
   @doc """
-  The group of the cause of a failure, from the path of the test and its
-  message. The groups that start with `runner:` are things that the runner
-  does not have yet. The groups that start with `library:` are differences
-  of the library from the Standard.
+  The group of the cause of a failure, from the path of the test, its name,
+  and its message. The groups that start with `runner:` are things that the
+  runner does not have yet. The groups that start with `library:` are
+  differences of the library from the Standard. The group `standard:` is
+  for a test of the pinned WPT commit that the current Standard changed.
   """
-  def cause(path, message) do
+  def cause(path, name, message) do
     message = message || ""
-    Enum.find_value(causes(), "library: a different result", &match(&1, path, message))
+    Enum.find_value(causes(), "library: a different result", &match(&1, path, name, message))
   end
 
   # The rules, in their sequence: the first rule that gives a group wins.
   defp causes do
     [
+      # The Encoding Standard now starts a new decoder after a fatal error
+      # ("Set this's do not flush to false"). These tests expect the state
+      # of the decoder after the error.
+      {:test, "encoding/textdecoder-mistakes.any.js",
+       "EUC-JP JIS0212 state after a fatal streaming error", @newer_standard},
+      {:test, "encoding/textdecoder-mistakes.any.js", "fatal stream: iso-2022-jp",
+       @newer_standard},
       # The streams of the Encoding Standard are not in the runner yet.
       {:path, "encoding/streams/", "runner: no streams"},
+      # The library returns the new destination of `encode_into/3`. The
+      # runner does not copy its bytes into the JavaScript buffer yet.
+      {:path, "encoding/encodeInto", "runner: no copy of the bytes that encodeInto writes"},
       {:text, ["'XMLHttpRequest' is not defined"], "runner: no XMLHttpRequest"},
       {:text, ["no server of WPT"], "runner: no server of WPT"},
       {:name, ~r/'(\w+)' is not defined/, "runner: no "},
@@ -141,13 +153,16 @@ defmodule Web.Test.QuickJS.WPT do
     ]
   end
 
-  defp match({:path, prefix, group}, path, _message),
+  defp match({:test, test_path, test_name, group}, path, name, _message),
+    do: if(path == test_path and name == test_name, do: group)
+
+  defp match({:path, prefix, group}, path, _name, _message),
     do: if(String.starts_with?(path, prefix), do: group)
 
-  defp match({:text, texts, group}, _path, message),
+  defp match({:text, texts, group}, _path, _name, message),
     do: if(Enum.all?(texts, &String.contains?(message, &1)), do: group)
 
-  defp match({:name, regex, group}, _path, message) do
+  defp match({:name, regex, group}, _path, _name, message) do
     case capture(regex, message) do
       nil -> nil
       name -> group <> name

@@ -53,14 +53,14 @@ defmodule Web.TextDecoder do
       ISO-8859-8-I, ISO-8859-10, ISO-8859-13 to ISO-8859-16, KOI8-R, KOI8-U,
       macintosh, windows-874, windows-1250 to windows-1258, and
       x-mac-cyrillic;
+    * the multi-byte encodings of Chinese, Japanese, and Korean: GBK,
+      gb18030, Big5, EUC-JP, ISO-2022-JP, Shift_JIS, and EUC-KR;
     * x-user-defined.
 
   As in the Standard, the labels `latin1`, `ascii`, and `iso-8859-1` are
-  labels of windows-1252.
-
-  This library has no decoder for the multi-byte encodings of Chinese,
-  Japanese, and Korean (GBK, gb18030, Big5, EUC-JP, ISO-2022-JP, Shift_JIS,
-  and EUC-KR). `new/2` raises `Web.RangeError` for their labels.
+  labels of windows-1252, and GBK and gb18030 have the same decoder. The
+  labels of the encoding replacement, for example `iso-2022-kr`, give
+  `Web.RangeError`.
 
   ## Examples
 
@@ -77,6 +77,7 @@ defmodule Web.TextDecoder do
   """
 
   alias Web.Encoding
+  alias Web.Encoding.MultiByte
 
   alias Web.TextDecoder.State
 
@@ -112,8 +113,8 @@ defmodule Web.TextDecoder do
   The options are `:fatal` and `:ignore_bom` (also `:ignoreBOM`). The field
   `:encoding` of the result is the name of the encoding in lowercase.
 
-  Raises `Web.RangeError` for a label that is not known, for the encoding
-  `replacement`, and for an encoding that this library cannot decode.
+  Raises `Web.RangeError` for a label that is not known, and for the
+  encoding `replacement`.
   """
   @spec new(String.t(), options()) :: t()
   def new(label \\ "utf-8", options \\ %{}) do
@@ -134,13 +135,7 @@ defmodule Web.TextDecoder do
         raise Web.RangeError, "The encoding label #{inspect(label)} is not valid"
 
       {:ok, encoding} ->
-        if Encoding.supported?(encoding) do
-          encoding
-        else
-          raise Web.RangeError,
-                "This library has no decoder for the encoding #{encoding} " <>
-                  "(the label #{inspect(label)})"
-        end
+        encoding
     end
   end
 
@@ -148,8 +143,36 @@ defmodule Web.TextDecoder do
     raise TypeError, "TextDecoder label must be a string"
   end
 
-  @spec decode(t(), binary() | Uint8Array.t(), decode_options()) :: String.t()
-  def decode(%__MODULE__{} = decoder, input, options \\ %{}) do
+  @doc """
+  Decodes the bytes of `input`, as the method `decode()` of the Encoding
+  Standard.
+
+  The input is a binary, a `Web.Uint8Array`, or a `Web.ArrayBuffer`. With
+  no input, or with `nil`, the decoder decodes no bytes. With the option
+  `stream: true`, the decoder keeps the bytes of a character that is not
+  complete, and its state, for the subsequent call. A call with no `stream`
+  option is the end of the data: the decoder decodes the bytes that it
+  kept, and starts again. Thus `decode/1` ends a stream.
+
+  Each byte sequence that is not valid gives U+FFFD. With the option
+  `fatal`, it raises `Web.TypeError`, and the decoder starts again.
+
+  ## Examples
+
+      iex> decoder = Web.TextDecoder.new("shift_jis")
+      iex> part = Web.TextDecoder.decode(decoder, <<0x93, 0xFA, 0x96>>, %{stream: true})
+      iex> {part, Web.TextDecoder.decode(decoder, <<0x7B>>)}
+      {"日", "本"}
+
+      iex> decoder = Web.TextDecoder.new()
+      iex> Web.TextDecoder.decode(decoder, <<0xE2, 0x82>>, %{stream: true})
+      ""
+      iex> Web.TextDecoder.decode(decoder)
+      "\uFFFD"
+  """
+  @spec decode(t(), binary() | Uint8Array.t() | Web.ArrayBuffer.t() | nil, decode_options()) ::
+          String.t()
+  def decode(%__MODULE__{} = decoder, input \\ nil, options \\ %{}) do
     stream = Map.get(options, :stream, false)
     chunk = normalize_input(input)
 
@@ -174,7 +197,7 @@ defmodule Web.TextDecoder do
   @doc false
   # The state of a decoder as data.
   @spec initial_state() :: map()
-  def initial_state, do: %{carry: "", bom_seen: false}
+  def initial_state, do: %{carry: "", bom_seen: false, decoder: nil}
 
   @doc false
   # The algorithm "UTF-8 decode" of the Encoding Standard for all the bytes
@@ -185,10 +208,26 @@ defmodule Web.TextDecoder do
   def decode_utf8(<<@bom, rest::binary>>), do: replace_invalid(rest)
   def decode_utf8(bytes) when is_binary(bytes), do: replace_invalid(bytes)
 
-  defp decode_chunk(%{carry: carry, bom_seen: bom_seen} = state, chunk, decoder, stream) do
+  # A multi-byte decoder keeps its state in the field `decoder`, and no
+  # bytes: see `Web.Encoding.MultiByte`.
+  defp decode_chunk(state, chunk, decoder, stream) do
+    case Encoding.kind(decoder.encoding) do
+      :multi_byte -> decode_multi_byte(state, chunk, decoder, stream)
+      kind -> decode_other(kind, state, chunk, decoder, stream)
+    end
+  end
+
+  defp decode_multi_byte(state, chunk, decoder, stream) do
+    case MultiByte.decode(decoder.encoding, state.decoder, chunk, not stream, decoder.fatal) do
+      {:ok, decoded, next} -> {{:ok, IO.iodata_to_binary(decoded)}, %{state | decoder: next}}
+      :error -> {{:error, invalid_data(decoder.encoding)}, %{state | decoder: nil}}
+    end
+  end
+
+  defp decode_other(kind, %{carry: carry, bom_seen: bom_seen} = state, chunk, decoder, stream) do
     data = IO.iodata_to_binary([carry, chunk])
 
-    case decode_bytes(Encoding.kind(decoder.encoding), data, decoder, stream) do
+    case decode_bytes(kind, data, decoder, stream) do
       {:ok, decoded, complete, trailing} ->
         build_decode_result(state, decoded, bom_seen, trailing, decoder, complete, stream)
 
@@ -329,6 +368,7 @@ defmodule Web.TextDecoder do
     %{state | carry: "", bom_seen: false}
   end
 
+  defp normalize_input(nil), do: ""
   defp normalize_input(input) when is_binary(input), do: input
   defp normalize_input(%Uint8Array{} = input), do: Uint8Array.to_binary(input)
   defp normalize_input(%Web.ArrayBuffer{} = input), do: Web.ArrayBuffer.data(input)

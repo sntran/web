@@ -5,7 +5,9 @@ defmodule Web.Encoding do
   #
   # The data comes from two files of the Encoding Standard, which this
   # module reads when it compiles: `encoding/labels.txt` and
-  # `encoding/single_byte_indexes.txt`.
+  # `encoding/single_byte_indexes.txt`. `Web.Encoding.MultiByte` has the
+  # decoders of the multi-byte encodings, and `Web.Encoding.Indexes` has
+  # their indexes.
 
   @labels_file Path.join(__DIR__, "encoding/labels.txt")
   @indexes_file Path.join(__DIR__, "encoding/single_byte_indexes.txt")
@@ -39,8 +41,9 @@ defmodule Web.Encoding do
                 end)
 
   @single_byte_names Map.keys(@single_byte)
+  @multi_byte_names ~w[gbk gb18030 big5 euc-jp iso-2022-jp shift_jis euc-kr]
   @utf16 ["utf-16le", "utf-16be"]
-  @supported ["utf-8", "x-user-defined"] ++ @utf16 ++ @single_byte_names
+  @supported ["utf-8", "x-user-defined"] ++ @utf16 ++ @single_byte_names ++ @multi_byte_names
 
   @doc """
   Gets an encoding from a label, as "get an encoding" of the Encoding
@@ -53,13 +56,8 @@ defmodule Web.Encoding do
   end
 
   @doc """
-  Returns `true` if this library has a decoder for the encoding.
-  """
-  @spec supported?(String.t()) :: boolean()
-  def supported?(name), do: name in @supported
-
-  @doc """
-  Returns the names of the encodings that this library can decode.
+  Returns the names of the encodings that this library can decode: each
+  encoding of the Encoding Standard other than replacement.
   """
   @spec supported() :: [String.t()]
   def supported, do: @supported
@@ -67,12 +65,14 @@ defmodule Web.Encoding do
   @doc """
   Returns the kind of the decoder of an encoding.
   """
-  @spec kind(String.t()) :: :utf8 | :utf16le | :utf16be | :user_defined | :single_byte
+  @spec kind(String.t()) ::
+          :utf8 | :utf16le | :utf16be | :user_defined | :single_byte | :multi_byte
   def kind("utf-8"), do: :utf8
   def kind("utf-16le"), do: :utf16le
   def kind("utf-16be"), do: :utf16be
   def kind("x-user-defined"), do: :user_defined
   def kind(name) when name in @single_byte_names, do: :single_byte
+  def kind(name) when name in @multi_byte_names, do: :multi_byte
 
   @doc """
   Returns the table of a single-byte encoding: a tuple with 256 entries.

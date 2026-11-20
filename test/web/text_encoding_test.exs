@@ -3,6 +3,7 @@ defmodule Web.TextEncodingTest do
   use ExUnitProperties
   import Web, only: [await: 1]
 
+  alias Web.ArrayBuffer
   alias Web.Response
   alias Web.TextDecoder
   alias Web.TextDecoderStream
@@ -391,12 +392,151 @@ defmodule Web.TextEncodingTest do
         assert TextDecoderStream.new(label).encoding == "utf-8"
       end
 
-      for label <- ["no-such-encoding", "", "replacement", "gbk", "shift_jis"] do
+      for label <- ["no-such-encoding", "", "replacement", "iso-2022-kr", "utf-7"] do
         assert_raise Web.RangeError, fn -> TextDecoder.new(label) end
         assert_raise Web.RangeError, fn -> TextDecoderStream.new(label) end
       end
 
       assert_raise Web.TypeError, fn -> TextDecoder.new(:utf8) end
+    end
+  end
+
+  describe "TextDecoder.decode/1 and no input" do
+    test "decodes no bytes, and a call with no stream option ends the stream" do
+      decoder = TextDecoder.new()
+      assert TextDecoder.decode(decoder) == ""
+
+      assert TextDecoder.decode(decoder, <<0xC9>>, %{stream: true}) == ""
+      assert TextDecoder.decode(decoder) == "\uFFFD"
+
+      assert TextDecoder.decode(decoder, <<0xC9>>, %{stream: true}) == ""
+      assert TextDecoder.decode(decoder, nil) == "\uFFFD"
+
+      assert TextDecoder.decode(decoder, <<0xC9>>, %{stream: true}) == ""
+      assert TextDecoder.decode(decoder, nil, %{}) == "\uFFFD"
+
+      # With stream: true, a call with no input keeps the bytes.
+      assert TextDecoder.decode(decoder, <<0xC3>>, %{stream: true}) == ""
+      assert TextDecoder.decode(decoder, nil, %{stream: true}) == ""
+      assert TextDecoder.decode(decoder, <<0xA9>>) == "\u00E9"
+    end
+
+    test "raises TypeError with the option fatal for bytes that are not complete, and starts again" do
+      for label <- ["utf-8", "utf-16le", "utf-16be"] do
+        decoder = TextDecoder.new(label, %{fatal: true})
+        assert TextDecoder.decode(decoder, <<0xF0>>, %{stream: true}) == ""
+        assert_raise Web.TypeError, fn -> TextDecoder.decode(decoder) end
+        assert TextDecoder.decode(decoder) == ""
+      end
+    end
+
+    property "gives the text of one call, when a call with no input ends the stream" do
+      check all(
+              label <- member_of(Web.Encoding.supported()),
+              bytes <- binary(max_length: 16),
+              sizes <- list_of(integer(1..4), min_length: 1, max_length: 6)
+            ) do
+        decoder = TextDecoder.new(label)
+        chunks = split_binary_into_chunks(bytes, sizes)
+        parts = Enum.map(chunks, &TextDecoder.decode(decoder, &1, %{stream: true}))
+
+        assert IO.iodata_to_binary([parts, TextDecoder.decode(decoder)]) ==
+                 TextDecoder.decode(TextDecoder.new(label), bytes)
+      end
+    end
+  end
+
+  describe "TextEncoder.encode_into/3" do
+    # A view of `length` bytes at `offset`, in a buffer with the byte
+    # `filler` in each place.
+    defp view(filler, offset, length, size) do
+      <<filler>> |> :binary.copy(size) |> ArrayBuffer.new() |> Uint8Array.new(offset, length)
+    end
+
+    test "follows the tests of the Standard" do
+      for {source, read, length, written} <- [
+            {"Hi", 0, 0, ""},
+            {"A", 1, 10, "A"},
+            {"\u{1D306}", 2, 4, <<0xF0, 0x9D, 0x8C, 0x86>>},
+            {"\u{1D306}A", 0, 3, ""},
+            {"\uFFFDA\uFFFDA\u00A5Hi", 5, 10, "\uFFFDA\uFFFDA\u00A5"},
+            {"A\uFFFD", 2, 4, "A\uFFFD"},
+            {"\u00A5\u00A5", 2, 4, "\u00A5\u00A5"}
+          ],
+          {offset, extra} <- [{0, 0}, {4, 10}],
+          filler <- [0, 0x80] do
+        destination = view(filler, offset, length, length + extra)
+        {result, changed} = TextEncoder.encode_into(TextEncoder.new(), source, destination)
+
+        assert result == %{read: read, written: byte_size(written)}
+        assert {changed.byte_offset, changed.byte_length} == {offset, length}
+        before = :binary.copy(<<filler>>, offset)
+        rest = :binary.copy(<<filler>>, length + extra - offset - byte_size(written))
+        assert ArrayBuffer.data(changed.buffer) == before <> written <> rest
+      end
+    end
+
+    property "writes the longest start of the UTF-8 form that fits, and no other byte" do
+      check all(
+              source <- string(:utf8, max_length: 12),
+              filler <- integer(0..255),
+              offset <- integer(0..4),
+              length <- integer(0..24),
+              tail <- integer(0..4)
+            ) do
+        destination = view(filler, offset, length, offset + length + tail)
+        {result, changed} = TextEncoder.encode_into(TextEncoder.new(), source, destination)
+
+        # The longest start of whole characters with no more than `length` bytes.
+        expected =
+          source
+          |> String.to_charlist()
+          |> Enum.scan("", &(&2 <> <<&1::utf8>>))
+          |> Enum.filter(&(byte_size(&1) <= length))
+          |> List.last("")
+
+        units = div(byte_size(:unicode.characters_to_binary(expected, :utf8, :utf16)), 2)
+        assert result == %{read: units, written: byte_size(expected)}
+        assert {changed.byte_offset, changed.byte_length} == {offset, length}
+
+        assert ArrayBuffer.data(changed.buffer) ==
+                 :binary.copy(<<filler>>, offset) <>
+                   expected <> :binary.copy(<<filler>>, length - byte_size(expected) + tail)
+      end
+    end
+
+    test "gives U+FFFD for bytes that are not valid UTF-8" do
+      {result, changed} =
+        TextEncoder.encode_into(TextEncoder.new(), <<"a", 0xFF, "b">>, view(0, 0, 6, 6))
+
+      assert result == %{read: 3, written: 5}
+      assert Uint8Array.to_binary(changed) == <<"a\uFFFDb", 0>>
+    end
+
+    test "writes no byte into a detached destination" do
+      buffer = ArrayBuffer.new("abc")
+      destination = Uint8Array.new(buffer)
+      _moved = ArrayBuffer.transfer(buffer)
+
+      assert TextEncoder.encode_into(TextEncoder.new(), "", destination) ==
+               {%{read: 0, written: 0}, destination}
+
+      assert TextEncoder.encode_into(TextEncoder.new(), "test", destination) ==
+               {%{read: 0, written: 0}, destination}
+    end
+
+    test "raises TypeError for a source that is not a string, or a destination that is not a Uint8Array" do
+      assert_raise Web.TypeError, "TextEncoder.encodeInto destination must be a Uint8Array", fn ->
+        TextEncoder.encode_into(TextEncoder.new(), "a", "destination")
+      end
+
+      assert_raise Web.TypeError, "TextEncoder.encodeInto destination must be a Uint8Array", fn ->
+        TextEncoder.encode_into(TextEncoder.new(), "a", ArrayBuffer.new(4))
+      end
+
+      assert_raise Web.TypeError, "TextEncoder.encodeInto source must be a string", fn ->
+        TextEncoder.encode_into(TextEncoder.new(), 1, view(0, 0, 4, 4))
+      end
     end
   end
 

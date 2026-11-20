@@ -68,13 +68,15 @@ MayAsk(b, h) ==
     /\ h < Chunks \/ Bug = "ask_after_end"
 
 \* The process handles the message, and asks for the next one when it may.
+\* With the bug "lose_flag", the process does not keep its flag when it
+\* asks.
 Handle ==
     /\ mailbox > 0
     /\ mailbox' = mailbox - 1
     /\ handled' = handled + 1
     /\ buffer' = buffer + 1
     /\ IF MayAsk(buffer + 1, handled + 1)
-       THEN active' = TRUE /\ asked' = TRUE
+       THEN active' = TRUE /\ asked' = (Bug /= "lose_flag")
        ELSE active' = active /\ asked' = FALSE
     /\ UNCHANGED <<sent, kernel, got>>
 
@@ -88,7 +90,7 @@ Read ==
     /\ buffer' = 0
     /\ LET waiting == IF Bug = "ask_with_message" THEN active ELSE asked
        IN IF ~waiting /\ MayAsk(0, handled)
-          THEN active' = TRUE /\ asked' = TRUE
+          THEN active' = TRUE /\ asked' = (Bug /= "lose_flag")
           ELSE UNCHANGED <<active, asked>>
     /\ UNCHANGED <<sent, kernel, mailbox, handled>>
 
@@ -120,6 +122,10 @@ TypeOK ==
 
 \* The mailbox has one message of the socket at most.
 MailboxBounded == mailbox <= 1
+
+\* The flag of the process tells the truth: the process asked when the
+\* socket can send a message, or when a message is in the mailbox.
+FlagMatchesSocket == asked = (active \/ mailbox > 0)
 
 \* The process keeps the limit, with the message on its way.
 BufferBounded == buffer + mailbox <= Limit

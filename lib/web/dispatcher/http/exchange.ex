@@ -611,10 +611,16 @@ defmodule Web.Dispatcher.HTTP.Exchange do
   # the process stops and starts to read many times.
   defp listen(%{armed?: true} = state), do: %{state | paused?: false}
 
+  # The flag is set before the socket can send its message, thus the flag
+  # tells the truth at each time: see `FlagMatchesSocket` in
+  # `tla/SocketFlow.tla`.
   defp listen(state) do
+    armed = %{state | armed?: true, paused?: false}
+    put(armed)
+
     case setopts(Mint.HTTP.get_socket(state.conn), active: :once) do
       :ok ->
-        %{state | armed?: true, paused?: false}
+        armed
 
       # The socket is closed: no message comes. The request fails.
       {:error, reason} ->

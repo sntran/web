@@ -334,6 +334,10 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(SpecModel.check("SocketFlow", bug("no_backpressure")), "BufferBounded")
     end
 
+    test "a process that does not keep its flag when it asks is found" do
+      assert_violates(SpecModel.check("SocketFlow", bug("lose_flag")), "FlagMatchesSocket")
+    end
+
     test "a process that reads its socket after the end of the response is found" do
       assert_violates(SpecModel.check("SocketFlow", bug("ask_after_end")), "NoReadAfterEnd")
     end

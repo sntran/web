@@ -1,6 +1,6 @@
 defmodule Web.TLA.SocketFlowPropertyTest do
   # Checks the properties of `tla/SocketFlow.tla` on the real process of a
-  # request of `Web.Dispatcher.HTTP`.
+  # request of `Web.Dispatcher.HTTP`, and of `Web.Dispatcher.TCP`.
   #
   # A server sends a random body in random chunks, with random pauses. A
   # reader reads the body with random pauses. After each read, the test
@@ -11,6 +11,7 @@ defmodule Web.TLA.SocketFlowPropertyTest do
   use ExUnitProperties
 
   alias Web.Dispatcher.HTTP.Exchange
+  alias Web.Dispatcher.TCP.Connection
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultReader
 
@@ -51,13 +52,74 @@ defmodule Web.TLA.SocketFlowPropertyTest do
         {:held, process} ->
           :erlang.trace(process, true, [:receive])
           reader = ReadableStream.get_reader(response.body)
-          assert read_all(reader, process, reads, []) == body
-          assert_no_read_after_end(process)
+          assert read_all(reader, {process, Exchange}, reads, []) == body
+          assert_no_read_after_end(process, Exchange)
 
         # The body came in 1 ms: it is in the struct.
         {:bytes, bytes} ->
           assert bytes == body
       end
+    end
+  end
+
+  property "a tcp: request reads one message at a time, and the reader gets the full body" do
+    check all(
+            body <- body(),
+            sizes <- list_of(integer(500..48_000), min_length: 1, max_length: 30),
+            pauses <- list_of(integer(0..3), min_length: 1, max_length: 30),
+            reads <- list_of(integer(0..4), min_length: 1, max_length: 30),
+            wait? <- boolean(),
+            max_runs: 40
+          ) do
+      {port, server} = start_tcp_server(body, sizes, pauses)
+
+      # The trace starts before the server sends: the test sees each
+      # message of the socket.
+      promise = Web.fetch("tcp://localhost:#{port}")
+      :erlang.trace(promise.pid, true, [:receive])
+      send(server, :go)
+      response = Web.await(promise)
+
+      case response.body.lazy.source do
+        {:held, process} ->
+          if wait?, do: wait_at_rest(process, port)
+          reader = ReadableStream.get_reader(response.body)
+          assert read_all(reader, {process, Connection}, reads, []) == body
+          assert_no_read_after_end(process, Connection)
+
+        {:bytes, bytes} ->
+          assert bytes == body
+          flush_trace(promise.pid)
+      end
+    end
+  end
+
+  # The reader waits until the server sent the full body, and until the
+  # process does not ask for more: at the limit, or at the end. Then the
+  # buffer has its largest size.
+  defp wait_at_rest(process, port) do
+    assert_receive {:tcp_server_done, ^port}, 5_000
+
+    at_rest = fn ->
+      case Process.info(process, :dictionary) do
+        {:dictionary, dictionary} ->
+          state = :proplists.get_value({Connection, :state}, dictionary)
+          state.phase != :open or not state.armed?
+
+        nil ->
+          true
+      end
+    end
+
+    eventually(at_rest)
+    assert_flow({process, Connection})
+  end
+
+  defp eventually(fun, attempts \\ 400) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
     end
   end
 
@@ -75,7 +137,7 @@ defmodule Web.TLA.SocketFlowPropertyTest do
     [method: "POST", body: ReadableStream.from(chunks), duplex: "half"]
   end
 
-  defp read_all(reader, process, [pause | reads], acc) do
+  defp read_all(reader, target, [pause | reads], acc) do
     Process.sleep(pause)
 
     case Web.await(ReadableStreamDefaultReader.read(reader)) do
@@ -83,30 +145,71 @@ defmodule Web.TLA.SocketFlowPropertyTest do
         acc |> Enum.reverse() |> IO.iodata_to_binary()
 
       %{value: chunk} ->
-        assert_flow(process)
-        read_all(reader, process, reads ++ [pause], [Web.Uint8Array.to_binary(chunk) | acc])
+        assert_flow(target)
+        read_all(reader, target, reads ++ [pause], [Web.Uint8Array.to_binary(chunk) | acc])
     end
   end
 
-  # The properties of the specification, on the real process.
-  defp assert_flow(process) do
-    with {:messages, messages} <- Process.info(process, :messages),
-         {:dictionary, dictionary} <- Process.info(process, :dictionary) do
-      socket_messages = Enum.filter(messages, &match?({:tcp, _socket, _data}, &1))
-      state = :proplists.get_value({Exchange, :state}, dictionary)
-      inflight = :proplists.get_value({Exchange, :inflight}, dictionary)
-
-      # MailboxBounded: one message of the socket at most.
-      assert length(socket_messages) <= 1
-
-      # The flag is cleared only when the process handles the message.
-      if socket_messages != [] and state.phase == :open, do: assert(state.armed?)
-
-      # BufferBounded: the process asks only below its limit. One message,
-      # or one piece of the decoder, can come after the limit.
-      assert inflight <= @limit + max(largest_message(process), 200_000)
+  # The properties of the specification, on the real process. The process
+  # is suspended while the test examines it: its state, its mailbox, and
+  # its socket are then one snapshot.
+  defp assert_flow({process, network}) do
+    if suspend(process) do
+      try do
+        assert_snapshot(process, network)
+      after
+        :erlang.resume_process(process)
+      end
     end
   end
+
+  defp assert_snapshot(process, network) do
+    {:dictionary, dictionary} = Process.info(process, :dictionary)
+    state = :proplists.get_value({network, :state}, dictionary)
+    inflight = :proplists.get_value({network, :inflight}, dictionary)
+
+    # The socket first: a message that comes after this is in the mailbox.
+    active = active(socket(network, state))
+    {:messages, messages} = Process.info(process, :messages)
+    socket_messages = Enum.filter(messages, &match?({:tcp, _socket, _data}, &1))
+
+    # MailboxBounded: one message of the socket at most.
+    assert length(socket_messages) <= 1
+
+    # FlagMatchesSocket: the process asked when the socket can send a
+    # message, or when a message is in the mailbox. A message can be on its
+    # way from the socket to the mailbox, thus the test does not examine
+    # the other direction.
+    if state.phase == :open and (active == :once or socket_messages != []),
+      do: assert(state.armed?)
+
+    # BufferBounded: the process asks only below its limit. One message can
+    # come after the limit, and for HTTP one piece of the decoder.
+    assert inflight <= @limit + slack(network, largest_message(process))
+  end
+
+  defp suspend(process) do
+    :erlang.suspend_process(process)
+  rescue
+    # The process stopped at the end of the body.
+    ArgumentError -> false
+  end
+
+  defp socket(Exchange, %{conn: nil}), do: nil
+  defp socket(Exchange, %{conn: conn}), do: Mint.HTTP.get_socket(conn)
+  defp socket(Connection, %{socket: socket}), do: socket
+
+  defp active(nil), do: false
+
+  defp active(socket) do
+    case :inet.getopts(socket, [:active]) do
+      {:ok, [active: active]} -> active
+      {:error, _closed} -> false
+    end
+  end
+
+  defp slack(Exchange, largest), do: max(largest, 200_000)
+  defp slack(Connection, largest), do: largest
 
   # The size of the largest message of the socket that the process got. The
   # trace events come after the messages: the test waits for each event of
@@ -136,10 +239,10 @@ defmodule Web.TLA.SocketFlowPropertyTest do
 
   # NoReadAfterEnd: after the end of the response, the process does not ask
   # its socket for a message.
-  defp assert_no_read_after_end(process) do
+  defp assert_no_read_after_end(process, network) do
     case Process.info(process, :dictionary) do
       {:dictionary, dictionary} ->
-        state = :proplists.get_value({Exchange, :state}, dictionary)
+        state = :proplists.get_value({network, :state}, dictionary)
         refute state.phase == :open and state.armed?
 
       # The process stopped at the end of the body.
@@ -182,6 +285,50 @@ defmodule Web.TLA.SocketFlowPropertyTest do
     case :gen_tcp.recv(socket, 0, 5_000) do
       {:ok, _data} -> drain(socket)
       {:error, _reason} -> :ok
+    end
+  end
+
+  # A server of bytes with no protocol: at the message `:go`, it sends the
+  # body in chunks, and closes the connection. The client sends nothing.
+  defp start_tcp_server(body, sizes, pauses) do
+    test = self()
+
+    server =
+      spawn_link(fn ->
+        {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+        {:ok, port} = :inet.port(listener)
+        send(test, {:port, port})
+        {:ok, socket} = :gen_tcp.accept(listener)
+
+        receive do
+          :go -> send_chunks(socket, body, sizes, pauses)
+        end
+
+        send(test, {:tcp_server_done, port})
+        :gen_tcp.close(socket)
+      end)
+
+    receive do
+      {:port, port} -> {port, server}
+    end
+  end
+
+  # The trace messages of a process that stopped go away.
+  defp flush_trace(process) do
+    ref = :erlang.trace_delivered(process)
+
+    receive do
+      {:trace_delivered, ^process, ^ref} -> :ok
+    end
+
+    flush_trace_messages(process)
+  end
+
+  defp flush_trace_messages(process) do
+    receive do
+      {:trace, ^process, _event, _message} -> flush_trace_messages(process)
+    after
+      0 -> :ok
     end
   end
 

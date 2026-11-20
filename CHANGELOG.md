@@ -68,6 +68,14 @@ All notable changes to this project are documented in this file.
   second conformance test compares `Web.CountingGovernor` with
   `tla/ConnectionPool.tla`: a governor and the pool count their slots with
   the same rules.
+- The tests run 74 JavaScript files of web-platform-tests with no change, in
+  the JavaScript engine QuickJS, against the library: `Headers`, `URL`,
+  `URLSearchParams`, `TextEncoder`, and `TextDecoder`. A layer makes the
+  JavaScript classes from the WebIDL files of WPT, and calls the library
+  through a port. 14585 of 17257 tests pass. The lists of the tests that do
+  not pass, with the group of their cause, are in
+  `test/wpt/quickjs/expectations/`. QuickJS is a tool of the tests only: the
+  tests download a pinned release, and examine its SHA-256 hash.
 - Ports of five files of web-platform-tests in `test/wpt/`: the default
   reader and the bad sources of the Streams tests, the basic headers and
   the header errors of the Fetch tests, and the abort event of the DOM
@@ -269,6 +277,10 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- `README.md` does not say that the library has 100 % WPT compliance for
+  `URL`. The JSON data of WPT for the parse of a URL passes, but the
+  JavaScript files of WPT show differences: see "Web Platform Tests in
+  QuickJS".
 - The readable side of a `Web.Socket` reads the connection one message for
   each pull of the stream. The stream sends its pull to the socket process
   directly, with no worker, and has one pull at a time, as the Streams

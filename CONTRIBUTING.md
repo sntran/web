@@ -105,6 +105,19 @@ connections of an origin, and the reads of a socket.
   the code for a moment, and make sure that the test fails. Then remove the
   fault.
 
+## Web Platform Tests
+
+- Run the files of WPT with no change where possible: see "Web Platform
+  Tests in QuickJS" in `README.md`.
+- Put no logic of a Standard in the WebIDL layer of the runner. The layer
+  converts values as WebIDL specifies, and calls the library. Thus a test
+  examines the library, not the layer.
+- A test that fails because the runner has no feature is a `runner:` group.
+  A test that fails because the library differs is a `library:` group.
+- When a change of the library corrects a difference, run
+  `WPT_UPDATE=1 mix test test/wpt/quickjs`, and examine the change of the
+  lists before you commit it.
+
 ## Tests
 
 - Use property tests (`ExUnitProperties`) for each rule that applies to

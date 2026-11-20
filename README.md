@@ -12,7 +12,8 @@
 `Web` provides a predictable, spec-pure interface for high-concurrency systems. While most Elixir libraries buffer data into memory by default, `Web` is built for **Zero-Buffer Streaming**. By implementing WHATWG and TC39 standards as **Native Process-backed** entities (`:gen_statem`), `Web` ensures your applications remain responsive even when handling gigabytes of data.
 
 ### Why Standards on the BEAM?
-* **Predictability**: 100% WPT compliance for core primitives like `URL` and `MIME`.
+* **Predictability**: the tests run web-platform-tests, the shared tests of
+  the browsers, against the library: see [Testing & Compliance](#-testing--compliance).
 * **Flow Control**: TC39-aligned concurrency management via `Web.Governor`.
 * **Context Propagation**: Ambient `AsyncContext` for metadata that survives process boundaries.
 * **Structured Data**: `structured_clone/2` of the HTML Standard, with transferable `ArrayBuffer`s and message ports.
@@ -631,6 +632,51 @@ mix precommit
 
 # Run the compliance suite directly
 mix test --cover
+```
+
+### Web Platform Tests in QuickJS
+
+The tests also run the JavaScript files of WPT with no change, in the
+JavaScript engine QuickJS, against the library. QuickJS runs `testharness.js`
+and the test file. A layer makes a JavaScript class for each interface from
+the WebIDL files of WPT, and each method calls the Elixir function of the
+library through a port. The layer converts the values as WebIDL specifies,
+and has no other logic: the library does the work. See
+`test/support/quickjs/bridge.ex`.
+
+QuickJS is a tool of the tests only. The tests download a pinned release of
+its Cosmopolitan build, one file for Linux, macOS, Windows, and the BSD
+systems, and examine its SHA-256 hash.
+
+| Suite | WPT tests | Pass | The runner lacks a feature | The library differs |
+| --- | --- | --- | --- | --- |
+| `Headers` | 287 | 94 | 184 | 9 |
+| `TextEncoder` and `TextDecoder` | 12101 | 11169 | 308 | 624 |
+| `URL` and `URLSearchParams` | 4869 | 3322 | 73 | 1474 |
+
+A test that the runner cannot run needs a feature that the runner does not
+have yet, for example `Request`, `XMLHttpRequest`, the streams of the Encoding
+Standard, or the server of WPT. The largest differences of the library are:
+
+* `Web.URL.new/2` raises `ArgumentError` for a URL that is not valid. The
+  Standard specifies `TypeError`. This fails 1406 tests.
+* The library has no decoders for the encodings of Chinese, Japanese, and
+  Korean (499 tests), and no `encodeInto` (86 tests).
+* `TextDecoder.decode/3` refuses a call with no input, which ends a stream.
+* The getters `search` and `hash` give `"?"` and `"#"` for an empty part, the
+  parser of `URLSearchParams` makes a pair for an empty sequence, `*` is
+  percent-encoded, and `sort/1` uses code points, not UTF-16 code units.
+* The iteration of `Headers` joins the values of `set-cookie`.
+* A `URLSearchParams` from a URL does not change the URL: the structs of the
+  library are immutable.
+
+`test/wpt/quickjs/expectations/` lists each test that does not pass, with
+the group of its cause. A new failure fails the test, and a listed test that
+passes also fails it: remove it from the list. To write the lists again
+after a change of the library, run:
+
+```shell
+WPT_UPDATE=1 mix test test/wpt/quickjs
 ```
 
 ### Specifications

@@ -216,8 +216,14 @@ stream stops after it is ended and all its chunks are read. It also stops
 when its owner stops and no process has locked it. A halt, such as
 `Enum.take/2`, cancels the stream.
 
-Read or cancel each response body. A body that no process starts to read
-releases its connection after 300 seconds
+A stream of bytes in memory has no process until a stream read: the body of
+`Web.Response.new/1` for a binary, `ReadableStream.from("text")`, and the
+body of a small `fetch` response. The body functions, such as
+`Web.Response.text/1`, take its bytes with no process. `get_reader/1`, a
+pipe, and `Enum` start the stream process at that time.
+
+Read or cancel each response body that comes slowly. A body that no
+process starts to read releases its connection after 300 seconds
 (`config :web, unread_body_timeout: ms`), and a later read rejects.
 
 `fetch` has no time limit for a full request, as in the Fetch Standard. Use
@@ -612,7 +618,7 @@ easy to make and hard to find with an example test:
 | `Promise.tla`        | One promise: it settles one time, and it stops.            |
 | `StreamLifetime.tla` | When a stream process stops, and when it must stay.        |
 | `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
-| `ResponseBody.tla`   | The body of a response: all its chunks, or an error.       |
+| `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |
 | `MessagePort.tla`    | The port message queue, the start, the transfer, and the close. |
 | `BroadcastChannel.tla` | The channels of one name, with a channel that is slow.   |
 | `Disposal.tla`       | The blocks of `using`: each resource is released one time. |

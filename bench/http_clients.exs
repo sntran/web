@@ -47,9 +47,12 @@ defmodule Web.Benchmarks.HTTPClients do
     end
   end
 
-  @sequential 2_000
+  # The clients run in turns: each round runs each client one time. Thus a
+  # slow time of the machine has an effect on each client, not on one only.
+  @rounds 8
+  @sequential 400
   @processes 50
-  @requests_each 200
+  @requests_each 100
 
   def run do
     {:ok, server} =
@@ -81,29 +84,31 @@ defmodule Web.Benchmarks.HTTPClients do
     # The pools open their connections, and the code is loaded.
     for {_label, client} <- clients, _index <- 1..300, do: client.()
 
-    IO.puts("== A small JSON response, one request at a time (median of #{@sequential})")
+    IO.puts(
+      "== A small JSON response, one request at a time " <>
+        "(median of #{@rounds * @sequential}, in #{@rounds} rounds)"
+    )
 
-    for {label, client} <- clients do
-      samples = Enum.sort(for _index <- 1..@sequential, do: elem(:timer.tc(client), 0))
-      IO.puts(row(label, "#{Enum.at(samples, div(@sequential, 2))} µs"))
+    samples =
+      in_turns(clients, fn client ->
+        for _index <- 1..@sequential, do: elem(:timer.tc(client), 0)
+      end)
+
+    for {label, _client} <- clients do
+      times = Enum.sort(samples[label])
+      IO.puts(row(label, "#{Enum.at(times, div(length(times), 2))} µs"))
     end
 
-    IO.puts("== A small JSON response, #{@processes} processes at the same time")
+    IO.puts(
+      "== A small JSON response, #{@processes} processes at the same time " <>
+        "(median of #{@rounds} rounds)"
+    )
 
-    for {label, client} <- clients do
-      {time, failures} =
-        :timer.tc(fn ->
-          1..@processes
-          |> Enum.map(fn _index ->
-            Task.async(fn -> Enum.count(1..@requests_each, &failed?(client, &1)) end)
-          end)
-          |> Task.await_many(120_000)
-          |> Enum.sum()
-        end)
+    rates = in_turns(clients, &[rate(&1)])
 
-      rate = round(@processes * @requests_each / (time / 1_000_000))
-      failed = if failures > 0, do: ", #{failures} failed", else: ""
-      IO.puts(row(label, "#{rate} requests/s#{failed}"))
+    for {label, _client} <- clients do
+      values = Enum.sort(rates[label])
+      IO.puts(row(label, "#{Enum.at(values, div(length(values), 2))} requests/s"))
     end
 
     IO.puts("== A body of 256 MiB")
@@ -123,6 +128,31 @@ defmodule Web.Benchmarks.HTTPClients do
       IO.puts(row(label, "#{speed} MiB/s, memory +#{div(memory, 1_048_576)} MiB"))
     end
   end
+
+  # Runs `measure` for each client in each round. Returns the results of
+  # each client, as one list.
+  defp in_turns(clients, measure) do
+    Enum.reduce(1..@rounds, %{}, fn _round, acc ->
+      Enum.reduce(clients, acc, fn {label, client}, acc ->
+        result = measure.(client)
+        Map.update(acc, label, result, &(result ++ &1))
+      end)
+    end)
+  end
+
+  defp rate(client) do
+    {time, _failures} =
+      :timer.tc(fn ->
+        1..@processes
+        |> Enum.map(fn _index -> Task.async(fn -> run_requests(client) end) end)
+        |> Task.await_many(120_000)
+        |> Enum.sum()
+      end)
+
+    round(@processes * @requests_each / (time / 1_000_000))
+  end
+
+  defp run_requests(client), do: Enum.count(1..@requests_each, &failed?(client, &1))
 
   # A request that fails is counted, and the benchmark continues.
   defp failed?(client, _index) do

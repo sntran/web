@@ -30,8 +30,24 @@ All notable changes to this project are documented in this file.
 - `examples/README.md`, an index of the examples, and a new
   `examples/demo.exs`: a short tour that needs no network.
 - `bench/http_clients.exs`, which compares `Web.fetch/2` with Finch and
-  Req on one server of the machine. Req is a dependency only in the
-  environment `:dev`.
+  Req on one server of the machine. The clients run in turns, in 8 rounds.
+  Req is a dependency only in the environment `:dev`.
+- A `Web.ReadableStream` of bytes in memory has no process until a stream
+  read: the body of `Web.Response.new/1` and `Web.Request.new/2` for a
+  binary, `ReadableStream.from/1` for a binary, a view, a buffer, or
+  `Web.URLSearchParams`, and the body of a `fetch` response that ends 1 ms
+  after its headers. The body functions, such as `Web.Response.text/1`,
+  take the bytes with no process, and the promise of a body of 64 KiB or
+  less is settled when the function returns. `get_reader/1`, a pipe, and
+  `Enum` start the stream process at that time. All the copies of the
+  struct have one state, in an `:atomics` array, and find the same stream
+  process. A read examines the abort signal of the body. A copy on a
+  different node does each operation on the node of the array. A stream
+  with no process has no owner: a copy in a different process can read it
+  after the process that made it stopped.
+- The optional callback `direct_pull/1` of the behaviour `Web.Stream`: the
+  stream process sends the pull to a source that is a process, with no
+  callback in the worker.
 
 - Time limits for `Web.fetch/2`. `config :web, connect_timeout: ms` is the
   time to open a connection, also for `Web.connect/2`. The default is
@@ -112,9 +128,11 @@ All notable changes to this project are documented in this file.
 - A property test that compares `Web.CountingGovernor` with a model: a
   counter with a first-in, first-out queue.
 - The application setting `config :web, unread_body_timeout: ms` for the
-  body of a `Web.fetch/2` response. A body that no process starts to read in
-  that time releases its connection, and a later read rejects. The default
-  is 300000 ms. The value `:infinity` removes the limit.
+  body of a `Web.fetch/2` response that holds its connection. A body that no
+  process starts to read in that time releases its connection, and a later
+  read rejects. The default is 300000 ms. The value `:infinity` removes the
+  limit. A body that ended 1 ms after its headers holds no connection, and
+  has no limit.
 - The option `:unread_timeout` for a stream that holds a resource.
 - `use Web` aliases `Web.ReadableStreamDefaultReader`.
 - Tests that count the processes of the VM, to find promises that a
@@ -203,12 +221,15 @@ All notable changes to this project are documented in this file.
 
 - The callbacks of a stream run in one worker process for the life of the
   stream. Before, each callback started a new task through one supervisor
-  of the application. A read of `Web.ReadableStream.from/1` with `Enum`
-  takes approximately 14 µs for each element, where it took 26 µs, and
-  many streams use all the cores: 4 streams at the same time read 150000
-  elements each second, where they read 53000. The supervisor
-  `Web.TaskSupervisor` is removed. A promise and a pipe also start with no
-  supervisor.
+  of the application. The supervisor `Web.TaskSupervisor` is removed. A
+  promise and a pipe also start with no supervisor.
+- The pull of `Web.ReadableStream.from/1` goes from the stream process to
+  the process of the enumerable, and back, with no worker between them. A
+  source that is a process gets its message `{:pull, stream}` from the
+  stream process directly. A read of `from/1` with `Enum` takes
+  approximately 7 µs for each element, where it took 26 µs, and many
+  streams use all the cores: 4 streams at the same time read 490000
+  elements each second, where they read 53000.
 - The internal readers of a stream (`Enum`, a pipe, and the body functions
   such as `Web.Response.text/1`) take all the chunks of the queue in one
   message, as reads one after the other do. Such a read does not change
@@ -229,15 +250,29 @@ All notable changes to this project are documented in this file.
   each run of a regular expression imports its pattern again.
   `Web.Request.new/2` takes approximately 3 µs, where it took 106 µs. A
   usual URL of a request takes a short path of the parser.
-- The HTTP dispatcher has no bridge process: its worker enqueues the body
-  chunks directly into the body stream. The body stream keeps 64 KiB, thus
-  a small body arrives fully, and its connection goes back to the pool,
-  also when no process reads it. The dispatcher gives the parts of the
-  parsed URL to Finch, thus Finch does not parse the URL again with
-  regular expressions. A small request with `fetch` and
-  `Web.Response.text/1` takes approximately 310 µs, where it took 630 to
-  680 µs, and 50 processes do 8300 to 8800 requests each second, where
-  they did 5200. See `BENCHMARKS.md`.
+- A request of `Web.fetch/2` has two processes. The process of the request
+  is also the promise of `fetch`. It follows the redirects, and it holds a
+  body that does not end 1 ms after its headers. Its worker runs the HTTP
+  client and sends each event to it, thus the process of the request
+  always answers: the readers, the abort signal, and the time limits.
+  - A body that ends 1 ms after its headers goes in the struct of the
+    response, and the worker gives that response directly to the
+    processes that await the promise. Then the two processes have no
+    work, and `text/1` starts none.
+  - A body that the process of the request holds gives all its bytes to a
+    read such as `text/1` in one message, and gives each piece to a stream
+    read when the stream pulls. The worker stops to read the connection
+    while 64 KiB have no reader.
+  - The stream of a body monitors the process of the request: a stop of
+    that process before the end of the body is an error, as before. A
+    cancel stops the two processes, thus the connection does not stay.
+  - The dispatcher gives the parts of the parsed URL to Finch, thus Finch
+    does not parse the URL again with regular expressions.
+  - A small request with `fetch` and `Web.Response.text/1` takes
+    approximately 135 µs, where it took 630 to 680 µs, and 50 processes do
+    18000 requests each second, where they did 5200. Req takes
+    approximately 110 µs, and does 22600 requests each second. See
+    `BENCHMARKS.md`.
 - **Breaking:** the JSON functions use the module `JSON` of Elixir and the
   module `:json` of Erlang/OTP. The package does not depend on Jason now.
   - `Web.Response.json/2` encodes with the protocol `JSON.Encoder`. A
@@ -303,8 +338,8 @@ All notable changes to this project are documented in this file.
 - **Breaking:** `Web.structured_clone/2` accepts all data: atoms, tuples,
   bitstrings, improper lists, and structs that have only data. Before, a
   map with an atom key raised `DataCloneError`. A `Web.Promise`, a
-  `Web.AbortSignal`, a `Web.AbortController`, a `Web.Request`, and a
-  `Web.Response` cannot be cloned. A detached `Web.ArrayBuffer` raises
+  `Web.AbortSignal`, a `Web.AbortController`, a `Web.Request`, a
+  `Web.Response`, and a `Web.ReadableStream` cannot be cloned. A detached `Web.ArrayBuffer` raises
   `DataCloneError`, not `Web.TypeError`, and options that are not correct
   raise `Web.TypeError`, not `ArgumentError`.
 - `Web.structured_clone/2` reads the value one time, and the clone of data
@@ -546,6 +581,9 @@ All notable changes to this project are documented in this file.
   - A response with no body has the body `nil`, and starts no stream. Before,
     each response had a stream. `Web.fetch/2` gives the body `nil` for a HEAD
     request and for a status that permits no body.
+  - A body of no bytes, such as `Response.new(body: "")`, gives no chunk, as
+    the Fetch Standard specifies. Before, it gave one empty chunk.
+    `ReadableStream.from("")` still gives one empty chunk.
   - The default of `url` is `""`. The response of `Web.fetch/2` has the type
     `"basic"`.
   - `json/2` has an empty status text, keeps a `content-type` that `init`
@@ -798,6 +836,10 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A cancel of a stream that closed with chunks in its queue discards the
+  chunks and calls the cancel callback of the source, as the Streams
+  Standard specifies: such a stream is readable until a read takes the last
+  chunk. Before, the cancel had no effect, and a read got the chunks.
 - A stream that closes with chunks in its queue stays readable until a
   read takes the last chunk, as the Streams Standard specifies. An error,
   or the abort of the signal of a fetch, at that time puts it in the

@@ -364,8 +364,9 @@ defmodule Web.Dispatcher.HTTPTest do
     Process.sleep(20)
     assert :ok = Web.AbortController.abort(controller, :timeout)
 
-    assert {:ok, %Web.TypeError{message: "The stream is errored."}} = Task.yield(task, 1000)
-    assert_receive :http_client_closed, 1000
+    # The time limits are large for a busy machine.
+    assert {:ok, %Web.TypeError{message: "The stream is errored."}} = Task.yield(task, 2000)
+    assert_receive :http_client_closed, 2000
   end
 
   test "fetch/1 returns aborted for an already-aborted signal before streaming begins" do

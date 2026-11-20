@@ -23,14 +23,19 @@ defmodule Web.PerformanceTest do
 
   describe "time" do
     test "now is a float of milliseconds that does not go back" do
+      # The sleep makes the time between the two calls. The test also
+      # measures that time in microseconds. A busy machine can make the
+      # sleep long, thus that measurement is the upper limit.
+      started_us = :erlang.monotonic_time(:microsecond)
       first = Performance.now()
       Process.sleep(5)
       second = Performance.now()
+      elapsed_us = :erlang.monotonic_time(:microsecond) - started_us
 
       assert is_float(first)
       assert first >= 0.0
       assert second - first >= 5.0
-      assert second - first < 1_000.0
+      assert round((second - first) * 1000) <= elapsed_us
     end
 
     test "the time origin and now give the time of the system" do

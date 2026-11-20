@@ -83,13 +83,13 @@ defmodule Web.FormDataTest do
     {stream, tracker} = tracked_source(byte_chunks(payload))
     form_data = Web.FormData.parse(stream, boundary)
     file = Web.FormData.get(form_data, "upload")
-    pulls_before = stable_source_pulls(tracker)
+    pulls_before = settled_parse_pulls(form_data, file, stream, tracker)
 
     later_field = Task.async(fn -> Web.FormData.get(form_data, "after") end)
 
-    Process.sleep(50)
+    wait_for_pending(form_data.coordinator, 1)
     assert Task.yield(later_field, 0) == nil
-    assert stable_source_pulls(tracker) == pulls_before
+    assert settled_parse_pulls(form_data, file, stream, tracker) == pulls_before
 
     assert Web.TestBytes.join(Web.File.stream(file)) == "hello file"
     assert Task.await(later_field) == "done"
@@ -117,7 +117,7 @@ defmodule Web.FormDataTest do
     get_waiter = Task.async(fn -> Web.FormData.get(form, "after") end)
     has_waiter = Task.async(fn -> Web.FormData.has?(form, "after") end)
 
-    Process.sleep(50)
+    wait_for_pending(form.coordinator, 2)
     assert Task.yield(get_waiter, 0) == nil
     assert Task.yield(has_waiter, 0) == nil
 
@@ -576,10 +576,10 @@ defmodule Web.FormDataTest do
     # A new stream pulls its source one time, to fill its queue. The test
     # waits for that pull, thus it is not counted as a read of the parser.
     assert_eventually(fn -> source_pulls(tracker) == 1 end)
-    pulls_before = stable_source_pulls(tracker)
+    pulls_before = settled_source_pulls(stream, tracker)
 
     assert :already_aborted = catch_exit(Web.FormData.parse(stream, "x", signal: signal))
-    assert stable_source_pulls(tracker) == pulls_before
+    assert settled_source_pulls(stream, tracker) == pulls_before
     assert ReadableStream.locked?(stream) == false
   end
 
@@ -881,7 +881,8 @@ defmodule Web.FormDataTest do
     file_stream = form |> Web.FormData.get("upload") |> Web.File.stream()
 
     send(form.coordinator, {:unrelated, :message})
-    Process.sleep(50)
+    # The coordinator handles the message before this request.
+    _state = :sys.get_state(form.coordinator)
     assert Process.alive?(form.coordinator)
 
     assert :ok = AbortController.abort(explicit, :explicit_abort)
@@ -1004,7 +1005,7 @@ defmodule Web.FormDataTest do
         end
       end)
 
-    Process.sleep(50)
+    wait_for_pending(form.coordinator, 1)
     assert Task.yield(waiter, 0) == nil
 
     assert :ok = await(ReadableStream.cancel(Web.File.stream(file), :skip_part))
@@ -1038,7 +1039,7 @@ defmodule Web.FormDataTest do
         end
       end)
 
-    Process.sleep(50)
+    wait_for_pending(form.coordinator, 1)
     assert Task.yield(waiter, 0) == nil
     assert Web.TestBytes.join(Web.File.stream(file)) == "payload"
 
@@ -1143,7 +1144,7 @@ defmodule Web.FormDataTest do
         end
       end)
 
-    Process.sleep(50)
+    wait_for_pending(form.coordinator, 1)
     assert Task.yield(waiter, 0) == nil
     ReadableStream.error(stream.controller_pid, Web.TypeError.exception("discard read failed"))
     assert :ok = await(ReadableStream.cancel(Web.File.stream(file), :skip_part))
@@ -1593,6 +1594,7 @@ defmodule Web.FormDataTest do
                end) do
             :blocked ->
               send(parent, :parser_entries_pull)
+              # A slow source: the parser waits for the second chunk.
               Process.sleep(100)
               Web.ReadableStreamDefaultController.enqueue(controller, second_chunk)
 
@@ -1606,13 +1608,19 @@ defmodule Web.FormDataTest do
       })
 
     form = Web.FormData.parse(stream, boundary)
+    coordinator = form.coordinator
 
-    waiter = Task.async(fn -> Web.FormData.Parser.entries(form.coordinator) end)
+    # The coordinator is suspended. Thus the calls of the two tasks are in
+    # its mailbox in a known sequence, before it handles one of them.
+    :erlang.suspend_process(coordinator)
+    waiter = Task.async(fn -> Web.FormData.Parser.entries(coordinator) end)
     assert_receive :parser_entries_pull
+    assert_eventually(fn -> call_queued?(coordinator, waiter.pid) end)
 
-    concurrent_waiter = Task.async(fn -> Web.FormData.Parser.entries(form.coordinator) end)
-    Process.sleep(10)
-    entries = Web.FormData.Parser.entries(form.coordinator)
+    concurrent_waiter = Task.async(fn -> Web.FormData.Parser.entries(coordinator) end)
+    assert_eventually(fn -> call_queued?(coordinator, concurrent_waiter.pid) end)
+    :erlang.resume_process(coordinator)
+    entries = Web.FormData.Parser.entries(coordinator)
 
     assert [
              {"field", "1"},
@@ -1946,21 +1954,48 @@ defmodule Web.FormDataTest do
     Agent.get(tracker, & &1.pulls)
   end
 
-  defp stable_source_pulls(tracker, attempts \\ 20)
-
-  defp stable_source_pulls(tracker, attempts) when attempts > 0 do
-    current = source_pulls(tracker)
-    Process.sleep(5)
-    next = source_pulls(tracker)
-
-    if current == next do
-      next
-    else
-      stable_source_pulls(tracker, attempts - 1)
-    end
+  # Waits until the source stream does no work before a read, and returns
+  # the count of its pulls.
+  defp settled_source_pulls(stream, tracker) do
+    wait_for_idle_stream(stream.controller_pid)
+    source_pulls(tracker)
   end
 
-  defp stable_source_pulls(tracker, 0), do: source_pulls(tracker)
+  # Waits until the parse does no work before a read, and returns the count
+  # of the pulls of the source. The stream of the file pulls from the
+  # coordinator, and the coordinator reads the source. Thus the test
+  # examines them in this sequence. The source can be idle for a short time
+  # while the coordinator reads for the file.
+  defp settled_parse_pulls(form, file, stream, tracker) do
+    wait_for_idle_stream(file.stream.controller_pid)
+    _state = :sys.get_state(form.coordinator)
+    settled_source_pulls(stream, tracker)
+  end
+
+  # Waits until a stream does not pull, and cannot start a pull before a
+  # read: its queue is full, or it is closed.
+  defp wait_for_idle_stream(pid) do
+    assert_eventually(fn ->
+      slots = ReadableStream.__get_slots__(pid)
+      not slots.pulling and (slots.state != :readable or slots.desired_size <= 0)
+    end)
+  end
+
+  # Waits until the coordinator keeps `count` queries that wait for a later
+  # part. The queries come from different processes, thus no message tells
+  # when the coordinator got them.
+  defp wait_for_pending(coordinator, count) do
+    assert_eventually(fn ->
+      {_state, data} = :sys.get_state(coordinator)
+      length(data.pending) == count
+    end)
+  end
+
+  # Tells if a call from `caller` is in the mailbox of `pid`.
+  defp call_queued?(pid, caller) do
+    {:messages, messages} = Process.info(pid, :messages)
+    Enum.any?(messages, &match?({:"$gen_call", {^caller, _tag}, _request}, &1))
+  end
 
   defp source_cancel_reason(tracker) do
     Agent.get(tracker, & &1.cancel_reason)
@@ -2240,17 +2275,37 @@ defmodule Web.FormDataEdgeTest do
     form = Web.FormData.parse(stream, boundary)
     file = Web.FormData.get(form, "upload")
 
-    # Start a reader task that will block partway through the file stream
+    test = self()
+
+    # Start a reader task that will block partway through the file stream:
+    # after the first chunk, it waits for the test.
     reader_task =
       Task.async(fn ->
         try do
-          {:ok, Web.TestBytes.join(Web.File.stream(file))}
+          body =
+            file
+            |> Web.File.stream()
+            |> Stream.with_index()
+            |> Stream.map(fn
+              {chunk, 0} ->
+                send(test, :file_reader_blocked)
+                receive do: (:continue -> chunk)
+
+              {chunk, _index} ->
+                chunk
+            end)
+            |> Web.TestBytes.join()
+
+          {:ok, body}
+        rescue
+          # The discard interrupts the reader: its next read raises an error.
+          error in Web.TypeError -> {:error, error}
         catch
           :exit, reason -> {:exit, reason}
         end
       end)
 
-    Process.sleep(20)
+    assert_receive :file_reader_blocked
 
     # Enum.to_list must not deadlock even with the blocked reader:
     # advancing to the next entry auto-discards the file stream,
@@ -2264,6 +2319,7 @@ defmodule Web.FormDataEdgeTest do
     Web.FormData.cancel(form)
 
     # The blocked reader is interrupted by the discard
+    send(reader_task.pid, :continue)
     Task.await(reader_task, 2_000)
   end
 

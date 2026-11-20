@@ -43,7 +43,8 @@ defmodule Web.ReadableStreamTest do
         Enum.each(stream, fn _ -> raise "error" end)
       end
 
-      Process.sleep(50)
+      # The release of the lock is a call. Thus the stream has no reader
+      # when the enumeration returns.
       assert ReadableStream.__get_slots__(pid).reader_pid == nil
     end
 
@@ -51,7 +52,7 @@ defmodule Web.ReadableStreamTest do
       ReadableStream.enqueue(pid, "a")
       ReadableStream.enqueue(pid, "b")
       assert Enum.take(stream, 1) == ["a"]
-      Process.sleep(50)
+      # The halt is a call that removes the reader.
       assert ReadableStream.__get_slots__(pid).reader_pid == nil
     end
 
@@ -258,7 +259,10 @@ defmodule Web.ReadableStreamTest do
       end)
 
       receive do: (:locked -> :ok)
-      Process.sleep(100)
+
+      # The stream gets the DOWN message of the reader from the runtime. No
+      # message to the test tells when the stream handled it.
+      eventually(fn -> ReadableStream.__get_slots__(pid).reader_pid == nil end)
       assert ReadableStream.__get_slots__(pid).reader_pid == nil
 
       # Send a DOWN message with a ref that doesn't match
@@ -534,8 +538,9 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStream.disturbed?(stream) == false
 
       _branches = ReadableStream.tee(stream)
-      Process.sleep(50)
 
+      # The tee process reads the source after the branches pull.
+      eventually(fn -> ReadableStream.disturbed?(stream) end)
       assert ReadableStream.disturbed?(stream) == true
     end
 
@@ -634,22 +639,30 @@ defmodule Web.ReadableStreamTest do
     end
 
     test "task down paths handle normal and abnormal exits" do
-      sleeper = fn _controller -> Process.sleep(5_000) end
+      test = self()
 
+      # The pull does not end in the test. Thus the task of the pull stays
+      # active.
+      sleeper = fn _controller ->
+        send(test, {:pulling, self()})
+        Process.sleep(5_000)
+      end
+
+      # The stream starts the task before it handles a later message. Thus
+      # the next call gets the reference of the task. The stream handles the
+      # messages of the test in the sequence that the test sends them.
       {:ok, normal_pid} = ReadableStream.start_link(source: %{pull: sleeper})
       send(normal_pid, {:internal, :maybe_pull})
-      Process.sleep(50)
+      assert_receive {:pulling, _worker}
       normal_ref = ReadableStream.__get_slots__(normal_pid).task_ref
       send(normal_pid, {:DOWN, normal_ref, :process, self(), :normal})
-      Process.sleep(50)
       assert ReadableStream.__get_slots__(normal_pid).state == :readable
 
       {:ok, abnormal_pid} = ReadableStream.start_link(source: %{pull: sleeper})
       send(abnormal_pid, {:internal, :maybe_pull})
-      Process.sleep(50)
+      assert_receive {:pulling, _worker}
       abnormal_ref = ReadableStream.__get_slots__(abnormal_pid).task_ref
       send(abnormal_pid, {:DOWN, abnormal_ref, :process, self(), :kaboom})
-      Process.sleep(50)
       assert ReadableStream.__get_slots__(abnormal_pid).state == :errored
     end
 
@@ -662,7 +675,7 @@ defmodule Web.ReadableStreamTest do
         send(parent, {:res, res})
       end)
 
-      Process.sleep(50)
+      wait_for_read_request(pid)
       ReadableStream.enqueue(pid, "v")
       receive do: ({:res, {:ok, "v"}} -> :ok)
     end
@@ -695,7 +708,7 @@ defmodule Web.ReadableStreamTest do
       end)
 
       receive do: (:locked -> :ok)
-      Process.sleep(50)
+      wait_for_read_request(p5)
       ReadableStream.close(p5)
       assert_receive {:r1, :done}
 
@@ -709,7 +722,7 @@ defmodule Web.ReadableStreamTest do
       end)
 
       receive do: (:locked_too -> :ok)
-      Process.sleep(50)
+      wait_for_read_request(p6)
       ReadableStream.error(p6, :boom)
       assert_receive {:r3, {:error, {:errored, :boom}}}
     end
@@ -829,8 +842,7 @@ defmodule Web.ReadableStreamTest do
 
       # Branch B should still be able to get data
       reader_b = ReadableStream.get_reader(branch_b)
-      # Wait a bit for async start/pull to complete if needed
-      Process.sleep(50)
+      # The read waits for the chunk.
       assert await(ReadableStreamDefaultReader.read(reader_b)) == %{value: "data", done: false}
       assert_receive :pull_called
 
@@ -916,12 +928,13 @@ defmodule Web.ReadableStreamTest do
 
       task_pid = Agent.get(counter, & &1)
       assert Process.alive?(task_pid)
+      task_monitor = Process.monitor(task_pid)
 
       # Cancel stream
       assert :ok = Web.Promise.await(ReadableStream.cancel(stream.controller_pid, :abort))
 
       # Task should be shut down
-      Process.sleep(100)
+      assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, _reason}
       refute Process.alive?(task_pid)
       Agent.stop(counter)
     end
@@ -947,11 +960,7 @@ defmodule Web.ReadableStreamTest do
     end
 
     test "tee/1 allows 16 chunks to queue on the fast branch" do
-      check all(
-              chunk_count <- StreamData.integer(16..16),
-              delay_ms <- StreamData.integer(50..80),
-              max_runs: 10
-            ) do
+      check all(chunk_count <- StreamData.integer(16..16), max_runs: 10) do
         {:ok, counter} = Agent.start_link(fn -> 1 end)
 
         try do
@@ -971,24 +980,29 @@ defmodule Web.ReadableStreamTest do
           [fast_branch, slow_branch] = ReadableStream.tee(stream)
 
           expected = Enum.to_list(1..chunk_count)
-          started_at = System.monotonic_time(:millisecond)
+          test = self()
+          ref = make_ref()
 
-          fast_task = Task.async(fn -> Enum.to_list(fast_branch) end)
-
+          # The slow branch takes one chunk. Then it waits for the test
+          # before it takes the next chunk.
           slow_task =
-            Task.async(fn -> Enum.each(slow_branch, fn _ -> Process.sleep(delay_ms) end) end)
+            Task.async(fn ->
+              Enum.map(slow_branch, fn chunk ->
+                send(test, {:slow_branch, ref, chunk})
+                receive do: (:continue -> chunk)
+              end)
+            end)
 
+          assert_receive {:slow_branch, ^ref, 1}
+
+          # The fast branch gets all the chunks while the slow branch waits:
+          # the chunks queue on the slow branch.
+          fast_task = Task.async(fn -> Enum.to_list(fast_branch) end)
           assert {:ok, ^expected} = Task.yield(fast_task, 10_000)
-          fast_elapsed_ms = System.monotonic_time(:millisecond) - started_at
-          assert :ok = Task.await(slow_task, 10_000)
-          slow_elapsed_ms = System.monotonic_time(:millisecond) - started_at
+          refute_received {:slow_branch, ^ref, 2}
 
-          # The fast branch must complete long before the slow branch finishes.
-          # With HWM=16, all chunks buffer into the fast branch so it completes
-          # without waiting for the slow branch to process each chunk.
-          # The slow branch takes ~chunk_count * delay_ms. The fast branch
-          # should finish in a fraction of that time.
-          assert fast_elapsed_ms < slow_elapsed_ms / 4
+          for _chunk <- expected, do: send(slow_task.pid, :continue)
+          assert Task.await(slow_task, 10_000) == expected
         after
           if Process.alive?(counter), do: Agent.stop(counter)
         end
@@ -1047,7 +1061,6 @@ defmodule Web.ReadableStreamTest do
           }
         )
 
-      Process.sleep(20)
       Web.Stream.terminate(pid, :error, :force_terminate)
       assert_receive {:terminated, {:error, :force_terminate}}, 500
     end
@@ -1097,8 +1110,8 @@ defmodule Web.ReadableStreamTest do
       {:ok, pid} = ReadableStream.start_link()
       stream = %ReadableStream{controller_pid: pid}
       # Use a non-linked shutdown to kill the stream cleanly
+      # The stop returns when the process stopped.
       :gen_statem.stop(pid)
-      Process.sleep(20)
       refute Process.alive?(pid)
       cancel_promise = ReadableStream.cancel(stream, :already_dead)
       assert :ok == Web.Promise.await(cancel_promise)
@@ -1116,23 +1129,38 @@ defmodule Web.ReadableStreamTest do
           end
         }).controller_pid
 
-      Process.sleep(50)
+      # The function `start` runs before `new` returns, and its close is a
+      # call.
       assert ReadableStream.__get_slots__(pid).state == :closed
     end
   end
 
-  defp wait_for_stream_state(pid, expected_state, attempts \\ 20)
-
-  defp wait_for_stream_state(pid, expected_state, attempts) when attempts > 0 do
-    if ReadableStream.__get_slots__(pid).state == expected_state do
-      :ok
-    else
-      Process.sleep(25)
-      wait_for_stream_state(pid, expected_state, attempts - 1)
-    end
+  defp wait_for_stream_state(pid, expected_state) do
+    eventually(fn -> ReadableStream.__get_slots__(pid).state == expected_state end)
+    assert ReadableStream.__get_slots__(pid).state == expected_state
   end
 
-  defp wait_for_stream_state(pid, expected_state, 0) do
-    assert ReadableStream.__get_slots__(pid).state == expected_state
+  # Waits until the stream keeps a read that waits for a chunk. The read
+  # comes from a different process, thus the test cannot put it in a
+  # sequence with its own messages.
+  defp wait_for_read_request(pid) do
+    eventually(fn -> not :queue.is_empty(ReadableStream.__get_slots__(pid).read_requests) end)
+  end
+
+  # Examines the condition until it is true, with a limit of 2 seconds for
+  # a busy machine. Use it only when no message tells that a different
+  # process did its step.
+  defp eventually(condition, attempts \\ 200) do
+    cond do
+      condition.() ->
+        :ok
+
+      attempts > 1 ->
+        Process.sleep(10)
+        eventually(condition, attempts - 1)
+
+      true ->
+        flunk("The condition did not become true in the time limit.")
+    end
   end
 end

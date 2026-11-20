@@ -30,6 +30,23 @@ defmodule Web.CompressionStandardTest do
     [head | split(rest, sizes)]
   end
 
+  # Examines the condition until it is true, with a limit of 2 seconds for a
+  # busy machine. Use it only when no message tells that a different process
+  # did its step.
+  defp wait_until(condition, attempts \\ 200) do
+    cond do
+      condition.() ->
+        :ok
+
+      attempts > 1 ->
+        Process.sleep(10)
+        wait_until(condition, attempts - 1)
+
+      true ->
+        flunk("The condition did not become true in the time limit.")
+    end
+  end
+
   describe "a decompression stream" do
     test "gives TypeError when the stream closes before the end of the data" do
       for format <- @formats do
@@ -141,7 +158,13 @@ defmodule Web.CompressionStandardTest do
         for _ <- 1..50,
             do: WritableStreamDefaultWriter.write(writer, :crypto.strong_rand_bytes(20_000))
 
-      Process.sleep(100)
+      # The transform waits for space on the readable side. Then the stream
+      # does no more work before a read.
+      wait_until(fn ->
+        slots = ReadableStream.__get_slots__(stream.readable.controller_pid)
+        not :queue.is_empty(slots.enqueue_waiters)
+      end)
+
       assert Enum.count(writes, &(Promise.peek(&1) == :pending)) >= 45
       assert :queue.len(ReadableStream.__get_slots__(stream.readable.controller_pid).queue) <= 2
     end

@@ -281,8 +281,9 @@ defmodule Web.WritableStreamTest do
 
     assert_receive {:closing_write, sink_pid, "first"}
 
-    close_task = Task.async(fn -> await(WritableStreamDefaultWriter.close(closing_writer)) end)
-    Process.sleep(50)
+    # The test process sends the close request before the next write. Thus
+    # the stream handles the close first.
+    close_promise = WritableStreamDefaultWriter.close(closing_writer)
 
     assert %TypeError{message: "The stream is closing."} =
              catch_exit(await(WritableStreamDefaultWriter.write(closing_writer, "second")))
@@ -292,7 +293,7 @@ defmodule Web.WritableStreamTest do
 
     send(sink_pid, :continue)
     assert {:ok, :ok} = Task.yield(write_task, 1_000)
-    assert {:ok, :ok} = Task.yield(close_task, 1_000)
+    assert :ok = await(close_promise)
 
     # A second close is an error, as in the Streams Standard.
     assert %TypeError{message: "The stream is closed."} =
@@ -331,7 +332,10 @@ defmodule Web.WritableStreamTest do
       WritableStream.new(%{
         abort: fn reason ->
           send(parent, {:abort_started, self(), reason})
-          Process.sleep(200)
+
+          # The callback continues when the test tells it to continue. Thus
+          # the test examines the stream while the callback runs.
+          receive do: (:finish_abort -> :ok)
           send(parent, {:abort_finished, reason})
           :ok
         end
@@ -342,7 +346,7 @@ defmodule Web.WritableStreamTest do
     abort_task =
       Task.async(fn -> await(WritableStreamDefaultWriter.abort(writer, :slow_boom)) end)
 
-    assert_receive {:abort_started, _sink_pid, :slow_boom}
+    assert_receive {:abort_started, sink_pid, :slow_boom}
     assert Task.yield(abort_task, 50) == nil
     assert Process.alive?(stream.controller_pid)
 
@@ -361,7 +365,8 @@ defmodule Web.WritableStreamTest do
              catch_exit(await(WritableStreamDefaultWriter.close(writer)))
 
     refute_receive {:abort_finished, :slow_boom}, 100
-    assert_receive {:abort_finished, :slow_boom}, 300
+    send(sink_pid, :finish_abort)
+    assert_receive {:abort_finished, :slow_boom}
     assert {:ok, :ok} = Task.yield(abort_task, 500)
 
     assert_wait(fn ->
@@ -469,38 +474,36 @@ defmodule Web.WritableStreamTest do
       WritableStream.__get_slots__(writer_lock_stream.controller_pid).writer_pid == nil
     end)
 
-    slow_stream =
-      WritableStream.new(%{
-        write: fn _chunk, _controller ->
-          Process.sleep(5_000)
-        end
-      })
+    # The write does not end in the test. Thus the task of the write stays
+    # active.
+    slow_write = fn _chunk, _controller ->
+      send(parent, {:writing, self()})
+      Process.sleep(5_000)
+    end
 
+    slow_stream = WritableStream.new(%{write: slow_write})
+
+    # The stream starts the task before it handles a later message. Thus the
+    # next call gets the reference of the task. The stream handles the
+    # messages of the test in the sequence that the test sends them.
     assert :ok = WritableStream.get_writer(slow_stream.controller_pid)
     spawn(fn -> WritableStream.write(slow_stream.controller_pid, parent, "x") end)
-    Process.sleep(50)
+    assert_receive {:writing, _worker}
 
     normal_ref = WritableStream.__get_slots__(slow_stream.controller_pid).task_ref
     send(slow_stream.controller_pid, {:DOWN, normal_ref, :process, self(), :normal})
-    Process.sleep(50)
 
     assert WritableStream.__get_slots__(slow_stream.controller_pid).state == :writable
     :gen_statem.stop(slow_stream.controller_pid)
 
-    abnormal_stream =
-      WritableStream.new(%{
-        write: fn _chunk, _controller ->
-          Process.sleep(5_000)
-        end
-      })
+    abnormal_stream = WritableStream.new(%{write: slow_write})
 
     assert :ok = WritableStream.get_writer(abnormal_stream.controller_pid)
     spawn(fn -> WritableStream.write(abnormal_stream.controller_pid, parent, "x") end)
-    Process.sleep(50)
+    assert_receive {:writing, _worker}
 
     abnormal_ref = WritableStream.__get_slots__(abnormal_stream.controller_pid).task_ref
     send(abnormal_stream.controller_pid, {:DOWN, abnormal_ref, :process, self(), :kaboom})
-    Process.sleep(50)
 
     assert WritableStream.__get_slots__(abnormal_stream.controller_pid).state == :errored
   end
@@ -566,6 +569,7 @@ defmodule Web.WritableStreamTest do
   test "race to abort does not crash and concurrent writes do not hang" do
     stream =
       WritableStream.new(%{
+        # A slow sink: the abort comes while the writes wait in the queue.
         write: fn _chunk, _controller ->
           Process.sleep(50)
           :ok

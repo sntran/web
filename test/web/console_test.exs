@@ -1,5 +1,11 @@
 defmodule Web.ConsoleTest do
-  use ExUnit.Case, async: true
+  # Each test adds a logger handler and removes it, and the capture of the
+  # log adds a handler too. When two processes change the handlers at the
+  # same time, the logger of Erlang/OTP can lose a handler: it handles a
+  # remove while an add is in progress, and then it puts back the list of
+  # handlers from before the add. Thus these tests do not run at the same
+  # time as other tests.
+  use ExUnit.Case, async: false
   use ExUnitProperties
 
   import ExUnit.CaptureLog

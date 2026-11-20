@@ -4,7 +4,13 @@ defmodule Web.TLA.ConsoleConformanceTest do
   # The test makes a random list of calls. It does each call on the real
   # console and on the specification, and it compares the message of the
   # call: its kind, its level, its indent, and the value of a counter.
-  use ExUnit.Case, async: true
+  #
+  # Each test adds a logger handler and removes it. The logger of
+  # Erlang/OTP can lose a handler that a different test adds at the same
+  # time, for example the handler of `capture_log/1`: see
+  # `test/web/console_test.exs`. Thus these tests do not run at the same
+  # time as other tests.
+  use ExUnit.Case, async: false
   use ExUnitProperties
 
   alias Web.Console

@@ -249,15 +249,35 @@ defmodule Web.ReadableStreamPropertyTest do
 
       # The stream pulls until its queue has `limit` chunks, and not more.
       for _ <- 1..limit, do: assert_receive({:pulled, ^ref}, 1_000)
-      Process.sleep(30)
+      wait_for_idle(stream.controller_pid)
       assert count_pulls(ref) == 0
 
       # Each read lets the stream pull one more chunk.
       reader = ReadableStream.get_reader(stream)
       assert %{value: :chunk} = await(ReadableStreamDefaultReader.read(reader))
       assert_receive {:pulled, ^ref}, 1_000
-      Process.sleep(10)
+      wait_for_idle(stream.controller_pid)
       assert count_pulls(ref) == 0
+    end
+  end
+
+  # Waits until the stream does not pull, and cannot start a pull before a
+  # read: its queue is full. A pull sends its message before it ends, thus
+  # the test has the messages of all the pulls. The limit is 2 seconds for a
+  # busy machine.
+  defp wait_for_idle(pid, attempts \\ 200) do
+    slots = ReadableStream.__get_slots__(pid)
+
+    cond do
+      not slots.pulling and slots.desired_size <= 0 ->
+        :ok
+
+      attempts > 1 ->
+        Process.sleep(10)
+        wait_for_idle(pid, attempts - 1)
+
+      true ->
+        flunk("The stream did not stop to pull in the time limit.")
     end
   end
 

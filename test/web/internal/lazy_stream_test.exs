@@ -122,6 +122,7 @@ defmodule Web.Internal.LazyStreamTest do
 
       starter =
         spawn(fn ->
+          # A slow start: the copy must wait while the state is "starting".
           Process.sleep(5)
           {:ok, _owner} = Registry.register(LazyStream.registry(), stream.lazy.ref, nil)
           :atomics.put(stream.lazy.ref, 1, 5)
@@ -133,7 +134,9 @@ defmodule Web.Internal.LazyStreamTest do
         end)
 
       assert LazyStream.state(stream.lazy) == {:process, starter}
-      assert_received :registered
+      # The starter sends the message after it sets the state. Thus the
+      # test must wait for the message.
+      assert_receive :registered
       send(starter, :stop)
     end
   end

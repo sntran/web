@@ -34,6 +34,9 @@ All notable changes to this project are documented in this file.
 - `Web.URL.parse/1,2`, `Web.URL.can_parse/1,2`, and `Web.URL.to_json/1`.
 - `Web.URLSearchParams.has/3` and `Web.URLSearchParams.delete/3`, with a
   value, and `Web.URLSearchParams.size/1`.
+- `Web.URLPattern.has_reg_exp_groups/1`, the attribute `hasRegExpGroups`.
+  `Web.URLPattern.new/0`, `test/1`, and `exec/1` use the default input
+  `{}` of the URL Pattern Standard.
 - `Web.fetch/2` decodes a response body with the header
   `Content-Encoding`, as the Fetch Standard specifies: `gzip`, `x-gzip`,
   `deflate` (the zlib format, or raw deflate data), and `zstd`. A list of
@@ -359,6 +362,24 @@ All notable changes to this project are documented in this file.
     does, and keeps the sequence of the pairs with the same name;
   - `new/1` accepts a pair as a list of two items, and raises
     `Web.TypeError` for an item that does not have two items.
+- **Breaking:** `Web.URLPattern` follows the algorithms of the URL Pattern
+  Standard: the tokenizer, the pattern parser, the constructor string
+  parser, the steps "process a URLPatternInit", and the encoding callbacks.
+  All the 373 URLPattern tests of WPT pass, where 252 passed.
+  - A pattern that is not valid raises `Web.TypeError`. It raised
+    `ArgumentError`. This includes a relative pattern string with no base
+    URL, and a base URL as a separate argument of a map input.
+  - The base URL gives each component that is less specific than the
+    components of the input, and an empty base URL raises `Web.TypeError`.
+  - The pattern string of a component is the canonical text of the
+    Standard. For example, `/foo/(.*)` gives `/foo/*`.
+  - A regular expression of a pattern has the syntax of ECMAScript with the
+    flag `v`, and the library refuses the syntax that ECMAScript refuses.
+  - `exec/3` gives `:inputs`, and a group that does not take part in the
+    match is `nil`. An input that the URL parser refuses gives `nil`.
+  - In `"https://user:pw@host"`, `:pw` is a named group of the username,
+    as in the Standard. Write `user\:pw` for a password.
+  - A map input gives its base URL in the key `:base_url`.
 - `README.md` does not say that the library has 100 % WPT compliance for
   `URL`. The JSON data of WPT for the parse of a URL passes, but the
   JavaScript files of WPT show differences: see "Web Platform Tests in
@@ -1022,6 +1043,11 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A change of a `Web.URLSearchParams` of a URL runs the "update steps" of
+  the URL Standard: a change that gives an empty serialization removes the
+  `?` of the URL, and a change on a URL with no query gives the URL a
+  query. Before, the URL kept its old query in these two cases. The request
+  target of `Web.fetch/2` also has the changed query.
 - A pipe to a stream that is closed or errored cancels the source. Before,
   the promise of the pipe did not settle.
 - The last chunk of a pipe is not lost when the source closes during a

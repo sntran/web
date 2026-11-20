@@ -678,8 +678,8 @@ systems, and examine its SHA-256 hash.
 | --- | --- | --- | --- | --- | --- | --- |
 | `Headers` | 287 | 121 | 32 | 99 | 0 | 35 |
 | `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11885 | 16 | 4 | 2 | 194 |
-| `URL` and `URLSearchParams` | 4869 | 4862 | 2 | 5 | 0 | 0 |
-| `URLPattern` | 373 | 252 | 0 | 121 | 0 | 0 |
+| `URL` and `URLSearchParams` | 4869 | 4867 | 2 | 0 | 0 | 0 |
+| `URLPattern` | 373 | 373 | 0 | 0 | 0 | 0 |
 | The streams, the readers, the writers, and the strategies | 1157 | 1012 | 79 | 66 | 0 | 0 |
 | `CompressionStream` and `DecompressionStream` | 318 | 229 | 1 | 88 | 0 | 0 |
 | `Request`, `Response`, and the body | 697 | 457 | 109 | 131 | 0 | 0 |
@@ -705,9 +705,6 @@ library. The runner answers a call when the library is at rest. Thus the
 library can do a step before the call returns, where JavaScript does it in a
 later microtask (27 stream tests). The differences of the library are:
 
-* `URLPattern` raises `ArgumentError`, not `TypeError`, for a pattern that is
-  not valid (45 tests), and the text of a compiled pattern is different from
-  the canonical text of the Standard, for example `/foo/(.*)` for `/foo/*`.
 * `Request` has no `destination`, `referrer`, `mode`, `credentials`, `cache`,
   and other attributes of the Fetch Standard. The headers of a request have
   no guard: they accept a forbidden name, such as `Cookie`.

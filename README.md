@@ -637,7 +637,7 @@ easy to make and hard to find with an example test:
 | `StreamLifetime.tla` | When a stream process stops, and when it must stay.        |
 | `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
 | `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |
-| `ConnectionPool.tla` | The connections of an origin: the limit, the queue, and the stops. |
+| `ConnectionPool.tla` | The connections of an origin, and the slots of a counting governor: the limit, the queue, and the stops. |
 | `SocketFlow.tla`     | A request reads its socket one message at a time, at the limit. |
 | `SharedConnection.tla` | HTTP/2 streams: one run of each request, the limit, GOAWAY. |
 | `MessagePort.tla`    | The port message queue, the start, the transfer, and the close. |
@@ -661,6 +661,11 @@ rule of the design, and a test makes sure that the checker finds it.
 # Examine the specifications and run the conformance tests
 mix test test/tla
 ```
+
+### Contributing
+
+`CONTRIBUTING.md` gives the rules for a change: the compliance with the Web
+Standards, the TLA+ specifications, the property tests, and the gate.
 
 * * * * *
 

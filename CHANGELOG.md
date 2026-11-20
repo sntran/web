@@ -64,7 +64,13 @@ All notable changes to this project are documented in this file.
   and `tla/SharedConnection.tla`, with a conformance test of the pool, a
   conformance test of the reads of the socket, and property tests of the
   shared HTTP/2 connection and of the content decoder. A property test
-  checks the properties of `tla/ResponseBody.tla` on the real body.
+  checks the properties of `tla/ResponseBody.tla` on the real body. A
+  second conformance test compares `Web.CountingGovernor` with
+  `tla/ConnectionPool.tla`: a governor and the pool count their slots with
+  the same rules.
+- `CONTRIBUTING.md`, with the rules for a change: the compliance with the
+  Web Standards, the TLA+ specifications, the property tests, the tests
+  that do not depend on time, the gate, and the benchmarks.
 - The path of the URL goes to the server with no change, as in a browser:
   the HTTP client does not check it again. For example, a path can have
   `|`.
@@ -253,6 +259,14 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- `Web.CompressionStream` and `Web.DecompressionStream` keep their zlib
+  handle in the worker of the stream, and close it in the callback
+  `terminate`. Before, each stream started an `Agent` to keep the handle.
+  `Web.DecompressionStream` uses the decoder of `Web.fetch/2`: it gives
+  chunks of 64 KiB at most.
+- The process of a request does not set the socket again before it gives
+  the connection back to the pool: the socket is passive already after the
+  end of the response.
 - The callbacks of a stream run in one worker process for the life of the
   stream. Before, each callback started a new task through one supervisor
   of the application. The supervisor `Web.TaskSupervisor` is removed. A
@@ -870,6 +884,10 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `Web.DecompressionStream` decodes only as the reader takes the chunks.
+  Before, one write decoded all its data at once: a gzip write of 20 KiB
+  that expands to 20 MB put 20 MB in the queue of the stream. Now the
+  stream keeps less than 200 KB, and the write waits for the reader.
 - A cancel of a stream that closed with chunks in its queue discards the
   chunks and calls the cancel callback of the source, as the Streams
   Standard specifies: such a stream is readable until a read takes the last

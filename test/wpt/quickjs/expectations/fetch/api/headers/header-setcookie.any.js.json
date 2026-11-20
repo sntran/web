@@ -1,6 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "Set-Cookie is a forbidden response header": "library: a different result"
+    "Set-Cookie is a forbidden response header": "scope: a server runtime has no guard for forbidden headers"
   }
 }

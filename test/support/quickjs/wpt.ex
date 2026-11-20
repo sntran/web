@@ -132,7 +132,8 @@ defmodule Web.Test.QuickJS.WPT do
     Enum.find_value(causes(), "library: a different result", &match(&1, path, name, message))
   end
 
-  @no_view_type "library: no view type other than Uint8Array"
+  @no_view_type "scope: the library has only Uint8Array views"
+  @no_guard "scope: a server runtime has no guard for forbidden headers"
   @no_microtask "runner: the library reacts before the microtasks of JavaScript"
 
   # The rules, in their sequence: the first rule that gives a group wins.
@@ -248,7 +249,30 @@ defmodule Web.Test.QuickJS.WPT do
       # `TextEncoderStream` converts a chunk to a string with `String.Chars`
       # of Elixir, not with the conversion of JavaScript.
       {:test, "encoding/streams/encode-bad-chunks.any.js", ~r//,
-       "library: String.Chars converts a chunk, not the rules of JavaScript"},
+       "scope: the rules of JavaScript to convert a value to a string"},
+      # The Fetch Standard forbids some headers for the code of a web page,
+      # such as `Cookie` and `Set-Cookie`, and allows only some headers for
+      # a request in the mode "no-cors". A server runtime has no page and no
+      # CORS: Node.js and Deno send each header too. The guard "immutable"
+      # of a response is in the library.
+      {:path, "fetch/api/headers/headers-no-cors.any.js", @no_guard},
+      {:test, "fetch/api/headers/headers-forbidden-override.any.js", ~r/is forbidden to use/,
+       @no_guard},
+      {:test, "fetch/api/headers/header-setcookie.any.js",
+       "Set-Cookie is a forbidden response header", @no_guard},
+      {:test, "fetch/api/request/request-headers.any.js",
+       ~r/^(Adding invalid (no-cors )?request header|Check that (no-cors )?request constructor is filtering)/,
+       @no_guard},
+      # The BEAM has no shared memory: a chunk from a `SharedArrayBuffer` is
+      # a usual buffer in the library.
+      {:test, "compression/compression-bad-chunks.any.js", ~r/shared|SharedArrayBuffer/,
+       "scope: the BEAM has no shared memory"},
+      # `Response.json()` serializes a JavaScript value. The library gets a
+      # reference to a JavaScript object, and a lone surrogate becomes
+      # U+FFFD before it comes to the library.
+      {:test, "fetch/api/response/response-static-json.any.js",
+       ~r/encodes JSON objects correctly|propagates JSON serializer errors|with input/,
+       "runner: a JavaScript value for JSON"},
       # A transform stream is one process with one state for its two sides.
       # The Standard has a writable side that can be "erroring" while the
       # readable side is readable, and one promise for flush and cancel.

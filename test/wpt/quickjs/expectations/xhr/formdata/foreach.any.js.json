@@ -1,8 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Entries iterator should return duplicate keys and non-deleted values": "library: a different result",
-    "Iterator should return duplicate keys and non-deleted values": "library: a different result",
-    "Values iterator should return non-deleted values": "library: a different result"
-  }
-}

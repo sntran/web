@@ -136,13 +136,13 @@ defmodule Web.Test.QuickJS.Bridge do
   @classes Map.new(Map.merge(@interfaces, @iterators), fn {name, module} -> {module, name} end)
 
   # The structs that are values: two equal structs are two objects.
+  # A blob and a file have an identity of their own (`id`), thus the same
+  # struct is the same object: `FormData.get/2` gives the same file.
   @values [
-    Web.Blob,
     Web.ByteLengthQueuingStrategy,
     Web.CountQueuingStrategy,
     Web.CustomEvent,
     Web.Event,
-    Web.File,
     Web.FormData,
     Web.Headers,
     Web.Request,

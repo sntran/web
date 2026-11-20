@@ -1,18 +1,18 @@
 {
   "harness": "OK",
   "failures": {
-    "chunk of type SharedArrayBuffer should error the stream for brotli": "library: a different result",
-    "chunk of type SharedArrayBuffer should error the stream for deflate": "library: a different result",
-    "chunk of type SharedArrayBuffer should error the stream for deflate-raw": "library: a different result",
-    "chunk of type SharedArrayBuffer should error the stream for gzip": "library: a different result",
+    "chunk of type SharedArrayBuffer should error the stream for brotli": "scope: the BEAM has no shared memory",
+    "chunk of type SharedArrayBuffer should error the stream for deflate": "scope: the BEAM has no shared memory",
+    "chunk of type SharedArrayBuffer should error the stream for deflate-raw": "scope: the BEAM has no shared memory",
+    "chunk of type SharedArrayBuffer should error the stream for gzip": "scope: the BEAM has no shared memory",
     "chunk of type array should error the stream for brotli": "library: a different result",
     "chunk of type null should error the stream for brotli": "library: a different result",
     "chunk of type numeric should error the stream for brotli": "library: a different result",
     "chunk of type object, not BufferSource should error the stream for brotli": "library: a different result",
-    "chunk of type shared Uint8Array should error the stream for brotli": "library: a different result",
-    "chunk of type shared Uint8Array should error the stream for deflate": "library: a different result",
-    "chunk of type shared Uint8Array should error the stream for deflate-raw": "library: a different result",
-    "chunk of type shared Uint8Array should error the stream for gzip": "library: a different result",
+    "chunk of type shared Uint8Array should error the stream for brotli": "scope: the BEAM has no shared memory",
+    "chunk of type shared Uint8Array should error the stream for deflate": "scope: the BEAM has no shared memory",
+    "chunk of type shared Uint8Array should error the stream for deflate-raw": "scope: the BEAM has no shared memory",
+    "chunk of type shared Uint8Array should error the stream for gzip": "scope: the BEAM has no shared memory",
     "chunk of type undefined should error the stream for brotli": "library: a different result"
   }
 }

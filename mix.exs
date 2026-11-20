@@ -75,8 +75,13 @@ defmodule Web.MixProject do
       {:jason, "~> 1.4"},
       {:benchee, "~> 1.5", only: [:dev, :test]},
       {:stream_data, "~> 1.3", only: :test},
-      # An HTTP/2 server for the tests of the setting `:http_protocols`.
-      {:bandit, "~> 1.5", only: :test},
+      # An HTTP server for the tests, and for the benchmark of the HTTP
+      # clients in `bench/`.
+      {:bandit, "~> 1.5", only: [:dev, :test]},
+      {:plug, "~> 1.16", only: [:dev, :test]},
+      # The benchmark `bench/http_clients.exs` compares `Web.fetch/2` with
+      # Req. Req is not a dependency of the package.
+      {:req, "~> 0.5", only: :dev},
       # The TLA+ model checker, in Elixir. It checks the specifications in
       # `tla/`, and the property tests use it to compare the code with them.
       {:accord,

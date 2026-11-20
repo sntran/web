@@ -76,6 +76,16 @@ defmodule Web.BodyJSONTextTest do
       assert json!(~s([{"k":"first","k":"last"}])) == [%{"k" => "last"}]
     end
 
+    property "keeps the last value of each key, for each sequence of the keys" do
+      check all(pairs <- list_of({member_of(["a", "b", "c", "d"]), integer()}, max_length: 8)) do
+        text =
+          "{" <> Enum.map_join(pairs, ",", fn {key, value} -> ~s("#{key}":#{value}) end) <> "}"
+
+        # A map from the pairs in their sequence keeps the last value.
+        assert json!(text) == Map.new(pairs)
+      end
+    end
+
     test "decodes the bytes as UTF-8 first, as the Fetch Standard specifies" do
       # A byte order mark goes away, and an invalid byte becomes U+FFFD.
       assert json!(<<0xEF, 0xBB, 0xBF>> <> ~s({"ok":true})) == %{"ok" => true}

@@ -948,20 +948,10 @@ defmodule Web.Test.QuickJS.Bridge do
   defp adapt("EventTarget", "operation", "removeEventListener", self, [type, callback | _rest]),
     do: {:ok, Web.EventTarget.remove_event_listener(self, type, callback)}
 
-  # The base URL of a pattern is an option of the library. In a map of the
-  # parts of a pattern, the library reads the key `:baseURL`.
+  # The base URL of a pattern string is an option of the library.
   defp adapt("URLPattern", "constructor", _member, _self, [input, base, options])
        when is_binary(base) do
-    {:ok, Web.URLPattern.new(pattern_input(input), Map.put(options, :base_url, base))}
-  end
-
-  defp adapt("URLPattern", "constructor", _member, _self, [input | options]),
-    do: {:ok, apply(Web.URLPattern, :new, [pattern_input(input) | options])}
-
-  defp adapt("URLPattern", "operation", operation, self, [input | base])
-       when operation in ["test", "exec"] do
-    {:ok,
-     apply(Web.URLPattern, String.to_existing_atom(operation), [self, pattern_input(input) | base])}
+    {:ok, Web.URLPattern.new(input, Map.put(options, :base_url, base))}
   end
 
   defp adapt(_interface, _kind, _member, _self, _args), do: :default
@@ -977,11 +967,6 @@ defmodule Web.Test.QuickJS.Bridge do
   end
 
   defp absolute(input), do: input
-
-  defp pattern_input(%{base_url: base} = input),
-    do: input |> Map.delete(:base_url) |> Map.put(:baseURL, base)
-
-  defp pattern_input(input), do: input
 
   defp options([%{} = init | _rest]), do: Map.to_list(init)
   defp options(_init), do: []

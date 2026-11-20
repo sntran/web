@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "urlpattern-hasregexpgroups": "library: no Web.URLPattern.has_reg_exp_groups/1"
-  }
-}

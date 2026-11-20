@@ -8,6 +8,13 @@ exclude =
     [:cluster]
   end
 
+# The tests in `test/wpt/` are ports of web-platform-tests. A test with the
+# tag `:wpt_failure` shows a known difference of this library from the
+# Standard: a comment above it tells the difference. These tests do not run
+# in the gate. Run them with `mix test --only wpt_failure`. Remove the tag
+# when the library follows the Standard.
+exclude = [:wpt_failure | exclude]
+
 # In `mix test`, the VM loads a module through the code server at its first
 # use. Many tests start at the same time, thus a first use can wait for a
 # long time, for example the first raise of an exception. The tests then

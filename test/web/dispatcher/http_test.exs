@@ -168,7 +168,9 @@ defmodule Web.Dispatcher.HTTPTest do
   end
 
   test "fetch/1 surfaces raw invalid body types as request build errors" do
-    port = HTTPServer.start_link([])
+    # The server waits after the request: the only failure is the chunk of
+    # the body, which is not bytes.
+    port = HTTPServer.start_link([:gate])
 
     req = %Request{
       url: Web.URL.new("http://localhost:#{port}/raw-invalid"),
@@ -181,7 +183,12 @@ defmodule Web.Dispatcher.HTTPTest do
       options: [redirect: "follow", signal: nil]
     }
 
-    assert {:error, _} = HTTP.fetch(req)
+    # A map is an enumerable: its first chunk is the pair `{:bad, :body}`.
+    assert {:error, %Web.TypeError{message: "The request body chunk must be" <> _}} =
+             HTTP.fetch(req)
+
+    assert_receive {:http_server_gate, ^port, server}
+    send(server, :go)
   end
 
   test "fetch/1 surfaces non-enumerable raw body types as request build errors" do

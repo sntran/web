@@ -49,7 +49,10 @@ defmodule Web.PipeBatchTest do
     destination =
       WritableStream.new(%{
         high_water_mark: 16,
-        write: fn chunk, _controller -> send(test, {:written, chunk}) && :ok end
+        write: fn chunk, _controller ->
+          send(test, {:written, chunk})
+          :ok
+        end
       })
 
     assert await(ReadableStream.pipe_to(source, destination)) == :ok

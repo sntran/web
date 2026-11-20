@@ -80,7 +80,7 @@ defmodule Web.TLA.SocketReadPropertyTest do
 
     if suspend(server) do
       try do
-        assert_snapshot(socket, server)
+        assert_snapshot(server)
       after
         :sys.resume(server)
       end
@@ -93,7 +93,7 @@ defmodule Web.TLA.SocketReadPropertyTest do
     assert queued(socket) <= @limit + 65_536
   end
 
-  defp assert_snapshot(socket, server) do
+  defp assert_snapshot(server) do
     state = :sys.get_state(server)
     active = active(state.socket)
     {:messages, messages} = Process.info(server, :messages)

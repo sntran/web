@@ -68,6 +68,16 @@ defmodule Web.StreamPullRulesTest do
     end
   end
 
+  defp wait_for_queue(stream, size, attempts \\ 200) do
+    queue = ReadableStream.__get_slots__(stream.controller_pid).queue
+
+    cond do
+      :queue.len(queue) >= size -> :ok
+      attempts == 0 -> flunk("the queue of the stream did not get #{size} chunks")
+      true -> Process.sleep(5) && wait_for_queue(stream, size, attempts - 1)
+    end
+  end
+
   defp readers do
     [
       enum: fn stream -> Enum.to_list(stream) end,
@@ -210,7 +220,10 @@ defmodule Web.StreamPullRulesTest do
       [left, _right] = ReadableStream.tee(ReadableStream.from(counting_enumerable(counter)))
 
       # Each branch has the high water mark 1: the tee reads one chunk for
-      # the pull at the start of a branch.
+      # the pull at the start of a branch. The pull of a branch is complete
+      # when the tee starts its read, before the chunk comes, thus the test
+      # waits for the chunk in the queue of the branch.
+      wait_for_queue(left, 1)
       settle(left)
       assert :counters.get(counter, 1) == 1
 

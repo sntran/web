@@ -495,8 +495,15 @@ defmodule Web.Dispatcher.HTTP do
 
   # The watcher gets the stream from the process that made it. A worker that
   # stops before the end of the body puts the stream in the errored state.
+  #
+  # The worker can complete a small body before this process starts. A
+  # monitor of a process that stopped gives the reason `:noproc`, thus the
+  # watcher cannot know if the body is complete. Thus the worker waits for
+  # `:http_watched` before it stops, and this message comes after the
+  # monitor.
   defp watch(worker, ref) do
     monitor = Process.monitor(worker)
+    send(worker, {:http_watched, ref})
 
     stream =
       receive do
@@ -556,6 +563,18 @@ defmodule Web.Dispatcher.HTTP do
       end
 
     report(result)
+    await_watcher(result)
+  end
+
+  # A worker with a body stream stops only when its watcher monitors it.
+  defp await_watcher({:ok, %{phase: :body} = acc}), do: receive_watched(acc.ref)
+  defp await_watcher({:error, _reason, %{phase: :body} = acc}), do: receive_watched(acc.ref)
+  defp await_watcher(_result), do: :ok
+
+  defp receive_watched(ref) do
+    receive do
+      {:http_watched, ^ref} -> :ok
+    end
   end
 
   defp handle_event({:status, status}, acc), do: {:cont, %{acc | status: status}}

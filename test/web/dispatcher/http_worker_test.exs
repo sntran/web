@@ -261,6 +261,49 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
     assert Enum.map(resp.body, &Web.Uint8Array.to_binary/1) == ["data"]
   end
 
+  # The worker can complete a small body before its watcher starts. A
+  # watcher that monitors a process that stopped gets the reason `:noproc`,
+  # and it errors the complete body. The trace of each message that the
+  # worker receives shows that the worker stops only after the watcher
+  # monitors it, at each run.
+  test "the worker of a full body stops only after its watcher monitors it" do
+    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
+    req = Request.new("http://localhost:#{port}/")
+    test = self()
+
+    pid =
+      spawn(fn ->
+        receive do
+          :go -> send(test, {:fetched, self(), HTTP.fetch(req)})
+        end
+      end)
+
+    :erlang.trace(pid, true, [:procs, :receive, :set_on_spawn])
+    send(pid, :go)
+    assert_receive {:trace, ^pid, :spawn, worker, _mfa}, 1_000
+    assert_receive {:trace, ^pid, :spawn, watcher, _mfa}, 1_000
+    assert_receive {:fetched, ^pid, {:ok, resp}}, 5_000
+
+    events = events_until_exit(worker)
+    assert List.last(events) == {:exit, :normal}
+    assert Enum.any?(events, &match?({:receive, {:http_watched, _ref}}, &1))
+
+    assert_receive {:trace, ^watcher, :receive, {:DOWN, _monitor, :process, ^worker, :normal}},
+                   1_000
+
+    assert Enum.map(resp.body, &Web.Uint8Array.to_binary/1) == ["data"]
+  end
+
+  # The trace events of a process, in order, until it stops.
+  defp events_until_exit(pid, events \\ []) do
+    receive do
+      {:trace, ^pid, :exit, reason} -> Enum.reverse([{:exit, reason} | events])
+      {:trace, ^pid, :receive, message} -> events_until_exit(pid, [{:receive, message} | events])
+    after
+      1_000 -> flunk("the process did not stop")
+    end
+  end
+
   test "an abort errors a full body that no process read" do
     port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
     controller = Web.AbortController.new()

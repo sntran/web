@@ -84,6 +84,38 @@ defmodule Web.HeadersTest do
       assert Headers.getSetCookie(headers) == ["a=1", "b=2"]
     end
 
+    # The steps "sort and combine" of the Fetch Standard.
+    test "the iteration gives each set-cookie value as a pair, and joins the other values" do
+      headers =
+        Headers.new([
+          {"set-cookie", "b=2"},
+          {"x-list", "1"},
+          {"Set-Cookie", "a=1"},
+          {"x-list", "2"},
+          {"accept", "*/*"}
+        ])
+
+      expected = [
+        {"accept", "*/*"},
+        {"set-cookie", "b=2"},
+        {"set-cookie", "a=1"},
+        {"x-list", "1, 2"}
+      ]
+
+      assert Enum.to_list(Headers.entries(headers)) == expected
+      assert Enum.to_list(headers) == expected
+      assert Enum.count(headers) == 4
+
+      assert Enum.to_list(Headers.keys(headers)) == [
+               "accept",
+               "set-cookie",
+               "set-cookie",
+               "x-list"
+             ]
+
+      assert Enum.to_list(Headers.values(headers)) == ["*/*", "b=2", "a=1", "1, 2"]
+    end
+
     test "missing headers return nil by default" do
       assert Headers.get(Headers.new(), "missing") == nil
       assert Headers.get(Headers.new(), "missing", :default) == :default

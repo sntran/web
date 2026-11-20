@@ -210,14 +210,19 @@ defmodule Web.Headers do
     normalized_entries(headers)
   end
 
+  # The steps "sort and combine" of the Fetch Standard: the names in their
+  # sequence, each value of `set-cookie` as a pair of its own, and the values
+  # of each other name joined.
   defp normalized_entries(%__MODULE__{data: data}) do
     data
     |> Enum.sort_by(fn {name, _values} -> name end)
-    |> Enum.map(fn {name, values} -> {name, join_values(name, values)} end)
+    |> Enum.flat_map(fn
+      {@set_cookie, values} -> Enum.map(values, &{@set_cookie, &1})
+      {name, values} -> [{name, join_values(name, values)}]
+    end)
   end
 
   defp join_values(_name, [value]), do: value
-  defp join_values(@set_cookie, values), do: Enum.join(values, ", ")
   defp join_values(_name, values), do: Enum.join(values, ", ")
 
   @doc false
@@ -281,7 +286,7 @@ defmodule Web.Headers do
 end
 
 defimpl Enumerable, for: Web.Headers do
-  def count(%Web.Headers{} = headers), do: {:ok, map_size(headers.data)}
+  def count(%Web.Headers{} = headers), do: {:ok, length(Web.Headers.enumerable_entries(headers))}
 
   def member?(%Web.Headers{} = headers, entry) do
     {:ok, entry in Web.Headers.enumerable_entries(headers)}

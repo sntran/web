@@ -1169,7 +1169,7 @@ defmodule Web.ReadableStream do
 
   defp tee_branch_source(tee, index, type) do
     source = %{
-      pull: fn _controller -> ReadableStreamTee.pull(tee) end,
+      pull: fn _controller -> ReadableStreamTee.pull(tee, index) end,
       cancel: fn reason -> ReadableStreamTee.cancel(tee, index, reason) end
     }
 

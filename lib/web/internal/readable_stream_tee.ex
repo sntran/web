@@ -45,8 +45,8 @@ defmodule Web.Internal.ReadableStreamTee do
   @spec attach(pid(), pid(), pid()) :: :ok
   def attach(tee, branch1, branch2), do: GenServer.call(tee, {:attach, branch1, branch2})
 
-  @spec pull(pid()) :: :ok
-  def pull(tee), do: GenServer.cast(tee, :pull)
+  @spec pull(pid(), index()) :: :ok
+  def pull(tee, index), do: GenServer.cast(tee, {:pull, index})
 
   # Records the cancel of a branch, and returns the promise of the Streams
   # Standard: it fulfils when the source is cancelled or complete, and it
@@ -140,10 +140,24 @@ defmodule Web.Internal.ReadableStreamTee do
     {:noreply, state}
   end
 
-  def handle_cast(:pull, %{branches: nil} = state), do: {:noreply, %{state | pull_wanted?: true}}
-  def handle_cast(:pull, %{request: nil} = state), do: {:noreply, start_read(state)}
+  def handle_cast({:pull, _index}, %{branches: nil} = state) do
+    {:noreply, %{state | pull_wanted?: true}}
+  end
+
+  # A pull is a message, thus it can come after a read that gave the branch
+  # its chunk. The Streams Standard drops such a pull: the chunk steps of its
+  # tee set the flag `readAgain` to false. Thus the process reads only for a
+  # branch that still wants a chunk.
+  def handle_cast({:pull, index}, %{request: nil} = state) do
+    if branch_wants_chunk?(state, index) do
+      {:noreply, start_read(state)}
+    else
+      {:noreply, state}
+    end
+  end
+
   # The read that is in progress gives its chunk to the two branches.
-  def handle_cast(:pull, state), do: {:noreply, state}
+  def handle_cast({:pull, _index}, state), do: {:noreply, state}
 
   def handle_cast({:cancel, index, reason}, state), do: cancel_branch(index, reason, state)
 
@@ -173,6 +187,11 @@ defmodule Web.Internal.ReadableStreamTee do
     Enum.find_value(branches || %{}, fn {index, branch} ->
       if branch == {pid, ref}, do: index
     end)
+  end
+
+  defp branch_wants_chunk?(%{branches: branches}, index) do
+    {pid, _monitor} = Map.fetch!(branches, index)
+    Web.Stream.call(pid, :wants_chunk?, false)
   end
 
   defp start_read(state) do

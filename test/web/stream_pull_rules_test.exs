@@ -213,8 +213,11 @@ defmodule Web.StreamPullRulesTest do
       settle(left)
       assert :counters.get(counter, 1) == 1
 
+      # The enumerable can be ahead of the chunk that the reader has by the
+      # chunk in the queue of the branch (the high water mark 1), and by a
+      # read of the tee that is in progress. It never stays behind.
       for chunk <- left do
-        assert :counters.get(counter, 1) in chunk..(chunk + 1)
+        assert :counters.get(counter, 1) in chunk..(chunk + 2)
       end
     end
 

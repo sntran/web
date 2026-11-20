@@ -934,6 +934,12 @@ defmodule Web.Stream do
 
   # The desired size of the Streams Standard: `nil` for an errored stream,
   # and 0 for a closed stream.
+  # Tells if the readable side wants a chunk now: the rule of a pull. A tee
+  # asks this before a read for the pull of a branch.
+  defp handle_common({:call, from}, :wants_chunk?, state, data) do
+    {:keep_state_and_data, [{:reply, from, state == :readable and readable_wants_chunk?(data)}]}
+  end
+
   defp handle_common({:call, from}, :desired_size, state, data) do
     desired =
       case state do

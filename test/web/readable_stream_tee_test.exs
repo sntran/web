@@ -269,7 +269,7 @@ defmodule Web.ReadableStreamTeeTest do
       assert Enum.to_list(right) == ["a"]
 
       send(tee, :not_for_the_tee)
-      ReadableStreamTee.pull(tee)
+      ReadableStreamTee.pull(tee, 1)
       ReadableStreamTee.cancel(tee, 1, :late)
       assert Process.alive?(tee)
       assert_down(tee)
@@ -387,19 +387,51 @@ defmodule Web.ReadableStreamTeeTest do
     end
   end
 
+  # A process in the place of a branch. It answers the question of the tee
+  # about a chunk, and ignores each other message.
+  defp wanting_branch(wants? \\ true) do
+    receive do
+      {:"$gen_call", from, :wants_chunk?} -> :gen_statem.reply(from, wants?)
+      _other -> :ok
+    end
+
+    wanting_branch(wants?)
+  end
+
   describe "the processes of a tee" do
+    test "do no read for a pull of a branch that has its chunk already" do
+      # A pull is a message: it can come after the read that gave the
+      # branch its chunk. The Streams Standard drops such a pull.
+      parent = self()
+      stream = ReadableStream.new(counting_source(parent), high_water_mark: 0)
+      {:ok, tee} = ReadableStreamTee.start(stream.controller_pid)
+
+      full = spawn(fn -> wanting_branch(false) end)
+      wanting = spawn(fn -> wanting_branch(true) end)
+      assert :ok = ReadableStreamTee.attach(tee, full, wanting)
+
+      ReadableStreamTee.pull(tee, 1)
+      refute_receive {:pulled, _index}, 50
+
+      ReadableStreamTee.pull(tee, 2)
+      assert_receive {:pulled, 0}
+
+      Enum.each([full, wanting], &Process.exit(&1, :kill))
+    end
+
     test "do no read of the source before a branch pulls" do
       parent = self()
       stream = ReadableStream.new(counting_source(parent), high_water_mark: 0)
       {:ok, tee} = ReadableStreamTee.start(stream.controller_pid)
 
-      # Two branches that do not pull.
-      branches = for _index <- 1..2, do: spawn(fn -> Process.sleep(:infinity) end)
+      # Two branches that do not pull. They tell the tee that they want a
+      # chunk.
+      branches = for _index <- 1..2, do: spawn(fn -> wanting_branch() end)
       [branch1, branch2] = branches
       assert :ok = ReadableStreamTee.attach(tee, branch1, branch2)
       refute_receive {:pulled, _index}, 50
 
-      ReadableStreamTee.pull(tee)
+      ReadableStreamTee.pull(tee, 1)
       assert_receive {:pulled, 0}
 
       Enum.each(branches, &Process.exit(&1, :kill))

@@ -40,10 +40,15 @@ defmodule Web.AsyncContext do
   @ambient_signal_key {__MODULE__, :ambient_signal}
 
   @doc false
-  @spec with_signal(Web.AbortSignal.t(), (-> result)) :: result when result: var
-  def with_signal(%Web.AbortSignal{} = signal, fun) when is_function(fun, 0) do
+  # With `nil`, the function runs with no ambient signal.
+  @spec with_signal(Web.AbortSignal.t() | nil, (-> result)) :: result when result: var
+  def with_signal(signal, fun)
+      when (is_nil(signal) or is_struct(signal, Web.AbortSignal)) and is_function(fun, 0) do
     previous = Process.get(@ambient_signal_key)
-    Process.put(@ambient_signal_key, signal)
+
+    if signal,
+      do: Process.put(@ambient_signal_key, signal),
+      else: Process.delete(@ambient_signal_key)
 
     try do
       fun.()

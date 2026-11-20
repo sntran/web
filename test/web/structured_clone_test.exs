@@ -273,7 +273,7 @@ defmodule Web.StructuredCloneTest do
       stream = Web.ReadableStream.from("payload")
 
       assert data_clone_error(fn -> Web.structured_clone(%{"body" => stream}) end) ==
-               "A pid cannot be cloned. It is in a Web.ReadableStream struct."
+               "A Web.ReadableStream cannot be cloned."
 
       assert data_clone_error(fn -> Web.structured_clone(Web.Response.new()) end) ==
                "A Web.Response cannot be cloned."

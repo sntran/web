@@ -350,20 +350,23 @@ defmodule Web.StreamTest do
     test "disturbed/locked behavior tracks stream usage" do
       stream = ReadableStream.from("hello")
 
-      assert ReadableStream.disturbed?(stream.controller_pid) == false
-      assert ReadableStream.locked?(stream.controller_pid) == false
+      assert ReadableStream.disturbed?(stream) == false
+      assert ReadableStream.locked?(stream) == false
 
+      # The reader starts the process of the stream. Each copy of the struct
+      # finds that process.
       reader = ReadableStream.get_reader(stream)
-      assert ReadableStream.locked?(stream.controller_pid) == true
+      assert ReadableStream.locked?(stream) == true
       assert %{value: chunk, done: false} = await(Web.ReadableStreamDefaultReader.read(reader))
       assert Web.Uint8Array.to_binary(chunk) == "hello"
-      assert ReadableStream.disturbed?(stream.controller_pid) == true
+      assert ReadableStream.disturbed?(stream) == true
+      assert ReadableStream.disturbed?(reader.controller_pid) == true
       assert :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
 
       # The Streams Standard permits a tee of a stream that is disturbed and
       # not locked. The branches get the chunks that are not read.
       assert [left, right] = ReadableStream.tee(stream)
-      assert ReadableStream.locked?(stream.controller_pid) == true
+      assert ReadableStream.locked?(stream) == true
       assert Enum.to_list(left) == []
       assert Enum.to_list(right) == []
     end
@@ -381,8 +384,8 @@ defmodule Web.StreamTest do
 
     test "disturbed prevents tee on a disturbed stream" do
       stream = ReadableStream.from("hello")
-      _reader = ReadableStream.get_reader(stream)
-      _ = ReadableStream.read(stream.controller_pid)
+      reader = ReadableStream.get_reader(stream)
+      _ = ReadableStream.read(reader.controller_pid)
 
       assert_raise Web.TypeError, ~r/already locked/, fn ->
         ReadableStream.tee(stream)

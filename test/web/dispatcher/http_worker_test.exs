@@ -1,18 +1,34 @@
 defmodule Web.Dispatcher.HTTPWorkerTest do
-  # These tests stop the processes of a request at a known time. A task of a
-  # stream that loses its source writes an error to the log, thus the tests
-  # do not run at the same time as tests that examine the log.
+  # These tests stop the processes of a request at a known time. A stream
+  # that loses its source writes an error to the log, thus the tests do not
+  # run at the same time as tests that examine the log.
   use ExUnit.Case, async: false
 
   @moduletag capture_log: true
 
+  # The process of a request is also the promise of `fetch`: it stays for
+  # the linger time after its work. A short linger time lets the tests see
+  # it stop.
+  setup do
+    previous = Application.get_env(:web, :linger)
+    Application.put_env(:web, :linger, 20)
+
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:web, :linger, previous),
+        else: Application.delete_env(:web, :linger)
+    end)
+  end
+
   alias Web.Dispatcher.HTTP
   alias Web.Dispatcher.HTTPTest.HTTPServer
+  alias Web.ReadableStream
   alias Web.Request
 
   # Runs the request in a different process, and returns that process with
-  # the worker of the request: the first process that the request makes.
-  # The process has no link to the test, thus a test can stop it.
+  # the process of the request: the process that `HTTP.fetch/1` makes. That
+  # process is also the promise. The process has no link to the test, thus a
+  # test can stop it.
   defp start_fetch(req) do
     test = self()
 
@@ -22,20 +38,17 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
           :go -> :ok
         end
 
-        result =
-          try do
-            HTTP.fetch(req)
-          rescue
-            error -> {:raised, error}
-          end
+        send(test, {:fetched, self(), HTTP.fetch(req)})
 
-        send(test, {:fetched, self(), result})
+        receive do
+          :stop -> :ok
+        end
       end)
 
     :erlang.trace(pid, true, [:procs])
     send(pid, :go)
-    assert_receive {:trace, ^pid, :spawn, worker, _mfa}, 1_000
-    {%{pid: pid}, worker}
+    assert_receive {:trace, ^pid, :spawn, request, _mfa}, 1_000
+    {%{pid: pid}, request}
   end
 
   defp await_fetch(%{pid: pid}) do
@@ -43,13 +56,12 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
     result
   end
 
-  # Runs the request, and returns the response with the worker and the
-  # watcher of its body: the first two processes that the request makes.
-  defp fetch_with_processes(req) do
-    {task, worker} = start_fetch(req)
-    assert_receive {:trace, _fetcher, :spawn, watcher, _mfa}, 1_000
+  # Runs the request, and returns the response with the process of the
+  # request.
+  defp fetch_with_process(req) do
+    {task, request} = start_fetch(req)
     assert {:ok, resp} = await_fetch(task)
-    {resp, worker, watcher}
+    {resp, request}
   end
 
   defp eventually(fun, attempts \\ 200) do
@@ -70,281 +82,244 @@ defmodule Web.Dispatcher.HTTPWorkerTest do
         {:sleep, 2_000}
       ])
 
-    fetch_with_processes(Request.new("http://localhost:#{port}/stalled", options))
+    fetch_with_process(Request.new("http://localhost:#{port}/stalled", options))
   end
 
   # Reads the first chunk, then starts the read of the subsequent one.
   defp read_until_stalled(resp) do
-    reader = Web.ReadableStream.get_reader(resp.body)
+    reader = ReadableStream.get_reader(resp.body)
     assert %{done: false} = Web.await(Web.ReadableStreamDefaultReader.read(reader))
     Web.ReadableStreamDefaultReader.read(reader)
   end
 
-  test "a reader that waits gets an error when the worker stops" do
-    {resp, worker, watcher} = stalled_response()
-    read = read_until_stalled(resp)
+  describe "a body that is complete when the promise settles" do
+    test "has no process, and the process of the request stops" do
+      port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
+      {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
 
-    Process.exit(worker, :kill)
+      assert resp.body.controller_pid == nil
+      assert {:bytes, "data"} = resp.body.lazy.source
+      eventually(fn -> stopped?([request]) end)
 
-    assert %Web.TypeError{
-             message: "The response body is not complete.",
-             cause: {:connection_process_stopped, :killed}
-           } = catch_exit(Web.await(read))
+      assert Enum.map(resp.body, &Web.Uint8Array.to_binary/1) == ["data"]
+    end
 
-    eventually(fn -> stopped?([watcher]) end)
-  end
+    test "gives the reason of an abort that came before the read" do
+      port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
+      controller = Web.AbortController.new()
+      request = Request.new("http://localhost:#{port}/", signal: controller.signal)
+      {resp, process} = fetch_with_process(request)
 
-  test "a body continues when the watcher stops" do
-    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata", "more"])
-    {resp, _worker, watcher} = fetch_with_processes(Request.new("http://localhost:#{port}/"))
+      eventually(fn -> stopped?([process]) end)
+      Web.AbortController.abort(controller, :stop)
 
-    Process.exit(watcher, :kill)
-
-    assert Web.await(Web.Response.text(resp)) == "datamore"
-  end
-
-  test "the processes of a request stop when the process that reads the body stops" do
-    {resp, worker, watcher} = stalled_response()
-    parent = self()
-
-    reader =
-      spawn(fn ->
-        _read = read_until_stalled(resp)
-        send(parent, :reading)
-        Process.sleep(:infinity)
-      end)
-
-    assert_receive :reading, 1_000
-    Process.exit(reader, :kill)
-
-    eventually(fn -> stopped?([worker, watcher]) end)
-  end
-
-  test "an abort with an exception as the reason gives that exception to the reader" do
-    controller = Web.AbortController.new()
-    {resp, worker, watcher} = stalled_response(signal: controller.signal)
-    read = read_until_stalled(resp)
-
-    reason = %RuntimeError{message: "the caller stopped the request"}
-    assert :ok = Web.AbortController.abort(controller, reason)
-
-    assert catch_exit(Web.await(read)) == reason
-    # The abort stops the processes of the request.
-    eventually(fn -> stopped?([worker, watcher]) end)
-  end
-
-  # The process of the request stops for a short time. The head of the
-  # response arrives in its mailbox. Then the function runs.
-  defp after_head(task, fun) do
-    :erlang.suspend_process(task.pid)
-
-    eventually(fn ->
-      {:messages, messages} = Process.info(task.pid, :messages)
-      Enum.any?(messages, &match?({:http_head, _ref, _status, _headers}, &1))
-    end)
-
-    fun.()
-  end
-
-  test "an abort that comes together with the head of a response stops the request" do
-    controller = Web.AbortController.new()
-
-    port =
-      HTTPServer.start_link([{:sleep, 100}, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"])
-
-    # A response to this method has no body: the request reads the response
-    # to its end before it returns.
-    req = Request.new("http://localhost:#{port}/head", method: "HEAD", signal: controller.signal)
-    {task, worker} = start_fetch(req)
-
-    reason = %RuntimeError{message: "the caller stopped the request"}
-
-    after_head(task, fn ->
-      assert :ok = Web.AbortController.abort(controller, reason)
-      eventually(fn -> not Process.alive?(controller.signal.pid) end)
-      :erlang.resume_process(task.pid)
-    end)
-
-    assert await_fetch(task) == {:raised, reason}
-    eventually(fn -> stopped?([worker]) end)
-  end
-
-  test "an abort with a reason that is not an exception gives an AbortError" do
-    controller = Web.AbortController.new()
-
-    port =
-      HTTPServer.start_link([{:sleep, 100}, "HTTP/1.1 204 No Content\r\n\r\n"])
-
-    req = Request.new("http://localhost:#{port}/", signal: controller.signal)
-    {task, _worker} = start_fetch(req)
-
-    after_head(task, fn ->
-      assert :ok = Web.AbortController.abort(controller, :stopped)
-      eventually(fn -> not Process.alive?(controller.signal.pid) end)
-      :erlang.resume_process(task.pid)
-    end)
-
-    assert {:raised, %Web.DOMException{name: "AbortError", message: ":stopped"}} =
-             await_fetch(task)
-  end
-
-  test "the worker stops when the process that called fetch stops before the body" do
-    parent = self()
-
-    port =
-      HTTPServer.start_link(
-        ["HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata", {:sleep, 2_000}],
-        false,
-        false,
-        parent
-      )
-
-    {task, worker} = start_fetch(Request.new("http://localhost:#{port}/"))
-    after_head(task, fn -> Process.exit(task.pid, :kill) end)
-
-    eventually(fn -> stopped?([worker]) end)
-  end
-
-  test "the worker stops when the stream is errored before the next chunk" do
-    controller = Web.AbortController.new()
-
-    port =
-      HTTPServer.start_link([
-        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata",
-        {:sleep, 200},
-        "more"
-      ])
-
-    {_resp, worker, watcher} =
-      fetch_with_processes(Request.new("http://localhost:#{port}/", signal: controller.signal))
-
-    # The watcher does not stop the worker at the abort. Thus the worker
-    # finds the errored stream when the next chunk arrives.
-    :erlang.suspend_process(watcher)
-    assert :ok = Web.AbortController.abort(controller, :no_more)
-
-    eventually(fn -> stopped?([worker]) end)
-    :erlang.resume_process(watcher)
-    eventually(fn -> stopped?([watcher]) end)
-  end
-
-  test "the worker stops when the stream stops while the worker waits for a pull" do
-    # The body is larger than the queue of the stream: the worker waits.
-    body = :binary.copy("x", 200_000)
-
-    port =
-      HTTPServer.start_link([
-        "HTTP/1.1 200 OK\r\nContent-Length: #{byte_size(body)}\r\n\r\n",
-        body,
-        {:sleep, 2_000}
-      ])
-
-    {resp, worker, watcher} = fetch_with_processes(Request.new("http://localhost:#{port}/"))
-
-    eventually(fn ->
-      {:current_function, function} = Process.info(worker, :current_function)
-      function == {Web.Dispatcher.HTTP, :await_demand, 2}
-    end)
-
-    Process.exit(resp.body.controller_pid, :kill)
-
-    eventually(fn -> stopped?([worker, watcher]) end)
-  end
-
-  test "the worker stops after a full body, and the body stays readable" do
-    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
-    {resp, worker, watcher} = fetch_with_processes(Request.new("http://localhost:#{port}/"))
-
-    # The worker closes the stream with the chunk in its queue, and stops.
-    eventually(fn -> stopped?([worker, watcher]) end)
-
-    assert Enum.map(resp.body, &Web.Uint8Array.to_binary/1) == ["data"]
-  end
-
-  # The worker can complete a small body before its watcher starts. A
-  # watcher that monitors a process that stopped gets the reason `:noproc`,
-  # and it errors the complete body. The trace of each message that the
-  # worker receives shows that the worker stops only after the watcher
-  # monitors it, at each run.
-  test "the worker of a full body stops only after its watcher monitors it" do
-    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
-    req = Request.new("http://localhost:#{port}/")
-    test = self()
-
-    pid =
-      spawn(fn ->
-        receive do
-          :go -> send(test, {:fetched, self(), HTTP.fetch(req)})
-        end
-      end)
-
-    :erlang.trace(pid, true, [:procs, :receive, :set_on_spawn])
-    send(pid, :go)
-    assert_receive {:trace, ^pid, :spawn, worker, _mfa}, 1_000
-    assert_receive {:trace, ^pid, :spawn, watcher, _mfa}, 1_000
-    assert_receive {:fetched, ^pid, {:ok, resp}}, 5_000
-
-    events = events_until_exit(worker)
-    assert List.last(events) == {:exit, :normal}
-    assert Enum.any?(events, &match?({:receive, {:http_watched, _ref}}, &1))
-
-    assert_receive {:trace, ^watcher, :receive, {:DOWN, _monitor, :process, ^worker, :normal}},
-                   1_000
-
-    assert Enum.map(resp.body, &Web.Uint8Array.to_binary/1) == ["data"]
-  end
-
-  # The trace events of a process, in order, until it stops.
-  defp events_until_exit(pid, events \\ []) do
-    receive do
-      {:trace, ^pid, :exit, reason} -> Enum.reverse([{:exit, reason} | events])
-      {:trace, ^pid, :receive, message} -> events_until_exit(pid, [{:receive, message} | events])
-    after
-      1_000 -> flunk("the process did not stop")
+      assert catch_exit(Web.await(Web.Response.text(resp))) == :stop
     end
   end
 
-  test "an abort errors a full body that no process read" do
-    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
-    controller = Web.AbortController.new()
-    request = Request.new("http://localhost:#{port}/", signal: controller.signal)
-    {resp, worker, _watcher} = fetch_with_processes(request)
+  describe "a body that the process of the request holds" do
+    test "gives all its bytes to a read at the end of the body" do
+      port =
+        HTTPServer.start_link([
+          "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata",
+          {:sleep, 100},
+          "more"
+        ])
 
-    # The body is complete, but a read did not take its chunk: the stream is
-    # readable, as the Streams Standard specifies for a close with chunks.
-    eventually(fn -> stopped?([worker]) end)
-    Web.AbortController.abort(controller, :stop)
+      {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
+      assert {:held, ^request} = resp.body.lazy.source
 
-    assert catch_exit(Web.await(Web.Response.text(resp))) == :stop
+      assert Web.await(Web.Response.text(resp)) == "datamore"
+      eventually(fn -> stopped?([request]) end)
+    end
+
+    test "gives a body larger than its queue to a read of all the bytes" do
+      body = :binary.copy("x", 200_000)
+
+      port =
+        HTTPServer.start_link([
+          "HTTP/1.1 200 OK\r\nContent-Length: #{byte_size(body)}\r\n\r\n",
+          {:sleep, 50},
+          body
+        ])
+
+      {resp, _request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
+      assert Web.await(Web.Response.text(resp)) == body
+    end
+
+    test "gives its bytes to one copy only" do
+      port =
+        HTTPServer.start_link([
+          "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata",
+          {:sleep, 50},
+          "more"
+        ])
+
+      {resp, _request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
+      copy = Task.async(fn -> resp end) |> Task.await()
+
+      assert Web.await(Web.Response.text(resp)) == "datamore"
+      assert Web.Response.body_used?(copy)
+      assert %Web.TypeError{} = catch_exit(Web.await(Web.Response.text(copy)))
+    end
+
+    test "gives an error to a reader that waits when the process stops" do
+      {resp, request} = stalled_response()
+      read = read_until_stalled(resp)
+
+      Process.exit(request, :kill)
+
+      assert %Web.TypeError{
+               message: "The response body is not complete.",
+               cause: {:connection_process_stopped, :killed}
+             } = catch_exit(Web.await(read))
+    end
+
+    test "gives an error to a read of all the bytes when the process stops" do
+      {resp, request} = stalled_response()
+      read = Web.Response.text(resp)
+      eventually(fn -> Web.Response.body_used?(resp) end)
+
+      Process.exit(request, :kill)
+
+      assert %Web.TypeError{cause: {:connection_process_stopped, :killed}} =
+               catch_exit(Web.await(read))
+    end
+
+    test "stops its process when the process that reads it stops" do
+      {resp, request} = stalled_response()
+      parent = self()
+
+      reader =
+        spawn(fn ->
+          _read = read_until_stalled(resp)
+          send(parent, :reading)
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive :reading, 1_000
+      Process.exit(reader, :kill)
+
+      eventually(fn -> stopped?([request]) end)
+    end
+
+    test "stops its process at a cancel" do
+      {resp, request} = stalled_response()
+
+      assert :ok = Web.await(ReadableStream.cancel(resp.body, :no_more))
+      eventually(fn -> stopped?([request]) end)
+    end
+
+    test "stops its process when the process that called fetch stops" do
+      {task, request} =
+        start_fetch(
+          Request.new(
+            "http://localhost:#{HTTPServer.start_link(["HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata", {:sleep, 2_000}])}/"
+          )
+        )
+
+      assert {:ok, _resp} = await_fetch(task)
+      Process.exit(task.pid, :kill)
+
+      eventually(fn -> stopped?([request]) end)
+    end
+
+    test "stops its process when the stream stops while the process waits for a pull" do
+      # The body is larger than the queue of the stream: the process waits.
+      body = :binary.copy("x", 200_000)
+
+      port =
+        HTTPServer.start_link([
+          "HTTP/1.1 200 OK\r\nContent-Length: #{byte_size(body)}\r\n\r\n",
+          body,
+          {:sleep, 2_000}
+        ])
+
+      {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
+      _reader = ReadableStream.get_reader(resp.body)
+      {:ok, stream} = ReadableStream.__process__(resp.body)
+
+      # The queue of the stream is full: the process waits for a pull.
+      eventually(fn -> ReadableStream.get_desired_size(stream) <= 0 end)
+
+      Process.exit(stream, :kill)
+
+      eventually(fn -> stopped?([request]) end)
+    end
   end
 
-  test "a response with no body gives an error when its connection fails" do
-    # A response with the status 205 has no body for the Fetch Standard. The
-    # HTTP client reads its content length, and the connection closes
-    # before the end.
-    port = HTTPServer.start_link(["HTTP/1.1 205 Reset Content\r\nContent-Length: 10\r\n\r\nab"])
-    {task, _worker} = start_fetch(Request.new("http://localhost:#{port}/"))
+  describe "an abort" do
+    test "with an exception as the reason gives that exception to the reader" do
+      controller = Web.AbortController.new()
+      {resp, request} = stalled_response(signal: controller.signal)
+      read = read_until_stalled(resp)
 
-    assert {:raised, %Web.TypeError{message: "The response body is not complete."}} =
-             await_fetch(task)
+      reason = %RuntimeError{message: "the caller stopped the request"}
+      assert :ok = Web.AbortController.abort(controller, reason)
+
+      assert catch_exit(Web.await(read)) == reason
+      # The abort stops the process of the request.
+      eventually(fn -> stopped?([request]) end)
+    end
+
+    test "before the response of a HEAD request rejects, and stops the request" do
+      controller = Web.AbortController.new()
+
+      port =
+        HTTPServer.start_link([{:sleep, 300}, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"])
+
+      req =
+        Request.new("http://localhost:#{port}/head", method: "HEAD", signal: controller.signal)
+
+      {task, request} = start_fetch(req)
+
+      Process.sleep(50)
+      assert :ok = Web.AbortController.abort(controller, :stop)
+
+      assert await_fetch(task) == {:error, :aborted}
+      eventually(fn -> stopped?([request]) end)
+    end
+
+    test "of a fetch rejects with the reason of the signal" do
+      controller = Web.AbortController.new()
+      port = HTTPServer.start_link([{:sleep, 300}, "HTTP/1.1 204 No Content\r\n\r\n"])
+      promise = Web.fetch("http://localhost:#{port}/", signal: controller.signal)
+
+      Process.sleep(50)
+      assert :ok = Web.AbortController.abort(controller, :stopped)
+      assert catch_exit(Web.await(promise)) == :stopped
+    end
   end
 
-  test "a response with no body gives an error when its worker stops" do
-    port =
-      HTTPServer.start_link([
-        "HTTP/1.1 205 Reset Content\r\nContent-Length: 10\r\n\r\nab",
-        {:sleep, 2_000}
-      ])
+  describe "a response with no body" do
+    test "gives an error when its connection fails" do
+      # A response with the status 205 has no body for the Fetch Standard. The
+      # HTTP client reads its content length, and the connection closes
+      # before the end.
+      port =
+        HTTPServer.start_link(["HTTP/1.1 205 Reset Content\r\nContent-Length: 10\r\n\r\nab"])
 
-    {task, worker} = start_fetch(Request.new("http://localhost:#{port}/"))
-    after_head(task, fn -> :ok end)
-    Process.exit(worker, :kill)
-    :erlang.resume_process(task.pid)
+      {task, _request} = start_fetch(Request.new("http://localhost:#{port}/"))
 
-    assert {:raised,
-            %Web.TypeError{
-              message: "The response body is not complete.",
-              cause: {:connection_process_stopped, :killed}
-            }} = await_fetch(task)
+      assert {:error, %Web.TypeError{message: "The response body is not complete."}} =
+               await_fetch(task)
+    end
+
+    test "gives an error when the process of the request stops" do
+      port =
+        HTTPServer.start_link([
+          "HTTP/1.1 205 Reset Content\r\nContent-Length: 10\r\n\r\nab",
+          {:sleep, 2_000}
+        ])
+
+      {task, request} = start_fetch(Request.new("http://localhost:#{port}/"))
+      Process.sleep(100)
+      Process.exit(request, :kill)
+
+      # The process is the promise: the await gets the error of a promise
+      # that stopped.
+      assert {:error, %Web.TypeError{message: "The promise is not available." <> _}} =
+               await_fetch(task)
+    end
   end
 end

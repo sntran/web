@@ -49,6 +49,35 @@ defmodule Web.Headers do
             "got: #{inspect(headers)}"
   end
 
+  @doc false
+  # The headers of a response from the HTTP client. The client gives each
+  # name in lower case, and it parsed each name and each value, thus only
+  # the bytes that a value must not have are examined.
+  @spec __network__([{String.t(), String.t()}]) :: t()
+  def __network__(list) when is_list(list) do
+    data =
+      Enum.reduce(list, %{}, fn {name, value}, data ->
+        if forbidden_value_byte?(value) do
+          raise Web.TypeError, "Invalid header value: #{inspect(value)}"
+        end
+
+        Map.update(data, name, [value], &(&1 ++ [value]))
+      end)
+
+    %__MODULE__{data: data}
+  end
+
+  @doc false
+  # `has/2` and `set/3` for a name of this library, which is in lower case.
+  @spec __has_lower__(t(), String.t()) :: boolean()
+  def __has_lower__(%__MODULE__{data: data}, lower_name), do: Map.has_key?(data, lower_name)
+
+  @doc false
+  @spec __set_lower__(t(), String.t(), String.t()) :: t()
+  def __set_lower__(%__MODULE__{data: data} = headers, lower_name, value) do
+    %{headers | data: Map.put(data, lower_name, [value])}
+  end
+
   @doc """
   Appends a value to a header name.
   """
@@ -235,9 +264,8 @@ defmodule Web.Headers do
     raise Web.TypeError, "Invalid header value: #{inspect(value)}"
   end
 
-  defp forbidden_value_byte?(<<char, _rest::binary>>) when char in [0, ?\r, ?\n], do: true
-  defp forbidden_value_byte?(<<_char, rest::binary>>), do: forbidden_value_byte?(rest)
-  defp forbidden_value_byte?(<<>>), do: false
+  # One search of the binary, with no function call for each byte.
+  defp forbidden_value_byte?(value), do: :binary.match(value, [<<0>>, "\r", "\n"]) != :nomatch
 
   defp trim_leading_whitespace(<<byte, rest::binary>>) when byte in @http_whitespace,
     do: trim_leading_whitespace(rest)

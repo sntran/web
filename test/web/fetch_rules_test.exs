@@ -321,7 +321,9 @@ defmodule Web.FetchRulesTest do
       assert response.status == 200
 
       assert_receive :server_connection_closed, 2_000
-      assert_down(response.body.controller_pid)
+      # The process of the request held the body.
+      %{source: {:held, holder}} = response.body.lazy
+      assert_down(holder)
 
       assert %TypeError{} = catch_exit(await(Response.text(response)))
     end
@@ -395,16 +397,26 @@ defmodule Web.FetchRulesTest do
       assert headers["transfer-encoding"] == "chunked"
     end
 
-    test "is released when the request is complete", %{port: port} do
+    # A body in memory has no process. The request uses it.
+    test "is used, with no process, when the request is complete", %{port: port} do
       request = Request.new(url(port, "/echo"), method: "POST", body: "payload")
       assert %{body: "payload"} = echo(await(fetch(request)))
-      assert_down(request.body.controller_pid)
+      assert request.body.controller_pid == nil
+      assert ReadableStream.disturbed?(request.body)
     end
 
-    test "is released when the request fails" do
+    test "is used, with no process, when the request fails" do
       request = Request.new("http://localhost:1/", method: "POST", body: "payload")
       catch_exit(await(fetch(request)))
-      assert_down(request.body.controller_pid)
+      assert request.body.controller_pid == nil
+      assert ReadableStream.disturbed?(request.body)
+    end
+
+    test "is released when the request is complete, for a body with a process", %{port: port} do
+      body = ReadableStream.__with_process__(ReadableStream.from("payload"))
+      request = Request.new(url(port, "/echo"), method: "POST", body: body, duplex: "half")
+      assert %{body: "payload"} = echo(await(fetch(request)))
+      assert_down(body.controller_pid)
     end
   end
 end

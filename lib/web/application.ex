@@ -20,6 +20,12 @@ defmodule Web.Application do
       # sockets.
       {DynamicSupervisor, name: Web.HandleSupervisor, strategy: :one_for_one},
       Web.AbortSignal.Reasons,
+      # The stream processes of the streams that started with no process:
+      # see `Web.Internal.LazyStream`.
+      {Registry,
+       keys: :unique,
+       name: Web.Internal.LazyStream.registry(),
+       partitions: System.schedulers_online()},
       Web.URLPattern.Cache,
       # The function reads the settings each time the pools start.
       %{id: Web.Finch, start: {__MODULE__, :start_finch, []}, type: :supervisor}

@@ -97,7 +97,8 @@ defmodule Web.StreamLifetimeTest do
     test "rejects a second read of a body after it stopped" do
       response = Response.new(body: "hello")
       assert await(Response.text(response)) == "hello"
-      assert_down(response.body.controller_pid)
+      # A body in memory has no process: the read takes its bytes.
+      assert response.body.controller_pid == nil
 
       assert %TypeError{message: "body already used"} =
                catch_exit(await(Response.text(response)))

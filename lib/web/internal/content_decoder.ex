@@ -42,7 +42,7 @@ defmodule Web.Internal.ContentDecoder do
   def new(headers) do
     codings =
       for {name, value} <- headers,
-          String.downcase(name) == "content-encoding",
+          content_encoding?(name),
           coding <- String.split(value, ","),
           coding = coding |> String.trim() |> String.downcase(),
           coding not in ["", "identity"],
@@ -54,6 +54,15 @@ defmodule Web.Internal.ContentDecoder do
       true -> nil
     end
   end
+
+  # The HTTP client gives the names in lower case. A name in a different
+  # case is converted only when it has the length of `content-encoding`.
+  defp content_encoding?("content-encoding"), do: true
+
+  defp content_encoding?(name) when byte_size(name) == 16,
+    do: String.downcase(name, :ascii) == "content-encoding"
+
+  defp content_encoding?(_name), do: false
 
   # The codings are in the sequence in which the server applied them. The
   # decoder removes the last one first.

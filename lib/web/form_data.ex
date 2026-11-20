@@ -181,7 +181,9 @@ defmodule Web.FormData do
   @spec parse(Web.ReadableStream.t() | binary() | iodata(), String.t(), keyword()) :: t()
   def parse(stream_or_binary, boundary, opts \\ []) do
     normalized_boundary = normalize_boundary(boundary)
-    source = Web.ReadableStream.from(stream_or_binary)
+    # The parser reads the stream process.
+    source =
+      stream_or_binary |> Web.ReadableStream.from() |> Web.ReadableStream.__with_process__()
 
     case Parser.start_link(source, normalized_boundary, opts) do
       {:ok, pid} ->

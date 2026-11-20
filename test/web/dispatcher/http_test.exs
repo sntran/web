@@ -453,7 +453,7 @@ defmodule Web.Dispatcher.HTTPTest do
     assert is_exception(error)
   end
 
-  test "fetch/1 returns error when bridge process dies before response head" do
+  test "fetch/1 returns an error when the process of the request stops before the head" do
     port =
       HTTPServer.start_link([
         {:sleep, 200},
@@ -476,19 +476,14 @@ defmodule Web.Dispatcher.HTTPTest do
     try do
       send(task_pid, :go)
 
-      bridge_pid =
-        receive do
-          {:trace, ^task_pid, :spawn, spawned_pid, _mfa} ->
-            spawned_pid
-        after
-          1000 ->
-            flunk("did not capture bridge spawn")
-        end
+      # The process of the request, which is also the promise.
+      assert_receive {:trace, ^task_pid, :spawn, request_pid, _mfa}, 1000
+      Process.exit(request_pid, :kill)
 
-      Process.exit(bridge_pid, :kill)
-
-      assert {:ok, {:error, reason}} = Task.yield(task, 2000)
-      assert reason in [:killed, :noproc]
+      # The process is the promise: the await gets the error of a promise
+      # that stopped.
+      assert {:ok, {:error, %Web.TypeError{message: "The promise is not available." <> _}}} =
+               Task.yield(task, 2000)
     after
       if Process.alive?(task_pid) do
         :erlang.trace(task_pid, false, [:procs])

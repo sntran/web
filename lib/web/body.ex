@@ -50,6 +50,7 @@ defmodule Web.Body do
 
   alias Web.FormData.Encoder
   alias Web.Internal.Bytes
+  alias Web.Internal.LazyStream
   alias Web.Internal.JSON, as: JSONText
 
   @callback text(struct()) :: Web.Promise.t()
@@ -145,7 +146,7 @@ defmodule Web.Body do
   # the Fetch Standard specifies. A stream from the caller stays as it is.
   @spec stream(term()) :: Web.ReadableStream.t()
   def stream(%Web.ReadableStream{} = stream), do: stream
-  def stream(body) when is_binary(body), do: Web.ReadableStream.from(body)
+  def stream(body) when is_binary(body), do: Web.ReadableStream.__bytes__(body)
 
   def stream(%struct{} = body)
       when struct in [Web.Blob, Web.ArrayBuffer, Web.Uint8Array, Web.URLSearchParams] do
@@ -168,14 +169,23 @@ defmodule Web.Body do
 
   @doc false
   def text(%{body: body}) do
-    Web.Promise.new(fn resolve, reject ->
-      ensure_usable!(body)
+    case take_now(body) do
+      {:ok, binary} ->
+        Web.Promise.resolve(Web.TextDecoder.decode_utf8(binary))
 
-      case read_body_to_text(body) do
-        {:ok, text} -> resolve.(text)
-        {:error, reason} -> reject.(reason)
-      end
-    end)
+      {:error, reason} ->
+        Web.Promise.reject(reason)
+
+      :later ->
+        Web.Promise.new(fn resolve, reject ->
+          ensure_usable!(body)
+
+          case read_body_to_text(body) do
+            {:ok, text} -> resolve.(text)
+            {:error, reason} -> reject.(reason)
+          end
+        end)
+    end
   end
 
   @doc false
@@ -260,22 +270,50 @@ defmodule Web.Body do
   def body_used?(%{body: body}), do: Web.ReadableStream.disturbed?(body)
 
   defp consume_body(body, mapper) do
-    Web.Promise.new(fn resolve, reject ->
-      ensure_usable!(body)
+    case take_now(body) do
+      {:ok, binary} ->
+        handle_consumed_body(mapper.(binary), &Web.Promise.resolve/1, &Web.Promise.reject/1)
 
-      case read_body_to_binary(body) do
-        {:ok, binary} ->
-          handle_consumed_body(mapper.(binary), resolve, reject)
+      {:error, reason} ->
+        Web.Promise.reject(reason)
 
-        {:error, reason} ->
-          reject.(reason)
-      end
-    end)
+      :later ->
+        Web.Promise.new(fn resolve, reject ->
+          ensure_usable!(body)
+
+          case read_body_to_binary(body) do
+            {:ok, binary} ->
+              handle_consumed_body(mapper.(binary), resolve, reject)
+
+            {:error, reason} ->
+              reject.(reason)
+          end
+        end)
+    end
   end
 
   defp handle_consumed_body({:ok, value}, resolve, _reject), do: resolve.(value)
   defp handle_consumed_body({:error, reason}, _resolve, reject), do: reject.(reason)
   defp handle_consumed_body(value, resolve, _reject), do: resolve.(value)
+
+  # A body of bytes with no process gives its bytes with no wait: the body
+  # function runs in the calling process, and its promise is settled. Thus
+  # a read of a small body starts no process. A large body goes to the
+  # process of a promise, because its function, such as a JSON parse, needs
+  # a large heap for some time.
+  @now_limit 65_536
+
+  defp take_now(%Web.ReadableStream{controller_pid: nil, lazy: %{source: {kind, binary}} = lazy})
+       when kind in [:bytes, :chunk] and byte_size(binary) <= @now_limit do
+    case LazyStream.take(lazy) do
+      {:ok, binary} -> {:ok, binary}
+      {:error, reason} -> {:error, reason}
+      {:process, _pid} -> :later
+      _used_or_locked -> {:error, Web.TypeError.exception("body already used")}
+    end
+  end
+
+  defp take_now(_body), do: :later
 
   defp read_body_to_binary(nil), do: {:ok, ""}
   defp read_body_to_binary(body) when is_binary(body), do: {:ok, body}
@@ -287,6 +325,17 @@ defmodule Web.Body do
     already_locked: "ReadableStream is already locked",
     released: "body already used"
   }
+
+  # A stream with no process gives all its bytes with no process.
+  defp read_body_to_binary(%Web.ReadableStream{controller_pid: nil, lazy: lazy}) do
+    case LazyStream.take(lazy) do
+      {:ok, binary} -> {:ok, binary}
+      {:error, reason} -> {:error, reason}
+      {:process, pid} -> read_body_to_binary(%Web.ReadableStream{controller_pid: pid})
+      :locked -> {:error, Web.TypeError.exception(@reader_errors.already_locked)}
+      :used -> {:error, Web.TypeError.exception(@reader_errors.released)}
+    end
+  end
 
   defp read_body_to_binary(%Web.ReadableStream{controller_pid: pid}) do
     case Web.ReadableStream.get_reader(pid) do
@@ -359,15 +408,14 @@ defmodule Web.Body do
 
   @doc false
   def put_inferred_content_type(%Web.Headers{} = headers, body) do
-    cond do
-      Web.Headers.has(headers, "content-type") ->
+    case infer_content_type(body) do
+      nil ->
         headers
 
-      inferred = infer_content_type(body) ->
-        Web.Headers.set(headers, "content-type", inferred)
-
-      true ->
-        headers
+      inferred ->
+        if Web.Headers.__has_lower__(headers, "content-type"),
+          do: headers,
+          else: Web.Headers.__set_lower__(headers, "content-type", inferred)
     end
   end
 

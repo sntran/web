@@ -254,8 +254,17 @@ defmodule Web.Internal.StructuredData do
 
   # These structs are not data, also when they have no pid at this time:
   # a promise that is settled, a signal that is aborted, a response with no
-  # body. The Standards do not make them serializable.
-  @live [Web.Request, Web.Response, Web.Promise, Web.AbortSignal, Web.AbortController]
+  # body, a stream that has no process yet. The Standards do not make them
+  # serializable. A stream is transferable in the HTML Standard, not
+  # serializable.
+  @live [
+    Web.Request,
+    Web.Response,
+    Web.Promise,
+    Web.AbortSignal,
+    Web.AbortController,
+    Web.ReadableStream
+  ]
 
   defp scan(%module{}, _special?, _env) when module in @live do
     data_clone_error!("A #{inspect(module)} cannot be cloned.")

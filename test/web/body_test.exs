@@ -260,7 +260,7 @@ defmodule Web.BodyTest do
   end
 
   test "a body whose stream stopped rejects with TypeError" do
-    stream = ReadableStream.from("hello")
+    stream = ReadableStream.__with_process__(ReadableStream.from("hello"))
     Web.Stream.stop(stream.controller_pid)
 
     for read <- [&BodyHarness.text/1, &BodyHarness.bytes/1] do

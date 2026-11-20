@@ -25,10 +25,17 @@ defmodule Web.ReadableStream do
 
   use Web.Stream
 
-  defstruct [:controller_pid]
+  defstruct [:controller_pid, :lazy]
 
-  @typedoc "A readable stream. The field is private."
-  @type t :: %__MODULE__{controller_pid: pid()}
+  @typedoc """
+  A readable stream. The fields are private.
+
+  A stream of bytes that are all in memory, such as the body of
+  `Web.Response.new/1` or of a small `fetch` response, has no process until
+  a stream read: `get_reader/1`, a pipe, or `Enum`. The body functions, such
+  as `Web.Response.text/1`, take its bytes with no process.
+  """
+  @type t :: %__MODULE__{controller_pid: pid() | nil, lazy: LazyStream.t() | nil}
 
   @released_message "The stream is not available. It ended, or its owner stopped."
 
@@ -36,6 +43,7 @@ defmodule Web.ReadableStream do
   alias Web.ArrayBuffer
   alias Web.AsyncContext.Snapshot
   alias Web.Blob
+  alias Web.Internal.LazyStream
   alias Web.Internal.ReadableStreamTee
   alias Web.Promise
   alias Web.ReadableByteStreamController
@@ -53,7 +61,15 @@ defmodule Web.ReadableStream do
   def start(pid, opts) do
     source = Keyword.get(opts, :source)
     stream_type = Keyword.get(opts, :stream_type, :default)
-    state = %{source: source, pid: pid, started: false, stream_type: stream_type}
+
+    state = %{
+      source: source,
+      pid: pid,
+      started: false,
+      stream_type: stream_type,
+      pull_process: Keyword.get(opts, :pull_process),
+      pull_message: Keyword.get(opts, :pull_message)
+    }
 
     # The function `start` of the source runs in the process that makes the
     # stream: see `Web.Stream.run_start/3`. This process waits for it.
@@ -67,11 +83,6 @@ defmodule Web.ReadableStream do
     |> await_pull_result()
 
     {:ok, %{state | started: true}}
-  end
-
-  def pull(_ctrl, %{source: source, pid: pid} = state) when is_pid(source) do
-    send(source, {:pull, pid})
-    {:ok, %{state | started: true}, :pause}
   end
 
   def pull(ctrl, %{source: {module, function, args}} = state) when is_list(args) do
@@ -93,6 +104,18 @@ defmodule Web.ReadableStream do
     # No pull source — pause to avoid a busy-loop
     {:ok, state, :pause}
   end
+
+  # The process of an enumerable gives one chunk for each pull, and a source
+  # that is a process gets the message `{:pull, stream}`. The stream sends
+  # these messages itself: see `Web.Stream.direct_pull/1`.
+  @impl Web.Stream
+  def direct_pull(%{pull_process: pid}) when is_pid(pid), do: {:process, pid}
+  def direct_pull(%{pull_message: {pid, message}}) when is_pid(pid), do: {:message, pid, message}
+
+  def direct_pull(%{source: source, pid: pid}) when is_pid(source),
+    do: {:message, source, {:pull, pid}}
+
+  def direct_pull(_state), do: nil
 
   @impl Web.Stream
   def terminate({type, reason}, %{source: source, pid: pid}) when type in [:cancel, :abort] do
@@ -224,6 +247,9 @@ defmodule Web.ReadableStream do
     from(URLSearchParams.to_string(params))
   end
 
+  # A value of bytes in memory gives a stream with no process: see
+  # `Web.Internal.LazyStream`.
+
   def from(%Blob{parts: parts}) do
     blob_parts_pid = start_blob_parts_queue(parts)
 
@@ -246,22 +272,41 @@ defmodule Web.ReadableStream do
   end
 
   # A buffer or a view gives one chunk, which is a `Web.Uint8Array`.
-  def from(%ArrayBuffer{} = buffer), do: from_chunk(Uint8Array.from(buffer))
-  def from(%Uint8Array{} = bytes), do: from_chunk(bytes)
+  def from(%ArrayBuffer{} = buffer), do: from_chunk(ArrayBuffer.data(buffer))
+  def from(%Uint8Array{} = bytes), do: %__MODULE__{lazy: LazyStream.new({:view, bytes})}
 
-  def from(data) when is_binary(data), do: from_chunk(Uint8Array.from(data))
+  def from(data) when is_binary(data), do: from_chunk(data)
 
   def from(%__MODULE__{} = stream), do: stream
 
   def from(enumerable), do: from_enumerable(enumerable, [])
 
-  defp from_chunk(chunk) do
-    new(%{
-      start: fn controller ->
-        Web.ReadableStreamDefaultController.enqueue(controller, chunk)
-        Web.ReadableStreamDefaultController.close(controller)
-      end
-    })
+  defp from_chunk(binary), do: %__MODULE__{lazy: LazyStream.new({:chunk, binary})}
+
+  @doc false
+  # The stream of a body of bytes in memory, with no process. No bytes give
+  # no chunk, as the Fetch Standard specifies for a body.
+  def __bytes__(binary) when is_binary(binary),
+    do: %__MODULE__{lazy: LazyStream.new({:bytes, binary})}
+
+  @doc false
+  # The pid of the stream process. A stream with no process starts it at
+  # this time. Returns `{:ok, pid}` or `{:error, :already_locked}` or
+  # `{:error, :released}`.
+  def __process__(%__MODULE__{controller_pid: pid}) when is_pid(pid), do: {:ok, pid}
+  def __process__(%__MODULE__{lazy: lazy}), do: LazyStream.process(lazy, Promise.owner())
+
+  @doc false
+  # The same stream, with its process. Raises `Web.TypeError` when the
+  # stream cannot have a process.
+  def __with_process__(stream), do: %__MODULE__{controller_pid: process!(stream)}
+
+  defp process!(stream) do
+    case __process__(stream) do
+      {:ok, pid} -> pid
+      {:error, :already_locked} -> raise TypeError, "ReadableStream is already locked"
+      {:error, :released} -> raise TypeError, @released_message
+    end
   end
 
   @doc false
@@ -276,16 +321,14 @@ defmodule Web.ReadableStream do
     if Enumerable.impl_for(enumerable) do
       enumerator = start_enumerator(enumerable)
 
+      # The stream asks the enumerator for each chunk directly, and the
+      # enumerator answers the stream: see `enumerator_loop/1`.
       new(
-        %{
-          # The enumerator gives one chunk to the stream, and the pull waits
-          # for it: see `enumerator_loop/1`.
-          pull: fn controller -> produce(enumerator, controller.pid) end,
-          cancel: fn _reason -> send(enumerator, :stop) end
-        },
+        %{cancel: fn _reason -> send(enumerator, :stop) end},
         opts
         |> Keyword.put_new(:high_water_mark, 0)
         |> Keyword.put(:cancel_on_reader_exit, true)
+        |> Keyword.put(:pull_process, enumerator)
       )
     else
       raise TypeError, "Cannot make a ReadableStream from #{inspect(enumerable)}"
@@ -457,26 +500,28 @@ defmodule Web.ReadableStream do
   # pull that runs, and the enumerable must then run its code for the end,
   # such as the `after` of `Stream.resource/3`.
   #
-  # For each pull, the enumerator gives one chunk to the stream. It also
-  # closes the stream, or puts it in the errored state. These messages come
-  # from one process, thus the stream gets them in their sequence.
+  # For each pull, the enumerator gives one chunk to the stream, and then
+  # tells the stream that the pull is complete. It also closes the stream,
+  # or puts it in the errored state. These messages come from one process,
+  # thus the stream gets them in their sequence. A pull costs two messages
+  # between the stream and the enumerator, and no other process.
   defp start_enumerator(enumerable) do
     spawn(fn -> enumerator_loop(%{enumerable: {:initial, enumerable}, stream: nil}) end)
   end
 
   defp enumerator_loop(state) do
     receive do
-      {:produce, stream, from, ref} ->
+      {:web_stream_pull, ref, stream} ->
         state = watch_stream(state, stream)
 
         case produce_chunk(state.enumerable, stream) do
           {:more, enumerable} ->
-            send(from, {ref, :ok})
+            send(stream, {ref, :pulled})
             enumerator_loop(%{state | enumerable: enumerable})
 
           # The enumerable is complete, or it failed, or a cancel stopped it.
           :ended ->
-            send(from, {ref, :ok})
+            send(stream, {ref, :pulled})
         end
 
       # The cancel callback of the stream sends `:stop`. The enumerator also
@@ -528,33 +573,20 @@ defmodule Web.ReadableStream do
 
   defp halt_enumerator(_initial_or_done), do: :ok
 
-  # The pull of a stream from an enumerable: it waits until the enumerator
-  # gave one chunk, or stopped. An enumerator that stopped with no error
-  # ends the stream. The error of an enumerator that failed is the error of
-  # the pull.
-  defp produce(enumerator, stream) do
-    ref = Process.monitor(enumerator)
-    send(enumerator, {:produce, stream, self(), ref})
-
-    receive do
-      {^ref, :ok} ->
-        Process.demonitor(ref, [:flush])
-        :ok
-
-      {:DOWN, ^ref, :process, ^enumerator, reason} when reason in [:normal, :noproc] ->
-        close(stream)
-
-      {:DOWN, ^ref, :process, ^enumerator, reason} ->
-        exit(reason)
-    end
-  end
-
   @doc false
   def disturbed?(nil), do: false
   def disturbed?(body) when is_binary(body) or is_list(body), do: false
 
-  def disturbed?(%__MODULE__{controller_pid: pid}) do
+  def disturbed?(%__MODULE__{controller_pid: pid}) when is_pid(pid) do
     disturbed?(pid)
+  end
+
+  def disturbed?(%__MODULE__{lazy: lazy}) do
+    case LazyStream.state(lazy) do
+      :readable -> false
+      {:process, pid} -> disturbed?(pid)
+      _used_or_gone -> true
+    end
   end
 
   def disturbed?(pid) when is_pid(pid) do
@@ -569,8 +601,16 @@ defmodule Web.ReadableStream do
   def locked?(nil), do: false
   def locked?(body) when is_binary(body) or is_list(body), do: false
 
-  def locked?(%__MODULE__{controller_pid: pid}) do
+  def locked?(%__MODULE__{controller_pid: pid}) when is_pid(pid) do
     locked?(pid)
+  end
+
+  def locked?(%__MODULE__{lazy: lazy}) do
+    case LazyStream.state(lazy) do
+      :teed -> true
+      {:process, pid} -> locked?(pid)
+      _other -> false
+    end
   end
 
   def locked?(pid) when is_pid(pid) do
@@ -590,6 +630,10 @@ defmodule Web.ReadableStream do
       iex> is_struct(reader, Web.ReadableStreamDefaultReader)
       true
   """
+  def get_reader(%__MODULE__{controller_pid: nil} = stream, opts) when is_list(opts) do
+    get_reader(%__MODULE__{controller_pid: process!(stream)}, opts)
+  end
+
   def get_reader(%__MODULE__{controller_pid: pid}, opts) when is_list(opts) do
     case reader_mode_from_options(opts) do
       :byob ->
@@ -626,6 +670,10 @@ defmodule Web.ReadableStream do
   end
 
   def get_reader(pid) when is_pid(pid), do: get_reader(pid, [])
+
+  def get_reader(%__MODULE__{controller_pid: nil} = stream) do
+    get_reader(%__MODULE__{controller_pid: process!(stream)})
+  end
 
   def get_reader(%__MODULE__{controller_pid: pid}) do
     case get_reader(pid, []) do
@@ -726,8 +774,17 @@ defmodule Web.ReadableStream do
 
   # A cancel of the stream object. The Streams Standard refuses it when the
   # stream has a reader: use the cancel function of the reader.
-  def cancel(%__MODULE__{controller_pid: pid}, reason) do
+  def cancel(%__MODULE__{controller_pid: pid}, reason) when is_pid(pid) do
     Web.Stream.promise_call(pid, {:terminate_unlocked, :cancel, reason}, :ok, &cancel_result/1)
+  end
+
+  # A stream with no process has no callback to call.
+  def cancel(%__MODULE__{lazy: lazy}, reason) do
+    case LazyStream.cancel(lazy) do
+      :ok -> Promise.resolve(:ok)
+      :locked -> Promise.reject(%TypeError{message: "Cannot cancel a locked stream."})
+      {:process, pid} -> cancel(%__MODULE__{controller_pid: pid}, reason)
+    end
   end
 
   # A cancel by a reader, or by the code of this library: it has no check of
@@ -781,6 +838,15 @@ defmodule Web.ReadableStream do
       iex> {Enum.to_list(left), Enum.to_list(right)}
       {["a", "b"], ["a", "b"]}
   """
+  def tee(%__MODULE__{controller_pid: nil, lazy: lazy} = stream) do
+    case LazyStream.tee(lazy) do
+      {:ok, branches} -> Enum.map(branches, &%__MODULE__{lazy: &1})
+      {:process, pid} -> tee(%__MODULE__{controller_pid: pid})
+      :teed -> raise TypeError, "ReadableStream is already locked"
+      _readable_or_used -> tee(%__MODULE__{controller_pid: process!(stream)})
+    end
+  end
+
   def tee(%__MODULE__{controller_pid: pid}) do
     case tee(pid) do
       branches when is_list(branches) ->
@@ -1208,7 +1274,27 @@ defimpl Enumerable, for: Web.ReadableStream do
   # the stream pulls as for one read after the other, as the Streams
   # Standard specifies. Thus an enumeration that takes few chunks, such as
   # `Enum.take/2`, takes no chunk that it does not use.
-  def reduce(stream, acc, fun) do
+  # A stream of bytes with no process gives its chunk with no process. A
+  # halt before the chunk is a cancel.
+  def reduce(%Web.ReadableStream{controller_pid: nil, lazy: lazy} = stream, acc, fun) do
+    case acc do
+      {:halt, acc} ->
+        _ = Web.ReadableStream.cancel(stream, :halted)
+        {:halted, acc}
+
+      _cont_or_suspend ->
+        case Web.Internal.LazyStream.take_chunks(lazy) do
+          {:ok, chunks} -> Enumerable.List.reduce(chunks, acc, fun)
+          {:error, reason} -> raise_stream_error(reason)
+          {:process, pid} -> reduce(%Web.ReadableStream{controller_pid: pid}, acc, fun)
+          _readable_used_or_gone -> reduce_process(stream, acc, fun)
+        end
+    end
+  end
+
+  def reduce(stream, acc, fun), do: reduce_process(stream, acc, fun)
+
+  defp reduce_process(stream, acc, fun) do
     reader = Web.ReadableStream.get_reader(stream)
     do_reduce({reader, [], 1}, acc, fun)
   end

@@ -56,7 +56,23 @@ defmodule Web.Stream do
   @doc "Called by the engine when the stream terminates."
   @callback terminate(event :: term(), state :: term()) :: :ok
 
-  @optional_callbacks [pull: 2, write: 3, flush: 2, terminate: 2]
+  @doc """
+  Tells the engine how to pull from a source that is a process, with no
+  callback in the worker. The engine calls it in the stream process at
+  each pull.
+
+  - `{:message, pid, message}` — the engine sends `message` to `pid`, and
+    the pull is complete at once. The source enqueues its chunks later.
+  - `{:process, pid}` — the engine sends `{:web_stream_pull, ref, stream}`
+    to `pid` and monitors it. The pull is complete when `pid` sends
+    `{ref, :pulled}`, and it fails with `{ref, {:error, reason}}`. A cancel
+    does not stop `pid`: the cancel callback must stop it.
+  - `nil` — the engine calls `pull/2` in the worker.
+  """
+  @callback direct_pull(state :: term()) ::
+              {:message, pid(), term()} | {:process, pid()} | nil
+
+  @optional_callbacks [pull: 2, write: 3, flush: 2, terminate: 2, direct_pull: 1]
 
   @doc """
   Sets up an implementing stream module with the `Web.Stream` behaviour and
@@ -144,6 +160,10 @@ defmodule Web.Stream do
     cancel_on_reader_exit: false,
     # Lifetime
     signal_subscription: nil,
+    # `{monitor, error_fun}` for the option `:watch_source`: the process that
+    # gives the chunks. A stop of that process before the end of the stream
+    # puts the stream in the errored state.
+    source_watch: nil,
     unread_timeout: nil,
     owner_ref: nil,
     owner_down_reason: nil,
@@ -436,8 +456,14 @@ defmodule Web.Stream do
       async_context: snapshot,
       owner_ref: Process.monitor(owner),
       linger: Keyword.get_lazy(opts, :linger, &Web.Promise.default_linger/0),
-      unread_timeout: Keyword.get(opts, :unread_timeout)
+      unread_timeout: Keyword.get(opts, :unread_timeout),
+      # A stream that replaces a stream with no process that a read used
+      # already: see `Web.Internal.LazyStream`.
+      disturbed: Keyword.get(opts, :disturbed, false),
+      source_watch: watch_source(Keyword.get(opts, :watch_source))
     }
+
+    register(Keyword.get(opts, :registry_key))
 
     {initial_state, default_actions} =
       case type do
@@ -467,6 +493,22 @@ defmodule Web.Stream do
     data = %{data | signal_subscription: bind_ambient_signal(snapshot)}
 
     {:ok, initial_state, data, all_actions}
+  end
+
+  defp watch_source({pid, error_fun}) when is_pid(pid) and is_function(error_fun, 1) do
+    {Process.monitor(pid), error_fun}
+  end
+
+  defp watch_source(nil), do: nil
+
+  # The copies of a stream with no process find this process with the key:
+  # see `Web.Internal.LazyStream`. The registry removes the key when the
+  # process stops.
+  defp register(nil), do: :ok
+
+  defp register(key) do
+    {:ok, _owner} = Registry.register(Web.Internal.LazyStream.registry(), key, nil)
+    :ok
   end
 
   @impl true
@@ -1217,6 +1259,23 @@ defmodule Web.Stream do
     {:keep_state, %{data | owner_ref: nil, owner_down_reason: {:owner_down, reason}}}
   end
 
+  # The source process stopped. Before the end of the stream, the chunks
+  # are not complete: the stream goes to the errored state.
+  defp handle_common(
+         :info,
+         {:DOWN, ref, :process, _pid, reason},
+         state,
+         %{source_watch: {ref, error_fun}} = data
+       ) do
+    data = %{data | source_watch: nil}
+
+    if state == :readable do
+      fail_stream(error_fun.(reason), data)
+    else
+      {:keep_state, data}
+    end
+  end
+
   defp handle_common(:info, {:DOWN, ref, :process, _pid, reason}, state, data) do
     cond do
       ref == data.reader_ref ->
@@ -1229,6 +1288,14 @@ defmodule Web.Stream do
       ref == data.task_ref and data.active_operation == :abort ->
         {:keep_state, clear_active_operation(data), abort_reply_actions(data, :ok)}
         |> clear_abort_request()
+
+      # The source process of a direct pull stopped with no failure before
+      # its answer, for example an enumerator that got `:stop`: the source
+      # has no more chunks.
+      ref == data.task_ref and is_map_key(data.active_task, :external) and
+          reason in [:normal, :noproc] ->
+        data = data |> clear_active_operation() |> Map.put(:pulling, false)
+        if state == :readable, do: handle_producer_close(data), else: {:keep_state, data}
 
       ref == data.task_ref and reason == :normal ->
         :keep_state_and_data
@@ -1765,6 +1832,31 @@ defmodule Web.Stream do
   defp after_pull_actions(_data), do: []
 
   defp do_trigger_pull(%{module: module, impl_state: impl_state} = data) do
+    case direct_pull(module, impl_state) do
+      {:message, pid, message} ->
+        send(pid, message)
+        :keep_state_and_data
+
+      # The source process answers this process directly: the pull costs
+      # two messages, and no worker runs. The source enqueues before its
+      # answer, thus the stream gets the chunk while it pulls, as in the
+      # Streams Standard.
+      {:process, pid} ->
+        ref = Process.monitor(pid)
+        send(pid, {:web_stream_pull, ref, self()})
+        task = %{ref: ref, pid: pid, external: true}
+        {:keep_state, set_active_task(data, task, :pull, pulling: true)}
+
+      nil ->
+        trigger_pull_task(module, impl_state, data)
+    end
+  end
+
+  defp direct_pull(module, impl_state) do
+    if function_exported?(module, :direct_pull, 1), do: module.direct_pull(impl_state)
+  end
+
+  defp trigger_pull_task(module, impl_state, data) do
     if function_exported?(module, :pull, 2) do
       ctrl = readable_controller(data)
 
@@ -2031,6 +2123,11 @@ defmodule Web.Stream do
 
     hibernate = if match?({:ok, _state, :hibernate}, result), do: [:hibernate], else: []
     {:keep_state, new_data, after_pull_actions(data) ++ hibernate}
+  end
+
+  # The source process of a direct pull answered: see `direct_pull/1`.
+  defp handle_task_result(:pulled, state, %{active_operation: :pull} = data) do
+    handle_task_result({:ok, data.impl_state}, state, data)
   end
 
   # Producer init (start_task) completed
@@ -2890,6 +2987,13 @@ defmodule Web.Stream do
 
   # Stops the callback that runs, and waits until the worker stopped. Thus
   # no callback of the stream runs at the same time as the next one.
+  # The process of a direct pull is the source, not the worker: its cancel
+  # callback stops it.
+  defp kill_task(%{ref: ref, external: true}) do
+    Process.demonitor(ref, [:flush])
+    :ok
+  end
+
   defp kill_task(%{ref: ref, pid: pid}) do
     Process.demonitor(ref, [:flush])
     stop_worker(pid)

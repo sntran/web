@@ -259,6 +259,28 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- `Web.fetch/2` of a `tcp:` URL, and of an rclone remote, has one process:
+  the process of the request, which is also the promise, as for HTTP. It
+  opens the socket, writes the request body, and holds the response body.
+  Before, a body used 15 processes: a bridge, the processes of a
+  `Web.Socket`, a second stream, and a process that examined the abort
+  signal each 25 ms. A small response takes approximately 600 µs, where it
+  took 1450 µs, and a stream read gives approximately 470 MiB/s, where it
+  gave 120 MiB/s. See `BENCHMARKS.md`. The body follows the rules of an HTTP
+  body: an abort puts it in the errored state with the reason of the
+  signal, where it ended with no error before. A signal that is aborted
+  before the fetch makes no connection. A request body that is not bytes
+  gives `{:error, %Web.TypeError{}}` from `Web.Dispatcher.TCP.fetch/1`,
+  where it raised before.
+- The process of an HTTP request sets its flag before it asks the socket
+  for a message. Before, a message could come between the request and the
+  flag. The TLA+ specification `tla/SocketFlow.tla` has the new invariant
+  `FlagMatchesSocket`, and its property test examines it on the real
+  process of an HTTP request and of a `tcp:` request.
+- `Response.json/1` keeps the last value of a key that is in an object two
+  times with less work: the decoder reverses the pairs of an object only
+  when a key is in it two times. A large text decodes approximately 8 %
+  faster.
 - `Web.CompressionStream` and `Web.DecompressionStream` keep their zlib
   handle in the worker of the stream, and close it in the callback
   `terminate`. Before, each stream started an `Agent` to keep the handle.

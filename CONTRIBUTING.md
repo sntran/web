@@ -67,6 +67,10 @@ the Standard does not specify.
   Do not let a library ask the socket for a message for you: two requests
   for a message can put two messages in the mailbox, and the mailbox then
   grows with no limit.
+- Set a flag before the step that it tells about. For example, a process
+  sets its flag "asked" before it asks the socket for a message: the
+  message can come before the next line of the code. Thus the flag tells
+  the truth at each time, also for a test that suspends the process.
 - Each buffer has a limit: 64 KiB of data that no reader took, and one
   message or one decoded piece more. A decoder makes its next piece only
   when the reader has space for it. Thus a small compressed input that
@@ -113,6 +117,10 @@ connections of an origin, and the reads of a socket.
   them, send the messages, and resume the process.
 - To close a socket from the side of the client, with no message to its
   owner, use `:erlang.port_close/1`.
+- To make a connect wait, connect to a listener with `backlog: 0` that has
+  one connection in its queue: the kernel drops the next connect.
+- To examine the state of a process, its mailbox, and its socket as one
+  snapshot, suspend the process first.
 - A test server must read the request until the client closes the
   connection. A socket that closes with bytes that it did not read sends a
   reset, and the reset can drop the end of the response.

@@ -364,9 +364,11 @@ defmodule Web.FormData do
       :ok
     end
 
+    # A parser that stopped cannot give the rest of the file part: the
+    # stream gets an error, not an end.
     def child_pull(pid, part_id, controller) do
       case call(pid, {:pull_file, part_id, controller}) do
-        {:error, _reason} -> close_pull_controller(controller)
+        {:error, reason} -> ReadableStream.error(controller.pid, file_error(reason))
         _ -> :ok
       end
 
@@ -389,7 +391,7 @@ defmodule Web.FormData do
       owner_ref = Process.monitor(owner)
       Snapshot.restore(snapshot)
 
-      case :gen_statem.start_link(__MODULE__, {source, boundary, opts, snapshot}, []) do
+      case :gen_statem.start_link(__MODULE__, {source, boundary, opts, snapshot, self()}, []) do
         {:ok, pid} = result ->
           send(caller, {reply_ref, result})
           owner_loop(pid, owner, owner_ref)
@@ -402,7 +404,8 @@ defmodule Web.FormData do
 
     defp owner_loop(pid, owner, owner_ref) do
       receive do
-        # The owner of the form stopped, thus the parser stops.
+        # The owner of the form stopped, thus the parser stops. The parser
+        # traps exits: it does its terminate, which ends its file stream.
         {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
           Process.exit(pid, :shutdown)
           :ok
@@ -416,8 +419,11 @@ defmodule Web.FormData do
     def callback_mode, do: :handle_event_function
 
     @impl true
-    def init({%ReadableStream{controller_pid: source_pid}, boundary, opts, snapshot}) do
+    def init({%ReadableStream{controller_pid: source_pid}, boundary, opts, snapshot, parent}) do
       Process.flag(:message_queue_data, :off_heap)
+      # The exit of the parent, the process of the owner, comes as a
+      # message: the parser then stops with its terminate.
+      Process.flag(:trap_exit, true)
       Snapshot.restore(snapshot)
 
       struct_snapshot = Keyword.get(opts, :struct_snapshot)
@@ -428,6 +434,7 @@ defmodule Web.FormData do
       case aborted_reason(subscription) do
         nil ->
           data = %{
+            parent: parent,
             source_pid: source_pid,
             source_lock_released?: false,
             signal_subscription: subscription,
@@ -486,8 +493,10 @@ defmodule Web.FormData do
 
     def handle_event({:call, from}, :materialize, :running, data) do
       case ensure_answer(:materialize, begin_materialization(data)) do
+        # The parse is complete: each call that waits gets its answer.
         {:reply, entries, done_data} ->
-          {:stop_and_reply, :normal, [{:reply, from, {:ok, entries}}], done_data}
+          {:ok, done_data, actions} = resolve_pending(done_data)
+          {:stop_and_reply, :normal, [{:reply, from, {:ok, entries}} | actions], done_data}
 
         {:error, reason, next_data} ->
           abort_later(reason, next_data, [{:reply, from, {:error, reason}}])
@@ -504,15 +513,9 @@ defmodule Web.FormData do
     end
 
     def handle_event({:call, from}, {:cancel_file, part_id, _reason}, :running, data) do
-      data = maybe_mark_file_discard(data, part_id)
-
-      case resolve_pending(data) do
-        {:ok, next_data, actions} ->
-          reply_or_stop(next_data, [{:reply, from, :ok} | actions])
-
-        {:error, reason, next_data, actions} ->
-          abort_later(reason, next_data, [{:reply, from, :ok} | actions])
-      end
+      data
+      |> maybe_mark_file_discard(part_id)
+      |> answer_pending([{:reply, from, :ok}])
     end
 
     def handle_event({:call, from}, {:pull_file, part_id, controller}, :running, data) do
@@ -550,22 +553,35 @@ defmodule Web.FormData do
     defp serve_query(from, request, data) do
       case maybe_reply(request, data) do
         {:reply, reply} ->
-          reply_or_stop(data, [{:reply, from, {:ok, reply}}])
+          answer_pending(data, [{:reply, from, {:ok, reply}}])
 
         :need_more ->
           case ensure_answer(request, data) do
             {:reply, reply, next_data} ->
-              reply_or_stop(next_data, [{:reply, from, {:ok, reply}}])
+              answer_pending(next_data, [{:reply, from, {:ok, reply}}])
 
+            # The query waits after the calls that waited before it.
             {:blocked, next_data} ->
               waiter = %{from: from, request: request}
-
-              {:keep_state, %{next_data | pending: next_data.pending ++ [waiter]},
-               hibernate_actions()}
+              answer_pending(%{next_data | pending: next_data.pending ++ [waiter]}, [])
 
             {:error, reason, next_data} ->
               abort_later(reason, next_data, [{:reply, from, {:error, reason}}])
           end
+      end
+    end
+
+    # A query can read more of the body, or discard a file part: a call that
+    # waits can have its answer now. Thus each call that waits gets its
+    # answer, also when no pull of a file stream comes after the query. See
+    # `tla/FormDataParser.tla`.
+    defp answer_pending(data, actions) do
+      case resolve_pending(data) do
+        {:ok, next_data, pending_actions} ->
+          reply_or_stop(next_data, actions ++ pending_actions)
+
+        {:error, reason, next_data, pending_actions} ->
+          abort_later(reason, next_data, actions ++ pending_actions)
       end
     end
 
@@ -894,16 +910,20 @@ defmodule Web.FormData do
            index
          )
          when ei < index do
-      discard_child_stream(cf.stream_pid, :skipped)
+      discard_child_stream(cf.stream_pid, discard_error())
       %{data | current_file: %{cf | mode: :discard}}
     end
 
     defp maybe_discard_before_index(data, _index), do: data
 
+    defp discard_error do
+      TypeError.exception("The file part is not complete: a read of its form went past it.")
+    end
+
     defp begin_materialization(%{materializing?: true} = data), do: data
 
     defp begin_materialization(%{current_file: %{mode: :await_pull} = current_file} = data) do
-      discard_child_stream(current_file.stream_pid, :materialized)
+      discard_child_stream(current_file.stream_pid, discard_error())
       %{data | materializing?: true, current_file: %{current_file | mode: :discard}}
     end
 
@@ -1060,8 +1080,53 @@ defmodule Web.FormData do
 
     defp percent_decode(<<char, rest::binary>>, acc), do: percent_decode(rest, [<<char>> | acc])
 
+    # A read of the source. The parser waits for the source, and it takes a
+    # cancel of the form, an abort of its signal, and the stop of its owner
+    # while it waits: a source that stalls does not keep them. See
+    # `tla/FormDataParser.tla`.
     defp read_more(data) do
-      case ReadableStream.read(data.source_pid) do
+      source = data.source_pid
+      monitor = Process.monitor(source)
+      send(source, {:"$gen_call", {self(), monitor}, {:read, self()}})
+
+      case await_read(data, monitor) do
+        {:reply, reply} ->
+          Process.demonitor(monitor, [:flush])
+          read_reply(reply, data)
+
+        {:stop, reason} ->
+          Process.demonitor(monitor, [:flush])
+          {:error, reason, data}
+      end
+    end
+
+    defp await_read(data, monitor) do
+      receive do
+        {^monitor, reply} ->
+          {:reply, reply}
+
+        # A source that stopped gives the reply of `Web.Stream.call/3` for a
+        # stream that is gone.
+        {:DOWN, ^monitor, :process, _pid, _reason} ->
+          {:reply, {:error, :not_locked_by_reader}}
+
+        {:"$gen_call", from, {:cancel, reason}} ->
+          :gen_statem.reply(from, :ok)
+          {:stop, reason}
+
+        {:EXIT, parent, _reason} when parent == data.parent ->
+          {:stop, gone_error()}
+
+        message when elem(message, 0) in [:abort, :DOWN] ->
+          case abort_reason_from_message(message, data.signal_subscription) do
+            {:ok, reason} -> {:stop, reason}
+            :ignore -> await_read(data, monitor)
+          end
+      end
+    end
+
+    defp read_reply(reply, data) do
+      case reply do
         {:ok, chunk} ->
           case normalize_chunk(chunk) do
             {:ok, binary} -> {:ok, %{data | buffer: data.buffer <> binary}}
@@ -1077,6 +1142,14 @@ defmodule Web.FormData do
         {:error, reason} ->
           {:error, reason, data}
       end
+    end
+
+    # The error of a call to a parser that stopped, and of the stop of its
+    # owner.
+    defp gone_error do
+      TypeError.exception(
+        "The form data is not available. Its body ended, or its parser stopped."
+      )
     end
 
     defp normalize_chunk(chunk) do
@@ -1230,25 +1303,26 @@ defmodule Web.FormData do
       :ok
     end
 
+    # The parser cannot give the rest of the file part: the file stream gets
+    # an error, thus its reader does not take a short file as complete. A
+    # cancel would close the stream as at the end of the file.
     defp error_child_stream(nil, _reason), do: :ok
-
-    defp error_child_stream(stream_pid, %TypeError{} = reason) when is_pid(stream_pid) do
-      if Process.alive?(stream_pid) do
-        ReadableStream.error(stream_pid, reason)
-      end
-
-      :ok
-    end
-
-    defp error_child_stream(_stream_pid, nil), do: :ok
 
     defp error_child_stream(stream_pid, reason) when is_pid(stream_pid) do
       if Process.alive?(stream_pid) do
-        Web.Stream.control_cast(stream_pid, {:terminate, :cancel, reason})
+        ReadableStream.error(stream_pid, file_error(reason))
       end
 
       :ok
     end
+
+    # A stop with no reason, or the stop of the owner, gives a TypeError.
+    # An abort gives its reason, as the body stream of the Fetch Standard.
+    defp file_error(reason) when reason in [nil, :normal, :shutdown] do
+      TypeError.exception("The file part is not complete: its form stopped.")
+    end
+
+    defp file_error(reason), do: reason
 
     defp discard_child_stream(stream_pid, reason) when is_pid(stream_pid) do
       error_child_stream(stream_pid, reason)
@@ -1494,10 +1568,8 @@ defmodule Web.FormData do
     # stream that is gone (see `Web.Stream.call/3`). A body that fails is a
     # `TypeError` in the Fetch Standard.
     defp normalize_call_exit({reason, {:gen_statem, :call, _args}})
-         when reason in [:noproc, :normal] do
-      TypeError.exception(
-        "The form data is not available. Its body ended, or its parser stopped."
-      )
+         when reason in [:noproc, :normal, :shutdown, :killed] do
+      gone_error()
     end
 
     defp normalize_call_exit(reason) do

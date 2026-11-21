@@ -1279,7 +1279,7 @@ defmodule Web.FormDataTest do
     assert :ok = ReadableStreamDefaultReader.release_lock(discarded_reader)
   end
 
-  test "parser child_pull closes controllers after parsing is already done" do
+  test "parser child_pull closes controllers after parsing is done, and errors them after a stop" do
     boundary = "child-pull-done-boundary"
 
     form =
@@ -1301,8 +1301,9 @@ defmodule Web.FormDataTest do
     assert :done = ReadableStream.read(closed_stream.controller_pid)
     assert :ok = ReadableStreamDefaultReader.release_lock(closed_reader)
 
-    # Also cover the dead-coordinator path: child_pull must close the controller
-    # to avoid resource leaks even when the coordinator is already gone.
+    # A coordinator that is gone cannot give the rest of a file part: the
+    # stream gets an error, not an end, thus a reader does not take a short
+    # file as complete. The stream ends, thus it does not stay.
     Web.FormData.cancel(form, :done)
 
     assert_eventually(fn -> not Process.alive?(form.coordinator) end)
@@ -1317,7 +1318,9 @@ defmodule Web.FormDataTest do
                %Web.ReadableStreamDefaultController{pid: dead_stream.controller_pid}
              )
 
-    assert :done = ReadableStream.read(dead_stream.controller_pid)
+    assert {:error, {:errored, %Web.TypeError{message: "The form data is not available." <> _}}} =
+             ReadableStream.read(dead_stream.controller_pid)
+
     assert :ok = ReadableStreamDefaultReader.release_lock(dead_reader)
   end
 
@@ -1850,6 +1853,240 @@ defmodule Web.FormDataTest do
 
       expected = Enum.map(files, fn {name, _filename, content} -> {name, content} end)
       assert result == expected
+    end
+  end
+
+  describe "the rules of tla/FormDataParser.tla" do
+    # A source that gives its chunks for the reads of the parser, and then
+    # stalls: it gives nothing more.
+    defp stalling_source(chunks) do
+      {:ok, queue} = Agent.start_link(fn -> chunks end)
+
+      ReadableStream.new(
+        %{
+          pull: fn controller ->
+            case Agent.get_and_update(queue, fn chunks -> {chunks, Enum.drop(chunks, 1)} end) do
+              [chunk | _rest] -> Web.ReadableStreamDefaultController.enqueue(controller, chunk)
+              [] -> :ok
+            end
+          end
+        },
+        high_water_mark: 0
+      )
+    end
+
+    # The parser waits for the source in a read.
+    defp reading?(coordinator) do
+      match?(
+        {:current_function, {Web.FormData.Parser, :await_read, 2}},
+        Process.info(coordinator, :current_function)
+      )
+    end
+
+    defp call_result(fun) do
+      Task.async(fn ->
+        try do
+          {:ok, fun.()}
+        rescue
+          error -> {:raise, error}
+        catch
+          :exit, reason -> {:exit, reason}
+        end
+      end)
+    end
+
+    # The body has the headers of a file part and some bytes of the file,
+    # and then the source stalls. The stream of the file takes the bytes
+    # when it starts. The test holds the lock of the file stream, and reads
+    # a chunk: the parser then waits for the source.
+    defp stalled_form(opts \\ []) do
+      boundary = "stalled-boundary"
+      body = multipart_payload(boundary, [%{name: "upload", filename: "f.txt", value: "abc"}])
+      {header_end, 4} = :binary.match(body, "\r\n\r\n")
+      source = stalling_source([binary_part(body, 0, header_end + 4), String.duplicate("a", 100)])
+      form = Web.FormData.parse(source, boundary, opts)
+      %Web.File{stream: stream} = Web.FormData.get(form, "upload")
+      reader = ReadableStream.get_reader(stream)
+      assert %{done: false} = await(ReadableStreamDefaultReader.read(reader))
+      assert_eventually(fn -> reading?(form.coordinator) end)
+      {form, reader, source}
+    end
+
+    test "a cancel while the parser waits for a source that stalls is prompt" do
+      {form, reader, _source} = stalled_form()
+      waiter = call_result(fn -> Web.FormData.get(form, "missing") end)
+      assert_eventually(fn -> call_queued?(form.coordinator, waiter.pid) end)
+
+      assert :ok = Web.FormData.cancel(form, :user_cancelled)
+      assert Task.await(waiter) == {:exit, :user_cancelled}
+      assert :user_cancelled = catch_exit(read_rest(reader))
+      assert_eventually(fn -> not Process.alive?(form.coordinator) end)
+    end
+
+    test "an abort of the signal while the parser waits for a source that stalls is prompt" do
+      controller = AbortController.new()
+      {form, reader, _source} = stalled_form(signal: controller.signal)
+
+      assert :ok = AbortController.abort(controller, :signal_abort)
+      assert :signal_abort = catch_exit(read_rest(reader))
+      assert_eventually(fn -> not Process.alive?(form.coordinator) end)
+
+      # A message that is not the abort of the signal has no effect.
+      {form, _reader, _source} = stalled_form(signal: AbortController.new().signal)
+      send(form.coordinator, {:abort, make_ref(), :other})
+      send(form.coordinator, {:DOWN, make_ref(), :process, self(), :other})
+
+      assert_eventually(fn ->
+        {:message_queue_len, 0} == Process.info(form.coordinator, :message_queue_len)
+      end)
+
+      assert reading?(form.coordinator)
+      assert :ok = Web.FormData.cancel(form)
+    end
+
+    test "the stop of the owner while the parser waits for a source that stalls is prompt" do
+      owner = spawn(fn -> receive(do: (:stop -> :ok)) end)
+      {form, reader, _source} = stalled_form(owner: owner)
+      waiter = call_result(fn -> Web.FormData.get(form, "missing") end)
+      assert_eventually(fn -> call_queued?(form.coordinator, waiter.pid) end)
+
+      send(owner, :stop)
+
+      assert {:raise, %Web.TypeError{message: "The form data is not available." <> _}} =
+               Task.await(waiter)
+
+      assert %Web.TypeError{} = catch_exit(read_rest(reader))
+      assert_eventually(fn -> not Process.alive?(form.coordinator) end)
+    end
+
+    test "a source that stops while the parser waits for it fails the parse" do
+      {form, reader, source} = stalled_form()
+      Process.exit(source.controller_pid, :kill)
+      assert :not_locked_by_reader = catch_exit(read_rest(reader))
+      assert_eventually(fn -> not Process.alive?(form.coordinator) end)
+    end
+
+    test "the stop of the owner ends the file stream with a TypeError, also with no pull" do
+      boundary = "owner-stop-boundary"
+      owner = spawn(fn -> receive(do: (:stop -> :ok)) end)
+
+      payload =
+        multipart_payload(boundary, [
+          %{name: "upload", filename: "f.txt", value: String.duplicate("a", 200)},
+          %{name: "after", value: "done"}
+        ])
+
+      form = Web.FormData.parse(byte_chunks(payload), boundary, owner: owner)
+      file = Web.FormData.get(form, "upload")
+      _reader = ReadableStream.get_reader(file.stream)
+      waiter = call_result(fn -> Web.FormData.get(form, "after") end)
+      wait_for_pending(form.coordinator, 1)
+      monitor = Process.monitor(form.coordinator)
+
+      send(owner, :stop)
+      assert_receive {:DOWN, ^monitor, :process, _pid, :shutdown}
+
+      assert {:raise, %Web.TypeError{message: "The form data is not available." <> _}} =
+               Task.await(waiter)
+
+      # The stream has a chunk in its queue: it does not pull, thus only the
+      # terminate of the parser ends it.
+      assert_eventually(fn ->
+        ReadableStream.__get_slots__(file.stream.controller_pid).state == :errored
+      end)
+    end
+
+    test "an abort gives its reason to the reader of the file, not an end" do
+      boundary = "abort-file-boundary"
+
+      payload =
+        multipart_payload(boundary, [
+          %{name: "upload", filename: "f.txt", value: String.duplicate("a", 200)}
+        ])
+
+      form = Web.FormData.parse(byte_chunks(payload), boundary, signal: :abort_token)
+      file = Web.FormData.get(form, "upload")
+      reader = ReadableStream.get_reader(file.stream)
+      assert %{done: false} = await(ReadableStreamDefaultReader.read(reader))
+
+      send(form.coordinator, {:abort, :abort_token, :aborted})
+      assert :aborted = catch_exit(await(ReadableStreamDefaultReader.read(reader)))
+    end
+
+    test "a kill of the parser gives a TypeError to the reader of the file, not an end" do
+      boundary = "kill-file-boundary"
+
+      payload =
+        multipart_payload(boundary, [
+          %{name: "upload", filename: "f.txt", value: String.duplicate("a", 200)}
+        ])
+
+      form = Web.FormData.parse(byte_chunks(payload), boundary)
+      file = Web.FormData.get(form, "upload")
+      reader = ReadableStream.get_reader(file.stream)
+      assert %{done: false} = await(ReadableStreamDefaultReader.read(reader))
+
+      Process.exit(form.coordinator, :kill)
+
+      assert %Web.TypeError{message: "The form data is not available." <> _} =
+               catch_exit(read_rest(reader))
+    end
+
+    test "a get that waits for a file part gets its answer when an iteration discards it" do
+      boundary = "iteration-discard-boundary"
+
+      payload =
+        multipart_payload(boundary, [
+          %{name: "upload", filename: "f.txt", value: String.duplicate("a", 200)},
+          %{name: "after", value: "done"}
+        ])
+
+      form = Web.FormData.parse(byte_chunks(payload), boundary)
+      waiter = call_result(fn -> Web.FormData.get(form, "after") end)
+      wait_for_pending(form.coordinator, 1)
+
+      assert [["upload", %Web.File{} = file], ["after", "done"]] = Enum.to_list(form)
+      assert Task.await(waiter) == {:ok, "done"}
+
+      # The reader of a file that a read of the form went past gets an
+      # error, not an end.
+      assert {:error, _reason} = read_file(file)
+    end
+
+    test "a get that waits for a file part gets its answer when a freeze completes the parse" do
+      boundary = "freeze-pending-boundary"
+
+      payload =
+        multipart_payload(boundary, [
+          %{name: "upload", filename: "f.txt", value: String.duplicate("a", 200)},
+          %{name: "after", value: "done"}
+        ])
+
+      form = Web.FormData.parse(byte_chunks(payload), boundary)
+      waiter = call_result(fn -> Web.FormData.get(form, "after") end)
+      wait_for_pending(form.coordinator, 1)
+
+      static = Web.FormData.append(form, "added", "x")
+      assert [{"upload", _file}, {"after", "done"}, {"added", "x"}] = static.entries
+      assert Task.await(waiter) == {:ok, "done"}
+    end
+  end
+
+  # Reads the file stream to its end: `{:ok, bytes}`, or the error of the
+  # stream.
+  defp read_file(%Web.File{stream: stream}) do
+    reader = ReadableStream.get_reader(stream)
+    {:ok, read_rest(reader)}
+  rescue
+    error -> {:error, error}
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  defp read_rest(reader) do
+    case await(ReadableStreamDefaultReader.read(reader)) do
+      %{done: true} -> ""
+      %{value: chunk} -> Web.Uint8Array.to_binary(chunk) <> read_rest(reader)
     end
   end
 

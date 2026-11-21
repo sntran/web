@@ -34,6 +34,14 @@ defmodule Web.TransformStreamTest do
     {writer, writes, Writer.close(writer)}
   end
 
+  defp eventually(fun, attempts \\ 400) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
+  end
+
   describe "new/2" do
     test "gives a struct with the two sides, which have the default limits of the Standard" do
       transform = TransformStream.new()
@@ -660,6 +668,12 @@ defmodule Web.TransformStreamTest do
         assert_receive {:controller, controller}
         writer = WritableStream.get_writer(transform.writable)
         reader = ReadableStream.get_reader(transform.readable)
+
+        # The writable side has the end of the function start: the error of
+        # the function cancel puts it in the state "errored", and not
+        # "erroring". The end of start comes in a message from the worker of
+        # the writable side.
+        eventually(fn -> writable_slots(transform).active_operation != :start end)
 
         result =
           if operation == :cancel,

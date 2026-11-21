@@ -652,7 +652,7 @@ defmodule Web.ReadableStream do
 
   def locked?(%__MODULE__{lazy: lazy}) do
     case LazyStream.state(lazy) do
-      :teed -> true
+      :locked -> true
       {:process, pid} -> locked?(pid)
       _other -> false
     end
@@ -934,7 +934,7 @@ defmodule Web.ReadableStream do
     :gen_statem.call(pid, :get_slots)
   end
 
-  def tee(pid) when is_pid(pid), do: do_tee(%__MODULE__{controller_pid: pid})
+  def tee(pid) when is_pid(pid), do: do_tee(%__MODULE__{controller_pid: pid}, false)
 
   @doc """
   Gives two branches of the stream, as `ReadableStream.prototype.tee()` of
@@ -964,17 +964,24 @@ defmodule Web.ReadableStream do
       iex> {Enum.to_list(left), Enum.to_list(right)}
       {["a", "b"], ["a", "b"]}
   """
-  def tee(%__MODULE__{controller_pid: nil, lazy: lazy} = stream) do
+  def tee(%__MODULE__{} = stream), do: __tee__(stream, false)
+
+  @doc false
+  # ReadableStreamTee with the argument cloneForBranch2. The Fetch Standard
+  # tees a body with the value `true`: the second branch of a default stream
+  # gets a structured clone of each chunk. The tee of a byte stream always
+  # gives each branch its own bytes.
+  def __tee__(%__MODULE__{controller_pid: nil, lazy: lazy} = stream, clone?) do
     case LazyStream.tee(lazy) do
       {:ok, branches} -> Enum.map(branches, &%__MODULE__{lazy: &1})
-      {:process, pid} -> tee(%__MODULE__{controller_pid: pid})
-      :teed -> raise TypeError, "ReadableStream is already locked"
-      _readable_or_used -> tee(%__MODULE__{controller_pid: process!(stream)})
+      {:process, pid} -> __tee__(%__MODULE__{controller_pid: pid}, clone?)
+      :locked -> raise TypeError, "ReadableStream is already locked"
+      _readable_or_used -> __tee__(%__MODULE__{controller_pid: process!(stream)}, clone?)
     end
   end
 
-  def tee(%__MODULE__{controller_pid: pid}) do
-    case tee(pid) do
+  def __tee__(%__MODULE__{controller_pid: pid}, clone?) do
+    case do_tee(%__MODULE__{controller_pid: pid}, clone?) do
       branches when is_list(branches) ->
         branches
 
@@ -1070,6 +1077,10 @@ defmodule Web.ReadableStream do
   defp run_pipe(readable, writable, options, resolve, reject, ready) do
     case acquire_pipe_locks(readable, writable) do
       {:ok, reader, writer} ->
+        # ReadableStreamPipeTo: "Set source.[[disturbed]] to true." The
+        # source is disturbed when `pipe_to/3` returns, also when the pipe
+        # reads no chunk.
+        :ok = Web.Stream.call(reader.controller_pid, :disturb, :ok)
         ready.(:ok)
 
         # The pipe releases its locks before its promise settles.
@@ -1144,11 +1155,13 @@ defmodule Web.ReadableStream do
   # The two branches are usual streams of the type of the source. The tee
   # process reads the source for them: ReadableStreamDefaultTee, or
   # ReadableByteStreamTee for a byte stream.
-  defp do_tee(%__MODULE__{controller_pid: source}) do
-    tee_module =
-      if source_type(source) == :bytes, do: ReadableByteStreamTee, else: ReadableStreamTee
+  defp do_tee(%__MODULE__{controller_pid: source}, clone?) do
+    {tee_module, started} =
+      if source_type(source) == :bytes,
+        do: {ReadableByteStreamTee, ReadableByteStreamTee.start(source)},
+        else: {ReadableStreamTee, ReadableStreamTee.start(source, clone?)}
 
-    with {:ok, tee} <- tee_module.start(source) do
+    with {:ok, tee} <- started do
       # The cancel callback of a branch waits until the two branches are
       # cancelled, thus a branch has no time limit for its callbacks.
       [branch1, branch2] =

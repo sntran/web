@@ -99,6 +99,16 @@ defmodule Web.Dispatcher.HTTPProcessTest do
     fetch_with_process(Request.new("http://localhost:#{port}/stalled", options))
   end
 
+  # Reads all the bytes into views of three bytes.
+  defp read_byob(reader, acc) do
+    view = Web.Uint8Array.new(Web.ArrayBuffer.new(3))
+
+    case Web.await(Web.ReadableStreamBYOBReader.read(reader, view)) do
+      %{done: true} -> acc |> Enum.reverse() |> IO.iodata_to_binary()
+      %{value: view} -> read_byob(reader, [Web.Uint8Array.to_binary(view) | acc])
+    end
+  end
+
   # Reads the first chunk, then starts the read of the subsequent one.
   defp read_until_stalled(resp) do
     reader = ReadableStream.get_reader(resp.body)
@@ -147,6 +157,22 @@ defmodule Web.Dispatcher.HTTPProcessTest do
       eventually(fn -> stopped?([request]) end)
     end
 
+    test "is a byte stream, which a BYOB reader reads, and has immutable headers" do
+      port =
+        HTTPServer.start_link([
+          "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata",
+          {:sleep, 50},
+          "more"
+        ])
+
+      {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
+      assert {:held, ^request} = resp.body.lazy.source
+      assert resp.headers.guard == "immutable"
+
+      reader = ReadableStream.get_reader(resp.body, mode: "byob")
+      assert read_byob(reader, []) == "datamore"
+    end
+
     test "gives a body larger than its queue to a read of all the bytes" do
       body = :binary.copy("x", 200_000)
 
@@ -191,8 +217,16 @@ defmodule Web.Dispatcher.HTTPProcessTest do
 
     test "gives an error to a read of all the bytes when the process stops" do
       {resp, request} = stalled_response()
+      {:monitored_by, before} = Process.info(request, :monitored_by)
       read = Web.Response.text(resp)
-      eventually(fn -> Web.Response.body_used?(resp) end)
+      assert Web.Response.body_used?(resp)
+
+      # The process of the promise monitors the holder, and asks it for the
+      # bytes.
+      eventually(fn ->
+        {:monitored_by, now} = Process.info(request, :monitored_by)
+        length(now) > length(before)
+      end)
 
       Process.exit(request, :kill)
 
@@ -476,9 +510,19 @@ defmodule Web.Dispatcher.HTTPProcessTest do
 
     test "gives the reason of an abort to a read of all the bytes that waits" do
       controller = Web.AbortController.new()
-      {resp, _request} = stalled_response(signal: controller.signal)
+      {resp, request} = stalled_response(signal: controller.signal)
+      :erlang.trace(request, true, [:receive])
       read = Web.Response.text(resp)
-      eventually(fn -> Web.Response.body_used?(resp) end)
+
+      # The body is used when `text/1` returns. The process of the promise
+      # then asks the holder for the bytes: the request is in the mailbox of
+      # the holder before the abort.
+      assert Web.Response.body_used?(resp)
+
+      assert_receive {:trace, ^request, :receive, {:web_body, _ref, {:take, _monitor, _pid}}},
+                     1_000
+
+      :erlang.trace(request, false, [:receive])
 
       Web.AbortController.abort(controller, :stop)
       assert catch_exit(Web.await(read)) == :stop

@@ -1,6 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "Consume JSON from text: '\"null\"'": "library: a different result"
+    "Consume JSON from text: '\"null\"'": "runner: the JSON null is nil, which is undefined in JavaScript"
   }
 }

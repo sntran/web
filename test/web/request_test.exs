@@ -310,10 +310,25 @@ defmodule Web.RequestTest do
   end
 
   describe "new/2 with a request as its input" do
-    test "gives the same request when init is empty" do
-      request = Request.new("https://example.com", method: "POST", body: "x")
+    test "gives the same request when init is empty and the input has no body" do
+      request = Request.new("https://example.com", method: "PUT")
       assert Request.new(request) == request
       assert Request.new(request, []) == request
+    end
+
+    test "takes the body of the input, which is then disturbed and locked" do
+      for body <- ["x", Web.ReadableStream.from(["x"])] do
+        input = Request.new("https://example.com", method: "POST", body: body, duplex: "half")
+        request = Request.new(input)
+
+        assert request.body != input.body
+        assert Request.body_used?(input)
+        assert Web.ReadableStream.locked?(input.body)
+        refute Request.body_used?(request)
+        assert await(Request.text(request)) == "x"
+
+        assert_raise TypeError, "Request body is already used", fn -> Request.new(input) end
+      end
     end
 
     test "replaces the values that init has, and keeps the others" do
@@ -344,16 +359,21 @@ defmodule Web.RequestTest do
       assert await(Request.text(second)) == "first"
     end
 
-    test "replaces the body, and can remove it" do
+    test "replaces the body, and keeps the body of the input for the body nil" do
       first = Request.new("https://example.com", method: "POST", body: "first")
 
       second = Request.new(first, body: "second")
       assert await(Request.text(second)) == "second"
       assert Web.Headers.get(second.headers, "content-type") =~ "text/plain"
+      refute Request.body_used?(first)
 
-      third = Request.new(first, method: "GET", body: nil)
-      assert third.body == nil
-      assert third.method == "GET"
+      # The Fetch Standard: a body of the input counts for the method GET.
+      assert_raise TypeError, ~r/GET\/HEAD method cannot have body/, fn ->
+        Request.new(first, method: "GET", body: nil)
+      end
+
+      refute Request.body_used?(first)
+      assert await(Request.text(Request.new(first, body: nil))) == "first"
     end
 
     test "applies the checks to the result" do
@@ -370,6 +390,273 @@ defmodule Web.RequestTest do
       assert_raise TypeError, ~r/Invalid header name/, fn ->
         Request.new(first, headers: %{"bad name" => "x"})
       end
+    end
+  end
+
+  describe "the attributes of the Fetch Standard" do
+    @enums %{
+      mode: ["same-origin", "no-cors", "cors"],
+      credentials: ["omit", "same-origin", "include"],
+      cache: ["default", "no-store", "reload", "no-cache", "force-cache"],
+      referrer_policy: [
+        "",
+        "no-referrer",
+        "no-referrer-when-downgrade",
+        "same-origin",
+        "origin",
+        "strict-origin",
+        "origin-when-cross-origin",
+        "strict-origin-when-cross-origin",
+        "unsafe-url"
+      ],
+      redirect: ["follow", "error", "manual"]
+    }
+
+    test "have the default values of the constructor" do
+      request = Request.new("https://example.com/")
+
+      assert %Request{
+               destination: "",
+               referrer: "about:client",
+               referrer_policy: "",
+               mode: "cors",
+               credentials: "same-origin",
+               cache: "default",
+               redirect: "follow",
+               integrity: "",
+               keepalive: false,
+               is_reload_navigation: false,
+               is_history_navigation: false,
+               duplex: "half"
+             } = request
+    end
+
+    property "take each value of their enumeration, as a string or an atom" do
+      check all(
+              {key, values} <- member_of(Map.to_list(@enums)),
+              value <- member_of(values),
+              form <- member_of([:string, :atom])
+            ) do
+        given = if form == :atom, do: String.to_atom(value), else: value
+        request = Request.new("https://example.com/", [{key, given}])
+        assert Map.fetch!(request, key) == value
+
+        # A new request with init has the referrer policy "".
+        expected = if key == :referrer_policy, do: "", else: value
+        assert Request.new(request, method: "POST") |> Map.fetch!(key) == expected
+      end
+    end
+
+    property "refuse each value that is not in their enumeration" do
+      check all(
+              key <- member_of([:priority | Map.keys(@enums)]),
+              value <- one_of([string(:printable), integer(), constant(true)]),
+              value not in Map.get(@enums, key, ["high", "low", "auto"])
+            ) do
+        assert_raise TypeError, fn -> Request.new("https://example.com/", [{key, value}]) end
+      end
+    end
+
+    test "take a priority, which is not a field" do
+      for priority <- ["high", "low", "auto", :low] do
+        request = Request.new("https://example.com/", priority: priority)
+        assert request.options[:priority] == priority
+        refute Map.has_key?(request, :priority)
+      end
+    end
+
+    test "take the integrity and the keepalive flag" do
+      request = Request.new("https://example.com/", integrity: "sha256-abc", keepalive: true)
+      assert {request.integrity, request.keepalive} == {"sha256-abc", true}
+      assert Request.new("https://example.com/", keepalive: false).keepalive == false
+
+      assert_raise TypeError, ~r/integrity/, fn ->
+        Request.new("https://example.com/", integrity: 1)
+      end
+
+      assert_raise TypeError, ~r/keepalive/, fn ->
+        Request.new("https://example.com/", keepalive: "yes")
+      end
+    end
+
+    test "give the referrer as the getter of the Standard" do
+      assert Request.new("https://example.com/", referrer: "").referrer == ""
+
+      # The scheme "about" and the path "client": the query has no effect.
+      for client <- ["about:client", "ABOUT:client", "about:client?x#y"] do
+        assert Request.new("https://example.com/", referrer: client).referrer == "about:client"
+      end
+
+      assert Request.new("https://example.com/", referrer: "https://a.example/x y").referrer ==
+               "https://a.example/x%20y"
+
+      # The BEAM has no base URL: a relative referrer is not valid.
+      for referrer <- ["http://:not a valid URL", "/relative", 1] do
+        assert_raise TypeError, ~r/referrer/, fn ->
+          Request.new("https://example.com/", referrer: referrer)
+        end
+      end
+    end
+
+    test "go back to the defaults of a new request when init is not empty" do
+      input =
+        Request.new("https://example.com/",
+          referrer: "https://a.example/",
+          referrer_policy: "origin",
+          mode: "same-origin",
+          cache: "no-store"
+        )
+
+      assert Request.new(input).referrer == "https://a.example/"
+
+      request = Request.new(input, method: "PUT")
+      assert {request.referrer, request.referrer_policy} == {"about:client", ""}
+      assert {request.mode, request.cache} == {"same-origin", "no-store"}
+    end
+
+    test "refuse a window that is not nil, and the mode navigate" do
+      assert %Request{} = Request.new("https://example.com/", window: nil)
+
+      assert_raise TypeError, ~r/window must be nil/, fn ->
+        Request.new("https://example.com/", window: "http://test.url")
+      end
+
+      assert_raise TypeError, ~r/"navigate" is not valid/, fn ->
+        Request.new("https://example.com/", mode: "navigate")
+      end
+    end
+
+    test "refuse the cache mode only-if-cached with a mode that is not same-origin" do
+      for mode <- ["cors", "no-cors"] do
+        assert_raise TypeError, ~r/"only-if-cached" permits only/, fn ->
+          Request.new("https://example.com/", cache: "only-if-cached", mode: mode)
+        end
+      end
+
+      assert_raise TypeError, ~r/"only-if-cached" permits only/, fn ->
+        Request.new("https://example.com/", cache: "only-if-cached")
+      end
+
+      request = Request.new("https://example.com/", cache: "only-if-cached", mode: "same-origin")
+      assert request.cache == "only-if-cached"
+    end
+
+    test "refuse the mode no-cors with a method that is not CORS-safelisted" do
+      for method <- ["GET", "HEAD", "POST", :post] do
+        assert %Request{mode: "no-cors"} =
+                 Request.new("https://example.com/", mode: "no-cors", method: method)
+      end
+
+      # A method is normalized before the check: "post" is "POST".
+      assert %Request{method: "POST"} =
+               Request.new("https://example.com/", mode: "no-cors", method: "post")
+
+      for method <- ["PUT", "DELETE", "patch", "Custom"] do
+        assert_raise TypeError, ~r/"no-cors" permits only/, fn ->
+          Request.new("https://example.com/", mode: "no-cors", method: method)
+        end
+      end
+
+      input = Request.new("https://example.com/", mode: "no-cors")
+
+      assert_raise TypeError, ~r/"no-cors" permits only/, fn ->
+        Request.new(input, method: "PUT")
+      end
+    end
+
+    test "refuse a stream body with keepalive, or with the mode no-cors" do
+      assert_raise TypeError, ~r/keepalive cannot have a body that is a stream/, fn ->
+        Request.new("https://example.com/",
+          method: "POST",
+          keepalive: true,
+          body: Web.ReadableStream.from(["a"]),
+          duplex: "half"
+        )
+      end
+
+      assert %Request{keepalive: true} =
+               Request.new("https://example.com/", method: "POST", keepalive: true, body: "a")
+
+      assert_raise TypeError, ~r/needs the mode "same-origin" or "cors"/, fn ->
+        Request.new("https://example.com/",
+          method: "POST",
+          mode: "no-cors",
+          body: Web.ReadableStream.from(["a"]),
+          duplex: "half"
+        )
+      end
+
+      input =
+        Request.new("https://example.com/",
+          method: "POST",
+          body: Web.ReadableStream.from(["a"]),
+          duplex: "half"
+        )
+
+      assert_raise TypeError, ~r/needs the mode "same-origin" or "cors"/, fn ->
+        Request.new(input, mode: "no-cors")
+      end
+
+      refute Request.body_used?(input)
+    end
+
+    test "refuse a body stream that is disturbed or locked" do
+      used = Web.ReadableStream.from(["a", "b"])
+      reader = Web.ReadableStream.get_reader(used)
+      assert %{value: "a"} = await(Web.ReadableStreamDefaultReader.read(reader))
+      :ok = Web.ReadableStreamDefaultReader.release_lock(reader)
+
+      locked = Web.ReadableStream.from(["a"])
+      _reader = Web.ReadableStream.get_reader(locked)
+
+      for body <- [used, locked] do
+        assert_raise TypeError, ~r/already used or locked/, fn ->
+          Request.new("https://example.com/", method: "POST", body: body, duplex: "half")
+        end
+
+        assert_raise TypeError, ~r/already used or locked/, fn -> Web.Response.new(body: body) end
+      end
+    end
+  end
+
+  describe "a new request from a request" do
+    property "does not change the input body when the constructor throws" do
+      check all(
+              init <-
+                member_of([
+                  [method: "GET"],
+                  [method: "HEAD"],
+                  [method: "CONNECT"],
+                  [mode: "navigate"],
+                  [mode: "no-cors", method: "PUT"],
+                  [window: "x"],
+                  [referrer: "/relative"],
+                  [cache: "only-if-cached"],
+                  [headers: %{"bad name" => "x"}],
+                  [duplex: "full"]
+                ]),
+              body <- member_of(["text", :stream])
+            ) do
+        body = if body == :stream, do: Web.ReadableStream.from(["text"]), else: body
+        input = Request.new("https://example.com/", method: "POST", body: body, duplex: "half")
+
+        assert_raise TypeError, fn -> Request.new(input, init) end
+        refute Request.body_used?(input)
+        refute Web.ReadableStream.locked?(input.body)
+        assert await(Request.text(Request.new(input))) == "text"
+        assert Request.body_used?(input)
+      end
+    end
+
+    test "takes a body stream with a process through a pipe" do
+      body = Web.ReadableStream.from(["a", "b"])
+      input = Request.new("https://example.com/", method: "POST", body: body, duplex: "half")
+      request = Request.new(input, headers: %{"x" => "1"})
+
+      assert Web.ReadableStream.locked?(body)
+      assert Request.body_used?(input)
+      assert request.body_source == nil
+      assert await(Request.text(request)) == "ab"
     end
   end
 end

@@ -1,8 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Check creating a new request from a disturbed request": "library: a different result",
-    "Input request used for creating new request became disturbed": "library: a different result",
-    "Request construction failure should not set \"bodyUsed\"": "library: a different result"
-  }
-}

@@ -160,6 +160,9 @@ defmodule Web.Test.QuickJS.Bridge do
     "interfaces/dom.idl",
     "interfaces/encoding.idl",
     "interfaces/fetch.idl",
+    # The enumeration `ReferrerPolicy` of the member `referrerPolicy` of
+    # `RequestInit`.
+    "interfaces/referrer-policy.idl",
     "interfaces/streams.idl",
     "interfaces/url.idl",
     "interfaces/urlpattern.idl",

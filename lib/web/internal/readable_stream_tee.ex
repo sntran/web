@@ -21,20 +21,26 @@ defmodule Web.Internal.ReadableStreamTee do
   #
   # A branch that stops is a cancelled branch.
   #
+  # With the argument cloneForBranch2 (`clone?`), the second branch gets a
+  # structured clone of each chunk, as the Fetch Standard specifies for the
+  # clone of a body. A chunk that cannot be cloned puts the two branches in
+  # the errored state, and cancels the source with the error.
+  #
   # The process keeps the reader lock until the source stops, because the
   # Streams Standard never releases the lock of a stream that has a tee.
   # Then the process stops.
 
   use GenServer
 
+  alias Web.Internal.StructuredData
   alias Web.ReadableStream
 
   @type index :: 1 | 2
 
   # Starts the process and takes the reader lock of the source.
-  @spec start(pid()) :: {:ok, pid()} | {:error, :already_locked | :released}
-  def start(source) when is_pid(source) do
-    case GenServer.start(__MODULE__, {source, self()}) do
+  @spec start(pid(), boolean()) :: {:ok, pid()} | {:error, :already_locked | :released}
+  def start(source, clone? \\ false) when is_pid(source) and is_boolean(clone?) do
+    case GenServer.start(__MODULE__, {source, self(), clone?}) do
       {:ok, tee} -> {:ok, tee}
       {:error, {:shutdown, reason}} -> {:error, reason}
     end
@@ -73,11 +79,12 @@ defmodule Web.Internal.ReadableStreamTee do
   end
 
   @impl true
-  def init({source, caller}) do
+  def init({source, caller, clone?}) do
     case ReadableStream.get_reader(source) do
       :ok ->
         state = %{
           source: source,
+          clone?: clone?,
           # The process that makes the branches. If it stops before it gives
           # the branches, no process can use this tee.
           caller: Process.monitor(caller),
@@ -228,6 +235,26 @@ defmodule Web.Internal.ReadableStreamTee do
 
   defp check_response(_message, nil), do: :no_reply
   defp check_response(message, request), do: :gen_statem.check_response(message, request)
+
+  # The chunk steps of ReadableStreamDefaultTee: "If canceled2 is false and
+  # cloneForBranch2 is true", the second branch gets
+  # `StructuredClone(chunk)`.
+  defp handle_read({:ok, chunk}, %{clone?: true} = state)
+       when not is_map_key(state.canceled, 2) do
+    StructuredData.clone(chunk)
+  rescue
+    error in [Web.DOMException, Web.TypeError] ->
+      each_active_branch(state, &ReadableStream.error(&1, error))
+      result = Web.Stream.terminate_and_wait(state.source, :cancel, error)
+      {:noreply, complete(%{state | result: result})}
+  else
+    copy ->
+      for {index, {pid, _monitor}} <- state.branches, not is_map_key(state.canceled, index) do
+        ReadableStream.enqueue(pid, if(index == 2, do: copy, else: chunk))
+      end
+
+      {:noreply, state}
+  end
 
   defp handle_read({:ok, chunk}, state) do
     each_active_branch(state, &ReadableStream.enqueue(&1, chunk))

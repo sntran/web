@@ -56,6 +56,8 @@ defmodule Web.Response do
     * `Web.TypeError` for a status text that is not a reason phrase;
     * `Web.TypeError` for a body together with a status that permits no body:
       101, 103, 204, 205, or 304;
+    * `Web.TypeError` for a body that is a `Web.ReadableStream` that a
+      process read from, or that has a reader;
     * `Web.TypeError` for a header name or a header value that is not valid.
 
   ## Examples
@@ -80,6 +82,7 @@ defmodule Web.Response do
     :ok = validate_status!(status)
     :ok = validate_status_text!(status_text)
     :ok = validate_null_body!(status, body)
+    :ok = validate_body_stream!(body)
 
     build(opts)
   end
@@ -106,13 +109,19 @@ defmodule Web.Response do
   @doc false
   # Makes the response of a dispatcher from the data of the network. The
   # checks of the constructor are not applicable: a server can give each
-  # status.
+  # status. The headers have the guard "immutable", as the Fetch Standard
+  # specifies for the response of `fetch`.
   @spec __network__(keyword()) :: t()
   def __network__(opts) when is_list(opts) do
     opts
     |> Keyword.put_new(:type, "basic")
     |> build()
+    |> immutable()
   end
+
+  # The step "create a Response object" with the guard "immutable".
+  defp immutable(%__MODULE__{headers: headers} = response),
+    do: %{response | headers: Web.Headers.__immutable__(headers)}
 
   defp build(opts) do
     status = Keyword.get(opts, :status, 200)
@@ -175,12 +184,22 @@ defmodule Web.Response do
 
   defp validate_null_body!(_status, _body), do: :ok
 
+  # The step "extract a body": a stream must not be disturbed or locked.
+  defp validate_body_stream!(%Web.ReadableStream{} = body) do
+    _stream = Web.Body.extract!(body)
+    :ok
+  end
+
+  defp validate_body_stream!(_body), do: :ok
+
   @doc """
   Returns a network error response, as `Response.error()`.
+
+  Its headers have the guard `"immutable"`: see `Web.Headers`.
   """
   @spec error() :: t()
   def error do
-    build(status: 0, type: "error")
+    [status: 0, type: "error"] |> build() |> immutable()
   end
 
   @doc """
@@ -219,7 +238,7 @@ defmodule Web.Response do
 
   The URL must be an absolute URL. Raises `Web.TypeError` for a URL that is
   not valid, and `Web.RangeError` for a status that is not 301, 302, 303,
-  307, or 308.
+  307, or 308. The headers have the guard `"immutable"`: see `Web.Headers`.
   """
   @spec redirect(String.t() | Web.URL.t(), non_neg_integer()) :: t()
   def redirect(url, status \\ 302) do
@@ -229,7 +248,7 @@ defmodule Web.Response do
       raise Web.RangeError, "Invalid redirect status: #{inspect(status)}"
     end
 
-    build(status: status, headers: %{"location" => location})
+    [status: status, headers: %{"location" => location}] |> build() |> immutable()
   end
 
   defp redirect_location!(%Web.URL{} = url), do: Web.URL.href(url)

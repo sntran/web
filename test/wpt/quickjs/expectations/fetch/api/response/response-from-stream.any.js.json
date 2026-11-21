@@ -1,8 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Constructing a Response with a stream on which getReader() is called": "library: a different result",
-    "Constructing a Response with a stream on which read() and releaseLock() are called": "library: a different result",
-    "Constructing a Response with a stream on which read() is called": "library: a different result"
-  }
-}

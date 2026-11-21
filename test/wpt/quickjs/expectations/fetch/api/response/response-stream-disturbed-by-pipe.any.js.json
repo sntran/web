@@ -1,7 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "using pipeThrough on Response body should disturb it synchronously": "library: a different result",
-    "using pipeTo on Response body should disturb it synchronously": "library: a different result"
-  }
-}

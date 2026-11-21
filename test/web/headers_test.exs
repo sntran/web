@@ -292,6 +292,75 @@ defmodule Web.HeadersTest do
     end
   end
 
+  describe "the guard \"immutable\"" do
+    # The token characters of RFC 9110 for a header name.
+    defp token,
+      do: string(Enum.concat([?a..?z, ?A..?Z, ?0..?9, ~c"!#$%&'*+-.^_`|~"]), min_length: 1)
+
+    # The responses of the Fetch Standard with the guard "immutable".
+    defp immutable_headers do
+      [
+        Web.Response.error().headers,
+        Web.Response.redirect("https://example.com/").headers,
+        Web.Response.__network__(status: 200, headers: Headers.__network__([{"a", "1"}])).headers
+      ]
+    end
+
+    property "refuses each change, and a copy of the headers accepts it" do
+      check all(name <- token(), value <- string(:alphanumeric)) do
+        for headers <- immutable_headers() do
+          assert headers.guard == "immutable"
+
+          for change <- [
+                &Headers.append(&1, name, value),
+                &Headers.set(&1, name, value),
+                &Headers.delete(&1, name),
+                &put_in(&1[name], value),
+                &Headers.pop(&1, name)
+              ] do
+            assert_raise Web.TypeError, "The headers are immutable.", fn -> change.(headers) end
+          end
+
+          copy = Headers.new(headers)
+          assert copy.guard == "none"
+          assert copy |> Headers.append(name, value) |> Headers.get(name) =~ value
+        end
+      end
+    end
+
+    test "examines the name and the value before the guard, as the Fetch Standard" do
+      headers = Web.Response.error().headers
+
+      assert_raise Web.TypeError, ~r/Invalid header name/, fn ->
+        Headers.append(headers, "bad name", "x")
+      end
+
+      assert_raise Web.TypeError, ~r/Invalid header value/, fn ->
+        Headers.set(headers, "x", "a\nb")
+      end
+
+      assert_raise Web.TypeError, ~r/Invalid header name/, fn -> Headers.delete(headers, "") end
+    end
+
+    test "is not in the headers of a response, a request, or a JSON response" do
+      for headers <- [
+            Web.Response.new(body: "x").headers,
+            Web.Response.json(%{}).headers,
+            Web.Request.new("https://example.com").headers,
+            Web.Response.new(headers: Web.Response.error().headers).headers
+          ] do
+        assert headers.guard == "none"
+        assert %Headers{} = Headers.append(headers, "x", "1")
+      end
+    end
+
+    test "stays in the clone of a response" do
+      {original, clone} = Web.Response.clone(Web.Response.redirect("https://example.com/"))
+      assert original.headers.guard == "immutable"
+      assert clone.headers.guard == "immutable"
+    end
+  end
+
   describe "inspect" do
     test "redacts sensitive header values" do
       output =

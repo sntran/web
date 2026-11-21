@@ -9,11 +9,19 @@ defmodule Web.CompressionPBTTest do
   alias Web.DecompressionStream
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController
+  alias Web.ReadableStreamDefaultReader
   alias Web.Uint8Array
   alias Web.WritableStream
   alias Web.WritableStreamDefaultWriter
 
   @formats ~w[brotli gzip deflate deflate-raw]
+
+  # The readable side has the high water mark 0, as the Compression Standard
+  # specifies. Thus the transform of a chunk starts only when a read waits,
+  # and a test starts a read before it waits for a write.
+  defp start_read(stream) do
+    stream.readable |> ReadableStream.get_reader() |> ReadableStreamDefaultReader.read()
+  end
 
   # ---------------------------------------------------------------------------
   # Basic unit tests: construction and validation
@@ -127,45 +135,50 @@ defmodule Web.CompressionPBTTest do
   # PBT Property 3: Backpressure Gating
   # ---------------------------------------------------------------------------
 
-  # This test verifies that the backpressure engine's enqueue_waiters queue
-  # suspends the transform task when the readable queue is saturated. The test
-  # is structurally deterministic: it polls for the invariant (enqueue_waiters ≥ 1)
-  # rather than relying on a fixed sleep, then verifies the write is still in-flight.
-  test "Backpressure Gating: transform task is suspended by enqueue_waiters mechanism" do
-    # Incompressible (random) data ensures zlib emits multiple ~4 KB output
-    # buffers for a single 100 KB deflate call. With the readable hwm=1, the
-    # second buffer triggers wait_for_capacity → enqueue_waiters park.
-    large_data = :crypto.strong_rand_bytes(100_000)
-
+  # The backpressure of the Streams Standard for a transform with the
+  # readable high water mark 0: a write starts only when a read asks for a
+  # chunk, and the output of a write goes to the queue at once.
+  test "Backpressure Gating: the next write starts only when a read waits for a chunk" do
+    # Random data does not compress: zlib gives more than one output buffer
+    # for one deflate call of 100 KB.
     cs = CompressionStream.new("deflate-raw")
     writer = WritableStream.get_writer(cs.writable)
+    reader = ReadableStream.get_reader(cs.readable)
     pid = cs.readable.controller_pid
 
-    # Start writing in the background. Once the readable queue is full the
-    # transform task parks itself in :enqueue_waiters and does NOT complete.
-    write_task =
-      Task.async(fn ->
-        await(WritableStreamDefaultWriter.write(writer, large_data))
-      end)
+    first_read = ReadableStreamDefaultReader.read(reader)
+    first = WritableStreamDefaultWriter.write(writer, :crypto.strong_rand_bytes(100_000))
+    second = WritableStreamDefaultWriter.write(writer, :crypto.strong_rand_bytes(100_000))
 
-    # Structurally wait for the engine to park the transform task (up to 5s).
-    # Polling the gen_statem state is deterministic — no fixed sleep required.
-    assert wait_until(5_000, fn ->
-             slots = :gen_statem.call(pid, :get_slots)
-             :queue.len(slots.enqueue_waiters) >= 1
-           end),
-           "enqueue_waiters never reached ≥ 1 within 5s — backpressure not gating"
+    # The first read starts the first write. The first buffer goes to the
+    # read, and the other buffers go to the queue: the write is complete.
+    assert :ok = await(first)
+    assert %{done: false, value: %Uint8Array{}} = await(first_read)
 
-    # With the queue saturated the write_task must still be running.
-    assert nil == Task.yield(write_task, 0),
-           "Write completed before readable was drained — backpressure not holding"
+    # No read waits for a chunk, thus the second write does not start.
+    slots = ReadableStream.__get_slots__(pid)
+    assert slots.active_task == nil
+    assert :queue.len(slots.queued_write_requests) == 1
+    assert :queue.is_empty(slots.enqueue_waiters)
+    queued = :queue.len(slots.queue)
+    assert queued >= 1
 
-    # Drain the readable side to release all parked tasks, then close.
-    close_task = Task.async(fn -> await(WritableStreamDefaultWriter.close(writer)) end)
-    _chunks = Enum.to_list(cs.readable)
+    # The reads take the chunks of the queue. They do not start the second
+    # write.
+    for _ <- 1..queued,
+        do: assert(%{done: false} = await(ReadableStreamDefaultReader.read(reader)))
 
-    assert :ok == Task.await(write_task, 5_000)
-    Task.await(close_task, 5_000)
+    assert Web.Promise.peek(second) == :pending
+    assert ReadableStream.__get_slots__(pid).active_task == nil
+
+    # A read that waits for a chunk starts the second write.
+    next_read = ReadableStreamDefaultReader.read(reader)
+    assert :ok = await(second)
+    assert %{done: false, value: %Uint8Array{}} = await(next_read)
+
+    close = WritableStreamDefaultWriter.close(writer)
+    _chunks = read_all(reader)
+    assert :ok = await(close)
   end
 
   # ---------------------------------------------------------------------------
@@ -176,6 +189,7 @@ defmodule Web.CompressionPBTTest do
     test "completely invalid bytes trigger TypeError during write (gzip)" do
       ds = DecompressionStream.new("gzip")
       writer = WritableStream.get_writer(ds.writable)
+      read = start_read(ds)
 
       # Write data that is not a valid gzip stream.
       error =
@@ -185,11 +199,14 @@ defmodule Web.CompressionPBTTest do
 
       assert %Web.TypeError{} = error,
              "Expected Web.TypeError from invalid gzip input, got: #{inspect(error)}"
+
+      assert %Web.TypeError{} = catch_exit(await(read))
     end
 
     test "invalid deflate bytes trigger TypeError (deflate)" do
       ds = DecompressionStream.new("deflate")
       writer = WritableStream.get_writer(ds.writable)
+      read = start_read(ds)
 
       error =
         catch_exit(
@@ -197,16 +214,19 @@ defmodule Web.CompressionPBTTest do
         )
 
       assert %Web.TypeError{} = error
+      assert %Web.TypeError{} = catch_exit(await(read))
     end
 
     test "invalid raw deflate bytes trigger TypeError (deflate-raw)" do
       ds = DecompressionStream.new("deflate-raw")
       writer = WritableStream.get_writer(ds.writable)
+      read = start_read(ds)
 
       error =
         catch_exit(await(WritableStreamDefaultWriter.write(writer, <<0xFF, 0xFE, 0xFD, 0xFC>>)))
 
       assert %Web.TypeError{} = error
+      assert %Web.TypeError{} = catch_exit(await(read))
     end
 
     property "random garbage data always triggers TypeError on decompression" do
@@ -225,11 +245,14 @@ defmodule Web.CompressionPBTTest do
             ) do
         ds = DecompressionStream.new(format)
         writer = WritableStream.get_writer(ds.writable)
+        read = start_read(ds)
 
         result = catch_exit(await(WritableStreamDefaultWriter.write(writer, garbage)))
 
         assert %Web.TypeError{} = result,
                "Expected TypeError for garbage #{format} input, got: #{inspect(result)}"
+
+        assert %Web.TypeError{} = catch_exit(await(read))
       end
     end
   end
@@ -244,9 +267,8 @@ defmodule Web.CompressionPBTTest do
 
   describe "Uint8Array and invalid chunk inputs" do
     test "CompressionStream accepts Uint8Array chunk" do
-      # Use pipe_through so the consumer drives the pipeline concurrently;
-      # a sequential write→close→read deadlocks because the flush task parks
-      # in enqueue_waiters until the reader drains the queue.
+      # The pipe reads while it writes. The readable side has the high water
+      # mark 0: a write waits for a read.
       arr = Uint8Array.new(ArrayBuffer.new("hello world"))
       cs = CompressionStream.new("gzip")
       ds = DecompressionStream.new("gzip")
@@ -258,13 +280,15 @@ defmodule Web.CompressionPBTTest do
     test "CompressionStream raises TypeError for non-binary non-Uint8Array chunk" do
       cs = CompressionStream.new("gzip")
       writer = WritableStream.get_writer(cs.writable)
+      read = start_read(cs)
       error = catch_exit(await(WritableStreamDefaultWriter.write(writer, 42)))
       assert %Web.TypeError{} = error
+      assert %Web.TypeError{} = catch_exit(await(read))
     end
 
     test "DecompressionStream accepts Uint8Array chunk" do
-      # DecompressionStream flush produces no output (inflate(<<>>) returns [])
-      # so the sequential write→close→read pattern is safe here.
+      # The pipe reads while it writes. The readable side has the high water
+      # mark 0: a write waits for a read.
       compressed = :zlib.gzip("hello world")
       arr = Uint8Array.new(ArrayBuffer.new(compressed))
       ds = DecompressionStream.new("gzip")
@@ -275,8 +299,10 @@ defmodule Web.CompressionPBTTest do
     test "DecompressionStream raises TypeError for non-binary non-Uint8Array chunk" do
       ds = DecompressionStream.new("gzip")
       writer = WritableStream.get_writer(ds.writable)
+      read = start_read(ds)
       error = catch_exit(await(WritableStreamDefaultWriter.write(writer, :not_a_binary)))
       assert %Web.TypeError{} = error
+      assert %Web.TypeError{} = catch_exit(await(read))
     end
   end
 
@@ -291,13 +317,18 @@ defmodule Web.CompressionPBTTest do
       compressed = :zlib.gzip(:binary.copy(<<0>>, size))
       ds = DecompressionStream.new("gzip")
       writer = WritableStream.get_writer(ds.writable)
+      reader = ReadableStream.get_reader(ds.readable)
+      first_read = ReadableStreamDefaultReader.read(reader)
       write = WritableStreamDefaultWriter.write(writer, compressed)
 
-      # With no reader, the stream keeps one small part of the output: the
-      # write waits for space.
+      # The first read gets one small piece of the output. Then the write
+      # waits for the next read, and the queue of the readable side is
+      # empty: the readable side has the high water mark 0.
       wait_for_full_readable_side(ds.readable.controller_pid)
+      assert %{done: false, value: first} = await(first_read)
+      assert first.byte_length < 200_000
       assert Web.Promise.peek(write) == :pending
-      assert ReadableStream.get_desired_size(ds.readable.controller_pid) > -200_000
+      assert ReadableStream.get_desired_size(ds.readable.controller_pid) == 0
 
       # The worker of the stream, which runs the write, keeps less than 1 MB
       # of the output: the decoder makes the next piece only when the
@@ -307,9 +338,8 @@ defmodule Web.CompressionPBTTest do
       {:binary, binaries} = Process.info(worker, :binary)
       assert binaries |> Enum.map(&elem(&1, 1)) |> Enum.sum() < 1_048_576
 
-      reader = ReadableStream.get_reader(ds.readable)
       close = WritableStreamDefaultWriter.close(writer)
-      sizes = read_sizes(reader, [])
+      sizes = read_sizes(reader, [first.byte_length])
 
       assert Enum.sum(sizes) == size
       assert Enum.max(sizes) < 200_000
@@ -318,7 +348,7 @@ defmodule Web.CompressionPBTTest do
     end
 
     defp read_sizes(reader, sizes) do
-      case await(Web.ReadableStreamDefaultReader.read(reader)) do
+      case await(ReadableStreamDefaultReader.read(reader)) do
         %{done: true} -> sizes
         %{value: chunk} -> read_sizes(reader, [chunk.byte_length | sizes])
       end
@@ -329,8 +359,11 @@ defmodule Web.CompressionPBTTest do
     test "DecompressionStream cancel closes the zlib port without raising" do
       ds = DecompressionStream.new("gzip")
       writer = WritableStream.get_writer(ds.writable)
+      read = start_read(ds)
       compressed = :zlib.gzip("hello")
       await(WritableStreamDefaultWriter.write(writer, compressed))
+      assert %{done: false, value: chunk} = await(read)
+      assert Uint8Array.to_binary(chunk) == "hello"
       # Aborting invokes the cancel: callback which calls stop_agent.
       await(WritableStreamDefaultWriter.abort(writer, :test_cancel))
       :ok
@@ -368,10 +401,24 @@ defmodule Web.CompressionPBTTest do
   # ---------------------------------------------------------------------------
 
   describe "wait_for_capacity error branch" do
-    test "returns :ok immediately when readable capacity is already available" do
+    test "waits for a read, and returns :ok at once while a read waits" do
       cs = CompressionStream.new("gzip")
-      ctrl = %ReadableStreamDefaultController{pid: cs.readable.controller_pid}
+      pid = cs.readable.controller_pid
+      ctrl = %ReadableStreamDefaultController{pid: pid}
 
+      # The readable side has the high water mark 0: with no read, it has no
+      # space.
+      waiter = Task.async(fn -> ReadableStreamDefaultController.wait_for_capacity(ctrl) end)
+
+      assert wait_until(2_000, fn ->
+               :queue.len(:gen_statem.call(pid, :get_slots).enqueue_waiters) >= 1
+             end),
+             "Waiter did not park in enqueue_waiters within 2s"
+
+      _read = start_read(cs)
+      assert :ok == Task.await(waiter, 2_000)
+
+      # The read still waits for a chunk. Thus the readable side has space.
       assert :ok == ReadableStreamDefaultController.wait_for_capacity(ctrl)
     end
 
@@ -392,7 +439,7 @@ defmodule Web.CompressionPBTTest do
 
     test "returns :ok when the stream errors while a waiter is parked" do
       # Build an errored-stream scenario:
-      #   1. Fill the readable queue to HWM=1.
+      #   1. Put a chunk in the readable queue (the high water mark is 0).
       #   2. Park a task in wait_for_capacity (queue full, no drain).
       #   3. Error the stream → fail_stream fires enqueue_error_actions →
       #      parked task receives {:error, _} instead of :ok.
@@ -439,12 +486,18 @@ defmodule Web.CompressionPBTTest do
     test "cancel closes the zlib port without raising" do
       cs = CompressionStream.new("gzip")
       writer = WritableStream.get_writer(cs.writable)
+      reader = ReadableStream.get_reader(cs.readable)
+      read = ReadableStreamDefaultReader.read(reader)
 
       await(WritableStreamDefaultWriter.write(writer, "hello"))
 
-      # Abort the stream — should close the zlib port safely.
+      # The first output of gzip is its header.
+      assert %{done: false, value: %Uint8Array{}} = await(read)
+
+      # Abort the stream — should close the zlib port safely. A read after
+      # the abort gets the reason of the abort.
       await(WritableStreamDefaultWriter.abort(writer, :test_cancel))
-      :ok
+      assert catch_exit(await(ReadableStreamDefaultReader.read(reader))) == :test_cancel
     end
   end
 
@@ -531,6 +584,14 @@ defmodule Web.CompressionPBTTest do
   defp valid_compressed_prefix?(_data, "deflate"), do: false
   defp valid_compressed_prefix?(_data, "deflate-raw"), do: false
 
+  # Reads the chunks until the end of the stream.
+  defp read_all(reader) do
+    case await(ReadableStreamDefaultReader.read(reader)) do
+      %{done: true} -> []
+      %{value: chunk} -> [chunk | read_all(reader)]
+    end
+  end
+
   # Waits until the transform waits for space on the readable side. Then
   # the stream does no more work before a read.
   defp wait_for_full_readable_side(pid) do
@@ -579,6 +640,7 @@ defmodule Web.CompressionRuntimeLogTest do
   alias Web.Console
   alias Web.DecompressionStream
   alias Web.ReadableStream
+  alias Web.ReadableStreamDefaultReader
   alias Web.WritableStream
   alias Web.WritableStreamDefaultWriter
 
@@ -667,6 +729,11 @@ defmodule Web.CompressionRuntimeLogTest do
           try do
             ds = DecompressionStream.new("gzip")
             writer = WritableStream.get_writer(ds.writable)
+
+            # The transform of a chunk starts only when a read waits.
+            _read =
+              ds.readable |> ReadableStream.get_reader() |> ReadableStreamDefaultReader.read()
+
             error = catch_exit(await(WritableStreamDefaultWriter.write(writer, "not gzip")))
             assert %Web.TypeError{} = error
           after

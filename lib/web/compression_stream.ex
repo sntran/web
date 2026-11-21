@@ -25,13 +25,18 @@ defmodule Web.CompressionStream do
 
       iex> cs = Web.CompressionStream.new("gzip")
       iex> writer = Web.WritableStream.get_writer(cs.writable)
-      iex> Web.await(Web.WritableStreamDefaultWriter.write(writer, "hello"))
-      :ok
-      iex> Web.await(Web.WritableStreamDefaultWriter.close(writer))
-      :ok
+      iex> write = Web.WritableStreamDefaultWriter.write(writer, "hello")
+      iex> close = Web.WritableStreamDefaultWriter.close(writer)
       iex> [%Web.Uint8Array{} | _] = chunks = Enum.to_list(cs.readable)
       iex> chunks |> Enum.map_join(&Web.Uint8Array.to_binary/1) |> :zlib.gunzip()
       "hello"
+      iex> {Web.await(write), Web.await(close)}
+      {:ok, :ok}
+
+  The transform of a chunk starts only when a read asks for a chunk, as the
+  Compression Standard specifies: the readable side has the high water mark
+  0, and the writable side has the high water mark 1. Thus start the read
+  before you wait for a write.
 
   Each chunk of the readable side is a `Web.Uint8Array`, as the Compression
   Standard specifies. A chunk for the writable side is a binary, a
@@ -42,6 +47,7 @@ defmodule Web.CompressionStream do
 
   require Logger
 
+  alias Web.CountQueuingStrategy
   alias Web.Internal.Brotli.Encoder
   alias Web.Internal.Bytes
   alias Web.ReadableStreamDefaultController
@@ -57,6 +63,17 @@ defmodule Web.CompressionStream do
 
   @valid_formats ~w[brotli gzip deflate deflate-raw]
 
+  # The Compression Standard sets up the stream with the steps "set up a
+  # TransformStream" of the Streams Standard. These steps give the writable
+  # side the high water mark 1 and the readable side the high water mark 0.
+  # The size of each chunk is 1 on the two sides. Thus the transform of a
+  # chunk starts only when a reader asks for a chunk.
+  @queuing [
+    high_water_mark: 1,
+    writable_size: :count,
+    strategy: %CountQueuingStrategy{high_water_mark: 0}
+  ]
+
   @doc """
   Creates a new `CompressionStream` for the given `format`.
 
@@ -65,7 +82,7 @@ defmodule Web.CompressionStream do
   """
   @spec new(String.t()) :: t()
   def new(format) when format in @valid_formats do
-    {:ok, pid} = start_link(format: format)
+    {:ok, pid} = start_link([format: format] ++ @queuing)
 
     %__MODULE__{
       readable: %Web.ReadableStream{controller_pid: pid},
@@ -92,30 +109,29 @@ defmodule Web.CompressionStream do
 
   # The callbacks run in the worker process of the stream: the handle opens
   # at the first chunk, thus it belongs to the worker.
+  #
+  # The step "compress and enqueue a chunk" of the Compression Standard puts
+  # all the output of a chunk in the queue of the readable side. The output
+  # of a chunk is approximately as large as the chunk, or smaller, and it is
+  # in the memory already. Thus the output does not wait for the reader, and
+  # the write is complete when the output is in the queue. The next write
+  # waits until a read asks for a chunk: see `@queuing`.
   @impl Web.Stream
   def write(chunk, ctrl, state) do
     bin = to_binary!(chunk, "CompressionStream")
     maybe_log_runtime_event("write", byte_size(bin))
     {chunks, state} = compress(state, bin)
-
-    for c <- chunks do
-      ReadableStreamDefaultController.wait_for_capacity(ctrl)
-      ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
-    end
-
+    enqueue_all(ctrl, chunks)
     {:ok, state}
   end
 
+  # The last chunks do not wait for the reader, thus the close of the
+  # writable side does not need a reader, as in the Streams Standard.
   @impl Web.Stream
   def flush(ctrl, state) do
     maybe_log_runtime_event("flush", 0)
     {final_chunks, state} = compress_end(state)
-
-    # The last chunks do not wait for the reader, thus the close of the
-    # writable side does not need a reader, as in the Streams Standard.
-    for c <- final_chunks,
-        do: ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
-
+    enqueue_all(ctrl, final_chunks)
     {:ok, state}
   end
 
@@ -162,6 +178,10 @@ defmodule Web.CompressionStream do
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  defp enqueue_all(ctrl, chunks) do
+    for c <- chunks, do: ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
+  end
 
   defp window_bits_for("gzip"), do: 31
   defp window_bits_for("deflate"), do: 15

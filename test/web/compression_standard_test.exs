@@ -30,6 +30,14 @@ defmodule Web.CompressionStandardTest do
     [head | split(rest, sizes)]
   end
 
+  # Reads until the end of the stream. The last result has `done: true`.
+  defp read_to_end(reader) do
+    case await(ReadableStreamDefaultReader.read(reader)) do
+      %{done: true} = result -> [result]
+      result -> [result | read_to_end(reader)]
+    end
+  end
+
   # Examines the condition until it is true, with a limit of 2 seconds for a
   # busy machine. Use it only when no message tells that a different process
   # did its step.
@@ -150,23 +158,105 @@ defmodule Web.CompressionStandardTest do
   end
 
   describe "the backpressure" do
+    # The Compression Standard sets up each stream with the steps "set up a
+    # TransformStream" of the Streams Standard: the writable side has the
+    # high water mark 1, the readable side has the high water mark 0, and
+    # the size of each chunk is 1.
+    test "gives the two sides the high water marks and the sizes of the Standard" do
+      for make <- [&CompressionStream.new/1, &DecompressionStream.new/1] do
+        stream = make.("gzip")
+        pid = stream.readable.controller_pid
+        writer = WritableStream.get_writer(stream.writable)
+        assert WritableStreamDefaultWriter.desired_size(writer) == 1
+        assert ReadableStream.__get_slots__(pid).readable_desired_size == 0
+
+        # A small chunk and a large chunk have the same size.
+        for chunk <- ["x", :binary.copy("x", 100_000)],
+            do: WritableStreamDefaultWriter.write(writer, chunk)
+
+        assert WritableStreamDefaultWriter.desired_size(writer) == -1
+      end
+
+      # A close with no write puts the last chunks of the compressed data in
+      # the queue of the readable side, with no read.
+      stream = CompressionStream.new("gzip")
+      writer = WritableStream.get_writer(stream.writable)
+      assert :ok = await(WritableStreamDefaultWriter.close(writer))
+
+      slots = ReadableStream.__get_slots__(stream.readable.controller_pid)
+      chunks = :queue.to_list(slots.queue)
+      assert chunks != []
+      assert Enum.sum_by(chunks, fn {chunk, _size} -> chunk.byte_length end) > length(chunks)
+      assert slots.total_queued_size == length(chunks)
+    end
+
+    # The step "compress and enqueue a chunk" puts all the output of a chunk
+    # in the queue. Thus a read that waits lets a write complete, also when
+    # the write gives more than one chunk.
+    property "lets a write of a compression stream complete when a read waits" do
+      check all(
+              format <- member_of(@formats),
+              sizes <- list_of(integer(0..100_000), min_length: 1, max_length: 3),
+              seed <- integer(),
+              max_runs: 30
+            ) do
+        :rand.seed(:exsss, seed)
+        chunks = Enum.map(sizes, &:rand.bytes/1)
+        stream = CompressionStream.new(format)
+        pid = stream.readable.controller_pid
+        writer = WritableStream.get_writer(stream.writable)
+        reader = ReadableStream.get_reader(stream.readable)
+
+        reads =
+          Enum.flat_map(chunks, fn chunk ->
+            # The reads take the chunks of the queue first. Then a read
+            # waits for a chunk.
+            queued = :queue.len(ReadableStream.__get_slots__(pid).queue)
+            reads = for _ <- 0..queued//1, do: ReadableStreamDefaultReader.read(reader)
+            assert :ok = await(WritableStreamDefaultWriter.write(writer, chunk))
+            reads
+          end)
+
+        close = WritableStreamDefaultWriter.close(writer)
+        output = Enum.map(reads, &await/1) ++ read_to_end(reader)
+        assert :ok = await(close)
+
+        compressed =
+          for %{done: false, value: chunk} <- output,
+              into: "",
+              do: Uint8Array.to_binary(chunk)
+
+        assert decompress([compressed], format) == IO.iodata_to_binary(chunks)
+      end
+    end
+
     test "holds the writes of a compression stream that no process reads" do
       stream = CompressionStream.new("gzip")
+      pid = stream.readable.controller_pid
       writer = WritableStream.get_writer(stream.writable)
 
       writes =
         for _ <- 1..50,
             do: WritableStreamDefaultWriter.write(writer, :crypto.strong_rand_bytes(20_000))
 
-      # The transform waits for space on the readable side. Then the stream
-      # does no more work before a read.
-      wait_until(fn ->
-        slots = ReadableStream.__get_slots__(stream.readable.controller_pid)
-        not :queue.is_empty(slots.enqueue_waiters)
-      end)
+      # The transform of a chunk waits for a read: no transform starts.
+      slots = ReadableStream.__get_slots__(pid)
+      assert slots.active_task == nil
+      assert :queue.len(slots.queued_write_requests) == 50
+      assert :queue.is_empty(slots.queue)
+      assert Enum.all?(writes, &(Promise.peek(&1) == :pending))
 
+      # A read starts the transforms. The read takes the first chunk of the
+      # output, and the other chunks of that write go to the queue. Then
+      # the stream does no more work before a read.
+      read = ReadableStreamDefaultReader.read(ReadableStream.get_reader(stream.readable))
+      assert %{done: false, value: %Uint8Array{}} = await(read)
+      wait_until(fn -> ReadableStream.__get_slots__(pid).active_task == nil end)
+
+      slots = ReadableStream.__get_slots__(pid)
       assert Enum.count(writes, &(Promise.peek(&1) == :pending)) >= 45
-      assert :queue.len(ReadableStream.__get_slots__(stream.readable.controller_pid).queue) <= 2
+      assert :queue.len(slots.queued_write_requests) >= 45
+      assert :queue.len(slots.queue) <= 2
     end
   end
 end

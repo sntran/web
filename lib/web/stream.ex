@@ -379,7 +379,32 @@ defmodule Web.Stream do
   # JavaScript, the reactions to that start come before the reaction to
   # each later operation. Thus the later operations find the processes
   # started. See `tla/TransformStream.tla`.
-
+  #
+  # Only `Web.TransformStream.new/2` uses the option. A readable stream and
+  # a writable stream get the end of start later, in a message from their
+  # worker, as JavaScript sets [[started]] in a reaction after the
+  # constructor. That gives a different time of a result, and never a
+  # result that the Streams Standard cannot give:
+  #
+  #   * [[started]] has an effect only in ReadableStreamDefaultControllerShouldCallPull
+  #     (and the same step of a byte stream), in
+  #     WritableStreamDefaultControllerAdvanceQueueIfNeeded, and in
+  #     WritableStreamStartErroring. Each of them only moves a step (a pull,
+  #     a write, a close, or WritableStreamFinishErroring) to the reaction
+  #     to start. The stream process also does these steps after its start
+  #     task.
+  #   * An operation of a caller that comes before the end of start finds
+  #     the state that a synchronous operation after the constructor finds
+  #     in JavaScript. An operation that comes after it finds the state that
+  #     an operation after an await finds. For example, an abort after an
+  #     error of the controller rejects with the stored error ("erroring"),
+  #     or fulfils ("errored"): each is the result of JavaScript for one
+  #     place of the reaction to start between the operations.
+  #   * No algorithm of these two streams reacts to a promise and then reads
+  #     the state that [[started]] changes. The pipe treats "erroring" and
+  #     "errored" alike. A transform stream is different: the reaction of
+  #     TransformStreamDefaultSourceCancelAlgorithm reads the state of the
+  #     writable side, which is a different process.
   def run_start(pids, start_fn, controller, opts \\ [])
 
   def run_start(pids, start_fn, controller, opts) when is_list(pids) do

@@ -34,6 +34,104 @@ defmodule Web.TransformStreamTest do
     {writer, writes, Writer.close(writer)}
   end
 
+  # A transformer with a function `transform` that does the default
+  # transform. Its transform runs in the worker of the writable side.
+  defp enqueue_transformer,
+    do: %{transform: fn chunk, controller -> Controller.enqueue(controller, chunk) end}
+
+  defp eventually(fun, attempts \\ 400) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
+  end
+
+  # The trace messages of the messages that `pid` got.
+  defp received_messages(pid) do
+    :erlang.trace(pid, false, [:receive])
+    ref = :erlang.trace_delivered(pid)
+    assert_receive {:trace_delivered, ^pid, ^ref}
+    collect_received(pid)
+  end
+
+  defp collect_received(pid) do
+    receive do
+      {:trace, ^pid, :receive, message} -> [message | collect_received(pid)]
+    after
+      0 -> []
+    end
+  end
+
+  # The results of a failure of the transform, for one transformer. The
+  # first chunk stays in the queue of the readable side, thus the
+  # backpressure is off for the second chunk.
+  defp failure_outcome(transformer, scenario) do
+    test = self()
+    start = fn controller -> send(test, {:controller, controller}) end
+
+    strategy =
+      if scenario == :size,
+        do: ByteLengthQueuingStrategy.new(16),
+        else: CountQueuingStrategy.new(2)
+
+    transform =
+      TransformStream.new(Map.put(transformer, :start, start), readable_strategy: strategy)
+
+    assert_receive {:controller, controller}
+    readable = transform.readable.controller_pid
+    writable = transform.writable.controller_pid
+    writer = WritableStream.get_writer(transform.writable)
+    reader = ReadableStream.get_reader(transform.readable)
+    first = Promise.wait(Writer.write(writer, "first"))
+
+    second =
+      case scenario do
+        # The chunk has no byte length: its size is not valid.
+        :size ->
+          Writer.write(writer, 42)
+
+        # The write is in the mailbox of the writable side before the
+        # message of the controller.
+        operation when operation in [:terminate, :error] ->
+          :erlang.suspend_process(writable)
+          write = Writer.write(writer, "second")
+
+          if operation == :terminate,
+            do: Controller.terminate(controller),
+            else: Controller.error(controller, :failed)
+
+          :erlang.resume_process(writable)
+          write
+
+        # The readable side stopped before the write.
+        :stopped ->
+          Process.exit(readable, :kill)
+          eventually(fn -> writable_slots(transform).transform.peer_ref == nil end)
+          Writer.write(writer, "second")
+
+        # The readable side stops before it handles the enqueue.
+        :stops ->
+          :erlang.suspend_process(readable)
+          write = Writer.write(writer, "second")
+
+          eventually(fn ->
+            {:messages, messages} = Process.info(readable, :messages)
+            Enum.any?(messages, &match?({:"$gen_call", _from, {_tag, "second"}}, &1))
+          end)
+
+          Process.exit(readable, :kill)
+          write
+      end
+
+    # The read comes after the end of the write: the readable side has the
+    # result of the failure.
+    second = Promise.wait(second)
+    closed = Promise.wait(Writer.closed(writer))
+    read = if scenario in [:stopped, :stops], do: nil, else: Promise.wait(Reader.read(reader))
+    {first, second, closed, read}
+  end
+
   describe "new/2" do
     test "gives a struct with the two sides, which have the default limits of the Standard" do
       transform = TransformStream.new()
@@ -262,6 +360,68 @@ defmodule Web.TransformStreamTest do
       end
     end
 
+    test "costs no message when it changes, and one message for each held write" do
+      transform = TransformStream.new()
+      writable = transform.writable.controller_pid
+      writer = WritableStream.get_writer(transform.writable)
+      reader = ReadableStream.get_reader(transform.readable)
+      :erlang.trace(writable, true, [:receive])
+
+      # The read comes first: its pull turns the backpressure off, and the
+      # transform turns it on again. The readable side handled the read when
+      # the call `slots/1` returns.
+      for index <- 1..5 do
+        read = Reader.read(reader)
+        _slots = slots(transform)
+        assert await(Writer.write(writer, index)) == :ok
+        assert await(read) == %{value: index, done: false}
+      end
+
+      # The write comes first: the writable side holds it. The pull of the
+      # read sends one message, and the transform runs.
+      write = Writer.write(writer, :held)
+      assert writable_slots(transform).active_task == nil
+      assert await(Reader.read(reader)) == %{value: :held, done: false}
+      assert await(write) == :ok
+
+      releases =
+        writable
+        |> received_messages()
+        |> Enum.count(&(&1 == {:"$gen_cast", {:transform_backpressure, false}}))
+
+      assert releases == 1
+    end
+
+    property "loses no write when the writer and the reader are different processes" do
+      check all(
+              chunks <- list_of(integer(), max_length: 60),
+              readable_limit <- integer(0..3),
+              writable_limit <- integer(1..3),
+              transformer <- member_of([%{}, enqueue_transformer()]),
+              max_runs: 40
+            ) do
+        transform =
+          TransformStream.new(transformer,
+            readable_strategy: CountQueuingStrategy.new(readable_limit),
+            writable_strategy: CountQueuingStrategy.new(writable_limit)
+          )
+
+        reader = Task.async(fn -> Enum.to_list(transform.readable) end)
+        writer = WritableStream.get_writer(transform.writable)
+
+        # The writer waits for the promise `ready` before each write, as a
+        # pipe does. The holds of the writes and the pulls of the reader come
+        # in each sequence.
+        for chunk <- chunks do
+          assert await(Writer.ready(writer)) == :ok
+          Writer.write(writer, chunk)
+        end
+
+        assert await(Writer.close(writer)) == :ok
+        assert Task.await(reader) == chunks
+      end
+    end
+
     test "goes through a pipe: a source with no end is read only for the reader" do
       counter = :counters.new(1, [])
 
@@ -289,6 +449,73 @@ defmodule Web.TransformStreamTest do
       assert Enum.take(result, 3) == [1, 2, 3]
       Process.sleep(100)
       assert :counters.get(counter, 1) <= pulled_with_no_reader + 6
+    end
+  end
+
+  describe "the default transform" do
+    test "runs in no worker of the writable side" do
+      for {transformer, worker?} <- [{%{}, false}, {enqueue_transformer(), true}] do
+        transform = TransformStream.new(transformer)
+        writer = WritableStream.get_writer(transform.writable)
+        reader = ReadableStream.get_reader(transform.readable)
+
+        for index <- 1..3 do
+          read = Reader.read(reader)
+          assert await(Writer.write(writer, index)) == :ok
+          assert await(read) == %{value: index, done: false}
+        end
+
+        {:dictionary, dictionary} = Process.info(transform.writable.controller_pid, :dictionary)
+        assert List.keymember?(dictionary, {Web.Stream, :worker}, 0) == worker?
+      end
+    end
+
+    test "calls the size function of the readable side in the worker" do
+      test = self()
+
+      size = fn _chunk ->
+        send(test, {:size, self()})
+        1
+      end
+
+      transform = TransformStream.new(%{}, readable_strategy: %{high_water_mark: 2, size: size})
+      writer = WritableStream.get_writer(transform.writable)
+
+      assert await(Writer.write(writer, :chunk)) == :ok
+      assert_received {:size, worker}
+      refute worker in [transform.readable.controller_pid, transform.writable.controller_pid]
+      assert Enum.take(transform.readable, 1) == [:chunk]
+    end
+
+    test "fails as a transform that enqueues the chunk" do
+      type_error = &%Web.TypeError{message: "Cannot enqueue a chunk: the stream is #{&1}."}
+      terminated = %Web.TypeError{message: "The transform stream was terminated."}
+
+      for scenario <- [:size, :terminate, :error, :stopped, :stops] do
+        outcome = failure_outcome(%{}, scenario)
+        assert outcome == failure_outcome(enqueue_transformer(), scenario)
+        assert {{:fulfilled, :ok}, {:rejected, second}, {:rejected, closed}, read} = outcome
+
+        case scenario do
+          :size ->
+            assert %Web.RangeError{} = second
+            assert {closed, read} == {second, {:rejected, second}}
+
+          # The readable side is closed with a chunk in its queue: the
+          # failure of the enqueue puts it in the errored state
+          # (TransformStreamError).
+          :terminate ->
+            assert {second, closed, read} ==
+                     {type_error.(:closed), terminated, {:rejected, type_error.(:closed)}}
+
+          :error ->
+            assert {second, closed, read} ==
+                     {type_error.(:errored), :failed, {:rejected, :failed}}
+
+          _stopped ->
+            assert {second, closed} == {type_error.(:closed), type_error.(:closed)}
+        end
+      end
     end
   end
 
@@ -660,6 +887,12 @@ defmodule Web.TransformStreamTest do
         assert_receive {:controller, controller}
         writer = WritableStream.get_writer(transform.writable)
         reader = ReadableStream.get_reader(transform.readable)
+
+        # The writable side has the end of the function start: the error of
+        # the function cancel puts it in the state "errored", and not
+        # "erroring". The end of start comes in a message from the worker of
+        # the writable side.
+        eventually(fn -> writable_slots(transform).active_operation != :start end)
 
         result =
           if operation == :cancel,

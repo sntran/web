@@ -67,6 +67,17 @@ defmodule Web.TLA.ModelCheckTest do
     test "a write that waits after the end of the backpressure is found" do
       assert_violates(SpecModel.check("TransformStream", bug("no_release")), "Progress")
     end
+
+    test "a held write that does not mark the cell of the backpressure is found" do
+      assert_violates(SpecModel.check("TransformStream", bug("no_mark")), "Progress")
+    end
+
+    test "a check and a mark of the cell in two steps are found" do
+      assert_violates(
+        SpecModel.check("TransformStream", bug("check_then_mark")),
+        "OffWhenWanted"
+      )
+    end
   end
 
   describe "StreamLifetime" do

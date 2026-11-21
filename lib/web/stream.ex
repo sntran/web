@@ -407,7 +407,8 @@ defmodule Web.Stream do
     :transform_error_unblock,
     :transform_error_if_needed,
     :transform_finish,
-    :transform_finished
+    :transform_finished,
+    :transform_write
   ]
 
   # The requests of `Web.ReadableByteStreamController` and
@@ -1516,15 +1517,24 @@ defmodule Web.Stream do
   end
 
   # The process of the other side of a transform stream stopped: its lock
-  # does not keep this side.
+  # does not keep this side. The default transform that it did not answer
+  # fails: see `run_write_task/2`.
   defp handle_common(
          :info,
          {:DOWN, ref, :process, _pid, _reason},
-         _state,
+         state,
          %{transform: %{peer_ref: ref}} = data
        )
        when is_reference(ref) do
-    {:keep_state, put_transform(data, peer_ref: nil, peer_locked: false)}
+    data = put_transform(data, peer_ref: nil, peer_locked: false)
+
+    case data.active_task do
+      %{enqueue: true, ref: task} ->
+        handle_common(:info, {task, {:error, enqueue_refusal_error(:closed)}}, state, data)
+
+      _other ->
+        {:keep_state, data}
+    end
   end
 
   # The process of the ambient AbortSignal stopped with no abort. A signal
@@ -2491,36 +2501,66 @@ defmodule Web.Stream do
   # (`:consumer`), each with its own state. The field `transform` of each
   # process has the slots of the transform stream that the side needs:
   #
-  #   * The readable side has [[backpressure]] and [[finishPromise]] of the
-  #     Standard. It changes the backpressure: an enqueue turns it on, and a
-  #     pull turns it off. It tells each change to the writable side. Thus
-  #     the writable side gets the changes in their sequence.
-  #   * The writable side has a copy of the backpressure. The write in
-  #     flight waits until the backpressure is off, and then the transform
-  #     runs: see `start_write_task/2`.
-  #   * [[finishPromise]] makes sure that only one of flush, an abort, and a
-  #     cancel calls the transformer. The callback of each one runs in the
-  #     worker of its side, and asks the readable side first: see
-  #     `Web.TransformStream`.
+  #   * [[backpressure]] of the Standard is one `:atomics` cell that the two
+  #     sides share. Its value is `@backpressure_off`, `@backpressure_on`, or
+  #     `@backpressure_held`: the backpressure is on, and the writable side
+  #     holds a write.
+  #   * The readable side changes the backpressure: an enqueue turns it on,
+  #     and a pull turns it off. A pull that finds a held write sends
+  #     `{:transform_backpressure, false}` to the writable side.
+  #   * The writable side reads the cell before the transform of each write.
+  #     When the backpressure is on, it holds the write, until the message
+  #     comes: see `start_write_task/2`. Thus a change of the backpressure
+  #     costs no message, and a held write costs one message.
+  #   * A transformer with no function `transform` has the default
+  #     transform: an enqueue on the readable side, with no code of the
+  #     user. The writable side sends it to the readable side, with no
+  #     worker: see `run_write_task/2`.
+  #   * The readable side has [[finishPromise]] of the Standard. It makes
+  #     sure that only one of flush, an abort, and a cancel calls the
+  #     transformer. The callback of each one runs in the worker of its side,
+  #     and asks the readable side first: see `Web.TransformStream`.
   #
-  # A stream process never waits for the other stream process. Only the
-  # workers make calls to the two processes.
+  # Each change of the cell is one atomic operation. The hold of a write
+  # changes "on" to "held" in one step, and a pull changes each value to
+  # "off" in one step. Thus the two steps cannot both miss the other: if the
+  # pull comes first, the writable side finds "off" and does not hold the
+  # write. If the hold comes first, the pull finds "held" and sends the
+  # message. See `tla/TransformStream.tla`.
+  #
+  # A stream process never waits for the other stream process. The reply of
+  # the default transform comes to the writable side as a usual message.
+  # Only the workers wait for the replies of the two processes.
   # ---------------------------------------------------------------------------
 
-  defp transform_side({:readable, writable}) do
+  @backpressure_off 0
+  @backpressure_on 1
+  @backpressure_held 2
+
+  @doc false
+  # InitializeTransformStream: the cell of [[backpressure]] for the two sides
+  # of a new transform stream. The backpressure is on.
+  def __transform_cell__ do
+    cell = :atomics.new(1, signed: false)
+    :atomics.put(cell, 1, @backpressure_on)
+    cell
+  end
+
+  defp transform_side({:readable, writable, cell}) do
     %{
       side: :readable,
       peer: writable,
       peer_ref: Process.monitor(writable),
       peer_locked: false,
-      backpressure: true,
+      cell: cell,
       finish: nil,
       cleared: false
     }
   end
 
-  defp transform_side(:writable) do
-    %{side: :writable, peer: nil, peer_ref: nil, peer_locked: false, backpressure: true}
+  # `enqueue` is `true` for the default transform.
+  defp transform_side({:writable, cell, enqueue}) do
+    %{side: :writable, peer: nil, peer_ref: nil, peer_locked: false, cell: cell, enqueue: enqueue}
   end
 
   defp transform_side(nil), do: nil
@@ -2529,12 +2569,30 @@ defmodule Web.Stream do
     %{data | transform: Map.merge(transform, Map.new(changes))}
   end
 
-  # TransformStreamSetBackpressure, on the readable side.
-  defp transform_backpressure(%{transform: %{backpressure: value}} = data, value), do: data
+  # TransformStreamSetBackpressure, on the readable side. The backpressure
+  # turns on only when it is off. A held write gets the end of the
+  # backpressure as a message.
+  defp transform_backpressure(%{transform: %{cell: cell}} = data, true) do
+    _ = :atomics.compare_exchange(cell, 1, @backpressure_off, @backpressure_on)
+    data
+  end
 
-  defp transform_backpressure(%{transform: transform} = data, value) do
-    :gen_statem.cast(transform.peer, {:transform_backpressure, value})
-    put_transform(data, backpressure: value)
+  defp transform_backpressure(%{transform: %{cell: cell} = transform} = data, false) do
+    if :atomics.exchange(cell, 1, @backpressure_off) == @backpressure_held do
+      :gen_statem.cast(transform.peer, {:transform_backpressure, false})
+    end
+
+    data
+  end
+
+  # The first steps of TransformStreamDefaultSinkWriteAlgorithm: `true` when
+  # the write must wait for the end of the backpressure. The writable side
+  # marks its hold in the same atomic step.
+  defp transform_hold?(cell) do
+    case :atomics.compare_exchange(cell, 1, @backpressure_on, @backpressure_held) do
+      :ok -> true
+      value -> value == @backpressure_held
+    end
   end
 
   # The last steps of ReadableStreamDefaultControllerEnqueue
@@ -2562,10 +2620,11 @@ defmodule Web.Stream do
   defp transform_should_pull?(data),
     do: data.active_operation != :init and readable_wants_chunk?(data)
 
-  # TransformStreamErrorWritableAndUnblockWrite, from the readable side.
+  # TransformStreamErrorWritableAndUnblockWrite, from the readable side. The
+  # writable side does TransformStreamUnblockWrite.
   defp transform_error_writable(%{transform: %{side: :readable} = transform} = data, reason) do
     control_cast(transform.peer, {:transform_error_unblock, reason})
-    put_transform(data, backpressure: false, cleared: true)
+    put_transform(data, cleared: true)
   end
 
   defp transform_error_writable(data, _reason), do: data
@@ -2584,12 +2643,9 @@ defmodule Web.Stream do
     {:keep_state, put_transform(data, peer_locked: locked)}
   end
 
-  # The backpressure changed. The end of the backpressure lets the write in
-  # flight continue.
-  defp handle_transform(:cast, {:transform_backpressure, value}, state, data) do
-    data = put_transform(data, backpressure: value)
-    if value, do: {:keep_state, data}, else: release_held_write(state, data)
-  end
+  # The end of the backpressure lets the held write continue.
+  defp handle_transform(:cast, {:transform_backpressure, false}, state, data),
+    do: release_held_write(state, data)
 
   # TransformStreamErrorWritableAndUnblockWrite, on the writable side:
   # WritableStreamDefaultControllerErrorIfNeeded and TransformStreamUnblockWrite.
@@ -2608,7 +2664,7 @@ defmodule Web.Stream do
   # TransformStreamDefaultControllerError, on the readable side. The
   # controller sent the error to the writable side also.
   defp handle_transform(:cast, {:transform_error, reason}, state, data) do
-    data = put_transform(data, backpressure: false, cleared: true)
+    data = put_transform(data, cleared: true)
     if final?(state, data), do: {:keep_state, data}, else: fail_stream(reason, data)
   end
 
@@ -2626,7 +2682,7 @@ defmodule Web.Stream do
   # TransformStreamDefaultControllerTerminate. The controller sent the error
   # to the writable side.
   defp handle_transform(:cast, :transform_terminate, state, data) do
-    data = put_transform(data, backpressure: false, cleared: true)
+    data = put_transform(data, cleared: true)
 
     if controller_refusal(state, data) == nil,
       do: handle_producer_close(data),
@@ -2644,6 +2700,32 @@ defmodule Web.Stream do
 
       refusal ->
         {:keep_state_and_data, [{:reply, from, {:error, refusal}}]}
+    end
+  end
+
+  # TransformStreamDefaultControllerPerformTransform with the default
+  # transform, from the writable side: see `run_write_task/2`. The reply is
+  # the result of the write. A failure is TransformStreamError: the readable
+  # side gets the error, and the write rejects with it.
+  defp handle_transform({:call, from}, {:transform_write, chunk}, state, data) do
+    case controller_refusal(state, data) do
+      nil ->
+        case enqueue_default(chunk, data) do
+          {:ok, data} ->
+            enqueued(data, [{:reply, from, :ok}])
+
+          # TransformStreamDefaultControllerEnqueue: the size is not valid.
+          # The write rejects with the stored error of the readable side.
+          {:error, reason} ->
+            data = transform_error_writable(data, reason)
+            fail_stream(reason, data, [{:reply, from, {:error, reason}}])
+        end
+
+      refusal ->
+        error = enqueue_refusal_error(refusal)
+        result = handle_transform(:cast, {:transform_error, error}, state, data)
+        {next_state, data, actions} = transition(result, state, data)
+        {:next_state, next_state, data, [{:reply, from, {:error, error}} | actions]}
     end
   end
 
@@ -2670,7 +2752,7 @@ defmodule Web.Stream do
     {result, transition} = finish_steps(kind, outcome, state, data)
     {next_state, data, actions} = transition(transition, state, data)
     replies = for waiter <- [from | waiters], do: {:reply, waiter, {:done, result}}
-    data = put_transform(data, finish: {:settled, result}, backpressure: false)
+    data = put_transform(data, finish: {:settled, result})
     {:next_state, next_state, data, actions ++ replies}
   end
 
@@ -2711,8 +2793,10 @@ defmodule Web.Stream do
         do: start_erroring(reason, data, actions),
         else: {:keep_state, data, actions}
 
+    # TransformStreamUnblockWrite: the held write continues. The writable
+    # side is not writable after the error, thus it reads the cell of the
+    # backpressure no more.
     {next_state, data, actions} = transition(result, state, data)
-    data = put_transform(data, backpressure: false)
     {final_state, data, more} = transition(release_held_write(next_state, data), next_state, data)
     {:next_state, final_state, data, actions ++ more}
   end
@@ -2737,17 +2821,45 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   # TransformStreamDefaultSinkWriteAlgorithm: the write of the writable side
-  # of a transform stream is in flight, and waits for the end of the
-  # backpressure. It has no task until then, thus no time limit: see
-  # `release_held_write/2`.
-  defp start_write_task(%{transform: %{side: :writable, backpressure: true}} = data, request) do
-    {from, _pid, _chunk} = request
+  # of a transform stream is in flight. With backpressure, it waits for the
+  # end of the backpressure. It has no task until then, thus no time limit:
+  # see `release_held_write/2`.
+  defp start_write_task(%{transform: %{side: :writable, cell: cell}} = data, request) do
+    if transform_hold?(cell) do
+      {from, _pid, _chunk} = request
 
-    %{data | pending_write_request: request, active_operation: {:write, from}}
-    |> refresh_backpressure()
+      %{data | pending_write_request: request, active_operation: {:write, from}}
+      |> refresh_backpressure()
+    else
+      run_write_task(data, request)
+    end
   end
 
   defp start_write_task(data, request), do: run_write_task(data, request)
+
+  # The default transform of a transform stream runs no code of the user.
+  # Thus the writable side sends the enqueue to the readable side as a call,
+  # with no worker, and gets the reply as the result of a callback. The
+  # write has no time limit: the readable side answers at once. When the
+  # readable side stopped, the enqueue fails, as an enqueue of a worker.
+  defp run_write_task(%{transform: %{enqueue: true} = transform} = data, request) do
+    {from, _pid, chunk} = request
+    ref = make_ref()
+
+    if transform.peer_ref,
+      do: send(transform.peer, {:"$gen_call", {self(), ref}, {:transform_write, chunk}}),
+      else: send(self(), {ref, {:error, enqueue_refusal_error(:closed)}})
+
+    task = %{ref: ref, pid: transform.peer, external: true, enqueue: true}
+
+    refresh_backpressure(%{
+      data
+      | pending_write_request: request,
+        active_task: task,
+        task_ref: ref,
+        active_operation: {:write, from}
+    })
+  end
 
   defp run_write_task(data, request) do
     {from, _pid, chunk} = request
@@ -2907,6 +3019,12 @@ defmodule Web.Stream do
     handle_task_result({:ok, data.impl_state}, state, data)
   end
 
+  # The readable side of a transform stream did the default transform: see
+  # `run_write_task/2`.
+  defp handle_task_result(:ok, state, %{active_operation: {:write, _from}} = data) do
+    handle_task_result({:ok, data.impl_state}, state, data)
+  end
+
   # Producer init (start_task) completed
   defp handle_task_result({:ok, :init_done}, _state, %{active_operation: :init} = data) do
     new_data = data |> Map.put(:pulling, false) |> clear_active_operation()
@@ -3061,6 +3179,12 @@ defmodule Web.Stream do
 
   defp terminated_error do
     Web.TypeError.exception("The transform stream was terminated.")
+  end
+
+  # The error of an enqueue that the readable side cannot accept, as
+  # `Web.ReadableStream.controller_enqueue/3` raises it.
+  defp enqueue_refusal_error(refusal) do
+    Web.TypeError.exception("Cannot enqueue a chunk: the stream is #{refusal}.")
   end
 
   defp close_consumer_stream(data, actions) do

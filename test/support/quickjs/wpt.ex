@@ -17,7 +17,7 @@ defmodule Web.Test.QuickJS.WPT do
   @root Path.expand("../../wpt/quickjs/expectations", __DIR__)
   @newer_standard "standard: the current Standard changed this test"
   @microtask "runner: the library does the steps of a later microtask before the call returns"
-  @one_state "library: a transform stream has one state for its two sides"
+  @creation_order "runner: the promises settle in the sequence of their creation"
   @new_error "runner: an error of the library is a new object each time"
 
   @doc "Runs the WPT file at `path`, and compares the results with the list."
@@ -219,14 +219,11 @@ defmodule Web.Test.QuickJS.WPT do
        @microtask},
       {:test, "streams/readable-streams/reentrant-strategies.any.js",
        "tee() inside size() should work", @microtask},
-      {:test, "streams/transform-streams/reentrant-strategies.any.js",
-       ~r/^writer\.(write|close)\(\) inside size\(\) should work$/, @microtask},
       {:test, "streams/writable-streams/floating-point-total-queue-size.any.js", ~r//,
        @microtask},
       # The bridge sends the settled promises in the sequence in which
       # JavaScript made them, not in the sequence in which they settled.
-      {:test, "encoding/streams/backpressure.any.js", ~r//,
-       "runner: the promises settle in the sequence of their creation"},
+      {:test, "encoding/streams/backpressure.any.js", ~r//, @creation_order},
       # The size function of a strategy object is a usual JavaScript function
       # of the layer: it has a prototype, and its length is 1.
       {:test, "streams/queuing-strategies.any.js",
@@ -273,19 +270,49 @@ defmodule Web.Test.QuickJS.WPT do
       {:test, "fetch/api/response/response-static-json.any.js",
        ~r/encodes JSON objects correctly|propagates JSON serializer errors|with input/,
        "runner: a JavaScript value for JSON"},
-      # A transform stream is one process with one state for its two sides.
-      # The Standard has a writable side that can be "erroring" while the
-      # readable side is readable, and one promise for flush and cancel.
-      {:test, "streams/transform-streams/reentrant-strategies.any.js",
-       ~r/^(error|readable cancel|writer\.abort)\(\) inside size\(\) should work$/, @one_state},
-      {:test, "streams/transform-streams/strategies.any.js",
-       ~r/^a bad readableStrategy size function should error the stream on enqueue even when/,
-       @one_state},
+      # The rules of the TransformStream, the WritableStream, and the pipe.
+      # In JavaScript, the start of a stream, the end of a write or a close,
+      # and the reaction to a cancel come in a microtask after the call. The
+      # bridge answers a call when the library is at rest, thus these steps
+      # are complete before the next statement of the test. For example, a
+      # writable stream is "errored" where JavaScript has it "erroring" (its
+      # start is not complete), and a write that JavaScript queues starts.
+      {:test, "streams/transform-streams/cancel.any.js",
+       "readable.cancel() and a parallel writable.close() should reject if a transformer.cancel() calls controller.error()",
+       @microtask},
+      {:test, "streams/transform-streams/errors.any.js",
+       ~r/^(abort should set the close reason for the writable when it happens before cancel during start|controller\.error\(\) should (do nothing the second time it is called|close writable immediately after readable\.cancel\(\)))/,
+       @microtask},
       {:test, "streams/transform-streams/general.any.js",
-       "terminate() should abort writable immediately after readable.cancel()", @one_state},
-      {:path, "streams/transform-streams/cancel.any.js", @one_state},
-      {:path, "streams/transform-streams/errors.any.js", @one_state},
-      {:path, "streams/transform-streams/terminate.any.js", @one_state},
+       "terminate() should abort writable immediately after readable.cancel()", @microtask},
+      {:test, "streams/transform-streams/reentrant-strategies.any.js",
+       ~r/^writer\.(write|close|abort)\(\) inside size\(\) should work$/, @microtask},
+      {:test, "streams/transform-streams/terminate.any.js",
+       ~r/^controller\.error\(\) after controller\.terminate\(\) with(out)? queued chunk/,
+       @microtask},
+      {:test, "streams/writable-streams/aborting.any.js",
+       ~r/^(Aborting a WritableStream (before it starts|prevents further writes after any|puts it in an errored state|causes any outstanding write)|Closing but then immediately aborting|promises returned from other writer methods should be rejected when writer abort\(\) happens during sink start|WritableStream if sink's abort throws, the promise returned by multiple writer\.abort\(\)s is the same|when calling abort\(\) twice on the same stream)/,
+       @microtask},
+      {:test, "streams/writable-streams/close.any.js",
+       ~r/^(when close is called on a WritableStream in writable state, ready should return a fulfilled promise|releaseLock\(\) should not change the result of sync close\(\)|close\(\) on an erroring stream should reject)$/,
+       @microtask},
+      {:test, "streams/writable-streams/general.any.js",
+       "ready promise should fire before closed on releaseLock", @microtask},
+      {:test, "streams/writable-streams/reentrant-strategy.any.js",
+       "writer.write() promises should resolve in the standard order", @microtask},
+      {:test, "streams/writable-streams/start.any.js",
+       "when start() rejects, writer promises should reject in standard order", @microtask},
+      {:test, "streams/piping/general-addition.any.js",
+       "enqueue() must not synchronously call write algorithm", @microtask},
+      {:test, "streams/piping/multiple-propagation.any.js",
+       ~r/^Piping from an errored readable stream to (an erroring|a closing) writable stream$/,
+       @microtask},
+      # The promises of a write, an abort, and `closed` settle in the same
+      # step of the library. The bridge sends them in the sequence of their
+      # creation.
+      {:test, "streams/writable-streams/aborting.any.js",
+       ~r/^(writer\.abort\(\)|controller\.error\(\)), .*while there is an in-flight (write|close), and then finish|^writer\.abort\(\) while there is an in-flight write, and then finish the write with rejection$/,
+       @creation_order},
       # The conversion of WebIDL to an async sequence is not in the layer
       # yet: `ReadableStream.from()` needs it.
       {:text, ["async_sequence is not in the layer"], "runner: no async sequence"},

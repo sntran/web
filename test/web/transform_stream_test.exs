@@ -11,7 +11,21 @@ defmodule Web.TransformStreamTest do
   alias Web.WritableStreamDefaultWriter, as: Writer
 
   defp rejection(promise), do: catch_exit(await(promise))
+
+  # The calls of the transformer that the test got.
+  defp calls do
+    receive do
+      call when call == :flush or elem(call, 0) == :cancel -> [call | calls()]
+    after
+      0 -> []
+    end
+  end
+
+  # The two sides have their own processes, as in the Streams Standard.
   defp slots(transform), do: ReadableStream.__get_slots__(transform.readable.controller_pid)
+
+  defp writable_slots(transform),
+    do: WritableStream.__get_slots__(transform.writable.controller_pid)
 
   # Writes the chunks and closes, with no await.
   defp write_all(transform, chunks) do
@@ -28,7 +42,7 @@ defmodule Web.TransformStreamTest do
                transform
 
       assert slots(transform).readable_desired_size == 0
-      assert slots(transform).writable_desired_size == 1
+      assert writable_slots(transform).writable_desired_size == 1
     end
 
     test "accepts a strategy for each side" do
@@ -38,9 +52,11 @@ defmodule Web.TransformStreamTest do
           readable_strategy: CountQueuingStrategy.new(7)
         )
 
-      assert slots(transform).writable_desired_size == 3
+      assert writable_slots(transform).writable_desired_size == 3
       assert slots(transform).readable_desired_size == 7
-      assert slots(TransformStream.new(%{}, high_water_mark: 4)).writable_desired_size == 4
+
+      assert writable_slots(TransformStream.new(%{}, high_water_mark: 4)).writable_desired_size ==
+               4
     end
 
     test "refuses a transformer that is not valid" do
@@ -174,11 +190,14 @@ defmodule Web.TransformStreamTest do
       ready = Writer.ready(writer)
 
       # This call comes after the writes from the same process. Thus the
-      # stream handled the writes when the call returns. No transform runs.
-      slots = slots(transform)
-      assert slots.active_operation == nil
+      # writable side handled the writes when the call returns. The first
+      # write is in flight, and waits for the end of the backpressure: no
+      # transform runs.
+      writable = writable_slots(transform)
+      assert writable.active_task == nil
+      assert {:write, _from} = writable.active_operation
       assert Enum.all?([ready | writes], &(Promise.peek(&1) == :pending))
-      assert :queue.len(slots.queue) == 0
+      assert :queue.len(slots(transform).queue) == 0
       refute_received {:transformed, _chunk}
       assert Writer.desired_size(writer) < 0
 
@@ -189,7 +208,7 @@ defmodule Web.TransformStreamTest do
       assert_receive {:transformed, 1}
       # The stream replied to the first write before this call. It holds the
       # second write, and no transform runs.
-      assert slots(transform).active_operation == nil
+      assert writable_slots(transform).active_task == nil
       refute_received {:transformed, 2}
       assert Promise.peek(Enum.at(writes, 1)) == :pending
     end
@@ -202,13 +221,12 @@ defmodule Web.TransformStreamTest do
       # The first three transforms fill the readable queue. Then the stream
       # holds the writes, and no transform runs.
       for write <- Enum.take(writes, 3), do: assert(await(write) == :ok)
-      slots = slots(transform)
-      assert slots.active_operation == nil
+      assert writable_slots(transform).active_task == nil
 
       assert Enum.map(writes, &Promise.peek/1) ==
                [{:fulfilled, :ok}, {:fulfilled, :ok}, {:fulfilled, :ok}, :pending, :pending]
 
-      assert :queue.len(slots.queue) == 3
+      assert :queue.len(slots(transform).queue) == 3
     end
 
     test "does not hold the close: the function flush runs with no reader" do
@@ -444,6 +462,31 @@ defmodule Web.TransformStreamTest do
         })
 
       assert Enum.to_list(transform.readable) == []
+      writer = WritableStream.get_writer(transform.writable)
+
+      assert %TypeError{message: "The transform stream was terminated."} =
+               rejection(Writer.closed(writer))
+
+      # A second close throws, as ReadableStreamDefaultController.close().
+      assert_raise TypeError, "Cannot close: the stream is closed.", fn ->
+        TransformStream.new(%{
+          start: fn controller ->
+            ReadableStreamDefaultController.close(controller)
+            ReadableStreamDefaultController.close(controller)
+          end
+        })
+      end
+    end
+
+    test "error of the readable stream controller puts the two sides in the errored state" do
+      transform =
+        TransformStream.new(%{
+          start: fn controller -> ReadableStreamDefaultController.error(controller, :failed) end
+        })
+
+      writer = WritableStream.get_writer(transform.writable)
+      assert rejection(Writer.closed(writer)) == :failed
+      assert rejection(Reader.read(ReadableStream.get_reader(transform.readable))) == :failed
     end
 
     test "terminate rejects a process that waits for the writable side with a message" do
@@ -571,6 +614,201 @@ defmodule Web.TransformStreamTest do
 
       assert await(WritableStream.abort(transform.writable, :stop)) == :ok
       assert_received {:cancel, :stop}
+    end
+  end
+
+  describe "the two sides" do
+    test "a transform that calls error completes its write, and then the two sides are errored" do
+      transform =
+        TransformStream.new(
+          %{
+            transform: fn chunk, controller ->
+              Controller.enqueue(controller, chunk)
+              Controller.error(controller, :failed)
+            end
+          },
+          readable_strategy: CountQueuingStrategy.new(1)
+        )
+
+      writer = WritableStream.get_writer(transform.writable)
+
+      # The writable side is erroring during the transform: the write in
+      # flight completes, as WritableStreamFinishInFlightWrite specifies.
+      assert await(Writer.write(writer, :chunk)) == :ok
+      assert rejection(Writer.closed(writer)) == :failed
+      assert rejection(Writer.write(writer, :late)) == :failed
+      assert rejection(Reader.read(ReadableStream.get_reader(transform.readable))) == :failed
+    end
+
+    test "a cancel or an abort whose function cancel calls error rejects with that error" do
+      for operation <- [:cancel, :abort] do
+        test = self()
+
+        transform =
+          TransformStream.new(%{
+            start: fn controller -> send(test, {:controller, controller}) end,
+            # The function gets the controller from the test.
+            cancel: fn _reason ->
+              send(test, {:cancel, self()})
+
+              receive do
+                {:controller, controller} -> Controller.error(controller, :failed)
+              end
+            end
+          })
+
+        assert_receive {:controller, controller}
+        writer = WritableStream.get_writer(transform.writable)
+        reader = ReadableStream.get_reader(transform.readable)
+
+        result =
+          if operation == :cancel,
+            do: Reader.cancel(reader, :no_interest),
+            else: Writer.abort(writer, :stop)
+
+        assert_receive {:cancel, worker}
+        send(worker, {:controller, controller})
+
+        # The other side is errored after the function: the operation
+        # rejects with its stored error, as the algorithms of the Standard
+        # specify. The side of the operation keeps its own state.
+        assert rejection(result) == :failed
+
+        if operation == :cancel do
+          assert await(Reader.closed(reader)) == :ok
+          assert rejection(Writer.closed(writer)) == :failed
+        else
+          assert rejection(Writer.closed(writer)) == :stop
+          assert rejection(Reader.closed(reader)) == :failed
+        end
+      end
+    end
+
+    test "a flush that calls error rejects the close with that error" do
+      transform = TransformStream.new(%{flush: &Controller.error(&1, :failed)})
+      writer = WritableStream.get_writer(transform.writable)
+
+      assert rejection(Writer.close(writer)) == :failed
+      assert rejection(Reader.read(ReadableStream.get_reader(transform.readable))) == :failed
+    end
+
+    test "a flush that terminates and then throws rejects the close, and the readable side stays closed" do
+      transform =
+        TransformStream.new(%{
+          flush: fn controller ->
+            Controller.terminate(controller)
+            raise "flush failed"
+          end
+        })
+
+      writer = WritableStream.get_writer(transform.writable)
+      assert %RuntimeError{message: "flush failed"} = rejection(Writer.close(writer))
+      assert Enum.to_list(transform.readable) == []
+    end
+
+    test "a cancel after the end of flush gets the result of flush, with no call of cancel" do
+      test = self()
+
+      transform =
+        TransformStream.new(%{
+          flush: fn controller -> Controller.enqueue(controller, :last) end,
+          cancel: fn reason -> send(test, {:cancel, reason}) end
+        })
+
+      writer = WritableStream.get_writer(transform.writable)
+      assert await(Writer.close(writer)) == :ok
+
+      # The readable side has a chunk in its queue: it is still readable.
+      assert await(ReadableStream.cancel(transform.readable, :no_interest)) == :ok
+      refute_received {:cancel, _reason}
+    end
+
+    test "a close during a cancel gets the result of the cancel, with no call of flush" do
+      test = self()
+
+      transform =
+        TransformStream.new(%{
+          flush: fn _controller -> send(test, :flush) end,
+          cancel: fn reason ->
+            send(test, {:cancel, self(), reason})
+
+            receive do
+              :continue -> :ok
+            end
+          end
+        })
+
+      writer = WritableStream.get_writer(transform.writable)
+      cancel = ReadableStream.cancel(transform.readable, :no_interest)
+      assert_receive {:cancel, worker, :no_interest}
+      close = Writer.close(writer)
+
+      # This call comes after the close from the same process: the flush of
+      # the writable side waits for [[finishPromise]].
+      assert WritableStream.__get_slots__(transform.writable.controller_pid).state == :closing
+      send(worker, :continue)
+
+      assert await(cancel) == :ok
+      assert await(close) == :ok
+      refute_received :flush
+    end
+
+    test "an abort after terminate calls no transformer, and rejects the write that waits" do
+      test = self()
+
+      transform =
+        TransformStream.new(%{
+          start: fn controller -> send(test, {:controller, controller}) end,
+          cancel: fn reason -> send(test, {:cancel, reason}) end
+        })
+
+      assert_receive {:controller, controller}
+      writer = WritableStream.get_writer(transform.writable)
+
+      # No process reads: the write waits for the backpressure, and the
+      # abort waits for the write.
+      write = Writer.write(writer, :chunk)
+      abort = Writer.abort(writer, :stop)
+      assert WritableStream.__get_slots__(transform.writable.controller_pid).state == :erroring
+
+      # The terminate ends the backpressure. The writable side is erroring:
+      # the write rejects with the stored error. The transformer has no
+      # algorithms after the terminate (TransformStreamDefaultControllerClearAlgorithms).
+      assert :ok = Controller.terminate(controller)
+      assert rejection(write) == :stop
+      assert await(abort) == :ok
+      refute_received {:cancel, _reason}
+    end
+
+    property "flush, cancel, and abort call the transformer one time, in each sequence" do
+      check all(
+              operations <-
+                map(list_of(member_of([:close, :cancel, :abort]), min_length: 1), &Enum.uniq/1),
+              max_runs: 40
+            ) do
+        test = self()
+
+        transform =
+          TransformStream.new(%{
+            flush: fn _controller -> send(test, :flush) end,
+            cancel: fn reason -> send(test, {:cancel, reason}) end
+          })
+
+        writer = WritableStream.get_writer(transform.writable)
+        reader = ReadableStream.get_reader(transform.readable)
+
+        promises =
+          Enum.map(operations, fn
+            :close -> Writer.close(writer)
+            :cancel -> Reader.cancel(reader, :no_interest)
+            :abort -> Writer.abort(writer, :stop)
+          end)
+
+        # Each operation settles. [[finishPromise]] lets only the first of
+        # flush, the cancel, and the abort call the transformer.
+        Enum.each(promises, &Promise.wait/1)
+        assert [_call] = calls()
+      end
     end
   end
 

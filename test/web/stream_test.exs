@@ -45,6 +45,39 @@ defmodule Web.StreamTest do
     end
   end
 
+  # A stream of the type `:producer_consumer` of the engine. The writes put
+  # their chunks in the readable queue: see `Web.CompressionStream`.
+  defmodule ProducerConsumerStream do
+    use Web.Stream
+
+    @impl Web.Stream
+    def start(_pid, _opts), do: {:producer_consumer, %{}}
+
+    @impl Web.Stream
+    def write(chunk, ctrl, state) do
+      Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
+      {:ok, state}
+    end
+  end
+
+  # A stream of the type `:producer_consumer` with the callbacks of the
+  # test.
+  defmodule CallbackStream do
+    use Web.Stream
+
+    @impl Web.Stream
+    def start(_pid, opts), do: {:producer_consumer, Map.new(opts)}
+
+    @impl Web.Stream
+    def write(chunk, ctrl, state) do
+      state.write.(chunk, ctrl)
+      {:ok, state}
+    end
+
+    @impl Web.Stream
+    def terminate(event, state), do: state.terminate.(event)
+  end
+
   defmodule InvalidReadableHwmStrategy do
     defstruct high_water_mark: :invalid
 
@@ -53,6 +86,7 @@ defmodule Web.StreamTest do
 
   alias Web.ReadableStream
   alias Web.ReadableStreamBYOBReader
+  alias Web.ReadableStreamDefaultReader
   alias Web.TransformStream
   alias Web.TypeError
   alias Web.Uint8Array
@@ -90,8 +124,8 @@ defmodule Web.StreamTest do
     end
 
     test "producer_consumer starts in writable state" do
-      ts = TransformStream.new(%{})
-      slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
+      {:ok, pid} = ProducerConsumerStream.start_link([])
+      slots = ReadableStream.__get_slots__(pid)
       assert slots.state == :writable
     end
 
@@ -415,7 +449,8 @@ defmodule Web.StreamTest do
       ts = TransformStream.new()
       assert %ReadableStream{} = ts.readable
       assert %WritableStream{} = ts.writable
-      assert ts.readable.controller_pid == ts.writable.controller_pid
+      # The two sides have their own processes, as in the Streams Standard.
+      assert ts.readable.controller_pid != ts.writable.controller_pid
     end
 
     test "passthrough transform (no transform function)" do
@@ -531,9 +566,8 @@ defmodule Web.StreamTest do
       # The option is the limit of the writable side. The default limit of
       # the readable side is 0, as in the Streams Standard.
       ts = TransformStream.new(%{}, high_water_mark: 5)
-      slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
-      assert slots.writable_desired_size == 5
-      assert slots.readable_desired_size == 0
+      assert WritableStream.__get_slots__(ts.writable.controller_pid).writable_desired_size == 5
+      assert ReadableStream.__get_slots__(ts.readable.controller_pid).readable_desired_size == 0
     end
 
     test "TransformStream refuses a readable strategy with a high water mark that is not a number" do
@@ -544,10 +578,10 @@ defmodule Web.StreamTest do
         )
       end
 
-      # The engine has no check: the readable side gets the high water mark
-      # of the writable side.
+      # The engine has no check: the readable side of a stream of the type
+      # `:producer_consumer` gets the high water mark of the writable side.
       {:ok, pid} =
-        Web.Stream.start_link(TransformStream,
+        Web.Stream.start_link(ProducerConsumerStream,
           high_water_mark: 3,
           strategy: %InvalidReadableHwmStrategy{}
         )
@@ -617,6 +651,167 @@ defmodule Web.StreamTest do
       WritableStreamDefaultWriter.write(writer, "hello")
       WritableStreamDefaultWriter.close(writer)
       assert Enum.join(ts.readable, "") == "HELLO"
+    end
+  end
+
+  describe "a stream of the type producer_consumer" do
+    # `Web.CompressionStream` and `Web.DecompressionStream` have this type.
+    # These tests use the parts that their controllers do not use.
+
+    defp gated_write(test) do
+      fn chunk, ctrl ->
+        send(test, {:write, self(), chunk})
+
+        receive do
+          :ok -> :ok
+          :enqueue -> Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
+          :raise -> raise "write failed"
+        end
+      end
+    end
+
+    defp callback_stream(opts) do
+      {:ok, pid} = CallbackStream.start_link(Keyword.put_new(opts, :terminate, fn _ -> :ok end))
+      {pid, WritableStream.get_writer(%WritableStream{controller_pid: pid})}
+    end
+
+    test "a close of the controller is a terminate: the writable side gets a TypeError" do
+      {:ok, pid} = ProducerConsumerStream.start_link([])
+      stream = %WritableStream{controller_pid: pid}
+      writer = WritableStream.get_writer(stream)
+      assert :ok = ReadableStream.controller_close(pid)
+
+      assert %TypeError{message: "The transform stream was terminated."} =
+               catch_exit(await(WritableStreamDefaultWriter.write(writer, :late)))
+
+      assert %TypeError{} = catch_exit(await(WritableStreamDefaultWriter.close(writer)))
+      assert WritableStream.desired_size(stream) == nil
+
+      assert {:error, {:errored, %TypeError{}}} =
+               WritableStream.ready(pid, writer.owner_pid)
+
+      # A second terminate has no effect.
+      :gen_statem.cast(pid, :terminate_transform)
+      assert ReadableStream.__get_slots__(pid).state == :closed
+
+      {:ok, other} = ProducerConsumerStream.start_link([])
+      assert :ok = ReadableStream.close(other)
+      assert ReadableStream.__get_slots__(other).state == :closed
+    end
+
+    test "a terminate during a write closes the stream when the write is complete" do
+      test = self()
+
+      for {answer, result} <- [ok: :ok, enqueue: :type_error, raise: :raised] do
+        {pid, writer} = callback_stream(write: gated_write(test))
+        reader = ReadableStream.get_reader(%ReadableStream{controller_pid: pid})
+        closed = ReadableStreamDefaultReader.closed(reader)
+        write = WritableStreamDefaultWriter.write(writer, :chunk)
+        assert_receive {:write, worker, :chunk}
+
+        # The write is in progress. The terminate waits for it, and an
+        # enqueue after the terminate throws a `TypeError`.
+        assert :ok = ReadableStream.controller_close(pid)
+        send(worker, answer)
+
+        case result do
+          :ok -> assert await(write) == :ok
+          :type_error -> assert %TypeError{} = catch_exit(await(write))
+          :raised -> assert %RuntimeError{} = catch_exit(await(write))
+        end
+
+        assert await(closed) == :ok
+      end
+    end
+
+    test "a write that fails after a terminate errors a readable side with chunks" do
+      test = self()
+
+      write = fn chunk, ctrl ->
+        Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
+        gated_write(test).(chunk, ctrl)
+      end
+
+      {pid, writer} = callback_stream(write: write, strategy: Web.CountQueuingStrategy.new(1))
+      pending = WritableStreamDefaultWriter.write(writer, :chunk)
+      assert_receive {:write, worker, :chunk}
+      assert :ok = ReadableStream.controller_close(pid)
+      send(worker, :raise)
+
+      assert %RuntimeError{} = catch_exit(await(pending))
+      assert ReadableStream.__get_slots__(pid).state == :errored
+    end
+
+    test "an abort stops the write in progress" do
+      test = self()
+      {pid, writer} = callback_stream(write: gated_write(test))
+      write = WritableStreamDefaultWriter.write(writer, :chunk)
+      assert_receive {:write, worker, :chunk}
+      monitor = Process.monitor(worker)
+
+      assert :ok = await(WritableStreamDefaultWriter.abort(writer, :stop))
+      assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
+      assert :stop = catch_exit(await(write))
+      assert ReadableStream.__get_slots__(pid).state == :errored
+    end
+
+    test "a cancel or an abort whose callback throws gives the thrown value to the other side" do
+      terminate = fn _event -> throw(:callback_failed) end
+
+      {pid, writer} = callback_stream(write: fn _chunk, _ctrl -> :ok end, terminate: terminate)
+      assert :callback_failed = catch_exit(await(ReadableStream.cancel(pid, :no_interest)))
+
+      assert :callback_failed =
+               catch_exit(await(WritableStreamDefaultWriter.write(writer, :late)))
+
+      {pid, writer} = callback_stream(write: fn _chunk, _ctrl -> :ok end, terminate: terminate)
+
+      assert :callback_failed =
+               catch_exit(await(WritableStreamDefaultWriter.abort(writer, :stop)))
+
+      assert ReadableStream.__get_slots__(pid).error_reason == :callback_failed
+    end
+
+    test "a pipe to a stream whose readable side was cancelled rejects with the reason" do
+      {:ok, pid} = ProducerConsumerStream.start_link([])
+      assert :ok = await(ReadableStream.cancel(pid, :no_interest))
+
+      pipe =
+        ReadableStream.pipe_to(ReadableStream.from([1]), %WritableStream{controller_pid: pid})
+
+      assert :no_interest = catch_exit(await(pipe))
+    end
+  end
+
+  describe "the requests of a writer with a process" do
+    test "the requests ready and abort check the state and the lock" do
+      stream = WritableStream.new()
+      writer = WritableStream.get_writer(stream)
+      pid = stream.controller_pid
+      other = spawn(fn -> Process.sleep(:infinity) end)
+
+      assert {:error, :not_locked_by_writer} = WritableStream.abort(pid, other, :stop)
+      assert :ok = await(WritableStreamDefaultWriter.abort(writer, :stop))
+      assert {:error, {:errored, :stop}} = :gen_statem.call(pid, {:ready, writer.owner_pid})
+      Process.exit(other, :kill)
+    end
+
+    test "a writer of a stream that stopped gets a TypeError" do
+      stream = WritableStream.new()
+      writer = WritableStream.get_writer(stream)
+      Web.Stream.stop(stream.controller_pid)
+
+      assert %TypeError{message: "The stream is not available." <> _} =
+               catch_exit(await(WritableStreamDefaultWriter.ready(writer)))
+    end
+
+    test "a transform stream gives an error of the engine to its writable side only" do
+      transform = TransformStream.new()
+      writer = WritableStream.get_writer(transform.writable)
+      Web.Stream.terminate(transform.writable.controller_pid, :error, :failed)
+
+      assert :failed = catch_exit(await(WritableStreamDefaultWriter.closed(writer)))
+      assert ReadableStream.__get_slots__(transform.readable.controller_pid).state == :readable
     end
   end
 
@@ -765,9 +960,8 @@ defmodule Web.StreamTest do
       # The write waits for a reader. It uses one place of the writable side.
       # This call comes after the write from the same process. Thus the
       # stream handled the write when the call returns.
-      slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
-      assert slots.readable_desired_size == 0
-      assert slots.writable_desired_size == 1
+      assert ReadableStream.__get_slots__(ts.readable.controller_pid).readable_desired_size == 0
+      assert WritableStream.__get_slots__(ts.writable.controller_pid).writable_desired_size == 1
 
       assert WritableStream.desired_size(ts.writable) == 1
       assert :ok = WritableStreamDefaultWriter.release_lock(writer)
@@ -1097,7 +1291,6 @@ defmodule Web.StreamTest do
 
       assert_receive {:transform_started, pid}
       assert pid == ts.readable.controller_pid
-      assert ts.readable.controller_pid == ts.writable.controller_pid
     end
 
     # --- writable_stream.ex line 41: start callback returning a Promise ---
@@ -1207,8 +1400,10 @@ defmodule Web.StreamTest do
     end
 
     test "legacy enqueue_ready call still supports immediate and parked backpressure checks" do
-      ts = TransformStream.new(%{}, readable_strategy: Web.CountQueuingStrategy.new(1))
-      pid = ts.readable.controller_pid
+      {:ok, pid} =
+        Web.Stream.start_link(ProducerConsumerStream, strategy: Web.CountQueuingStrategy.new(1))
+
+      readable = %ReadableStream{controller_pid: pid}
 
       assert :ok = :gen_statem.call(pid, :enqueue_ready)
 
@@ -1220,14 +1415,33 @@ defmodule Web.StreamTest do
         :queue.len(Web.ReadableStream.__get_slots__(pid).enqueue_waiters) == 1
       end)
 
-      reader = Web.ReadableStream.get_reader(ts.readable)
+      reader = Web.ReadableStream.get_reader(readable)
       assert %{value: "full", done: false} == await(Web.ReadableStreamDefaultReader.read(reader))
       assert :ok = Task.await(waiter, 1_000)
     end
 
+    test "a writer of a stream of the type producer_consumer gets the error of a cancel" do
+      {:ok, pid} = ProducerConsumerStream.start_link([])
+      writer = WritableStream.get_writer(%WritableStream{controller_pid: pid})
+
+      # A cancel of the readable side puts the writable side in the errored
+      # state, with the reason of the cancel.
+      assert :ok = await(ReadableStream.cancel(pid, :no_interest))
+      assert :no_interest = catch_exit(await(WritableStreamDefaultWriter.ready(writer)))
+      assert :no_interest = catch_exit(await(WritableStreamDefaultWriter.closed(writer)))
+    end
+
+    test "a writer of a stream of the type producer_consumer gets the error of a size" do
+      {:ok, pid} =
+        ProducerConsumerStream.start_link(writable_size: fn _chunk -> throw(:size_failed) end)
+
+      writer = WritableStream.get_writer(%WritableStream{controller_pid: pid})
+      assert :size_failed = catch_exit(await(WritableStreamDefaultWriter.write(writer, :chunk)))
+      assert ReadableStream.__get_slots__(pid).state == :errored
+    end
+
     test "legacy enqueue_ready call returns ok after the stream is closed" do
-      ts = TransformStream.new(%{})
-      pid = ts.readable.controller_pid
+      {:ok, pid} = ProducerConsumerStream.start_link([])
 
       Web.Stream.terminate(pid, :close)
 

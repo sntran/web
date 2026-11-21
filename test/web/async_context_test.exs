@@ -914,9 +914,11 @@ defmodule Web.AsyncContextTest do
       ready = Web.WritableStreamDefaultWriter.ready(writer)
 
       # This process sent the write and the request of `ready` before this
-      # call. Thus the stream handled them, and the write waits in its queue.
+      # call. Thus the stream handled them. The write is in flight, and
+      # waits for the end of the backpressure with no transform.
       slots = WritableStream.__get_slots__(ts.writable.controller_pid)
-      assert :queue.len(slots.queued_write_requests) == 1
+      assert {:write, _from} = slots.active_operation
+      assert slots.active_task == nil
       assert Promise.peek(third) == :pending
       assert Promise.peek(ready) == :pending
       assert :counters.get(pull_count, 1) == 2

@@ -1,7 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "original reader should error when new reader is created within strategy.size()": "library: a different result",
-    "writer.write() promises should resolve in the standard order": "library: a different result"
+    "writer.write() promises should resolve in the standard order": "runner: the library does the steps of a later microtask before the call returns"
   }
 }

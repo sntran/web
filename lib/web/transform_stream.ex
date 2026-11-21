@@ -23,6 +23,14 @@ defmodule Web.TransformStream do
   close with no await, or read in a different process, or use
   `Web.ReadableStream.pipe_through/2`.
 
+  ## The two sides
+
+  The two sides have their own states, as in the Streams Standard. For
+  example, an abort during a transform puts the writable side in the state
+  "erroring": the readable side stays readable, the write completes, and
+  then the function `cancel` runs. Only one of `flush` and `cancel` runs,
+  also when a close, an abort, and a cancel come at the same time.
+
   ## Usage
 
       iex> ts = Web.TransformStream.new(%{
@@ -49,78 +57,165 @@ defmodule Web.TransformStream do
 
   # ---------------------------------------------------------------------------
   # Web.Stream behavior callbacks
+  #
+  # A transform stream has two stream processes, as in the Streams Standard:
+  # the readable side is a `:producer`, and the writable side is a
+  # `:consumer`. Each one has its own state. The engine keeps the slots that
+  # the two sides share: see "The two sides of a transform stream" in
+  # `Web.Stream`. The callbacks below are the algorithms of the Standard for
+  # the underlying sink and the underlying source of the two sides. They run
+  # in the worker of their side.
   # ---------------------------------------------------------------------------
 
   @impl Web.Stream
   def start(pid, opts) do
-    transformer = Keyword.get(opts, :transformer, %{})
-    state = %{transformer: transformer, pid: pid}
+    {side, peer} =
+      case Keyword.get(opts, :transform) do
+        {:readable, writable} -> {:readable, writable}
+        _writable -> {:writable, nil}
+      end
+
+    state = %{
+      side: side,
+      pid: pid,
+      peer: peer,
+      transformer: Keyword.get(opts, :transformer, %{})
+    }
 
     # The function `start` of the transformer runs in the process that makes
-    # the stream: see `Web.Stream.run_start/3`. This process waits for it,
-    # and the writes wait until it is complete.
-    {:producer_consumer, state, Web.Stream.start_actions(opts)}
+    # the stream: see `Web.Stream.run_start/3`. The two sides wait for it.
+    type = if side == :readable, do: :producer, else: :consumer
+    {type, state, Web.Stream.start_actions(opts)}
   end
 
+  # TransformStreamDefaultControllerPerformTransform. A transform that fails
+  # puts the two sides in the errored state (TransformStreamError): the
+  # write rejects, and the writable side gets the error from the rejection.
   @impl Web.Stream
-  def write(chunk, _ctrl, %{transformer: transformer, pid: pid} = state) do
-    ctrl = %Controller{pid: pid}
+  def write(chunk, _ctrl, state) do
+    controller = controller(state)
 
     result =
-      case Map.get(transformer, :transform) do
-        transform when is_function(transform, 2) ->
-          transform.(chunk, ctrl)
-
-        _ ->
-          # The default transform gives the chunk with no change.
-          Controller.enqueue(ctrl, chunk)
-          :ok
+      case Map.get(state.transformer, :transform) do
+        nil -> outcome(fn -> Controller.enqueue(controller, chunk) end)
+        transform -> outcome(fn -> transform.(chunk, controller) end)
       end
 
     case result do
-      %Web.Promise{} = promise -> Web.Promise.await(promise)
-      _ -> :ok
-    end
+      :ok ->
+        {:ok, state}
 
-    {:ok, state}
+      {:error, reason} ->
+        Web.Stream.control_cast(controller.pid, {:transform_error, reason})
+        {:error, reason}
+    end
   end
 
+  # TransformStreamDefaultSinkCloseAlgorithm.
   @impl Web.Stream
-  def flush(_ctrl, %{transformer: transformer, pid: pid} = state) do
-    ctrl = %Controller{pid: pid}
-
-    result =
-      case Map.get(transformer, :flush) do
-        flush_fn when is_function(flush_fn, 1) ->
-          flush_fn.(ctrl)
-
-        _ ->
-          :ok
-      end
-
-    case result do
-      %Web.Promise{} = promise -> Web.Promise.await(promise)
-      _ -> :ok
+  def flush(_ctrl, state) do
+    case finish(state, :flush, &callback(&1, state, :flush, [controller(state)])) do
+      :ok -> {:ok, state}
+      {:error, reason} -> {:error, reason}
     end
-
-    {:ok, state}
   end
 
+  # TransformStreamDefaultSinkAbortAlgorithm, for an abort of the writable
+  # side.
   @impl Web.Stream
-  # A cancel of the readable side, and an abort of the writable side, call
-  # the function `cancel` of the transformer with the reason.
-  def terminate({type, reason}, %{transformer: transformer}) when type in [:cancel, :abort] do
-    do_terminate(reason, transformer)
+  def terminate({:abort, reason}, %{side: :writable} = state) do
+    state
+    |> finish({:abort, reason}, &callback(&1, state, :cancel, [reason]))
+    |> terminal_result()
+  end
+
+  # TransformStreamDefaultSourceCancelAlgorithm, for a cancel of the
+  # readable side. An abort of the readable side, for example by an ambient
+  # `Web.AbortSignal`, does the same steps.
+  def terminate({type, reason}, %{side: :readable} = state) when type in [:cancel, :abort] do
+    state
+    |> finish(:cancel, &source_cancel(&1, state, reason))
+    |> terminal_result()
   end
 
   def terminate(_event, _state), do: :ok
 
-  defp do_terminate(reason, transformer) do
-    case Map.get(transformer, :cancel) do
-      cancel when is_function(cancel, 1) -> cancel.(reason)
-      _ -> :ok
+  # The steps of TransformStreamDefaultSourceCancelAlgorithm after the
+  # callback: the writable side gets the reason, or the error of the
+  # callback, if it is not errored. The worker calls the writable side.
+  defp source_cancel(run?, state, reason) do
+    case callback(run?, state, :cancel, [reason]) do
+      :ok ->
+        case Web.Stream.call(state.peer, {:transform_error_if_needed, reason}, :ok) do
+          :ok -> :ok
+          {:errored, error} -> {:error, error}
+        end
+
+      {:error, error} ->
+        _ = Web.Stream.call(state.peer, {:transform_error_if_needed, error}, :ok)
+        {:error, error}
     end
   end
+
+  # [[finishPromise]] of the controller: the readable side runs only the
+  # first request. `fun` gets `true` when the transformer still has its
+  # algorithms (TransformStreamDefaultControllerClearAlgorithms), and gives
+  # `:ok` or `{:error, reason}`.
+  defp finish(state, kind, fun) do
+    readable = if state.side == :readable, do: state.pid, else: state.peer
+
+    # A readable side that stopped is closed or errored: the two sides have
+    # their end, and the request has no effect.
+    case Web.Stream.call(readable, {:transform_finish, kind}, {:done, :ok}) do
+      {:run, run?} ->
+        outcome = fun.(run?)
+
+        {:done, result} =
+          Web.Stream.call(readable, {:transform_finished, kind, outcome}, {:done, outcome})
+
+        result
+
+      {:done, result} ->
+        result
+    end
+  end
+
+  defp callback(false, _state, _name, _args), do: :ok
+
+  defp callback(true, state, name, args) do
+    case Map.get(state.transformer, name) do
+      nil -> :ok
+      fun -> outcome(fn -> apply(fun, args) end)
+    end
+  end
+
+  # The result of a callback, as the reaction to its promise: `:ok`, or
+  # `{:error, reason}` with the reason of a rejection or the thrown value.
+  defp outcome(fun) do
+    case fun.() do
+      %Web.Promise{} = promise ->
+        case Web.Promise.wait(promise) do
+          {:fulfilled, _value} -> :ok
+          {:rejected, reason} -> {:error, reason}
+        end
+
+      _value ->
+        :ok
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    _kind, reason -> {:error, reason}
+  end
+
+  # The engine takes a rejected promise as the failure of a cancel or an
+  # abort.
+  defp terminal_result(:ok), do: :ok
+  defp terminal_result({:error, reason}), do: Web.Promise.reject(reason)
+
+  # The callbacks of the writable side get the controller.
+  defp controller(%{pid: writable, peer: readable}),
+    do: %Controller{pid: readable, writable_pid: writable}
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -180,26 +275,50 @@ defmodule Web.TransformStream do
       )
 
     writable_hwm = QueuingStrategy.high_water_mark!(writable_hwm, 1)
+    start_fn = Map.get(transformer, :start)
 
+    # The options of the engine for each side. Each other option, such as
+    # `:timeout_ms`, goes to the two sides.
     opts =
       opts
-      |> Keyword.drop([:writable_strategy, :readable_strategy])
-      |> Keyword.put(:transformer, transformer)
-      |> Keyword.put(:high_water_mark, writable_hwm)
-      |> Keyword.put(:strategy, Web.CountQueuingStrategy.new(readable_hwm))
-      |> Keyword.put(:readable_size, readable_size)
-      |> Keyword.put(:writable_size, writable_size)
+      |> Keyword.drop([:writable_strategy, :readable_strategy, :high_water_mark])
+      |> Keyword.merge(transformer: transformer, has_start: is_function(start_fn))
 
-    start_fn = Map.get(transformer, :start)
-    {:ok, pid} = start_link(Keyword.put(opts, :has_start, is_function(start_fn)))
+    # InitializeTransformStream. The readable side tells each change of the
+    # backpressure to the writable side, thus the writable side starts
+    # first.
+    {:ok, writable} =
+      start_link(
+        opts ++
+          [
+            transform: :writable,
+            high_water_mark: writable_hwm,
+            strategy: Web.CountQueuingStrategy.new(writable_hwm),
+            size: writable_size
+          ]
+      )
+
+    {:ok, readable} =
+      start_link(
+        opts ++
+          [
+            transform: {:readable, writable},
+            high_water_mark: readable_hwm,
+            strategy: Web.CountQueuingStrategy.new(readable_hwm),
+            size: readable_size
+          ]
+      )
+
+    :ok = Web.Stream.call(writable, {:transform_peer, readable}, :ok)
+    controller = %Controller{pid: readable, writable_pid: writable}
 
     if start_fn do
-      Web.Stream.run_start(pid, start_fn, %Controller{pid: pid})
+      Web.Stream.run_start([readable, writable], start_fn, controller)
     end
 
     %__MODULE__{
-      readable: %Web.ReadableStream{controller_pid: pid},
-      writable: %Web.WritableStream{controller_pid: pid}
+      readable: %Web.ReadableStream{controller_pid: readable},
+      writable: %Web.WritableStream{controller_pid: writable}
     }
   end
 

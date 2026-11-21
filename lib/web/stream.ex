@@ -23,7 +23,10 @@ defmodule Web.Stream do
 
   - `:producer` — readable source (e.g. `ReadableStream`)
   - `:consumer` — writable sink (e.g. `WritableStream`)
-  - `:producer_consumer` — transform (e.g. `TransformStream`)
+  - `:producer_consumer` — transform in one process (e.g. `CompressionStream`)
+
+  A `Web.TransformStream` has two processes: a `:producer` and a
+  `:consumer`. See "The two sides of a transform stream".
   """
 
   @behaviour :gen_statem
@@ -128,6 +131,10 @@ defmodule Web.Stream do
     # stream is in the errored state: the readable side was cancelled (the
     # reason of the cancel), or the transformer called `terminate`.
     writable_error: nil,
+    # The slots of `Web.TransformStream` that the two sides share, for the
+    # process of one side: see "The two sides of a transform stream". `nil`
+    # for each other stream.
+    transform: nil,
     read_requests: :queue.new(),
     disturbed: false,
     # The stream was cancelled: see `complete_linger/1`.
@@ -135,6 +142,15 @@ defmodule Web.Stream do
     # Consumer (writable) side
     writer_pid: nil,
     writer_ref: nil,
+    # The promises `ready` and `closed` of the writer that holds the lock, and
+    # of the writers that released their lock: see "The promises of a
+    # writer".
+    writer_ready: nil,
+    writer_closed: nil,
+    released_writer_promises: %{},
+    # The lock of a writer that the stream released at an error or a
+    # terminal event, not the writer: that writer still has the stream.
+    cleared_writer_ref: nil,
     # A pipe holds the writer lock. Such a lock does not keep the stream.
     writer_is_pipe: false,
     pending_write_request: nil,
@@ -338,17 +354,22 @@ defmodule Web.Stream do
   end
 
   @doc false
-  def run_start(pid, start_fn, controller) do
-    resolve = call(pid, :take_start_resolver, nil)
+  # The two sides of a transform stream have the same start: give the list
+  # of their processes. The first process owns the promises of `start`.
+  def run_start(pids, start_fn, controller) when is_list(pids) do
+    resolvers = Enum.map(pids, &call(&1, :take_start_resolver, nil))
     # A promise from `start` becomes the result of the gate.
-    resolve.(Web.Promise.with_owner(pid, fn -> start_fn.(controller) end))
+    result = Web.Promise.with_owner(hd(pids), fn -> start_fn.(controller) end)
+    Enum.each(resolvers, & &1.(result))
     :ok
   catch
     kind, value ->
       stacktrace = __STACKTRACE__
-      stop(pid)
+      Enum.each(pids, &stop/1)
       :erlang.raise(kind, value, stacktrace)
   end
+
+  def run_start(pid, start_fn, controller), do: run_start([pid], start_fn, controller)
 
   @doc false
   # Stops a stream process, with no call to a callback.
@@ -375,6 +396,19 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   @priority_alias {__MODULE__, :priority_alias}
+
+  # The requests between the two sides of a transform stream: see
+  # `handle_transform/4`.
+  @transform_requests [
+    :transform_peer,
+    :transform_peer_locked,
+    :transform_backpressure,
+    :transform_error,
+    :transform_error_unblock,
+    :transform_error_if_needed,
+    :transform_finish,
+    :transform_finished
+  ]
 
   # The requests of `Web.ReadableByteStreamController` and
   # `Web.ReadableStreamBYOBRequest`: see `handle_byte_request/4`.
@@ -422,6 +456,7 @@ defmodule Web.Stream do
        do: true
 
   defp abortive?({:abort, _owner, _reason}), do: true
+  defp abortive?({:as_writer, _lock, message}), do: abortive?(message)
   defp abortive?({:error, _reason}), do: true
   defp abortive?(_message), do: false
 
@@ -528,7 +563,8 @@ defmodule Web.Stream do
       # already: see `Web.Internal.LazyStream`.
       disturbed: Keyword.get(internal, :disturbed, false),
       source_watch: watch_source(Keyword.get(internal, :watch_source)),
-      direct_pull: Keyword.get(internal, :direct_pull)
+      direct_pull: Keyword.get(internal, :direct_pull),
+      transform: transform_side(Keyword.get(opts, :transform))
     }
 
     register(Keyword.get(internal, :registry_key))
@@ -602,6 +638,31 @@ defmodule Web.Stream do
     end
   end
 
+  # A request of a writer of `Web.WritableStreamDefaultWriter`, with the
+  # reference of its lock. The state function handles the request of the
+  # writer that holds the lock. A writer that released its lock has no
+  # effect on the stream, also when the same process has a new writer.
+  defp as_writer({:call, from} = type, {:as_writer, lock, message}, data, fun) do
+    cond do
+      lock == data.writer_ref ->
+        fun.(type, message, data)
+
+      # The stream released this lock, not the writer: see
+      # `cleared_writer_ref`.
+      is_reference(lock) and lock == data.cleared_writer_ref and
+          message in [:writer_ready, :writer_closed] ->
+        fun.(type, message, data)
+
+      is_reference(lock) and lock == data.cleared_writer_ref ->
+        fun.(type, writer_message(message, data.writer_pid), data)
+
+      true ->
+        {:keep_state_and_data, [{:reply, from, released_writer_reply(message, lock, data)}]}
+    end
+  end
+
+  defp as_writer(type, content, data, fun), do: fun.(type, content, data)
+
   # ---------------------------------------------------------------------------
   # State: readable  (producers only)
   # ---------------------------------------------------------------------------
@@ -655,7 +716,7 @@ defmodule Web.Stream do
 
   def writable(type, content, data) do
     type
-    |> do_writable(content, data)
+    |> as_writer(content, data, &do_writable/3)
     |> start_held_write(:writable, data)
     |> with_lifetime(:writable, data)
   end
@@ -702,7 +763,7 @@ defmodule Web.Stream do
 
   def closing(type, content, data) do
     type
-    |> do_closing(content, data)
+    |> as_writer(content, data, &do_closing/3)
     |> start_held_write(:closing, data)
     |> with_lifetime(:closing, data)
   end
@@ -741,7 +802,7 @@ defmodule Web.Stream do
   @doc false
   # A state function of `:gen_statem`.
   def erroring(type, content, data) do
-    type |> do_erroring(content, data) |> with_lifetime(:erroring, data)
+    type |> as_writer(content, data, &do_erroring/3) |> with_lifetime(:erroring, data)
   end
 
   defp do_erroring(type, content, data) do
@@ -792,7 +853,7 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   def closed(type, content, data) do
-    type |> do_closed(content, data) |> with_lifetime(:closed, data)
+    type |> as_writer(content, data, &do_closed/3) |> with_lifetime(:closed, data)
   end
 
   defp do_closed(type, content, data) do
@@ -806,7 +867,7 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   def errored(type, content, data) do
-    type |> do_errored(content, data) |> with_lifetime(:errored, data)
+    type |> as_writer(content, data, &do_errored/3) |> with_lifetime(:errored, data)
   end
 
   defp do_errored(type, content, data) do
@@ -849,11 +910,40 @@ defmodule Web.Stream do
     end
   end
 
+  # The attributes `ready` and `closed` of the writer that holds the lock.
+  defp handle_common({:call, from}, request, state, data)
+       when request in [:writer_ready, :writer_closed] do
+    {promise, data} = writer_promise(request, state, data)
+    {:keep_state, data, [{:reply, from, promise}]}
+  end
+
   # The attribute `closed` of a reader: the same promise for each request.
   defp handle_common({:call, from}, {:reader_closed, lock}, state, data) do
     {promise, data} = reader_closed(lock, state, data)
     {:keep_state, data, [{:reply, from, promise}]}
   end
+
+  # The requests between the two sides of a transform stream: see "The two
+  # sides of a transform stream".
+  defp handle_common(type, request, state, %{transform: %{}} = data)
+       when is_tuple(request) and elem(request, 0) in @transform_requests do
+    handle_transform(type, request, state, data)
+  end
+
+  # `terminate`, `close`, and `error` of the controller of the readable side.
+  defp handle_common(:cast, :transform_terminate, state, %{transform: %{}} = data),
+    do: handle_transform(:cast, :transform_terminate, state, data)
+
+  defp handle_common(
+         {:call, _from} = type,
+         :close,
+         state,
+         %{transform: %{side: :readable}} = data
+       ),
+       do: handle_transform(type, :close, state, data)
+
+  defp handle_common(:cast, {:error, reason}, state, %{transform: %{side: :readable}} = data),
+    do: handle_transform(:cast, {:error, reason}, state, data)
 
   # Reader lock acquisition
   defp handle_common({:call, from}, {:get_reader, pid}, state, data)
@@ -941,6 +1031,7 @@ defmodule Web.Stream do
   defp handle_common({:call, from}, {:release_lock, :writer, pid}, _state, data) do
     if pid == data.writer_pid do
       if data.writer_ref, do: Process.demonitor(data.writer_ref, [:flush])
+      data = release_writer_promises(data)
       {data, closed_actions} = release_closed_waiters(data, :writer, pid)
 
       {:keep_state, %{data | writer_pid: nil, writer_ref: nil},
@@ -1015,8 +1106,17 @@ defmodule Web.Stream do
        when data.type in [:consumer, :producer_consumer] do
     ref = Process.monitor(pid)
 
-    {:keep_state, %{data | writer_pid: pid, writer_ref: ref, writer_is_pipe: kind == :pipe},
-     [{:reply, from, :ok}]}
+    data = %{
+      data
+      | writer_pid: pid,
+        writer_ref: ref,
+        writer_is_pipe: kind == :pipe,
+        writer_ready: nil,
+        writer_closed: nil,
+        cleared_writer_ref: nil
+    }
+
+    {:keep_state, data, [{:reply, from, {:ok, ref}}]}
   end
 
   defp handle_common({:call, from}, {:get_writer, _pid, _kind}, _state, data)
@@ -1161,13 +1261,7 @@ defmodule Web.Stream do
   end
 
   # The attribute `desiredSize` of a writer. A writer that released its
-  # lock throws a `TypeError`. An error releases the lock of a transform
-  # stream, thus the lock is not examined in the state `errored`.
-  defp handle_common({:call, from}, {:desired_size, :writer, pid}, state, data)
-       when state != :errored and pid != data.writer_pid do
-    {:keep_state_and_data, [{:reply, from, {:error, :not_locked_by_writer}}]}
-  end
-
+  # lock throws a `TypeError`: see `as_writer/4`.
   defp handle_common({:call, from}, {:desired_size, :writer, _pid}, state, data) do
     handle_common({:call, from}, :desired_size, state, data)
   end
@@ -1415,6 +1509,18 @@ defmodule Web.Stream do
     end
   end
 
+  # The process of the other side of a transform stream stopped: its lock
+  # does not keep this side.
+  defp handle_common(
+         :info,
+         {:DOWN, ref, :process, _pid, _reason},
+         _state,
+         %{transform: %{peer_ref: ref}} = data
+       )
+       when is_reference(ref) do
+    {:keep_state, put_transform(data, peer_ref: nil, peer_locked: false)}
+  end
+
   # The process of the ambient AbortSignal stopped with no abort. A signal
   # that aborts sends its reason before it stops: see the clause for
   # `{:abort, ref, reason}`.
@@ -1460,7 +1566,8 @@ defmodule Web.Stream do
         maybe_cancel_on_reader_exit(reason, state, data)
 
       ref == data.writer_ref ->
-        {:keep_state, %{data | writer_pid: nil, writer_ref: nil}}
+        {:keep_state,
+         %{data | writer_pid: nil, writer_ref: nil, writer_ready: nil, writer_closed: nil}}
 
       ref == data.task_ref ->
         task_down(reason, state, data)
@@ -1549,10 +1656,11 @@ defmodule Web.Stream do
     else
       case enqueue_default(chunk, data) do
         {:ok, data} ->
-          {:keep_state, data, [{:reply, from, :ok}, {:next_event, :internal, :maybe_pull}]}
+          enqueued(data, [{:reply, from, :ok}])
 
         # The size of the chunk is not valid.
         {:error, reason} ->
+          data = transform_error_writable(data, reason)
           fail_stream_for_caller(reason, from, data, [size_error_reply(from, reason, reason)])
       end
     end
@@ -1568,22 +1676,29 @@ defmodule Web.Stream do
     case QueuingStrategy.validate(result) do
       {:ok, size} ->
         if readable_side_open?(state, data) do
-          data = data |> put_chunk(chunk, size) |> refresh_backpressure()
-          {:keep_state, data, [{:reply, from, :ok}, {:next_event, :internal, :maybe_pull}]}
+          data
+          |> put_chunk(chunk, size)
+          |> refresh_backpressure()
+          |> enqueued([{:reply, from, :ok}])
         else
           {:keep_state_and_data, [{:reply, from, :ok}]}
         end
 
+      # TransformStreamDefaultControllerEnqueue: the writable side of a
+      # transform stream gets the error of the size, also when the readable
+      # side is not readable.
       {:error, reason} ->
+        data = transform_error_writable(data, reason)
+
         cond do
           readable_side_open?(state, data) ->
             fail_stream_for_caller(reason, from, data, [size_error_reply(from, reason, reason)])
 
           state == :errored ->
-            {:keep_state_and_data, [size_error_reply(from, reason, data.error_reason)]}
+            {:keep_state, data, [size_error_reply(from, reason, data.error_reason)]}
 
           true ->
-            {:keep_state_and_data, [size_error_reply(from, reason, reason)]}
+            {:keep_state, data, [size_error_reply(from, reason, reason)]}
         end
     end
   end
@@ -1724,7 +1839,10 @@ defmodule Web.Stream do
     # capacity continues.
     {data, waiter_actions} = maybe_resolve_enqueue_waiters(data)
 
-    {:keep_state, data, [{:next_event, :internal, :maybe_pull} | waiter_actions]}
+    case data do
+      %{transform: %{side: :readable}} -> {:keep_state, transform_pull(data), waiter_actions}
+      _other -> {:keep_state, data, [{:next_event, :internal, :maybe_pull} | waiter_actions]}
+    end
   end
 
   # A batch read of an internal reader, such as the enumeration of a stream.
@@ -1932,8 +2050,8 @@ defmodule Web.Stream do
   # the errored state.
   defp handle_producer_enqueue(chunk, _state, %{stream_type: :default} = data) do
     case enqueue_default(chunk, data) do
-      {:ok, data} -> {:keep_state, data, [{:next_event, :internal, :maybe_pull}]}
-      {:error, reason} -> fail_stream(reason, data)
+      {:ok, data} -> enqueued(data, [])
+      {:error, reason} -> fail_stream(reason, transform_error_writable(data, reason))
     end
   end
 
@@ -2016,6 +2134,14 @@ defmodule Web.Stream do
   defp after_pull_actions(%{pull_again: true}), do: [{:next_event, :internal, :maybe_pull}]
   defp after_pull_actions(_data), do: []
 
+  # TransformStreamDefaultSourcePullAlgorithm: the pull of the readable side
+  # of a transform stream ends the backpressure. The Standard gives the next
+  # change of the backpressure as the result of the pull. Here the pull is
+  # complete at once: a pull while the backpressure is off has no effect.
+  defp do_trigger_pull(%{transform: %{side: :readable}} = data) do
+    {:keep_state, transform_backpressure(data, false)}
+  end
+
   defp do_trigger_pull(%{module: module, impl_state: impl_state} = data) do
     case data.direct_pull do
       {:message, pid, message} ->
@@ -2092,18 +2218,36 @@ defmodule Web.Stream do
         {:keep_state_and_data, [{:reply, from, {:error, {:errored, terminated_error()}}}]}
 
       true ->
-        accept_write(from, pid, chunk, QueuingStrategy.validate(size_result), data)
+        accept_write(from, pid, chunk, QueuingStrategy.validate(size_result), size_result, data)
     end
   end
 
-  # WritableStreamDefaultControllerGetChunkSize and EnqueueValueWithSize: a
-  # size that is not valid puts the stream in the errored state, and the
-  # write rejects with that error.
-  defp accept_write(from, _pid, _chunk, {:error, reason}, data) do
+  # WritableStreamDefaultControllerGetChunkSize: a size function that throws
+  # starts the error of the stream (WritableStreamDefaultControllerErrorIfNeeded).
+  # The write rejects with that error at once.
+  defp accept_write(
+         from,
+         _pid,
+         _chunk,
+         {:error, reason},
+         {:thrown, _, _, _},
+         %{type: :consumer} = data
+       ),
+       do: start_erroring(reason, data, [{:reply, from, {:error, {:errored, reason}}}])
+
+  # WritableStreamDefaultControllerWrite: a size that is not valid
+  # (EnqueueValueWithSize) starts the error after the write request is in
+  # the queue. The write rejects when the error is complete. A write in
+  # flight completes first.
+  defp accept_write(from, pid, chunk, {:error, reason}, _result, %{type: :consumer} = data),
+    do: data |> enqueue_write_request({from, pid, chunk}) |> then(&start_erroring(reason, &1, []))
+
+  # The writable side of a stream of the type `:producer_consumer`.
+  defp accept_write(from, _pid, _chunk, {:error, reason}, _result, data) do
     fail_stream(reason, data, [{:reply, from, {:error, {:errored, reason}}}])
   end
 
-  defp accept_write(from, pid, chunk, {:ok, size}, data) do
+  defp accept_write(from, pid, chunk, {:ok, size}, _result, data) do
     data = add_write_size(data, size)
 
     if active_consumer_operation?(data) or not transform_ready?(data) do
@@ -2332,10 +2476,272 @@ defmodule Web.Stream do
   defp settle_abort_request(data, _reply), do: {data, []}
 
   # ---------------------------------------------------------------------------
+  # The two sides of a transform stream
+  #
+  # A `Web.TransformStream` has two stream processes, as in the Streams
+  # Standard: a readable side (`:producer`) and a writable side
+  # (`:consumer`), each with its own state. The field `transform` of each
+  # process has the slots of the transform stream that the side needs:
+  #
+  #   * The readable side has [[backpressure]] and [[finishPromise]] of the
+  #     Standard. It changes the backpressure: an enqueue turns it on, and a
+  #     pull turns it off. It tells each change to the writable side. Thus
+  #     the writable side gets the changes in their sequence.
+  #   * The writable side has a copy of the backpressure. The write in
+  #     flight waits until the backpressure is off, and then the transform
+  #     runs: see `start_write_task/2`.
+  #   * [[finishPromise]] makes sure that only one of flush, an abort, and a
+  #     cancel calls the transformer. The callback of each one runs in the
+  #     worker of its side, and asks the readable side first: see
+  #     `Web.TransformStream`.
+  #
+  # A stream process never waits for the other stream process. Only the
+  # workers make calls to the two processes.
+  # ---------------------------------------------------------------------------
+
+  defp transform_side({:readable, writable}) do
+    %{
+      side: :readable,
+      peer: writable,
+      peer_ref: Process.monitor(writable),
+      peer_locked: false,
+      backpressure: true,
+      finish: nil,
+      cleared: false
+    }
+  end
+
+  defp transform_side(:writable) do
+    %{side: :writable, peer: nil, peer_ref: nil, peer_locked: false, backpressure: true}
+  end
+
+  defp transform_side(nil), do: nil
+
+  defp put_transform(%{transform: transform} = data, changes) do
+    %{data | transform: Map.merge(transform, Map.new(changes))}
+  end
+
+  # TransformStreamSetBackpressure, on the readable side.
+  defp transform_backpressure(%{transform: %{backpressure: value}} = data, value), do: data
+
+  defp transform_backpressure(%{transform: transform} = data, value) do
+    :gen_statem.cast(transform.peer, {:transform_backpressure, value})
+    put_transform(data, backpressure: value)
+  end
+
+  # The last steps of ReadableStreamDefaultControllerEnqueue
+  # (ReadableStreamDefaultControllerCallPullIfNeeded) and of
+  # TransformStreamDefaultControllerEnqueue. The pull of the readable side of
+  # a transform stream has no callback, thus it runs here, with no event:
+  # see `do_trigger_pull/1`. After the pull, the readable side has
+  # backpressure when it does not want more chunks.
+  defp enqueued(%{transform: %{side: :readable}} = data, actions) do
+    pull? = transform_should_pull?(data)
+    {:keep_state, transform_backpressure(data, not pull?), actions}
+  end
+
+  defp enqueued(data, actions),
+    do: {:keep_state, data, actions ++ [{:next_event, :internal, :maybe_pull}]}
+
+  # ReadableStreamDefaultControllerCallPullIfNeeded for the readable side of
+  # a transform stream, after a read that waits.
+  defp transform_pull(data) do
+    if transform_should_pull?(data), do: transform_backpressure(data, false), else: data
+  end
+
+  # ReadableStreamDefaultControllerShouldCallPull. The readable side is
+  # readable here.
+  defp transform_should_pull?(data),
+    do: data.active_operation != :init and readable_wants_chunk?(data)
+
+  # TransformStreamErrorWritableAndUnblockWrite, from the readable side.
+  defp transform_error_writable(%{transform: %{side: :readable} = transform} = data, reason) do
+    control_cast(transform.peer, {:transform_error_unblock, reason})
+    put_transform(data, backpressure: false, cleared: true)
+  end
+
+  defp transform_error_writable(data, _reason), do: data
+
+  # The writable side learns the readable side. The worker gets it for its
+  # calls to the readable side.
+  defp handle_transform({:call, from}, {:transform_peer, readable}, _state, data) do
+    data =
+      %{data | impl_state: Map.put(data.impl_state, :peer, readable)}
+      |> put_transform(peer: readable, peer_ref: Process.monitor(readable))
+
+    {:keep_state, data, [{:reply, from, :ok}]}
+  end
+
+  defp handle_transform(:cast, {:transform_peer_locked, locked}, _state, data) do
+    {:keep_state, put_transform(data, peer_locked: locked)}
+  end
+
+  # The backpressure changed. The end of the backpressure lets the write in
+  # flight continue.
+  defp handle_transform(:cast, {:transform_backpressure, value}, state, data) do
+    data = put_transform(data, backpressure: value)
+    if value, do: {:keep_state, data}, else: release_held_write(state, data)
+  end
+
+  # TransformStreamErrorWritableAndUnblockWrite, on the writable side:
+  # WritableStreamDefaultControllerErrorIfNeeded and TransformStreamUnblockWrite.
+  defp handle_transform(:cast, {:transform_error_unblock, reason}, state, data) do
+    error_and_unblock(reason, state, data, [])
+  end
+
+  # The steps of TransformStreamDefaultSourceCancelAlgorithm on the writable
+  # side, with no step between them.
+  defp handle_transform({:call, from}, {:transform_error_if_needed, reason}, state, data) do
+    if state == :errored,
+      do: {:keep_state_and_data, [{:reply, from, {:errored, data.error_reason}}]},
+      else: error_and_unblock(reason, state, data, [{:reply, from, :ok}])
+  end
+
+  # TransformStreamDefaultControllerError, on the readable side. The
+  # controller sent the error to the writable side also.
+  defp handle_transform(:cast, {:transform_error, reason}, state, data) do
+    data = put_transform(data, backpressure: false, cleared: true)
+    if final?(state, data), do: {:keep_state, data}, else: fail_stream(reason, data)
+  end
+
+  # `Web.ReadableStream.error/2` on the readable side of a transform stream:
+  # TransformStreamError.
+  defp handle_transform(:cast, {:error, reason}, state, data) do
+    handle_transform(
+      :cast,
+      {:transform_error, reason},
+      state,
+      transform_error_writable(data, reason)
+    )
+  end
+
+  # TransformStreamDefaultControllerTerminate. The controller sent the error
+  # to the writable side.
+  defp handle_transform(:cast, :transform_terminate, state, data) do
+    data = put_transform(data, backpressure: false, cleared: true)
+
+    if controller_refusal(state, data) == nil,
+      do: handle_producer_close(data),
+      else: {:keep_state, data}
+  end
+
+  # `close` of the controller of the readable side is a terminate. It
+  # throws a `TypeError` when the readable side cannot close.
+  defp handle_transform({:call, from}, :close, state, data) do
+    case controller_refusal(state, data) do
+      nil ->
+        data
+        |> transform_error_writable(terminated_error())
+        |> handle_producer_close([{:reply, from, :ok}])
+
+      refusal ->
+        {:keep_state_and_data, [{:reply, from, {:error, refusal}}]}
+    end
+  end
+
+  # [[finishPromise]]: the first request runs its callback. Each later
+  # request gets the result of that callback.
+  defp handle_transform({:call, from}, {:transform_finish, _kind}, _state, data) do
+    case data.transform.finish do
+      nil ->
+        run = not data.transform.cleared
+        data = put_transform(data, finish: {:pending, []}, cleared: true)
+        {:keep_state, data, [{:reply, from, {:run, run}}]}
+
+      {:pending, waiters} ->
+        {:keep_state, put_transform(data, finish: {:pending, [from | waiters]})}
+
+      {:settled, result} ->
+        {:keep_state_and_data, [{:reply, from, {:done, result}}]}
+    end
+  end
+
+  # The callback is complete: the steps after it, on the readable side.
+  defp handle_transform({:call, from}, {:transform_finished, kind, outcome}, state, data) do
+    {:pending, waiters} = data.transform.finish
+    {result, transition} = finish_steps(kind, outcome, state, data)
+    {next_state, data, actions} = transition(transition, state, data)
+    replies = for waiter <- [from | waiters], do: {:reply, waiter, {:done, result}}
+    data = put_transform(data, finish: {:settled, result}, backpressure: false)
+    {:next_state, next_state, data, actions ++ replies}
+  end
+
+  # TransformStreamDefaultSinkCloseAlgorithm.
+  defp finish_steps(:flush, :ok, :errored, data),
+    do: {{:error, data.error_reason}, :keep_state_and_data}
+
+  defp finish_steps(:flush, :ok, state, data) do
+    if controller_refusal(state, data) == nil,
+      do: {:ok, handle_producer_close(data)},
+      else: {:ok, :keep_state_and_data}
+  end
+
+  # TransformStreamDefaultSinkAbortAlgorithm.
+  defp finish_steps({:abort, _reason}, :ok, :errored, data),
+    do: {{:error, data.error_reason}, :keep_state_and_data}
+
+  defp finish_steps({:abort, reason}, :ok, state, data),
+    do: {:ok, readable_error(reason, state, data)}
+
+  # TransformStreamDefaultSourceCancelAlgorithm: the worker did the steps
+  # on the writable side.
+  defp finish_steps(:cancel, outcome, _state, _data), do: {outcome, :keep_state_and_data}
+
+  # A flush or a cancel of the transformer that failed.
+  defp finish_steps(_kind, {:error, reason}, state, data),
+    do: {{:error, reason}, readable_error(reason, state, data)}
+
+  # ReadableStreamDefaultControllerError: it has an effect only on a
+  # readable side that is readable.
+  defp readable_error(reason, state, data) do
+    if final?(state, data), do: :keep_state_and_data, else: fail_stream(reason, data)
+  end
+
+  defp error_and_unblock(reason, state, data, actions) do
+    result =
+      if state in [:writable, :closing],
+        do: start_erroring(reason, data, actions),
+        else: {:keep_state, data, actions}
+
+    {next_state, data, actions} = transition(result, state, data)
+    data = put_transform(data, backpressure: false)
+    {final_state, data, more} = transition(release_held_write(next_state, data), next_state, data)
+    {:next_state, final_state, data, actions ++ more}
+  end
+
+  # The write in flight continues after the backpressure. The stream that
+  # is erroring rejects it with the stored error, as
+  # TransformStreamDefaultSinkWriteAlgorithm specifies.
+  defp release_held_write(
+         state,
+         %{pending_write_request: {from, _pid, _chunk} = request, active_task: nil} = data
+       )
+       when data.active_operation == {:write, from} do
+    if state == :erroring,
+      do: consumer_failure(data.error_reason, state, data),
+      else: {:keep_state, run_write_task(data, request)}
+  end
+
+  defp release_held_write(_state, data), do: {:keep_state, data}
+
+  # ---------------------------------------------------------------------------
   # Consumer task starters
   # ---------------------------------------------------------------------------
 
-  defp start_write_task(data, request) do
+  # TransformStreamDefaultSinkWriteAlgorithm: the write of the writable side
+  # of a transform stream is in flight, and waits for the end of the
+  # backpressure. It has no task until then, thus no time limit: see
+  # `release_held_write/2`.
+  defp start_write_task(%{transform: %{side: :writable, backpressure: true}} = data, request) do
+    {from, _pid, _chunk} = request
+
+    %{data | pending_write_request: request, active_operation: {:write, from}}
+    |> refresh_backpressure()
+  end
+
+  defp start_write_task(data, request), do: run_write_task(data, request)
+
+  defp run_write_task(data, request) do
     {from, _pid, chunk} = request
     module = data.module
     impl_state = data.impl_state
@@ -2716,7 +3122,13 @@ defmodule Web.Stream do
 
   defp clear_writer_lock(%{writer_ref: writer_ref} = data) do
     if writer_ref, do: Process.demonitor(writer_ref, [:flush])
-    %{data | writer_pid: nil, writer_ref: nil}
+
+    %{
+      data
+      | writer_pid: nil,
+        writer_ref: nil,
+        cleared_writer_ref: writer_ref || data.cleared_writer_ref
+    }
   end
 
   defp pending_write_error_actions(%{pending_write_request: {from, _pid, _chunk}}, reason) do
@@ -2786,8 +3198,11 @@ defmodule Web.Stream do
   defp with_lifetime(result, state, data) do
     case transition(result, state, data) do
       {next_state, new_data, actions} ->
+        notify_peer_lock(data, new_data)
         clear_writable_size(next_state, new_data)
+        {new_data, synced?} = sync_writer_promises(next_state, new_data)
         {new_data, settled?} = settle_closed_promise(next_state, new_data)
+        settled? = settled? or synced?
         {new_data, closed_actions} = closed_waiter_actions(next_state, new_data)
         timeout = lifetime_timeout(next_state, new_data)
 
@@ -2897,6 +3312,184 @@ defmodule Web.Stream do
   defp released_reader_reply(_message), do: {:error, :not_locked_by_reader}
 
   defp released_reader_error, do: Web.TypeError.exception("This reader is no longer locked.")
+
+  # ---------------------------------------------------------------------------
+  # The promises of a writer
+  #
+  # The attributes `ready` and `closed` of a writer give the same promise
+  # until the Streams Standard replaces it ([[readyPromise]] and
+  # [[closedPromise]]). The stream makes each promise at the first request,
+  # thus a writer that does not ask for it costs no process. The process
+  # that holds the lock owns the promise. An entry is
+  # `{:pending, promise, resolve, reject}` or `{:settled, promise, outcome}`.
+  #
+  # After each event, the stream compares each entry with the state of the
+  # stream (`sync_writer_promises/2`):
+  #
+  #   * A pending entry settles: WritableStreamUpdateBackpressure resolves
+  #     `ready`, WritableStreamStartErroring rejects it, and the end of the
+  #     stream settles `closed`.
+  #   * A settled `ready` that no longer tells the state goes away: the next
+  #     request makes a new promise, as WritableStreamUpdateBackpressure and
+  #     WritableStreamDefaultWriterEnsureReadyPromiseRejected specify.
+  #
+  # WritableStreamDefaultWriterRelease rejects the pending promises with a
+  # `TypeError`. The writer that released its lock keeps them: see
+  # `released_writer_promises`.
+  # ---------------------------------------------------------------------------
+
+  defp writer_promise(request, state, data) do
+    {field, status} =
+      if request == :writer_ready,
+        do: {:writer_ready, writer_ready_status(state, data)},
+        else: {:writer_closed, writer_closed_status(state, data)}
+
+    case Map.fetch!(data, field) do
+      nil ->
+        entry = new_writer_entry(status, data)
+        {entry_promise(entry), Map.put(data, field, entry)}
+
+      entry ->
+        {entry_promise(entry), data}
+    end
+  end
+
+  # The value of [[readyPromise]] for the state of the stream.
+  defp writer_ready_status(state, data) do
+    cond do
+      state in [:errored, :erroring] -> {:rejected, data.error_reason}
+      state == :closed -> closed_status(data)
+      state == :closing or not data.backpressure -> {:fulfilled, :ok}
+      true -> :pending
+    end
+  end
+
+  # The value of [[closedPromise]]. It rejects after the abort callback of
+  # the sink, as WritableStreamFinishErroring specifies.
+  defp writer_closed_status(:closed, data), do: closed_status(data)
+
+  defp writer_closed_status(:errored, data) do
+    if data.type == :consumer and data.active_operation == :abort,
+      do: :pending,
+      else: {:rejected, data.error_reason}
+  end
+
+  defp writer_closed_status(_state, _data), do: :pending
+
+  defp closed_status(data) do
+    case closed_reply(data, :writer) do
+      :ok -> {:fulfilled, :ok}
+      {:error, {:errored, reason}} -> {:rejected, reason}
+    end
+  end
+
+  defp new_writer_entry(status, data) do
+    {promise, resolve, reject} =
+      Web.Promise.with_owner(data.writer_pid || self(), fn -> Web.Promise.with_resolvers() end)
+
+    settle_writer_entry({:pending, promise, resolve, reject}, status)
+  end
+
+  defp settle_writer_entry({:pending, promise, resolve, reject} = entry, status) do
+    case status do
+      :pending -> entry
+      {:fulfilled, value} -> settled_entry(promise, resolve, status, value)
+      {:rejected, reason} -> settled_entry(promise, reject, status, reason)
+    end
+  end
+
+  defp settled_entry(promise, settle, outcome, value) do
+    settle.(value)
+    {:settled, promise, outcome}
+  end
+
+  # A promise that settled stops after its linger time: then the request
+  # gets a promise with the same outcome.
+  defp entry_promise({:pending, promise, _resolve, _reject}), do: promise
+
+  defp entry_promise({:settled, promise, outcome}) do
+    if Process.alive?(promise.pid), do: promise, else: %Web.Promise{state: outcome}
+  end
+
+  defp sync_writer_promises(_state, %{writer_ready: nil, writer_closed: nil} = data),
+    do: {data, false}
+
+  defp sync_writer_promises(state, data) do
+    ready = sync_ready(data.writer_ready, writer_ready_status(state, data))
+    closed = sync_closed(data.writer_closed, writer_closed_status(state, data))
+    changed? = ready != data.writer_ready or closed != data.writer_closed
+    {%{data | writer_ready: ready, writer_closed: closed}, changed?}
+  end
+
+  defp sync_ready({:pending, _promise, _resolve, _reject} = entry, status),
+    do: settle_writer_entry(entry, status)
+
+  # The backpressure is on again, or the stream is erroring: the next
+  # request gets a new promise.
+  defp sync_ready({:settled, _promise, {:fulfilled, _value}}, status)
+       when status == :pending or elem(status, 0) == :rejected,
+       do: nil
+
+  defp sync_ready(entry, _status), do: entry
+
+  defp sync_closed({:pending, _promise, _resolve, _reject} = entry, status),
+    do: settle_writer_entry(entry, status)
+
+  defp sync_closed(entry, _status), do: entry
+
+  # WritableStreamDefaultWriterRelease: [[readyPromise]] and then
+  # [[closedPromise]] reject with a `TypeError`.
+  defp release_writer_promises(data) do
+    error = released_writer_error()
+    ready = reject_pending(data.writer_ready, error)
+    closed = reject_pending(data.writer_closed, error)
+    lock = data.writer_ref || data.cleared_writer_ref
+
+    released =
+      if is_nil(ready) and is_nil(closed),
+        do: data.released_writer_promises,
+        else: Map.put(data.released_writer_promises, lock, %{ready: ready, closed: closed})
+
+    %{
+      data
+      | writer_ready: nil,
+        writer_closed: nil,
+        cleared_writer_ref: nil,
+        released_writer_promises: released
+    }
+  end
+
+  # A promise that settled before the release is replaced: the writer gets a
+  # new rejected promise, thus the entry goes away.
+  defp reject_pending({:pending, _promise, _resolve, _reject} = entry, error),
+    do: settle_writer_entry(entry, {:rejected, error})
+
+  defp reject_pending(_entry, _error), do: nil
+
+  # The reply to a request of a writer that released its lock. The Streams
+  # Standard rejects each operation with a `TypeError`. `releaseLock()` has
+  # no effect.
+  defp released_writer_reply({:release_lock, :writer, _pid}, _lock, _data), do: :ok
+
+  defp released_writer_reply(request, lock, data)
+       when request in [:writer_ready, :writer_closed] do
+    field = if request == :writer_ready, do: :ready, else: :closed
+
+    case get_in(data.released_writer_promises, [lock, field]) do
+      nil -> Web.Promise.reject(released_writer_error())
+      entry -> entry_promise(entry)
+    end
+  end
+
+  defp released_writer_reply(_message, _lock, _data), do: {:error, :not_locked_by_writer}
+
+  defp released_writer_error, do: Web.TypeError.exception("This writer is no longer locked.")
+
+  # A request of the writer whose lock the stream released: the stream
+  # handles it as a request of the lock holder.
+  # The requests `release_lock` and `desired_size` name the side first.
+  defp writer_message({request, :writer, _pid}, holder), do: {request, :writer, holder}
+  defp writer_message(message, holder), do: put_elem(message, 1, holder)
 
   # The writable side does not call the size function of the user after it
   # is closed or errored.
@@ -3016,9 +3609,31 @@ defmodule Web.Stream do
   # for the process that reads the destination, or for the owner. If the
   # pipe kept the destination, a pipe with an endless source would have no
   # end after all its users stopped.
-  defp locked?(data) do
+  #
+  # The two sides of a transform stream are one stream for these rules: a
+  # lock of one side keeps the two sides. Each side tells the other side when
+  # its own lock changes: see `notify_peer_lock/2`.
+  defp locked?(data), do: own_lock?(data) or peer_locked?(data)
+
+  defp own_lock?(data) do
     is_pid(data.reader_pid) or (is_pid(data.writer_pid) and not data.writer_is_pipe)
   end
+
+  defp peer_locked?(%{transform: %{peer_locked: locked}}), do: locked
+  defp peer_locked?(_data), do: false
+
+  defp notify_peer_lock(%{transform: %{peer: peer}} = old, new) when is_pid(peer) do
+    if lock_fields(old) != lock_fields(new) do
+      locked = own_lock?(new)
+      if own_lock?(old) != locked, do: :gen_statem.cast(peer, {:transform_peer_locked, locked})
+    end
+
+    :ok
+  end
+
+  defp notify_peer_lock(_old, _new), do: :ok
+
+  defp lock_fields(data), do: {data.reader_pid, data.writer_pid, data.writer_is_pipe}
 
   defp handoff_linger(linger) when is_integer(linger), do: linger
   defp handoff_linger(_infinity), do: @handoff_linger
@@ -3052,6 +3667,14 @@ defmodule Web.Stream do
   # Gives the result of the terminal callback together with the transition.
   # A callback that throws does not stop the stream process: the stream
   # goes to its terminal state, and the caller gets the thrown value.
+  # A side of a transform stream calls its callback in its worker: the
+  # callback calls the other side, and the stream process must answer.
+  defp termination_with_result(type, reason, %{transform: %{}} = data)
+       when type in [:cancel, :abort] do
+    {data, abort_actions} = settle_abort_request(data, :ok)
+    {:ok, type |> terminate_with_task(reason, nil, data) |> add_actions(abort_actions)}
+  end
+
   defp termination_with_result(type, reason, data) do
     data = data |> clear_owner() |> clear_task()
     {data, abort_actions} = settle_abort_request(data, :ok)
@@ -3150,10 +3773,7 @@ defmodule Web.Stream do
   # A terminal event releases the writer lock. It does not release the
   # reader lock, as the Streams Standard specifies: the reader reads the
   # end of the stream, and gets its promise `closed`.
-  defp clear_owner(%{writer_ref: writer_ref} = data) do
-    if writer_ref, do: Process.demonitor(writer_ref, [:flush])
-    %{data | writer_pid: nil, writer_ref: nil}
-  end
+  defp clear_owner(data), do: clear_writer_lock(data)
 
   defp clear_task(data) do
     if data.active_task, do: kill_task(data.active_task)

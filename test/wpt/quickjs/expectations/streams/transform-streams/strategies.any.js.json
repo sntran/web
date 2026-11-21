@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "a bad readableStrategy size function should error the stream on enqueue even when transformer.transform() catches the exception": "library: a transform stream has one state for its two sides"
-  }
-}

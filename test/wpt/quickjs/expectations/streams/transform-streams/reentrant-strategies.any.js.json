@@ -1,9 +1,7 @@
 {
   "harness": "OK",
   "failures": {
-    "error() inside size() should work": "library: a transform stream has one state for its two sides",
-    "readable cancel() inside size() should work": "library: a transform stream has one state for its two sides",
-    "writer.abort() inside size() should work": "library: a transform stream has one state for its two sides",
+    "writer.abort() inside size() should work": "runner: the library does the steps of a later microtask before the call returns",
     "writer.close() inside size() should work": "runner: the library does the steps of a later microtask before the call returns",
     "writer.write() inside size() should work": "runner: the library does the steps of a later microtask before the call returns"
   }

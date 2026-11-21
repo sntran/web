@@ -14,9 +14,11 @@ defmodule Web.TransformStreamDefaultController do
       ["A", "B"]
   """
 
-  defstruct [:pid]
+  # The process of the readable side, and the process of the writable side.
+  defstruct [:pid, :writable_pid]
 
-  @type t :: %__MODULE__{pid: pid()}
+  @typedoc "A controller. The fields are private."
+  @type t :: %__MODULE__{pid: pid(), writable_pid: pid()}
 
   @doc """
   Puts a chunk in the queue of the readable side.
@@ -31,11 +33,18 @@ defmodule Web.TransformStreamDefaultController do
   end
 
   @doc """
-  Puts the two sides of the stream in the errored state.
+  Puts the two sides of the stream in the errored state, as
+  TransformStreamDefaultControllerError specifies.
+
+  The readable side gets the error only when it is readable. The writable
+  side gets it only when it is writable. A second call has no effect.
   """
   @spec error(t(), term()) :: :ok
-  def error(%__MODULE__{pid: pid}, reason) do
-    Web.ReadableStream.error(pid, reason)
+  def error(%__MODULE__{pid: pid, writable_pid: writable}, reason) do
+    # The writable side gets the error first: a transform that calls this
+    # function sends its result to the writable side after this message.
+    error_writable(writable, reason)
+    Web.Stream.control_cast(pid, {:transform_error, reason})
   end
 
   @doc """
@@ -45,9 +54,14 @@ defmodule Web.TransformStreamDefaultController do
   stream. A write that comes after this call rejects with `Web.TypeError`.
   """
   @spec terminate(t()) :: :ok
-  def terminate(%__MODULE__{pid: pid}) do
-    Web.Stream.control_cast(pid, :terminate_transform)
+  def terminate(%__MODULE__{pid: pid, writable_pid: writable}) do
+    error_writable(writable, Web.TypeError.exception("The transform stream was terminated."))
+    Web.Stream.control_cast(pid, :transform_terminate)
   end
+
+  # TransformStreamErrorWritableAndUnblockWrite.
+  defp error_writable(writable, reason),
+    do: Web.Stream.control_cast(writable, {:transform_error_unblock, reason})
 
   @doc """
   Returns the number of chunks that the readable side can accept before it

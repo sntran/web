@@ -479,6 +479,24 @@ defmodule Web.StreamLifetimeTest do
     end
   end
 
+  describe "a transform stream" do
+    test "keeps its readable side while a different process holds the writer of its writable side" do
+      transform = in_short_process(fn -> TransformStream.new() end)
+      writer = WritableStream.get_writer(transform.writable)
+
+      # The two sides are two processes. The lock of the writable side keeps
+      # the readable side also. This is a negative check on a time limit:
+      # the readable side must not stop after the linger time. Thus the test
+      # waits for more than that time.
+      refute_down(transform.readable.controller_pid, 4 * @linger)
+
+      write = WritableStreamDefaultWriter.write(writer, :chunk)
+      reader = ReadableStream.get_reader(transform.readable)
+      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: :chunk, done: false}
+      assert await(write) == :ok
+    end
+  end
+
   describe "a text decoder" do
     test "stops its state process when its owner stops" do
       decoder = in_short_process(fn -> TextDecoder.new() end)

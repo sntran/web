@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "blob with custom name": "runner: each call waits until the library is at rest, and the test allows 200 ms for some calls",
+    "blob with type": "runner: each call waits until the library is at rest, and the test allows 200 ms for some calls",
+    "blob without type": "runner: each call waits until the library is at rest, and the test allows 200 ms for some calls",
+    "file without lastModified or custom name": "runner: each call waits until the library is at rest, and the test allows 200 ms for some calls"
+  }
+}

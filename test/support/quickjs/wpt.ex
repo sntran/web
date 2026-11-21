@@ -26,7 +26,8 @@ defmodule Web.Test.QuickJS.WPT do
   # The groups of the tests whose result can change from run to run, for a
   # cause that the runner cannot remove. Such a test can pass or fail.
   @real_time "runner: a timer of the library runs in real time between two statements of JavaScript"
-  @unstable [@real_time]
+  @slow_calls "runner: each call waits until the library is at rest, and the test allows 200 ms for some calls"
+  @unstable [@real_time, @slow_calls]
 
   @doc "Runs the WPT file at `path`, and compares the results with the list."
   def check!(path) do
@@ -171,6 +172,11 @@ defmodule Web.Test.QuickJS.WPT do
       # a timer fires only after the statements of the current task.
       {:test, "dom/abort/timeout.any.js", ~r/./, @real_time},
       {:test, "dom/abort/abort-signal-any.any.js", ~r/AbortSignal\.timeout\(\)/, @real_time},
+      # These tests allow 200 ms between the set of a blob, which gives the
+      # file its `lastModified`, and `Date.now()` some calls later. Each call
+      # waits until the processes of the run are at rest: on a busy machine,
+      # the calls took up to 858 ms. In a browser, the calls take no time.
+      {:test, "xhr/formdata/set-blob.any.js", ~r/^(blob|file without lastModified)/, @slow_calls},
       # The global object of the runner is not an `EventTarget`.
       {:test, "dom/events/EventTarget-removeEventListener.any.js",
        "removing a null event listener should succeed",

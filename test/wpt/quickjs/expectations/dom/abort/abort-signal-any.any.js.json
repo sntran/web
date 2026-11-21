@@ -1,13 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "Abort events for AbortSignal.any() signals fire in the right order (using AbortController)": "library: a different result",
-    "AbortSignal.any() follows a single signal (using AbortController)": "library: no Web.AbortSignal.onabort/2",
-    "AbortSignal.any() follows multiple signals (using AbortController)": "library: no Web.AbortSignal.onabort/2",
-    "AbortSignal.any() signals are composable (using AbortController)": "library: no Web.AbortSignal.onabort/2",
-    "AbortSignal.any() works with intermediate signals (using AbortController)": "library: no Web.AbortSignal.onabort/2",
-    "AbortSignal.any() works with signals returned by AbortSignal.timeout() (using AbortController)": "library: no Web.AbortSignal.onabort/2",
-    "Dependent signals for AbortSignal.any() are aborted correctly for reentrant aborts (using AbortController)": "library: a different result",
-    "Dependent signals for AbortSignal.any() are marked aborted before abort events fire (using AbortController)": "library: a different result"
+    "AbortSignal.any() works with signals returned by AbortSignal.timeout() (using AbortController)": "runner: a timer of the library runs in real time between two statements of JavaScript"
   }
 }

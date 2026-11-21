@@ -25,6 +25,9 @@ defmodule Web.Resolver do
 
       iex> Web.Resolver.resolve("bare-string")
       Web.Dispatcher.HTTP
+
+      iex> Web.Resolver.resolve("blob:null/40a5fb5a-d56d-4a33-b4e2-0acf6a8e5f64")
+      Web.Dispatcher.Blob
   """
   def resolve(%Web.URL{} = url) do
     protocol = Web.URL.protocol(url)
@@ -36,6 +39,9 @@ defmodule Web.Resolver do
       protocol == "tcp:" ->
         Web.Dispatcher.TCP
 
+      protocol == "blob:" ->
+        Web.Dispatcher.Blob
+
       Web.URL.rclone?(url) ->
         Web.Dispatcher.TCP
 
@@ -45,7 +51,8 @@ defmodule Web.Resolver do
   end
 
   def resolve(input) when is_binary(input) do
-    if remote_syntax?(input) do
+    # A blob URL has the syntax of a remote name: its scheme decides.
+    if remote_syntax?(input) and not blob_scheme?(input) do
       Web.Dispatcher.TCP
     else
       resolve_string_input(input)
@@ -59,6 +66,11 @@ defmodule Web.Resolver do
   rescue
     Web.TypeError -> Web.Dispatcher.HTTP
   end
+
+  defp blob_scheme?(<<scheme::binary-size(5), _rest::binary>>),
+    do: String.downcase(scheme) == "blob:"
+
+  defp blob_scheme?(_input), do: false
 
   # A remote name: a letter or a digit, then letters, digits, "+", ".", and
   # "-", then ":" that is not followed by "//". The rest is one line: it has

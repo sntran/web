@@ -1,8 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Blob.stream() garbage collection of blob shouldn't break stream consumption": "library: a different result",
-    "Blob.stream() garbage collection of stream shouldn't break stream consumption": "library: a different result",
-    "Reading Blob.stream() with BYOB reader": "library: a different result"
-  }
-}

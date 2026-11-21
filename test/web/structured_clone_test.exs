@@ -180,7 +180,14 @@ defmodule Web.StructuredCloneTest do
 
     test "a blob and a file get a new identity and the same content" do
       blob = Blob.new(["hello"], type: "text/plain")
-      file = File.new([blob, " world"], name: "upload", filename: "hello.txt", type: "text/plain")
+
+      file =
+        File.new([blob, " world"],
+          name: "upload",
+          filename: "hello.txt",
+          type: "text/plain",
+          last_modified: 123
+        )
 
       [blob_clone, file_clone, blob_again] = Web.structured_clone([blob, file, blob])
 
@@ -191,6 +198,8 @@ defmodule Web.StructuredCloneTest do
 
       assert %File{name: "upload", filename: "hello.txt", type: "text/plain"} = file_clone
       assert file_clone.size == file.size
+      # The File API: "Set serialized.[[LastModified]]".
+      assert file_clone.last_modified == 123
       refute file_clone.id == file.id
 
       assert Blob.to_binary(Blob.new(file_clone.parts)) == "hello world"
@@ -764,7 +773,7 @@ defmodule Web.StructuredCloneTest do
 
   defp canonicalize(%File{} = value) do
     {:file, Enum.map(value.parts, &canonicalize/1), value.type, value.name, value.filename,
-     value.size}
+     value.size, value.last_modified}
   end
 
   defp canonicalize(%Headers{} = value) do

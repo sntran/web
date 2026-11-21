@@ -121,6 +121,12 @@ connections of an origin, and the reads of a socket.
 - The result of each test must be the same in each run. The bridge answers
   a call, and sends the settled promises, only when the processes of the
   run are at rest. A new kind of message to the bridge must keep this rule.
+- A `runner:` group can be unstable only when the runner cannot control
+  its cause, for example a timer of the library that runs in real time
+  while JavaScript runs. Put such a group in `@unstable` of
+  `test/support/quickjs/wpt.ex`, and tell the cause in its name. A test of
+  an unstable group can pass or fail. Do not put a `library:` group there:
+  find the race.
 - A stream or a promise of the library stops when the linger time goes by
   after its end, and a page of JavaScript keeps each object. A suite with
   files that make their objects when the script loads, and use them in a

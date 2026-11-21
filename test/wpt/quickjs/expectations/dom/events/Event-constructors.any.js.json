@@ -1,7 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Event-constructors 3": "library: no Web.Event.src_element/1",
-    "Event-constructors 4": "library: no Web.Event.src_element/1"
-  }
-}

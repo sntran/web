@@ -1,6 +1,6 @@
 {
   "harness": "OK",
   "failures": {
-    "removing a null event listener should succeed": "library: a different result"
+    "removing a null event listener should succeed": "runner: the global object is not an EventTarget"
   }
 }

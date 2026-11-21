@@ -124,6 +124,16 @@ const start = nextLine();
 globalThis.self = globalThis;
 globalThis.queueMicrotask = (callback) => { Promise.resolve().then(callback); };
 
+// The console of QuickJS has only `log`. A helper script such as
+// `common/gc.js` writes a warning. The standard output has the lines of
+// the bridge: a warning goes to the standard error, which the bridge reads
+// as the output of QuickJS.
+for (const level of ["warn", "error", "info", "debug"]) {
+  if (typeof console[level] !== "function") {
+    console[level] = (...args) => { std.err.puts(args.map(String).join(" ") + "\n"); };
+  }
+}
+
 // A timer of a test fires after the library is idle. A test of WPT uses a
 // timer to wait until the work of the platform is complete, for example
 // with `flushAsyncEvents()`. The library does its work in other processes:
@@ -207,8 +217,16 @@ function localPath(input) {
 // For a test of the Fetch Standard, the response is a `Response` of the
 // library. The other tests get a plain object: their data can have text
 // that a JSON parser of Elixir refuses, such as a lone surrogate.
-globalThis.fetch = (input) => {
-  const path = localPath(typeof input === "object" && input !== null && "url" in input ? input.url : input);
+// A blob URL is a URL of the library: the `fetch` of the library reads it.
+let libraryFetch = null;
+
+globalThis.fetch = (input, init) => {
+  const url = typeof input === "object" && input !== null && "url" in input ? input.url : input;
+  if (/^blob:/i.test(String(url))) {
+    libraryFetch = libraryFetch || globalThis.__webidl.globalOperation("WindowOrWorkerGlobalScope", "fetch");
+    return libraryFetch(input, init);
+  }
+  const path = localPath(url);
   // A file that a server program makes, such as `inspect-headers.py`, and
   // each other host, need the server of WPT, which the runner does not
   // have.

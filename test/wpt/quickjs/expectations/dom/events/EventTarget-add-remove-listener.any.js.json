@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Removing an event listener without explicit capture arg should succeed": "library: no Web.EventTarget.new/0"
-  }
-}

@@ -2396,8 +2396,11 @@ defmodule Web.Stream do
   end
 
   # An abort of a writable stream aborts the signal of its controller.
+  # The stream process must answer other processes while the listeners of
+  # the signal run: the signal is aborted before the call returns, and a new
+  # process runs the listeners.
   defp abort_signal(%{abort_controller: %Web.AbortController{} = controller} = data, reason) do
-    :ok = Web.AbortController.abort(controller, reason)
+    :ok = Web.AbortSignal.__signal_abort_later__(controller.signal, reason)
     data
   end
 

@@ -1,7 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Test that strings are not NFC normalized by File constructor": "library: a different result",
-    "Test that unpaired surrogates are replaced by File constructor": "library: a different result"
-  }
-}

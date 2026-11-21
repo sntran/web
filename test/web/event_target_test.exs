@@ -277,7 +277,9 @@ defmodule Web.EventTargetTest do
     test "a task makes its event in the process, and answers" do
       test = self()
       server = start_server()
-      :ok = Server.add_event_listener(server, "made", fn event -> send(test, event) end, %{})
+      # The options can be a keyword list.
+      :ok =
+        Server.add_event_listener(server, "made", fn event -> send(test, event) end, once: false)
 
       :ok = Server.run_task(server, task({__MODULE__, :build_event, ["made", 7]}, {self(), :one}))
 

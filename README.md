@@ -627,7 +627,7 @@ Enum.to_list(form)
 form =
   FormData.new()
   |> FormData.append("title", "Report")
-  |> FormData.append("file", File.new(["bytes"], filename: "report.txt", type: "text/plain"))
+  |> FormData.append("file", File.new(["bytes"], "report.txt", type: "text/plain"))
 
 await(fetch("https://example.com/upload", method: "POST", body: form))
 ```

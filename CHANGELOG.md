@@ -457,6 +457,15 @@ All notable changes to this project are documented in this file.
   - Each body that the library makes is a byte stream, and a `Web.Blob`
     body is one chunk. The clone of a body gives the second branch a
     structured clone of each chunk. A pipe disturbs the source at once.
+- **Breaking:** `Web.File` follows the File API for its name. The field
+  `name` is the name of the file, and the field `filename` is removed. The
+  constructor is `Web.File.new(file_bits, file_name, options \\ [])`, as
+  `new File(fileBits, fileName, options)`, with the options `:type` and
+  `:last_modified`. Change `Web.File.new(parts, filename: name)` to
+  `Web.File.new(parts, name)`. The name of a form field is the name of the
+  entry of a `Web.FormData`, not a field of the file. A file part of a
+  parsed form with no `Content-Type` has the type `text/plain`, as the
+  steps of `formData()` specify.
 - **Breaking:** `Web.AbortSignal.throw_if_aborted/1` raises the reason of
   the signal, also a reason that is not an exception, as `throwIfAborted()`
   throws. It put the reason in an `AbortError` before.

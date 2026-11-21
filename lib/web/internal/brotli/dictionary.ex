@@ -183,7 +183,7 @@ defmodule Web.Internal.Brotli.Dictionary do
       index = word_id &&& (1 <<< bits) - 1
       base = binary_part(@bytes, elem(@doffset, length) + index * length, length)
       {prefix, transform, suffix} = elem(@transforms, transform_id)
-      IO.iodata_to_binary([prefix, apply_transform(transform, base), suffix])
+      <<prefix::binary, apply_transform(transform, base)::binary, suffix::binary>>
     else
       :error
     end

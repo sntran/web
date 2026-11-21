@@ -63,6 +63,12 @@ defmodule Web.Internal.BrotliTest do
   # `{result, output}`: the result is `{:end, rest}`, `:more`, or
   # `{:error, :invalid}`. The chunks after the end go to the decoder too.
   defp decode(chunks, limit \\ 65_536) do
+    {result, pieces} = pieces(chunks, limit)
+    {result, IO.iodata_to_binary(pieces)}
+  end
+
+  # The same as `decode/2`, with the list of the pieces.
+  defp pieces(chunks, limit) do
     {result, pieces} =
       Enum.reduce_while(chunks, {{:more, Decoder.new()}, []}, fn chunk, {{_, decoder}, acc} ->
         case drain(Decoder.append(decoder, chunk), limit, acc) do
@@ -78,7 +84,7 @@ defmodule Web.Internal.BrotliTest do
         error -> error
       end
 
-    {result, pieces |> Enum.reverse() |> IO.iodata_to_binary()}
+    {result, Enum.reverse(pieces)}
   end
 
   defp drain(decoder, limit, acc) do
@@ -216,6 +222,25 @@ defmodule Web.Internal.BrotliTest do
       end
     end
 
+    # The input has 40 bytes or more in some chunks: the fast loop of the
+    # commands starts and stops at many positions. The limit stops it in
+    # the literals and in the copies.
+    property "gives the same output for each split of the input and each limit" do
+      check all(
+              {_name, hex, size, digest} <- member_of([@switches | @vectors]),
+              sizes <- list_of(integer(1..80), max_length: 12),
+              limit <- one_of([integer(1..40), constant(65_536)]),
+              max_runs: 200
+            ) do
+        {result, pieces} = pieces(split(Base.decode16!(hex, case: :lower), sizes), limit)
+        output = IO.iodata_to_binary(pieces)
+        assert result == {:end, 0}
+        assert byte_size(output) == size
+        assert hash(output) == digest
+        assert Enum.all?(pieces, &(byte_size(&1) in 1..limit))
+      end
+    end
+
     test "gives the output in pieces of the limit" do
       {"zeros", hex, size, _digest} = Enum.at(@vectors, 5)
       input = Base.decode16!(hex, case: :lower)
@@ -328,7 +353,16 @@ defmodule Web.Internal.BrotliTest do
           ]
         end
 
-      assert decode([B.bytes([B.window(16), blocks])]) == {{:end, 0}, :binary.copy(words, 4)}
+      stream = B.bytes([B.window(16), blocks])
+      assert decode([stream]) == {{:end, 0}, :binary.copy(words, 4)}
+
+      # A word can make the output longer than the limit: the next piece
+      # has the rest.
+      for limit <- [1, 3, 10] do
+        {result, pieces} = pieces([stream], limit)
+        assert {result, IO.iodata_to_binary(pieces)} == {{:end, 0}, :binary.copy(words, 4)}
+        assert Enum.all?(pieces, &(byte_size(&1) in 1..limit)), "the limit #{limit}"
+      end
     end
 
     test "decodes many meta-blocks with input after each one" do
@@ -435,10 +469,15 @@ defmodule Web.Internal.BrotliTest do
       {literal, _} = B.simple([?a], 256)
       {distance, distances} = B.simple([16], 64)
 
-      # Three literals in a meta-block of 2 bytes.
+      # Three literals in a meta-block of 2 bytes, and 66 literals: the
+      # insert length code 14 with 5 extra bits.
       {command, commands} = B.simple([152], 704)
       fields = meta_block(2, literal, command, distance, [B.symbol(commands, 152)])
       assert invalid?([B.window(16), fields])
+      {command, commands} = B.simple([304], 704)
+      fields = meta_block(2, literal, command, distance, [B.symbol(commands, 304), {0, 5}])
+      assert invalid?([B.window(16), fields])
+      assert output_before_error([B.window(16), fields]) <= 2
 
       # A copy of 3 bytes after 1 literal in a meta-block of 3 bytes.
       {command, commands} = B.simple([137], 704)
@@ -451,6 +490,7 @@ defmodule Web.Internal.BrotliTest do
         ])
 
       assert invalid?([B.window(16), fields])
+      assert output_before_error([B.window(16), fields]) <= 3
     end
 
     test "a reference to the dictionary that is not valid" do
@@ -475,7 +515,27 @@ defmodule Web.Internal.BrotliTest do
     end
   end
 
-  defp invalid?(fields), do: decode([B.bytes(fields)]) |> elem(0) == {:error, :invalid}
+  # The largest number of bytes that the decoder gives before the error,
+  # with the limit 1, with and without 64 bytes after the data.
+  defp output_before_error(fields) do
+    data = B.bytes(fields)
+
+    for input <- [data, data <> :binary.copy(<<0>>, 64)] do
+      {{:error, :invalid}, pieces} = pieces([input], 1)
+      IO.iodata_length(pieces)
+    end
+    |> Enum.max()
+  end
+
+  # The data must be invalid also with 64 bytes after it: then the fast
+  # loop of the commands decodes it.
+  defp invalid?(fields) do
+    data = B.bytes(fields)
+
+    Enum.all?([data, data <> :binary.copy(<<0>>, 64)], fn input ->
+      elem(decode([input]), 0) == {:error, :invalid}
+    end)
+  end
 
   # ---------------------------------------------------------------------------
   # The encoder

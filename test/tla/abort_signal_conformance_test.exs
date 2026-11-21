@@ -302,17 +302,6 @@ defmodule Web.TLA.AbortSignalConformanceTest do
     end
   end
 
-  # A dependent signal that runs stops after the steps of the abort.
-  defp stop_dependent(model, "running", monitor) do
-    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 2_000
-    SpecModel.step!(model, "DepStop")
-  end
-
-  defp stop_dependent(model, _dep, monitor) do
-    if monitor, do: Process.demonitor(monitor, [:flush])
-    model
-  end
-
   defp run(:owner_stop, model, system) do
     if SpecModel.enabled?(model, "OwnerStop") do
       Process.exit(system.owner, :kill)
@@ -332,15 +321,6 @@ defmodule Web.TLA.AbortSignalConformanceTest do
     else
       {model, system}
     end
-  end
-
-  # The signal gets the stop of the client from the system: the test waits
-  # until the signal removed the client.
-  defp await_users(model, system) do
-    if SpecModel.get(model, "running"),
-      do: eventually(fn -> real_users(system) == SpecModel.get(model, "users") end)
-
-    model
   end
 
   # The test waits for more than the linger time. After that time, a signal
@@ -366,6 +346,26 @@ defmodule Web.TLA.AbortSignalConformanceTest do
       end
 
     {model, system}
+  end
+
+  # The signal gets the stop of the client from the system: the test waits
+  # until the signal removed the client.
+  defp await_users(model, system) do
+    if SpecModel.get(model, "running"),
+      do: eventually(fn -> real_users(system) == SpecModel.get(model, "users") end)
+
+    model
+  end
+
+  # A dependent signal that runs stops after the steps of the abort.
+  defp stop_dependent(model, "running", monitor) do
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 2_000
+    SpecModel.step!(model, "DepStop")
+  end
+
+  defp stop_dependent(model, _dep, monitor) do
+    if monitor, do: Process.demonitor(monitor, [:flush])
+    model
   end
 
   defp assert_down(pid, message) do

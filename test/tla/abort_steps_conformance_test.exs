@@ -121,13 +121,6 @@ defmodule Web.TLA.AbortStepsConformanceTest do
     end
   end
 
-  defp make_dependent(signal, test) do
-    dep = AbortSignal.any([signal])
-    EventTarget.add_event_listener(dep, "abort", fn -> send(test, {:step, "dep_event"}) end)
-    send(test, {:dependent, dep})
-    Process.sleep(:infinity)
-  end
-
   # The maker stops: after the linger time, the dependent signal stops with
   # no abort, and the signal removes it.
   defp prepare(:dep_expire, model, system) do
@@ -142,6 +135,13 @@ defmodule Web.TLA.AbortStepsConformanceTest do
     else
       model
     end
+  end
+
+  defp make_dependent(signal, test) do
+    dep = AbortSignal.any([signal])
+    EventTarget.add_event_listener(dep, "abort", fn -> send(test, {:step, "dep_event"}) end)
+    send(test, {:dependent, dep})
+    Process.sleep(:infinity)
   end
 
   # ---------------------------------------------------------------------------

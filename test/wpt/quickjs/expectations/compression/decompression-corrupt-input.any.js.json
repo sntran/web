@@ -1,8 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "the unchanged input for 'brotli' should decompress successfully": "library: a different result",
-    "trailing junk for 'brotli' should give an error": "library: a different result",
-    "truncating the input for 'brotli' should give an error": "library: a different result"
-  }
-}

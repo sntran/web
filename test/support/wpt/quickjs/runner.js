@@ -194,6 +194,26 @@ globalThis.WebAssembly = {
   },
 };
 
+// `Array.fromAsync` of ECMAScript 2024: this QuickJS does not have it. The
+// helper `compression/resources/decompress.js` uses it. This form takes
+// only the first argument.
+if (typeof Array.fromAsync !== "function") {
+  Array.fromAsync = async function fromAsync(items) {
+    const values = [];
+    for await (const value of items) values.push(value);
+    return values;
+  };
+}
+
+// The UTF-8 bytes of a string, for the method `bytes` of the response of
+// the runner.
+function utf8Bytes(text) {
+  const binary = unescape(encodeURIComponent(text));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 // A test loads its data files with `fetch`. This `fetch` is part of the
 // runner, not of the library: it reads a file of WPT next to the test.
 // The path of a file of WPT for a URL of the page, or null for a URL that
@@ -245,6 +265,7 @@ globalThis.fetch = (input, init) => {
     text: () => Promise.resolve(bytes === null ? body : String.fromCharCode(...bytes)),
     json: () => Promise.resolve(JSON.parse(body)),
     arrayBuffer: () => Promise.resolve(bytes === null ? new ArrayBuffer(0) : bytes.buffer),
+    bytes: () => Promise.resolve(bytes === null ? utf8Bytes(body) : bytes),
   });
 };
 

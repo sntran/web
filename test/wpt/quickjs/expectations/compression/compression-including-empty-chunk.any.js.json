@@ -1,8 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "the result of compressing [,Hello,Hello] with brotli should be 'HelloHello'": "library: a different result",
-    "the result of compressing [Hello,,Hello] with brotli should be 'HelloHello'": "library: a different result",
-    "the result of compressing [Hello,Hello,] with brotli should be 'HelloHello'": "library: a different result"
-  }
-}

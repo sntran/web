@@ -11,15 +11,19 @@ defmodule Web.Internal.ContentDecoder do
   # expands to many bytes does not become one large binary, and the caller
   # takes the next piece only when it has space for it: the backpressure.
   #
-  # The codings are `gzip`, `x-gzip`, `deflate`, and `zstd`. Erlang/OTP 28
-  # and later have the module `:zstd`. A body with a coding that the decoder
-  # does not know, for example `br`, is not decoded, as the Fetch Standard
-  # specifies.
+  # The codings are `gzip`, `x-gzip`, `deflate`, `br`, and `zstd`. Erlang/OTP
+  # 28 and later have the module `:zstd`. The decoder of `br` is
+  # `Web.Internal.Brotli.Decoder`, in Elixir. A body with a coding that the
+  # decoder does not know is not decoded, as the Fetch Standard specifies.
   #
   # Data that is not valid, and data that ends before the end of its
-  # compressed form, raise `Web.Internal.ContentDecoder.Error`.
+  # compressed form, raise `Web.Internal.ContentDecoder.Error`. The pieces
+  # before the error come first: a pull that finds an error after a part of
+  # a piece gives that part, and the next pull raises.
 
   import Bitwise
+
+  alias Web.Internal.Brotli.Decoder, as: Brotli
 
   defmodule Error do
     @moduledoc false
@@ -35,7 +39,7 @@ defmodule Web.Internal.ContentDecoder do
 
   @doc "The value of the request header `accept-encoding`."
   @spec accept_encoding() :: String.t()
-  def accept_encoding, do: "gzip, deflate, zstd"
+  def accept_encoding, do: "gzip, deflate, br, zstd"
 
   @doc """
   Makes the decoder for the headers of a response. Returns `nil` when the
@@ -53,7 +57,7 @@ defmodule Web.Internal.ContentDecoder do
 
     cond do
       codings == [] -> nil
-      Enum.all?(codings, &(&1 in ["gzip", "x-gzip", "deflate", "zstd"])) -> stages(codings)
+      Enum.all?(codings, &(&1 in ["gzip", "x-gzip", "deflate", "br", "zstd"])) -> stages(codings)
       true -> nil
     end
   end
@@ -73,11 +77,13 @@ defmodule Web.Internal.ContentDecoder do
 
   @doc """
   Makes the decoder of a format of the Compression Standard, for
-  `Web.DecompressionStream`: `"gzip"`, `"deflate"` (the zlib format only),
-  or `"deflate-raw"`. The decoder is strict, as the Standard specifies: data
-  after the end of the compressed data, and an empty input, raise.
+  `Web.DecompressionStream`: `"brotli"`, `"gzip"`, `"deflate"` (the zlib
+  format only), or `"deflate-raw"`. The decoder is strict, as the Standard
+  specifies: data after the end of the compressed data, and an empty input,
+  raise.
   """
   @spec format(String.t()) :: [map()]
+  def format("brotli"), do: [brotli_stage("brotli", true)]
   def format("gzip"), do: [zlib_stage("gzip", 31, true)]
   def format("deflate"), do: [zlib_stage("deflate", 15, true)]
   def format("deflate-raw"), do: [zlib_stage("deflate-raw", -15, true)]
@@ -90,6 +96,8 @@ defmodule Web.Internal.ContentDecoder do
   defp stage("deflate") do
     %{coding: "deflate", kind: :deflate, buffer: <<>>, input: :queue.new(), ended?: false}
   end
+
+  defp stage("br"), do: brotli_stage("br", false)
 
   defp stage("zstd") do
     {:ok, context} = :zstd.context(:decompress)
@@ -108,6 +116,19 @@ defmodule Web.Internal.ContentDecoder do
 
   # A strict stage refuses data after the end of the compressed data, and an
   # empty input. An HTTP body has no such rule.
+  defp brotli_stage(coding, strict?) do
+    %{
+      coding: coding,
+      kind: :brotli,
+      decoder: Brotli.new(),
+      strict?: strict?,
+      fed?: false,
+      input: :queue.new(),
+      ended?: false,
+      done?: false
+    }
+  end
+
   defp zlib_stage(coding, window_bits, strict? \\ false) do
     zlib = :zlib.open()
     :ok = :zlib.inflateInit(zlib, window_bits, if(strict?, do: :error, else: :cut))
@@ -127,6 +148,7 @@ defmodule Web.Internal.ContentDecoder do
 
   @doc "Gives a chunk of the body to the decoder."
   @spec push([map()], binary()) :: [map()]
+  def push([%{kind: :failed}] = failed, _data), do: failed
   def push([first | rest], data), do: [add_input(first, data) | rest]
 
   @doc """
@@ -134,6 +156,8 @@ defmodule Web.Internal.ContentDecoder do
   that closed at the end of its data is not closed again.
   """
   @spec close([map()]) :: :ok
+  def close([%{kind: :failed, stages: stages}]), do: close(stages)
+
   def close(stages) do
     for %{kind: :zlib, zlib: zlib} <- stages do
       try do
@@ -148,6 +172,7 @@ defmodule Web.Internal.ContentDecoder do
 
   @doc "The body has no more chunks."
   @spec finish([map()]) :: [map()]
+  def finish([%{kind: :failed}] = failed), do: failed
   def finish([first | rest]), do: [%{first | ended?: true} | rest]
 
   @doc """
@@ -157,6 +182,7 @@ defmodule Web.Internal.ContentDecoder do
   complete.
   """
   @spec pull([map()]) :: {:piece, binary(), [map()]} | {:more, [map()]} | {:done, [map()]}
+  def pull([%{kind: :failed, error: error}]), do: raise(error)
   def pull(stages), do: collect(stages, [], 0)
 
   # The output of a stage comes in small parts: zlib gives 16 KiB at most.
@@ -165,12 +191,20 @@ defmodule Web.Internal.ContentDecoder do
     {:piece, IO.iodata_to_binary(acc), stages}
   end
 
+  # The Compression Standard enqueues the output of a chunk before the error
+  # for data after the end. Thus an error after a part of a piece gives the
+  # part, and the decoder keeps the error for the next pull.
   defp collect(stages, acc, size) do
     case pull_chain(stages) do
       {:piece, piece, stages} -> collect(stages, [acc | piece], size + byte_size(piece))
       {status, stages} when size == 0 -> {status, stages}
       {_status, stages} -> {:piece, IO.iodata_to_binary(acc), stages}
     end
+  rescue
+    error in Error ->
+      if size == 0,
+        do: reraise(error, __STACKTRACE__),
+        else: {:piece, IO.iodata_to_binary(acc), [%{kind: :failed, error: error, stages: stages}]}
   end
 
   defp add_input(stage, <<>>), do: stage
@@ -250,6 +284,17 @@ defmodule Web.Internal.ContentDecoder do
     end
   end
 
+  defp pull_stage(%{kind: :brotli, done?: true} = stage), do: {:done, stage}
+
+  defp pull_stage(%{kind: :brotli} = stage) do
+    case Brotli.run(stage.decoder, @piece_size) do
+      {:output, piece, decoder} -> {:piece, piece, %{stage | decoder: decoder}}
+      {:more, decoder} -> brotli_input(%{stage | decoder: decoder})
+      {:end, decoder} -> brotli_end(%{stage | decoder: decoder})
+      {:error, :invalid} -> invalid!(stage)
+    end
+  end
+
   defp pull_stage(%{kind: :zstd, done?: true} = stage), do: {:done, stage}
 
   defp pull_stage(%{kind: :zstd, remaining: <<>>} = stage) do
@@ -271,6 +316,40 @@ defmodule Web.Internal.ContentDecoder do
   end
 
   defp pull_stage(%{kind: :zstd} = stage), do: decompress(stage, stage.remaining)
+
+  # The brotli decoder takes the next chunk when it needs more input. A
+  # stage that got no data is an empty body. A strict stage needs data.
+  defp brotli_input(stage) do
+    case :queue.out(stage.input) do
+      {{:value, data}, input} ->
+        decoder = Brotli.append(stage.decoder, data)
+        pull_stage(%{stage | decoder: decoder, input: input, fed?: true})
+
+      {:empty, _input} when stage.ended? and not stage.fed? and not stage.strict? ->
+        {:done, %{stage | done?: true}}
+
+      {:empty, _input} when stage.ended? ->
+        not_complete!(stage)
+
+      {:empty, _input} ->
+        {:more, stage}
+    end
+  end
+
+  # Data after the end of a brotli stream is an error for a strict stage. An
+  # HTTP body drops it, as the zlib stages do.
+  defp brotli_end(stage) do
+    cond do
+      stage.strict? and (Brotli.rest(stage.decoder) > 0 or not :queue.is_empty(stage.input)) ->
+        invalid!(stage)
+
+      stage.ended? ->
+        {:done, %{stage | done?: true}}
+
+      true ->
+        {:more, %{stage | input: :queue.new()}}
+    end
+  end
 
   # `deflate` in HTTP is the zlib format. Some servers send raw deflate
   # data, and browsers accept it. A zlib stream starts with two bytes: the

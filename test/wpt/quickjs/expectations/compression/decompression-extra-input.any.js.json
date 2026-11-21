@@ -1,9 +1,9 @@
 {
   "harness": "OK",
   "failures": {
-    "decompressing brotli input with extra pad should still give the output": "library: a different result",
-    "decompressing deflate input with extra pad should still give the output": "library: a different result",
-    "decompressing deflate-raw input with extra pad should still give the output": "library: a different result",
-    "decompressing gzip input with extra pad should still give the output": "library: a different result"
+    "decompressing brotli input with extra pad should still give the output": "library: the readable side of a compression stream has the high water mark 1, not 0",
+    "decompressing deflate input with extra pad should still give the output": "library: the readable side of a compression stream has the high water mark 1, not 0",
+    "decompressing deflate-raw input with extra pad should still give the output": "library: the readable side of a compression stream has the high water mark 1, not 0",
+    "decompressing gzip input with extra pad should still give the output": "library: the readable side of a compression stream has the high water mark 1, not 0"
   }
 }

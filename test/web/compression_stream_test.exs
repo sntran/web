@@ -13,7 +13,7 @@ defmodule Web.CompressionPBTTest do
   alias Web.WritableStream
   alias Web.WritableStreamDefaultWriter
 
-  @formats ~w[gzip deflate deflate-raw]
+  @formats ~w[brotli gzip deflate deflate-raw]
 
   # ---------------------------------------------------------------------------
   # Basic unit tests: construction and validation
@@ -29,7 +29,7 @@ defmodule Web.CompressionPBTTest do
 
     test "rejects unknown format string with TypeError" do
       assert_raise Web.TypeError, ~r/Unsupported compression format/, fn ->
-        CompressionStream.new("brotli")
+        CompressionStream.new("br")
       end
     end
 
@@ -66,7 +66,7 @@ defmodule Web.CompressionPBTTest do
   # ---------------------------------------------------------------------------
 
   describe "basic compress/decompress smoke tests" do
-    for format <- ~w[gzip deflate deflate-raw] do
+    for format <- ~w[brotli gzip deflate deflate-raw] do
       @format format
       test "#{format}: round-trip empty binary" do
         assert round_trip(<<>>, @format) == <<>>

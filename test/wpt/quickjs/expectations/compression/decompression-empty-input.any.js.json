@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "decompressing brotli empty input should work": "library: a different result"
-  }
-}

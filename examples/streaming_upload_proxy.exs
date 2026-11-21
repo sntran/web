@@ -68,7 +68,10 @@ route =
 
 IO.puts("route=#{inspect(route)}")
 
-%Web.File{} = payload = Web.FormData.get(form_data, "payload")
+# The name of the entry is the name of the field. The name of the file
+# comes from the parameter `filename` of the part.
+%Web.File{name: "payload.bin"} = payload = Web.FormData.get(form_data, "payload")
+IO.puts("file=#{payload.name} type=#{payload.type}")
 payload_stream = Web.File.stream(payload)
 
 {:ok, sink_state} =

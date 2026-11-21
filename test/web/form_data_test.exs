@@ -40,10 +40,30 @@ defmodule Web.FormDataTest do
 
     assert Web.FormData.get(form_data, "field") == "value"
 
-    assert %Web.File{name: "upload", filename: "hello.txt", type: "text/plain"} =
+    assert %Web.File{name: "hello.txt", type: "text/plain"} =
              file = Web.FormData.get(form_data, "upload")
 
     assert Web.TestBytes.join(Web.File.stream(file)) == "hello file"
+  end
+
+  test "parse gives a file the type text/plain when its part has no Content-Type" do
+    boundary = "----type-boundary"
+
+    payload =
+      multipart_payload(boundary, [
+        %{name: "plain", filename: "a.txt", value: "a"},
+        %{name: "empty", filename: "b.bin", content_type: "", value: "b"},
+        %{name: "typed", filename: "c.bin", content_type: "Image/PNG", value: "c"}
+      ])
+
+    form = Web.FormData.parse(payload, boundary)
+
+    # The Fetch Standard, `formData()`: the type is the value of the header
+    # `Content-Type`, and `text/plain` when the part has no such header.
+    assert [["plain", plain], ["empty", empty], ["typed", typed]] = Enum.to_list(form)
+    assert {plain.name, plain.type} == {"a.txt", "text/plain"}
+    assert {empty.name, empty.type} == {"b.bin", ""}
+    assert {typed.name, typed.type} == {"c.bin", "image/png"}
   end
 
   test "parse raises on malformed multipart payload" do
@@ -67,7 +87,7 @@ defmodule Web.FormDataTest do
 
     form_data = Web.FormData.parse(payload, boundary)
 
-    assert %Web.File{filename: "€rates.txt"} =
+    assert %Web.File{name: "€rates.txt"} =
              Web.FormData.get(form_data, "upload")
   end
 
@@ -153,7 +173,7 @@ defmodule Web.FormDataTest do
 
     assert Web.FormData.get(form, "a") == "1"
     assert Web.FormData.has?(form, "a") == true
-    assert [%Web.File{filename: "blob.txt", type: "text/plain"}] = Web.FormData.get_all(form, "b")
+    assert [%Web.File{name: "blob.txt", type: "text/plain"}] = Web.FormData.get_all(form, "b")
     assert Web.FormData.content_type(form) == "multipart/form-data; boundary=eager-boundary"
 
     updated =
@@ -167,32 +187,32 @@ defmodule Web.FormDataTest do
     assert Web.FormData.cancel(updated) == :ok
   end
 
-  test "append uses blob filename fallback and file filename override" do
+  test "append gives a blob the file name blob, and a file the given file name" do
     blob_form =
       Web.FormData.new()
       |> Web.FormData.append("upload", Web.Blob.new(["x"], type: "text/plain"))
 
-    assert %Web.File{filename: "blob", type: "text/plain"} =
+    assert %Web.File{name: "blob", type: "text/plain"} =
              Web.FormData.get(blob_form, "upload")
 
-    file = Web.File.new(["x"], name: "upload", filename: "old.txt", type: "text/plain")
+    file = Web.File.new(["x"], "old.txt", type: "text/plain")
     updated = Web.FormData.new() |> Web.FormData.append("upload", file, "new.txt")
-    assert %Web.File{filename: "new.txt"} = Web.FormData.get(updated, "upload")
+    assert %Web.File{name: "new.txt"} = Web.FormData.get(updated, "upload")
   end
 
-  test "append preserves existing file metadata when no filename override is provided" do
-    file = Web.File.new(["x"], name: "upload", filename: "kept.txt", type: "text/plain")
+  test "append keeps the name and the type of a file when no file name is given" do
+    file = Web.File.new(["x"], "kept.txt", type: "text/plain")
 
     form =
       Web.FormData.new()
       |> Web.FormData.append("upload", file)
 
-    assert %Web.File{filename: "kept.txt", type: "text/plain"} =
+    assert %Web.File{name: "kept.txt", type: "text/plain"} =
              Web.FormData.get(form, "upload")
   end
 
   test "static files stream from blob parts when no live stream is attached" do
-    file = Web.File.new(["hello"], name: "upload", filename: "hello.txt", type: "text/plain")
+    file = Web.File.new(["hello"], "hello.txt", type: "text/plain")
     assert Web.TestBytes.join(Web.File.stream(file)) == "hello"
   end
 
@@ -299,7 +319,7 @@ defmodule Web.FormDataTest do
     assert frozen.coordinator == nil
     assert Web.FormData.get(frozen, "destination") == "archive"
     assert Web.FormData.get(frozen, "after") == "done"
-    assert %Web.File{filename: "big.bin", stream: nil} = Web.FormData.get(frozen, "payload")
+    assert %Web.File{name: "big.bin", stream: nil} = Web.FormData.get(frozen, "payload")
 
     assert_eventually(fn -> not Process.alive?(live_form.coordinator) end)
     assert_eventually(fn -> ReadableStream.locked?(stream) == false end)
@@ -460,7 +480,7 @@ defmodule Web.FormDataTest do
       ])
       |> Web.FormData.parse(boundary)
 
-    assert %Web.File{filename: "a\"b.txt"} = Web.FormData.get(form, "upload")
+    assert %Web.File{name: "a\"b.txt"} = Web.FormData.get(form, "upload")
   end
 
   test "filename* decodes iso-8859-1 values" do
@@ -476,7 +496,7 @@ defmodule Web.FormDataTest do
       ])
       |> Web.FormData.parse(boundary)
 
-    assert %Web.File{filename: "£rates.txt"} = Web.FormData.get(form, "upload")
+    assert %Web.File{name: "£rates.txt"} = Web.FormData.get(form, "upload")
   end
 
   test "filename* preserves invalid percent escapes" do
@@ -492,7 +512,7 @@ defmodule Web.FormDataTest do
       ])
       |> Web.FormData.parse(boundary)
 
-    assert %Web.File{filename: "bad%ZZname.txt"} = Web.FormData.get(form, "upload")
+    assert %Web.File{name: "bad%ZZname.txt"} = Web.FormData.get(form, "upload")
   end
 
   test "malformed extended filename parameters fall back to regular decoding" do
@@ -508,7 +528,7 @@ defmodule Web.FormDataTest do
       ])
       |> Web.FormData.parse(boundary)
 
-    assert %Web.File{filename: "not-rfc5987"} = Web.FormData.get(form, "upload")
+    assert %Web.File{name: "not-rfc5987"} = Web.FormData.get(form, "upload")
   end
 
   test "filename* with an unknown charset falls back to decoded bytes" do
@@ -524,7 +544,7 @@ defmodule Web.FormDataTest do
       ])
       |> Web.FormData.parse(boundary)
 
-    assert %Web.File{filename: "abc.txt"} = Web.FormData.get(form, "upload")
+    assert %Web.File{name: "abc.txt"} = Web.FormData.get(form, "upload")
   end
 
   test "filename* with an unknown charset preserves percent-decoded bytes" do
@@ -540,7 +560,7 @@ defmodule Web.FormDataTest do
       ])
       |> Web.FormData.parse(boundary)
 
-    assert %Web.File{filename: "ab cd.txt"} = Web.FormData.get(form, "upload")
+    assert %Web.File{name: "ab cd.txt"} = Web.FormData.get(form, "upload")
   end
 
   test "invalid multipart chunk types raise a type error" do
@@ -1429,7 +1449,7 @@ defmodule Web.FormDataTest do
 
     parsed = Web.FormData.parse(ReadableStream.from(byte_chunks(payload)), boundary)
 
-    assert %Web.File{filename: "tiny.txt"} = file = Web.FormData.get(parsed, "upload")
+    assert %Web.File{name: "tiny.txt"} = file = Web.FormData.get(parsed, "upload")
     assert Web.TestBytes.join(Web.File.stream(file)) == "abc"
     assert Web.FormData.get(parsed, "after") == "done"
   end
@@ -1624,19 +1644,19 @@ defmodule Web.FormDataTest do
 
     assert [
              {"field", "1"},
-             {"upload", %Web.File{filename: "file.txt", stream: nil}},
+             {"upload", %Web.File{name: "file.txt", stream: nil}},
              {"after", "done"}
            ] = Task.await(waiter)
 
     assert [
              {"field", "1"},
-             {"upload", %Web.File{filename: "file.txt", stream: nil}},
+             {"upload", %Web.File{name: "file.txt", stream: nil}},
              {"after", "done"}
            ] = Task.await(concurrent_waiter)
 
     assert [
              {"field", "1"},
-             {"upload", %Web.File{filename: "file.txt", stream: nil}},
+             {"upload", %Web.File{name: "file.txt", stream: nil}},
              {"after", "done"}
            ] =
              entries
@@ -1663,7 +1683,7 @@ defmodule Web.FormDataTest do
     assert Web.FormData.get(appended, "after") == "done"
     assert Web.FormData.get(appended, "extra") == "extra_val"
     # File is materialized with stream: nil (freeze_file materializing? = true, L1132)
-    assert %Web.File{filename: "f.txt", stream: nil} = Web.FormData.get(appended, "upload")
+    assert %Web.File{name: "f.txt", stream: nil} = Web.FormData.get(appended, "upload")
   end
 
   test "Enumerable top-level halt and suspend pass-through on live form" do
@@ -1710,8 +1730,8 @@ defmodule Web.FormDataTest do
     assert Web.FormData.get(result, "after") == "done"
     assert Web.FormData.get(result, "extra") == "val"
     # Files are frozen with stream: nil (L1132) when materialized
-    assert %Web.File{filename: "f1.txt", stream: nil} = Web.FormData.get(result, "file1")
-    assert %Web.File{filename: "f2.txt", stream: nil} = Web.FormData.get(result, "file2")
+    assert %Web.File{name: "f1.txt", stream: nil} = Web.FormData.get(result, "file1")
+    assert %Web.File{name: "f2.txt", stream: nil} = Web.FormData.get(result, "file2")
   end
 
   test "drain_live on truncated file propagates upstream error (L418)" do
@@ -2122,7 +2142,7 @@ defmodule Web.FormDataEdgeTest do
       Task.async(fn -> Enum.to_list(form) end)
       |> Task.await(30_000)
 
-    assert [["upload", %Web.File{filename: "large.bin"}], ["after", "done"]] = entries
+    assert [["upload", %Web.File{name: "large.bin"}], ["after", "done"]] = entries
 
     # Coordinator is still alive after iteration; cancel to free resources
     Web.FormData.cancel(form)
@@ -2205,8 +2225,8 @@ defmodule Web.FormDataEdgeTest do
     entries = Enum.to_list(form)
 
     assert [
-             ["file1", %Web.File{filename: "first.bin"}],
-             ["file2", %Web.File{filename: "second.bin"}],
+             ["file1", %Web.File{name: "first.bin"}],
+             ["file2", %Web.File{name: "second.bin"}],
              ["tail", "end"]
            ] = entries
 
@@ -2254,7 +2274,7 @@ defmodule Web.FormDataEdgeTest do
     form = Web.FormData.parse(ReadableStream.from(byte_chunks(payload)), boundary)
     entries = Enum.to_list(form)
 
-    assert [["field", ^field_value], ["upload", %Web.File{filename: "big.bin"}], ["tail", "end"]] =
+    assert [["field", ^field_value], ["upload", %Web.File{name: "big.bin"}], ["tail", "end"]] =
              entries
 
     Web.FormData.cancel(form)
@@ -2314,7 +2334,7 @@ defmodule Web.FormDataEdgeTest do
       Task.async(fn -> Enum.to_list(form) end)
       |> Task.await(5_000)
 
-    assert [[_, %Web.File{filename: "blocked.txt"}], ["after", "done"]] = entries
+    assert [[_, %Web.File{name: "blocked.txt"}], ["after", "done"]] = entries
 
     Web.FormData.cancel(form)
 

@@ -345,13 +345,12 @@ defmodule Web.Internal.StructuredData do
     node(File, File.identity(file), ctx, fn key, ctx ->
       {parts, ctx} = build(file.parts, ctx)
 
-      data = [
+      data = %{
         name: file.name,
-        filename: file.filename,
         type: file.type,
         size: file.size,
         last_modified: file.last_modified
-      ]
+      }
 
       {%Node{type: :file, key: key, data: {parts, data}}, ctx}
     end)
@@ -459,9 +458,12 @@ defmodule Web.Internal.StructuredData do
     {Blob.new(parts, type: type), memo}
   end
 
+  # The clone has the size of the original file. A file of a parsed form
+  # that the parser discarded has no bytes, but it has a size.
   defp make(%Node{type: :file, data: {parts, data}}, memo) do
     {parts, memo} = revive(parts, memo)
-    {File.new(parts, data), memo}
+    file = File.new(parts, data.name, type: data.type, last_modified: data.last_modified)
+    {%{file | size: data.size}, memo}
   end
 
   @spec data_clone_error!(String.t()) :: no_return()

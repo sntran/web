@@ -318,7 +318,7 @@ defmodule Web.BodyTest do
 
     assert Web.FormData.get(form_data, "field") == "ok"
 
-    assert %Web.File{name: "upload", filename: "a.txt", type: "text/plain"} =
+    assert %Web.File{name: "a.txt", type: "text/plain"} =
              file = Web.FormData.get(form_data, "upload")
 
     assert Web.TestBytes.join(Web.File.stream(file)) == "hello"

@@ -56,13 +56,10 @@ defmodule Web.Benchmarks.FormDataMemory do
   end
 
   defp encode do
-    file =
-      Web.File.new([],
-        name: "upload",
-        filename: "large.bin",
-        type: "application/octet-stream",
-        stream: Web.ReadableStream.from(file_chunks())
-      )
+    # A file of the library that gives its bytes from a stream, as a file
+    # of a parsed form does.
+    file = Web.File.new([], "large.bin", type: "application/octet-stream")
+    file = %{file | stream: Web.ReadableStream.from(file_chunks())}
 
     form = FormData.new(boundary: @boundary) |> FormData.append("upload", file)
 

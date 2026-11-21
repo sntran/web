@@ -200,7 +200,7 @@ defmodule Web.BlobTest do
 
         assert Blob.new([], type: type).type == expected
         assert Blob.slice(Blob.new(["a"]), 0, 1, type).type == expected
-        assert Web.File.new([], type: type).type == expected
+        assert Web.File.new([], "a", type: type).type == expected
       end
     end
 
@@ -234,7 +234,7 @@ defmodule Web.BlobTest do
     end
 
     test "a file is a blob: its bytes, its slices, and its streams" do
-      file = Web.File.new(["héllo"], filename: "a.txt", type: "text/plain")
+      file = Web.File.new(["héllo"], "a.txt", type: "text/plain")
       blob = Blob.new([file, "!"])
 
       assert Blob.to_binary(blob) == "héllo!"
@@ -246,7 +246,7 @@ defmodule Web.BlobTest do
 
     test "a file from a stream gives the bytes of the stream" do
       stream = Web.ReadableStream.from(["ab", "c"])
-      file = Web.File.new([], filename: "s.bin", stream: stream, size: nil)
+      file = %{Web.File.new([], "s.bin") | stream: stream, size: nil}
 
       assert {:ok, "abc"} = Blob.text(file)
     end
@@ -287,18 +287,53 @@ defmodule Web.BlobTest do
   end
 
   describe "File" do
-    test "new/2 has the time of the last change: the option, or the time now" do
+    property "new/3 has the bits, the name, and the options of FilePropertyBag" do
+      check all(
+              parts <- list_of(binary(max_length: 6), max_length: 4),
+              name <- string(:printable, max_length: 12),
+              last_modified <- integer()
+            ) do
+        file = Web.File.new(parts, name, type: "Text/Plain", last_modified: last_modified)
+
+        assert file.name == name
+        assert file.type == "text/plain"
+        assert file.last_modified == last_modified
+        assert file.size == IO.iodata_length(parts)
+        assert Blob.to_binary(file) == IO.iodata_to_binary(parts)
+      end
+    end
+
+    test "new/3 has the time of the last change: the option, or the time now" do
       before = System.os_time(:millisecond)
-      file = Web.File.new(["a"])
+      file = Web.File.new(["a"], "a.txt")
 
       assert file.last_modified >= before
       assert file.last_modified <= System.os_time(:millisecond)
-      assert Web.File.new([], last_modified: -5).last_modified == -5
+      assert Web.File.new([], "a.txt", last_modified: -5).last_modified == -5
+      assert {file.name, file.type} == {"a.txt", ""}
+    end
+
+    property "new/3 takes the name of the file as a string, not in the options" do
+      # The old form `new(parts, filename: name)` has a keyword list there.
+      not_a_string =
+        one_of([
+          keyword_of(string(:printable)),
+          constant(nil),
+          atom(:alphanumeric),
+          integer(),
+          list_of(integer(0..255))
+        ])
+
+      check all(name <- not_a_string) do
+        assert_raise FunctionClauseError, fn -> Web.File.new(["a"], name) end
+      end
+
+      refute Map.has_key?(Web.File.new(["a"], "a.txt"), :filename)
     end
 
     test "FormData makes a new File for a blob, and for a file with a new name" do
       blob = Blob.new(["a"], type: "text/plain")
-      file = Web.File.new(["b"], filename: "b.txt", last_modified: 123)
+      file = Web.File.new(["b"], "b.txt", last_modified: 123)
 
       form =
         Web.FormData.new()
@@ -307,14 +342,15 @@ defmodule Web.BlobTest do
         |> Web.FormData.append("file", file)
         |> Web.FormData.append("renamed", file, "c.txt")
 
-      assert %Web.File{filename: "blob", type: "text/plain", size: 1} =
+      assert %Web.File{name: "blob", type: "text/plain", size: 1} =
                Web.FormData.get(form, "blob")
 
-      assert %Web.File{filename: "named.txt"} = Web.FormData.get(form, "named")
+      assert %Web.File{name: "named.txt"} = Web.FormData.get(form, "named")
       assert Web.FormData.get(form, "file") == file
 
       renamed = Web.FormData.get(form, "renamed")
-      assert %Web.File{filename: "c.txt", last_modified: 123} = renamed
+      assert %Web.File{name: "c.txt", last_modified: 123} = renamed
+      assert Blob.to_binary(renamed) == "b"
       refute renamed.id == file.id
     end
   end

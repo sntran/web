@@ -149,6 +149,43 @@ in a transform stream that the script makes.
 | `Web.CompressionStream` | 92.3 ms |
 | `:zlib` in a transform stream | 97.6 ms |
 
+## Brotli
+
+The decoder of brotli is in Elixir (`Web.Internal.Brotli.Decoder`). The
+table gives the output in MB each second, for input in chunks of 16 KiB
+and pieces of 64 KiB at most. The old decoder and the new decoder ran in
+turns in the same VM, and the values are the medians of 7 rounds of CPU
+time. The reference encoder of node made the inputs.
+
+| Input | Before | Now | C decoder of node |
+| --- | --- | --- | --- |
+| Text, 3.28 MB, quality 5 | 8.7 | 29.9 | approximately 207 |
+| Text, quality 11 | 10.4 | 42.4 | approximately 193 |
+| Map data, 1.14 MB, quality 11 | 29.6 | 79.8 | approximately 357 |
+| Map data, quality 5 | 45.7 | 107.2 | approximately 509 |
+| Output of the encoder of the library (text) | 7.2 | 32.8 | approximately 146 |
+
+The decoder keeps the state of a meta-block in the arguments of its loop,
+and writes its state map only when the loop stops. Each entry of a prefix
+code table gives the value of its symbol in one lookup. A copy of 11 bytes
+costs approximately 49 ns on the BEAM, and a literal 18 ns: most of the
+cost that stays is the cost of the instructions and the allocations of the
+BEAM.
+
+The decoders of the library on the same text, in chunks of 16 KiB (wall
+time, median of 5):
+
+| Coding | Output, MB each second | Compressed input, MB each second |
+| --- | --- | --- |
+| gzip, level 6 | 216 | 60 |
+| zstd, level 3 and 19 | 722 and 755 | 203 and 171 |
+| br, quality 5 and 11, decoder in Elixir | 28 and 36 | 7.0 and 8.0 |
+| br, quality 5 and 11, C decoder (`brotli: :native`) | 222 and 216 | 56 and 48 |
+
+On one core, the decoder in Elixir takes less than a link of 100 Mbit/s
+gives. An application that needs more selects `config :web, brotli:
+:native` or `:not_requested`: see `README.md`.
+
 ## Garbage collection of a stream process
 
 ```shell

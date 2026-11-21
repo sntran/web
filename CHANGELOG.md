@@ -89,9 +89,16 @@ All notable changes to this project are documented in this file.
   `Web.Internal.Brotli`, with the static dictionary of the RFC in
   `lib/web/internal/brotli/dictionary.txt`. The decoder takes chunks of
   each size, and gives pieces of 64 KiB at most as the reader takes them.
-  It decodes text at 15–37 MB each second. The encoder uses LZ77 with one
-  hash candidate, and gives a ratio near the quality 1 of the reference
-  encoder.
+  It decodes 30 to 42 MB of text each second, and 80 to 107 MB of map
+  data, approximately 5 to 7 times slower than the C decoder. The encoder
+  uses LZ77 with one hash candidate, and gives a ratio near the quality 1 of
+  the reference encoder.
+- The setting `config :web, brotli: :elixir | :native | :not_requested`
+  selects the decoder of `br` and of the format `"brotli"`. `:native` uses
+  the C decoder of the Hex package `brotli`, which the application adds:
+  the library does not depend on it. `:not_requested` removes `br` from the
+  default `accept-encoding` of a request. A value that is not valid, and
+  `:native` with no package, raise `ArgumentError`.
 - `tla/TransformStream.tla`: the backpressure of the two sides of a
   transform stream, and one call of the finish of the transformer.
 - `Web.fetch/2` decodes a response body with the header
@@ -481,13 +488,24 @@ All notable changes to this project are documented in this file.
   InitializeTransformStream specifies: the writable side can be "erroring"
   while the readable side is readable. A cancel, an abort, and a close call
   the transformer one time, and the others get its result. An abort during
-  a transform waits for that transform. A pipe through a transform stream
-  is approximately 15 % slower with chunks of 64 KiB, and takes 38–39 µs
-  for each small chunk, where it took 31–34 µs. See `BENCHMARKS.md`.
+  a transform waits for that transform. The two sides share
+  [[backpressure]] in one `:atomics` cell, and a transform stream with no
+  function `transform` runs no worker. A pipe through a transform stream
+  takes 27.5 µs for each small chunk, where it took 41.3 µs, and gives
+  approximately 2100 MiB of chunks of 64 KiB each second, where it gave
+  1400. See `BENCHMARKS.md`.
 - A `Web.WritableStreamDefaultWriter` has its own lock, as a reader has. A
   writer that released its lock gets `Web.TypeError` for each operation.
   `ready` and `closed` give the same promise until the Standard replaces
   it. A size function that raises errors the stream, and the write rejects.
+- The readable side of `Web.CompressionStream` and of
+  `Web.DecompressionStream` has the high water mark 0, as the Compression
+  Standard specifies: a transform starts only when a reader asks for a
+  chunk, thus a write fulfils only after a read. Await a write after you
+  start a read, or use a pipe. A compression stream enqueues all the output
+  of a chunk at once. A decompression stream keeps its limit of 64 KiB for
+  each piece: a write whose output is larger completes when the reads took
+  its pieces.
 - A decompression stream gives the output of a chunk before the
   `Web.TypeError` for data after the end, for each format.
 - `README.md` does not say that the library has 100 % WPT compliance for

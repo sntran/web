@@ -278,8 +278,27 @@ as the Fetch Standard specifies: `gzip`, `x-gzip`, `deflate`, `br`, and
 `zstd`. The body is decoded chunk by chunk, and the headers of the response
 do not change. A request with no header `accept-encoding` sends the codings
 that the library can decode. A body with a coding that the library does
-not know is not changed. The decoder of brotli is in Elixir: it is
-approximately 15 to 25 times slower than the C decoder of brotli.
+not know is not changed.
+
+The default decoder of brotli is in Elixir. It is approximately 5 to 7
+times slower than the C decoder of brotli: on one core it gives 30 to 45 MB
+of text each second, thus it takes approximately 8 MB (60 Mbit) of
+compressed data each second. The decoders of gzip and zstd come from
+Erlang/OTP: they take 60 MB and 170 to 200 MB of compressed text each
+second. The setting `:brotli` selects the decoder of `br`, and of the
+format `"brotli"` of `DecompressionStream`:
+
+| Setting | Effect |
+| ------- | ------ |
+| `config :web, brotli: :elixir` | The decoder in Elixir. A request accepts `br`. This is the default. |
+| `config :web, brotli: :native` | The C decoder of the Hex package `brotli`. Add `{:brotli, "~> 0.3"}` to the dependencies of the application: the library does not depend on it. A request accepts `br`. |
+| `config :web, brotli: :not_requested` | A request does not accept `br`: the header is `gzip, deflate, zstd`. A server that sends `br` all the same gets the decoder in Elixir. |
+
+One call of the C decoder gives the output of its window at most (16 MiB),
+and the library gives this output in pieces of 64 KiB. A setting that is
+not valid, and `:native` when the application does not have the package
+`brotli`, raise `ArgumentError`: `fetch` then rejects with a
+`Web.TypeError`, and the field `cause` has the error.
 
 ```elixir
 # Create a stream from any enumerable
@@ -300,6 +319,10 @@ upper =
 ```
 
 Standard-compliant gzip/deflate and text encoding that works across streamed chunk boundaries.
+The readable side of a compression stream has the high water mark 0, as
+the Compression Standard specifies: a write waits until a reader asks for a
+chunk. Thus read and write at the same time, for example with a pipe, and do
+not await a write before the read.
 `TextDecoder` and `TextDecoderStream` decode UTF-8, UTF-16LE, UTF-16BE, and
 the single-byte encodings of the Encoding Standard, such as windows-1252
 (the label `latin1`), windows-1251, and KOI8-R.
@@ -682,7 +705,7 @@ systems, and examine its SHA-256 hash.
 | `URL` and `URLSearchParams` | 4869 | 4867 | 2 | 0 | 0 | 0 |
 | `URLPattern` | 373 | 373 | 0 | 0 | 0 | 0 |
 | The streams, the readers, the writers, and the strategies | 1157 | 1025 | 108 | 9 | 0 | 15 |
-| `CompressionStream` and `DecompressionStream` | 318 | 305 | 1 | 4 | 0 | 8 |
+| `CompressionStream` and `DecompressionStream` | 318 | 309 | 1 | 0 | 0 | 8 |
 | `Request`, `Response`, and the body | 697 | 521 | 119 | 5 | 2 | 50 |
 | `Blob`, `File`, and `FormData` | 527 | 402 | 51 | 3 | 0 | 71 |
 | `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 71 | 5 | 0 | 0 | 0 |
@@ -719,8 +742,6 @@ can change from run to run. The differences of the library are:
   steps, and can call `abort()` or `close()` again (4 tests).
 * A body accepts a binary of Elixir as a chunk of bytes. The Standard
   accepts only a `Uint8Array` (5 tests).
-* The readable side of a compression stream has the high water mark 1. The
-  Standard gives 0, thus a transform waits for a read (4 tests).
 * A `Request` does not keep the blob of a blob URL: a revoke before the
   fetch makes the fetch fail (2 tests).
 * A view of a byte stream is a `Web.Uint8Array`: the library has no other

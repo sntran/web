@@ -189,6 +189,8 @@ defmodule Web.Test.QuickJS.Bridge do
   `{status, message}`.
   """
   def run!(path) do
+    :ok = __load_code__()
+
     # A process of its own for each run: no message of a run, such as the
     # answer of a stopped process, comes to the next run.
     {pid, monitor} = spawn_monitor(fn -> exit({:result, run(path)}) end)
@@ -523,6 +525,23 @@ defmodule Web.Test.QuickJS.Bridge do
     Process.group_leader(pid, get(:group))
     send(pid, :go)
     pid
+  end
+
+  @doc false
+  # A process of the run that calls a module that is not loaded waits for
+  # the code server, which is not a process of the run. The rest check
+  # cannot see this work: `process_info/2` of `:current_function` is a
+  # signal that the process handles, thus it changes the reductions of the
+  # process, and the run never comes to rest. On a busy machine, a load can
+  # take more than the 250 ms of the watchdog of the runner, and a test then
+  # times out. Thus each run loads the code of the library and of its
+  # applications first. A module that is loaded costs one lookup.
+  def __load_code__ do
+    for app <- [:web | Application.spec(:web, :applications)],
+        module <- Application.spec(app, :modules) || [],
+        do: Code.ensure_loaded(module)
+
+    :ok
   end
 
   defp members(group) do

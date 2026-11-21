@@ -284,6 +284,31 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
       finish(tl(tl(busy)), tl(rest))
     end
 
+    test "gives back a connection that came after the abort of the request that waited",
+         context do
+      {busy, [first | rest]} = fill(context)
+      pool = pool(context)
+      controller = AbortController.new()
+      waiting = fetch(context.base <> "/", signal: controller.signal)
+      eventually(fn -> waiting(pool) == 1 end)
+
+      # The abort comes first, then the connection that the pool gives to
+      # the request: the request gives the connection back.
+      :erlang.suspend_process(waiting.pid)
+      AbortController.abort(controller, :stop)
+      send(first, :release)
+
+      eventually(fn ->
+        {:messages, messages} = Process.info(waiting.pid, :messages)
+        Enum.any?(messages, &match?({_slot, {:conn, _conn}}, &1))
+      end)
+
+      :erlang.resume_process(waiting.pid)
+      assert catch_exit(await(waiting)) == :stop
+      eventually(fn -> length(idle(pool)) == 1 end)
+      finish(tl(busy), rest)
+    end
+
     test "stops the connect of an aborted request, and gets back its slot" do
       # The server accepts the connection, and does not answer: the TLS
       # connect waits.

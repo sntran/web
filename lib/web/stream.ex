@@ -235,8 +235,9 @@ defmodule Web.Stream do
   #         `{:pull, stream}` of a source that is a process;
   #       - `{:process, pid}`: the engine sends
   #         `{:web_stream_pull, ref, stream}` to `pid` and monitors it. The
-  #         pull is complete when `pid` sends `{ref, :pulled}`. A cancel does
-  #         not stop `pid`: the cancel callback must stop it.
+  #         pull is complete when `pid` sends `{ref, :pulled}` with
+  #         `__send_info__/2`. A cancel does not stop `pid`: the cancel
+  #         callback must stop it.
   #   * `:watch_source` — `{pid, error_fun}`: a stop of `pid` before the end
   #     of the stream puts the stream in the errored state.
   #   * `:registry_key` — the stream registers itself with this key: see
@@ -440,11 +441,36 @@ defmodule Web.Stream do
   # Erlang/OTP keeps the sequence of the signals of one sender: the fence
   # comes before the priority message. Thus the fence is in the mailbox when
   # the stream gets the priority message, also when the sender stopped after
-  # it. The usual messages of this module tell their sender: a cast has the
-  # form `{:"$web_sent", sender, message}`, and a call of `promise_call/4`
-  # has the sender in its tag. A message that does not tell its sender, for
-  # example a message of a different module, can come after the priority
-  # message.
+  # it.
+  #
+  # Each message that can wait in the mailbox before a priority message of
+  # the same sender tells its sender:
+  #
+  #   * A call names its sender in its `from`: the tag
+  #     `{:"$web_sent", sender, ref}` of `promise_call/4`, which gets the
+  #     reply in a different process, or else the pid. The pipe, the tees,
+  #     and the parser of `Web.FormData` send calls with no wait, with their
+  #     own pid.
+  #   * A cast has the form `{:"$web_sent", sender, message}`: see
+  #     `control_cast/2` and `__usual_cast__/2`.
+  #   * An info message of a process that is not a stream has the form
+  #     `{:"$web_sent", sender, message}`: see `__send_info__/2`. For example,
+  #     a source that is a process tells the end of a pull, and it can then
+  #     put the stream in the errored state.
+  #
+  # The other messages have no sender, and the stream handles them after the
+  # priority message. No such message can wait in the mailbox before a
+  # priority message of its sender:
+  #
+  #   * The result of a callback comes from the worker when the callback
+  #     returned. A priority message of the callback comes before it, and the
+  #     next callback starts after the stream handled it.
+  #   * A `:DOWN` message comes after each message of the process that
+  #     stopped, and that process sends nothing after it.
+  #   * The timers and the abort of an ambient signal: the stream and the
+  #     process of a signal send no priority message to a stream.
+  #   * The messages between the two sides of a transform stream: see "The
+  #     two sides of a transform stream".
   #
   # A priority message needs a priority alias of the stream process. The
   # stream keeps its alias in its process dictionary, where a sender reads
@@ -548,9 +574,26 @@ defmodule Web.Stream do
   defp fenced({:"$gen_cast", message}, fence),
     do: {:"$gen_cast", {@fenced, self(), fence, message}}
 
+  @doc false
+  # Sends a usual cast that tells its sender: see "Priority messages". It is
+  # never a priority message, also for a message that `control_cast/2` sends
+  # with priority.
+  def __usual_cast__(pid, message) when is_pid(pid) do
+    send(pid, with_sender(pid, {:"$gen_cast", message}))
+    :ok
+  end
+
+  @doc false
+  # Sends an info message that tells its sender, from a process that is not
+  # a stream: see "Priority messages".
+  def __send_info__(pid, message) when is_pid(pid) do
+    send(pid, {@sent, self(), message})
+    :ok
+  end
+
   # The messages that keep the sequence of one sender, for each state
   # function `fun`: see "Priority messages".
-  defp in_sequence(:cast, {@sent, _sender, message}, data, fun), do: fun.(:cast, message, data)
+  defp in_sequence(type, {@sent, _sender, message}, data, fun), do: fun.(type, message, data)
 
   # The stream handled the fence before the priority message came: it
   # handled the usual messages of the sender before the fence.
@@ -575,8 +618,16 @@ defmodule Web.Stream do
       {:"$gen_call", {_replier, {@sent, ^sender, _ref}} = from, message} ->
         sender_events(sender, fence, [{:next_event, {:call, from}, message} | events])
 
+      # A call with no such tag names its sender with the pid of `from`.
+      {:"$gen_call", {^sender, tag} = from, message}
+      when not is_tuple(tag) or elem(tag, 0) != @sent ->
+        sender_events(sender, fence, [{:next_event, {:call, from}, message} | events])
+
       {:"$gen_cast", {@sent, ^sender, message}} ->
         sender_events(sender, fence, [{:next_event, :cast, message} | events])
+
+      {@sent, ^sender, message} ->
+        sender_events(sender, fence, [{:next_event, :info, message} | events])
     end
   end
 

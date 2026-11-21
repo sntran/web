@@ -678,6 +678,10 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(SpecModel.check("PriorityMessages", bug("usual_abort")), "AbortPasses")
     end
 
+    test "a usual message that does not tell its sender is found" do
+      assert_violates(SpecModel.check("PriorityMessages", bug("no_sender")), "SenderOrder")
+    end
+
     test "a stream that handles each message up to the fence first is found" do
       assert_violates(SpecModel.check("PriorityMessages", bug("take_all")), "AbortPasses")
     end

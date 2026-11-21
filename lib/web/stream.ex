@@ -1109,6 +1109,12 @@ defmodule Web.Stream do
     {:keep_state_and_data, [{:reply, from, data.disturbed}]}
   end
 
+  # ReadableStreamPipeTo sets [[disturbed]] of the source before its first
+  # read: see `Web.ReadableStream.pipe_to/3`.
+  defp handle_common({:call, from}, :disturb, _state, data) do
+    {:keep_state, %{data | disturbed: true}, [{:reply, from, :ok}]}
+  end
+
   # The signal of the controller of a writable stream, as the attribute
   # `signal` of the Streams Standard. The stream makes it for the first
   # request, thus a stream that does not use it has no process for it.
@@ -1246,13 +1252,13 @@ defmodule Web.Stream do
     end
   end
 
-  # ReadableStreamCancel: the cancel of an errored stream rejects with the
-  # error of the stream. The errored state of a transform stream can come
-  # from its writable side, before the readable side is errored: such a
-  # cancel has no effect.
+  # ReadableStreamCancel: the cancel sets [[disturbed]], and the cancel of
+  # an errored stream rejects with the error of the stream. The errored
+  # state of a transform stream can come from its writable side, before the
+  # readable side is errored: such a cancel has no effect.
   defp handle_common({:call, from}, {:terminate, :cancel, _reason}, :errored, data)
        when data.type == :producer do
-    {:keep_state_and_data, [{:reply, from, {:error, data.error_reason}}]}
+    {:keep_state, %{data | disturbed: true}, [{:reply, from, {:error, data.error_reason}}]}
   end
 
   defp handle_common({:call, from}, {:terminate, type, reason}, state, data)
@@ -1438,7 +1444,9 @@ defmodule Web.Stream do
   end
 
   # The source process stopped. Before the end of the stream, the chunks
-  # are not complete: the stream goes to the errored state.
+  # are not complete: the stream goes to the errored state. A byte stream
+  # with a close request has all its chunks: it closes when a read takes
+  # the last bytes of its queue.
   defp handle_common(
          :info,
          {:DOWN, ref, :process, _pid, reason},
@@ -1447,7 +1455,7 @@ defmodule Web.Stream do
        ) do
     data = %{data | source_watch: nil}
 
-    if state == :readable do
+    if state == :readable and not match?(%{bytes: %{close_requested: true}}, data) do
       fail_stream(error_fun.(reason), data)
     else
       {:keep_state, data}

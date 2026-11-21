@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Check that the body of a new request can be duplicated from an existing Request object": "library: no Web.Request.cache/1"
-  }
-}

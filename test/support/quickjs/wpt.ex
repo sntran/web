@@ -135,6 +135,7 @@ defmodule Web.Test.QuickJS.WPT do
   @no_view_type "scope: the library has only Uint8Array views"
   @no_guard "scope: a server runtime has no guard for forbidden headers"
   @no_microtask "runner: the library reacts before the microtasks of JavaScript"
+  @empty_form "standard: RFC 7578 and each browser give the close delimiter for an empty form"
 
   # The rules, in their sequence: the first rule that gives a group wins.
   defp causes do
@@ -263,6 +264,43 @@ defmodule Web.Test.QuickJS.WPT do
       {:test, "fetch/api/request/request-headers.any.js",
        ~r/^(Adding invalid (no-cors )?request header|Check that (no-cors )?request constructor is filtering)/,
        @no_guard},
+      # The rules of the files of `Request`, `Response`, and the body.
+      #
+      # A binary of Elixir is bytes. A JavaScript string that a stream gives
+      # comes to the library as a binary, and a body takes a binary as a
+      # chunk of bytes: Elixir code makes streams of binaries. The Fetch
+      # Standard requires a `Uint8Array`.
+      {:test, "fetch/api/response/response-stream-bad-chunk.any.js",
+       ~r/^ReadableStream with non-Uint8Array chunk/,
+       "library: a binary chunk of a body is bytes"},
+      # Each browser encodes a form with no entries as the close delimiter
+      # of RFC 7578, and fails these tests (wpt.fyi). The library does the
+      # same: `formData()` of that body gives a form, as in
+      # `fetch/api/body/formdata.any.js`.
+      {:test, "fetch/api/response/response-consume-empty.any.js",
+       "Consume empty FormData response body as text", @empty_form},
+      {:test, "fetch/api/request/request-consume-empty.any.js",
+       "Consume empty FormData request body as text", @empty_form},
+      # The JSON `null` is `nil` in the library, and the bridge gives `nil`
+      # to JavaScript as `undefined`.
+      {:test, "fetch/api/request/request-consume.any.js", "Consume JSON from text: '\"null\"'",
+       "runner: the JSON null is nil, which is undefined in JavaScript"},
+      # WPT has no file `hello.txt`: the server of WPT gives a response with
+      # the status 404, and the `fetch` of the runner rejects.
+      {:text, ["hello.txt gave the status 404"], "runner: no server of WPT"},
+      # The `fetch` of the runner makes its response with the `Response`
+      # constructor. A response of `Web.fetch/2` has immutable headers.
+      {:test, "fetch/api/response/response-headers-guard.any.js",
+       "Ensure response headers are immutable",
+       "runner: the fetch of the runner makes a response with the constructor"},
+      # The library gives each branch of the clone its own chunk. A buffer of
+      # JavaScript that comes back from the library is a new object: thus
+      # the first branch cannot give the same object.
+      {:test, "fetch/api/response/response-clone.any.js",
+       "Check response clone use structureClone for teed ReadableStreams (Uint8Arraychunk)",
+       "runner: a buffer of JavaScript comes back as a new object"},
+      {:test, "fetch/api/response/response-clone.any.js",
+       ~r/^Check response clone use structureClone for teed ReadableStreams/, @no_view_type},
       # The BEAM has no shared memory: a chunk from a `SharedArrayBuffer` is
       # a usual buffer in the library.
       {:test, "compression/compression-bad-chunks.any.js", ~r/shared|SharedArrayBuffer/,

@@ -74,9 +74,8 @@ defmodule Web.BodyTest do
   end
 
   test "clone of locked stream raises TypeError" do
-    stream = ReadableStream.from("hello")
-    _reader = ReadableStream.get_reader(stream)
-    response = Response.new(body: stream)
+    response = Response.new(body: ReadableStream.from("hello"))
+    _reader = ReadableStream.get_reader(response.body)
 
     assert_raise Web.TypeError, "ReadableStream is already locked", fn ->
       Response.clone(response)
@@ -105,10 +104,8 @@ defmodule Web.BodyTest do
   end
 
   test "Response.text/1 rejects when stream is already locked" do
-    # read_body_to_binary already_locked branch (source line 177)
-    stream = ReadableStream.from("hello")
-    _reader = ReadableStream.get_reader(stream)
-    response = Response.new(body: stream)
+    response = Response.new(body: ReadableStream.from("hello"))
+    _reader = ReadableStream.get_reader(response.body)
 
     assert %Web.TypeError{} = catch_exit(await(Response.text(response)))
   end
@@ -154,9 +151,8 @@ defmodule Web.BodyTest do
   end
 
   test "Response.array_buffer/1 rejects when body stream is already locked" do
-    stream = ReadableStream.from("hello")
-    _reader = ReadableStream.get_reader(stream)
-    response = Response.new(body: stream)
+    response = Response.new(body: ReadableStream.from("hello"))
+    _reader = ReadableStream.get_reader(response.body)
 
     assert %Web.TypeError{message: "ReadableStream is already locked"} =
              catch_exit(await(Response.array_buffer(response)))

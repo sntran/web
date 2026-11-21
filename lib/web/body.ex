@@ -19,8 +19,19 @@ defmodule Web.Body do
   - plain string/binary bodies default to `text/plain;charset=UTF-8`
   - `%Web.Blob{}` uses the blob's non-empty `type`
 
-  The injected functions respect the stream's `[[disturbed]]` slot. Once a body has
-  been consumed, subsequent calls reject with `Web.TypeError.exception("body already used")`.
+  - `text_stream/1` gives the body as a stream of text.
+
+  The injected functions follow the step "consume body" of the Fetch
+  Standard. A body function takes the reader of the body before it returns,
+  and the reader keeps its lock: after `text/1`, the body stream is
+  disturbed and locked, and `Web.ReadableStream.get_reader/1` raises
+  `Web.TypeError`. A second body function rejects with
+  `Web.TypeError.exception("body already used")`.
+
+  A chunk of a body stream must be bytes: a `Web.Uint8Array`, as the Fetch
+  Standard specifies, or a binary, iodata, or a `Web.ArrayBuffer`. A binary
+  is the usual form of bytes in Elixir. Each other chunk rejects with
+  `Web.TypeError`.
 
   ## Examples
 
@@ -48,10 +59,12 @@ defmodule Web.Body do
       "hello"
   """
 
+  alias Web.ArrayBuffer
   alias Web.FormData.Encoder
   alias Web.Internal.Bytes
   alias Web.Internal.JSON, as: JSONText
   alias Web.Internal.LazyStream
+  alias Web.Uint8Array
 
   @callback text(struct()) :: Web.Promise.t()
   @callback json(struct()) :: Web.Promise.t()
@@ -59,6 +72,7 @@ defmodule Web.Body do
   @callback array_buffer(struct()) :: Web.Promise.t()
   @callback bytes(struct()) :: Web.Promise.t()
   @callback blob(struct()) :: Web.Promise.t()
+  @callback text_stream(struct()) :: Web.ReadableStream.t()
   @callback clone(struct()) :: {struct(), struct()}
   defmacro __using__(_opts) do
     quote do
@@ -119,10 +133,26 @@ defmodule Web.Body do
       end
 
       @doc """
+      Returns the body as a stream of text, as `textStream()` of the Fetch
+      Standard: the body piped through a `Web.TextDecoderStream` for UTF-8.
+      Each chunk is a string. The `content-type` header has no effect.
+
+      The body is disturbed and locked when the function returns. A struct
+      with no body gives a new stream with no chunks. Raises
+      `Web.TypeError` if the body is already disturbed or locked.
+      """
+      @impl Web.Body
+      def text_stream(%{body: _} = struct) do
+        Web.Body.text_stream(struct)
+      end
+
+      @doc """
       Clones the struct body by teeing the underlying readable stream.
 
       Returns `{updated_original, clone}` where both have independent streams.
-      Raises `Web.TypeError` if the body is already disturbed or locked.
+      The clone gets a structured clone of each chunk of a stream, as the
+      Fetch Standard specifies. Raises `Web.TypeError` if the body is
+      already disturbed or locked.
       """
       @impl Web.Body
       def clone(%{body: _} = struct) do
@@ -142,21 +172,33 @@ defmodule Web.Body do
 
   @doc false
   # Makes the body stream of a request or a response from the body that the
-  # caller gave. The chunks of the stream are `Web.Uint8Array` values, as
-  # the Fetch Standard specifies. A stream from the caller stays as it is.
+  # caller gave: the step "extract a body" of the Fetch Standard. The chunks
+  # of the stream are `Web.Uint8Array` values. A stream from the caller
+  # stays as it is. Each other body is a byte stream, thus a BYOB reader can
+  # read it.
   @spec stream(term()) :: Web.ReadableStream.t()
   def stream(%Web.ReadableStream{} = stream), do: stream
   def stream(body) when is_binary(body), do: Web.ReadableStream.__bytes__(body)
 
-  def stream(%struct{} = body)
-      when struct in [Web.Blob, Web.ArrayBuffer, Web.Uint8Array, Web.URLSearchParams] do
-    Web.ReadableStream.from(body)
-  end
+  # A copy of the bytes of a buffer source, as the Fetch Standard specifies.
+  def stream(%Web.ArrayBuffer{} = buffer), do: buffer |> ArrayBuffer.data() |> stream()
+  def stream(%Web.Uint8Array{} = view), do: view |> Uint8Array.to_binary() |> stream()
+  def stream(%Web.Blob{} = blob), do: blob |> Web.Blob.to_binary() |> stream()
+
+  def stream(%Web.URLSearchParams{} = params),
+    do: params |> Web.URLSearchParams.to_string() |> stream()
 
   # A form is encoded as `multipart/form-data`, as the Fetch Standard
   # specifies. The header `content-type` has the boundary of the form: see
-  # `put_inferred_content_type/2`.
-  def stream(%Web.FormData{} = form), do: form |> Encoder.encode() |> stream()
+  # `put_inferred_content_type/2`. A form with all its data in memory gives
+  # its bytes. A form with a file stream reads the file when a process
+  # reads the body. A form with no entries gives the close delimiter, as
+  # RFC 7578 and the browsers do.
+  def stream(%Web.FormData{} = form) do
+    if Web.FormData.static?(form),
+      do: form |> Encoder.encode() |> Enum.join() |> stream(),
+      else: form |> Encoder.encode() |> stream()
+  end
 
   # Each binary that an enumerable gives becomes a `Web.Uint8Array`.
   def stream(body) do
@@ -168,24 +210,42 @@ defmodule Web.Body do
   end
 
   @doc false
-  def text(%{body: body}) do
-    case take_now(body) do
-      {:ok, binary} ->
-        Web.Promise.resolve(Web.TextDecoder.decode_utf8(binary))
+  # The step "extract a body" of the Fetch Standard for the constructors: a
+  # `ReadableStream` that a process read from, or that has a reader, throws
+  # a `TypeError`.
+  @spec extract!(term()) :: Web.ReadableStream.t()
+  def extract!(%Web.ReadableStream{} = body) do
+    if Web.ReadableStream.disturbed?(body) or Web.ReadableStream.locked?(body) do
+      raise Web.TypeError, "The body stream is already used or locked"
+    end
 
-      {:error, reason} ->
-        Web.Promise.reject(reason)
+    body
+  end
 
-      :later ->
-        Web.Promise.new(fn resolve, reject ->
-          ensure_usable_stream!(body)
-          settle_with(read_body_to_text(body), resolve, reject)
-        end)
+  def extract!(body), do: stream(body)
+
+  @doc false
+  # The step "create a proxy" of the Streams Standard, for the body of a
+  # request that a new request takes: the new body has the chunks of the
+  # stream, and the stream is disturbed and locked. A stream with its bytes
+  # in memory gives a new stream of the same bytes, with no process. Each
+  # other stream is piped through an identity transform stream.
+  @spec __proxy__(Web.ReadableStream.t()) :: Web.ReadableStream.t()
+  def __proxy__(%Web.ReadableStream{controller_pid: nil, lazy: lazy} = stream) do
+    case LazyStream.proxy(lazy) do
+      {:ok, proxy} -> %Web.ReadableStream{lazy: proxy}
+      {:process, pid} -> __proxy__(%Web.ReadableStream{controller_pid: pid})
+      :locked -> raise Web.TypeError, "ReadableStream is already locked"
+      _readable_used_or_held -> stream |> Web.ReadableStream.__with_process__() |> __proxy__()
     end
   end
 
-  defp settle_with({:ok, value}, resolve, _reject), do: resolve.(value)
-  defp settle_with({:error, reason}, _resolve, reject), do: reject.(reason)
+  def __proxy__(%Web.ReadableStream{} = stream) do
+    Web.ReadableStream.pipe_through(stream, Web.TransformStream.new())
+  end
+
+  @doc false
+  def text(%{body: body}), do: consume_body(body, &Web.TextDecoder.decode_utf8/1)
 
   @doc false
   # The algorithm "parse JSON from bytes" of the Fetch Standard: the UTF-8
@@ -211,26 +271,58 @@ defmodule Web.Body do
   end
 
   @doc false
+  # The steps of `formData()`. A body of the type `multipart/form-data`
+  # goes to the parser of `Web.FormData`, which reads the stream. Each
+  # other body is read in full first, as "consume body" of the Fetch
+  # Standard specifies: thus an error of the stream comes before the
+  # `TypeError` of a type that is not a form.
   def form_data(%{body: body} = struct) do
     owner = self()
     explicit_signal = Map.get(struct, :signal)
     struct_snapshot = Map.get(struct, :snapshot)
     # Derive the signal: explicit field takes priority, then creation-time ambient.
     signal = explicit_signal || (struct_snapshot && struct_snapshot.ambient_signal)
+    content_type = content_type(struct)
 
-    Web.Promise.new(fn resolve, reject ->
-      try do
-        ensure_usable!(body)
-        Web.AbortSignal.check!(signal)
+    case form_type(content_type) do
+      :multipart ->
+        Web.Promise.new(fn resolve, reject ->
+          try do
+            ensure_usable!(body)
+            Web.AbortSignal.check!(signal)
 
-        case parse_form_data(body, content_type(struct), signal, struct_snapshot, owner) do
-          {:ok, form_data} -> resolve.(form_data)
-          {:error, reason} -> reject.(reason)
-        end
-      catch
-        :throw, {:abort, reason} -> reject.(reason)
-      end
-    end)
+            case parse_multipart(body, content_type, signal, struct_snapshot, owner) do
+              {:ok, form_data} -> resolve.(form_data)
+              {:error, reason} -> reject.(reason)
+            end
+          catch
+            :throw, {:abort, reason} -> reject.(reason)
+          end
+        end)
+
+      type ->
+        consume(body, fn binary -> parse_form_bytes(type, binary, content_type) end, fn ->
+          Web.AbortSignal.check!(signal)
+        end)
+    end
+  end
+
+  defp form_type(content_type) do
+    lower = String.downcase(content_type)
+
+    cond do
+      String.starts_with?(lower, "multipart/form-data") -> :multipart
+      String.starts_with?(lower, "application/x-www-form-urlencoded") -> :urlencoded
+      true -> :other
+    end
+  end
+
+  defp parse_form_bytes(:urlencoded, binary, _content_type),
+    do: {:ok, parse_urlencoded_form_data(binary)}
+
+  defp parse_form_bytes(:other, _binary, content_type) do
+    {:error,
+     Web.TypeError.exception("Cannot parse form data from content-type #{inspect(content_type)}")}
   end
 
   @doc false
@@ -255,11 +347,24 @@ defmodule Web.Body do
   end
 
   @doc false
+  # The steps of `textStream()`: the body piped through a `TextDecoderStream`
+  # for UTF-8. The `content-type` of the body has no effect. A struct with
+  # no body gives a new closed stream.
+  def text_stream(%{body: nil}), do: Web.ReadableStream.from(nil)
+
+  def text_stream(%{body: body}) do
+    :ok = ensure_usable!(body)
+    Web.ReadableStream.pipe_through(body, Web.TextDecoderStream.new("utf-8"))
+  end
+
+  @doc false
+  # The steps of `clone()`: a tee of the body, with a structured clone of
+  # each chunk for the second branch.
   def clone(%{body: nil} = struct), do: {struct, struct}
 
   def clone(%{body: body} = struct) do
-    ensure_usable!(body)
-    [branch_a, branch_b] = Web.ReadableStream.tee(body)
+    :ok = ensure_usable!(body)
+    [branch_a, branch_b] = Web.ReadableStream.__tee__(body, true)
     {%{struct | body: branch_a}, %{struct | body: branch_b}}
   end
 
@@ -268,31 +373,6 @@ defmodule Web.Body do
   def body_used?(%{body: nil}), do: false
   def body_used?(%{body: body}), do: Web.ReadableStream.disturbed?(body)
 
-  defp consume_body(body, mapper) do
-    case take_now(body) do
-      {:ok, binary} ->
-        handle_consumed_body(mapper.(binary), &Web.Promise.resolve/1, &Web.Promise.reject/1)
-
-      {:error, reason} ->
-        Web.Promise.reject(reason)
-
-      :later ->
-        Web.Promise.new(fn resolve, reject ->
-          ensure_usable_stream!(body)
-          consume_read(read_body_to_binary(body), mapper, resolve, reject)
-        end)
-    end
-  end
-
-  defp consume_read({:ok, binary}, mapper, resolve, reject),
-    do: handle_consumed_body(mapper.(binary), resolve, reject)
-
-  defp consume_read({:error, reason}, _mapper, _resolve, reject), do: reject.(reason)
-
-  defp handle_consumed_body({:ok, value}, resolve, _reject), do: resolve.(value)
-  defp handle_consumed_body({:error, reason}, _resolve, reject), do: reject.(reason)
-  defp handle_consumed_body(value, resolve, _reject), do: resolve.(value)
-
   # A body of bytes with no process gives its bytes with no wait: the body
   # function runs in the calling process, and its promise is settled. Thus
   # a read of a small body starts no process. A large body goes to the
@@ -300,46 +380,102 @@ defmodule Web.Body do
   # a large heap for some time.
   @now_limit 65_536
 
-  defp take_now(%Web.ReadableStream{controller_pid: nil, lazy: %{source: {kind, binary}} = lazy})
-       when kind in [:bytes, :chunk] and byte_size(binary) <= @now_limit do
+  # The messages for a body that gives no reader.
+  @used_message "body already used"
+  @locked_message "ReadableStream is already locked"
+
+  # The algorithm "consume body" of the Fetch Standard. The function takes
+  # the reader of the body before it returns, and the reader keeps its
+  # lock, as in the Standard: after `text/1`, the body is disturbed and
+  # locked. The function `convert` changes the bytes into the value of the
+  # promise.
+  defp consume_body(body, convert), do: consume(body, convert, fn -> :ok end)
+
+  # `check` runs in the process of the promise before the read, and can
+  # throw `{:abort, reason}`.
+  defp consume(body, convert, check) do
+    case acquire(body) do
+      {:bytes, binary} when byte_size(binary) <= @now_limit ->
+        settle_now(binary, convert, check)
+
+      {:error, reason} ->
+        Web.Promise.reject(reason)
+
+      acquired ->
+        Web.Promise.new(fn resolve, reject ->
+          try do
+            check.()
+
+            case read_acquired(acquired) do
+              {:ok, binary} -> settle_with(convert.(binary), resolve, reject)
+              {:error, reason} -> reject.(reason)
+            end
+          catch
+            :throw, {:abort, reason} -> reject.(reason)
+          end
+        end)
+    end
+  end
+
+  defp settle_now(binary, convert, check) do
+    check.()
+
+    case convert.(binary) do
+      {:ok, value} -> Web.Promise.resolve(value)
+      {:error, reason} -> Web.Promise.reject(reason)
+      value -> Web.Promise.resolve(value)
+    end
+  catch
+    :throw, {:abort, reason} -> Web.Promise.reject(reason)
+  end
+
+  defp settle_with({:ok, value}, resolve, _reject), do: resolve.(value)
+  defp settle_with({:error, reason}, _resolve, reject), do: reject.(reason)
+  defp settle_with(value, resolve, _reject), do: resolve.(value)
+
+  # The steps of "consume body" that run before the function returns: the
+  # check "unusable", and "get a reader". Returns `{:bytes, binary}` for a
+  # body with its bytes in memory, `{:held, lazy}` for a body that a
+  # process holds, `{:reader, pid, owner}` for a stream process, or
+  # `{:error, reason}`.
+  defp acquire(nil), do: {:bytes, ""}
+  defp acquire(body) when is_binary(body), do: {:bytes, body}
+  defp acquire(body) when is_list(body), do: {:bytes, IO.iodata_to_binary(body)}
+
+  defp acquire(%Web.ReadableStream{controller_pid: nil, lazy: lazy}) do
     case LazyStream.take(lazy) do
-      {:ok, binary} -> {:ok, binary}
+      {:ok, binary} -> {:bytes, binary}
       {:error, reason} -> {:error, reason}
-      {:process, _pid} -> :later
-      _used_or_locked -> {:error, Web.TypeError.exception("body already used")}
+      :held -> {:held, lazy}
+      {:process, pid} -> acquire(%Web.ReadableStream{controller_pid: pid})
+      # A tee, a body function, and a proxy disturb the stream and keep its
+      # lock.
+      _locked_or_used -> {:error, Web.TypeError.exception(@used_message)}
     end
   end
 
-  defp take_now(_body), do: :later
+  # The reader belongs to the owner of the promise: the promise and its
+  # work stop when the owner stops, and the stream then frees the lock. The
+  # first read of "read all bytes" disturbs the stream before the function
+  # returns, as in the Standard.
+  defp acquire(%Web.ReadableStream{controller_pid: pid}) do
+    owner = Web.Promise.owner()
 
-  defp read_body_to_binary(nil), do: {:ok, ""}
-  defp read_body_to_binary(body) when is_binary(body), do: {:ok, body}
-  defp read_body_to_binary(body) when is_list(body), do: {:ok, IO.iodata_to_binary(body)}
-
-  # The messages for a stream that gives no reader: the stream has a
-  # reader, or it stopped after the check of `ensure_usable!/1`.
-  @reader_errors %{
-    already_locked: "ReadableStream is already locked",
-    released: "body already used"
-  }
-
-  # A stream with no process gives all its bytes with no process.
-  defp read_body_to_binary(%Web.ReadableStream{controller_pid: nil, lazy: lazy}) do
-    case LazyStream.take(lazy) do
-      {:ok, binary} -> {:ok, binary}
-      {:error, reason} -> {:error, reason}
-      {:process, pid} -> read_body_to_binary(%Web.ReadableStream{controller_pid: pid})
-      :locked -> {:error, Web.TypeError.exception(@reader_errors.already_locked)}
-      :used -> {:error, Web.TypeError.exception(@reader_errors.released)}
+    with false <- Web.ReadableStream.disturbed?(pid),
+         {:ok, _lock} <- Web.Stream.call(pid, {:get_reader, owner}, {:error, :released}) do
+      :ok = Web.Stream.call(pid, :disturb, :ok)
+      {:reader, pid, owner}
+    else
+      {:error, :already_locked} -> {:error, Web.TypeError.exception(@locked_message)}
+      _used_or_released -> {:error, Web.TypeError.exception(@used_message)}
     end
   end
 
-  defp read_body_to_binary(%Web.ReadableStream{controller_pid: pid}) do
-    case Web.ReadableStream.get_reader(pid) do
-      :ok -> read_stream_chunks(pid, [])
-      {:error, reason} -> {:error, Web.TypeError.exception(Map.fetch!(@reader_errors, reason))}
-    end
-  end
+  # The steps of "consume body" in the process of the promise: "read all
+  # bytes".
+  defp read_acquired({:bytes, binary}), do: {:ok, binary}
+  defp read_acquired({:held, lazy}), do: LazyStream.take_held(lazy)
+  defp read_acquired({:reader, pid, owner}), do: read_stream_chunks(pid, owner, [])
 
   # A read from an errored stream rejects with the error of the stream, as
   # the Streams Standard specifies. A stream that stopped in the middle of a
@@ -352,37 +488,27 @@ defmodule Web.Body do
   end
 
   # The body reads the chunks in batches of 64 at most: it reads all of
-  # them, thus the source can work ahead.
-  defp read_stream_chunks(pid, acc) do
-    case Web.ReadableStream.read_batch(pid, self(), 64) do
-      {:chunks, chunks} -> add_chunks(pid, chunks, acc)
-      {:ok, chunk} -> add_chunks(pid, [chunk], acc)
-      :done -> finish_chunks(pid, :done, acc)
-      {:error, _reason} = error -> finish_chunks(pid, error, acc)
+  # them, thus the source can work ahead. The reader keeps its lock at the
+  # end, as in the Fetch Standard.
+  defp read_stream_chunks(pid, owner, acc) do
+    case Web.ReadableStream.read_batch(pid, owner, 64) do
+      {:chunks, chunks} -> add_chunks(pid, owner, chunks, acc)
+      {:ok, chunk} -> add_chunks(pid, owner, [chunk], acc)
+      :done -> {:ok, join_chunks(acc)}
+      {:error, reason} -> {:error, stream_error(reason)}
     end
   end
 
-  defp add_chunks(pid, [], acc), do: read_stream_chunks(pid, acc)
+  defp add_chunks(pid, owner, [], acc), do: read_stream_chunks(pid, owner, acc)
 
-  defp add_chunks(pid, [chunk | chunks], acc) do
+  # The Fetch Standard requires a `Uint8Array` chunk. A binary and iodata
+  # are the forms of bytes of Elixir, and a `Web.ArrayBuffer` is accepted
+  # also: see `Web.Internal.Bytes`. Each other chunk gives a `TypeError`.
+  defp add_chunks(pid, owner, [chunk | chunks], acc) do
     case Bytes.to_binary(chunk) do
-      {:ok, binary} ->
-        add_chunks(pid, chunks, [binary | acc])
-
-      :error ->
-        Web.ReadableStream.release_lock(pid)
-        {:error, chunk_error()}
+      {:ok, binary} -> add_chunks(pid, owner, chunks, [binary | acc])
+      :error -> {:error, chunk_error()}
     end
-  end
-
-  defp finish_chunks(pid, :done, acc) do
-    Web.ReadableStream.release_lock(pid)
-    {:ok, join_chunks(acc)}
-  end
-
-  defp finish_chunks(pid, {:error, reason}, _acc) do
-    Web.ReadableStream.release_lock(pid)
-    {:error, stream_error(reason)}
   end
 
   # The chunks are in the sequence from the last to the first. A body with
@@ -390,14 +516,6 @@ defmodule Web.Body do
   defp join_chunks([]), do: ""
   defp join_chunks([chunk]), do: chunk
   defp join_chunks(chunks), do: chunks |> :lists.reverse() |> IO.iodata_to_binary()
-
-  # The text of a body is the UTF-8 decode of its bytes, with no byte order
-  # mark, as the Fetch Standard specifies.
-  defp read_body_to_text(body) do
-    with {:ok, binary} <- read_body_to_binary(body) do
-      {:ok, Web.TextDecoder.decode_utf8(binary)}
-    end
-  end
 
   defp chunk_error do
     Web.TypeError.exception("Body stream chunk must be binary, Uint8Array, or iodata")
@@ -416,14 +534,14 @@ defmodule Web.Body do
     end
   end
 
-  # A stream with no process gives its own errors at the read: the change
-  # of its state and the check are one operation.
-  defp ensure_usable_stream!(%Web.ReadableStream{controller_pid: nil}), do: :ok
-  defp ensure_usable_stream!(body), do: ensure_usable!(body)
-
+  # "unusable" of the Fetch Standard: the body stream is disturbed or
+  # locked. The multipart parser of `Web.FormData` takes its own reader: it
+  # refuses a stream that is locked.
   defp ensure_usable!(body) do
-    if Web.ReadableStream.disturbed?(body) do
-      raise Web.TypeError, "body already used"
+    cond do
+      Web.ReadableStream.disturbed?(body) -> raise Web.TypeError, @used_message
+      Web.ReadableStream.locked?(body) -> raise Web.TypeError, @locked_message
+      true -> :ok
     end
   end
 
@@ -436,28 +554,14 @@ defmodule Web.Body do
   defp infer_content_type(body) when is_binary(body), do: "text/plain;charset=UTF-8"
   defp infer_content_type(_body), do: nil
 
-  defp parse_form_data(body, content_type, signal, struct_snapshot, owner) do
-    cond do
-      String.starts_with?(String.downcase(content_type), "multipart/form-data") ->
-        with {:ok, boundary} <- multipart_boundary(content_type) do
-          {:ok,
-           Web.FormData.parse(body, boundary,
-             signal: signal,
-             struct_snapshot: struct_snapshot,
-             owner: owner
-           )}
-        end
-
-      String.starts_with?(String.downcase(content_type), "application/x-www-form-urlencoded") ->
-        with {:ok, binary} <- read_body_to_binary(body) do
-          {:ok, parse_urlencoded_form_data(binary)}
-        end
-
-      true ->
-        {:error,
-         Web.TypeError.exception(
-           "Cannot parse form data from content-type #{inspect(content_type)}"
-         )}
+  defp parse_multipart(body, content_type, signal, struct_snapshot, owner) do
+    with {:ok, boundary} <- multipart_boundary(content_type) do
+      {:ok,
+       Web.FormData.parse(body, boundary,
+         signal: signal,
+         struct_snapshot: struct_snapshot,
+         owner: owner
+       )}
     end
   rescue
     e in Web.TypeError -> {:error, e}

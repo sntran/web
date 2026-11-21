@@ -9,6 +9,29 @@ defmodule Web.Headers do
     * A header value has its leading and trailing HTTP whitespace removed.
       A value that contains a NUL, CR, or LF character raises
       `Web.TypeError`.
+
+  ## The guard
+
+  The field `guard` is the headers guard of the Fetch Standard: `"none"` or
+  `"immutable"`. The headers of `Web.Response.error/0`, of
+  `Web.Response.redirect/2`, and of a response of `Web.fetch/2` have the
+  guard `"immutable"`: `append/3`, `set/3`, and `delete/2` raise
+  `Web.TypeError` for them. `new/1` always gives the guard `"none"`, thus
+  `Web.Headers.new(response.headers)` is a copy that you can change.
+
+  A server runtime has no guard for the forbidden header names, as Node.js
+  and Deno. Thus this library does not have the guards `"request"`,
+  `"request-no-cors"`, and `"response"`.
+
+  ## Examples
+
+      iex> headers = Web.Response.error().headers
+      iex> headers.guard
+      "immutable"
+      iex> Web.Headers.append(headers, "x-name", "value")
+      ** (Web.TypeError) The headers are immutable.
+      iex> Web.Headers.new(headers) |> Web.Headers.append("x-name", "value") |> Web.Headers.get("x-name")
+      "value"
   """
 
   @behaviour Access
@@ -17,20 +40,24 @@ defmodule Web.Headers do
 
   @set_cookie "set-cookie"
 
-  defstruct data: %{}
+  defstruct data: %{}, guard: "none"
 
   @type header_name :: String.t()
   @type header_value :: String.t()
   @type t :: %__MODULE__{
-          data: %{header_name() => [header_value()]}
+          data: %{header_name() => [header_value()]},
+          guard: String.t()
         }
 
   @doc """
   Creates a new headers struct from another `%Web.Headers{}`, a map, or a list of tuples.
+
+  The new struct has the guard `"none"`, as the `Headers` constructor of the
+  Fetch Standard specifies: a copy of immutable headers can change.
   """
   @spec new(t() | map() | [{term(), term()}]) :: t()
   def new(headers \\ %{})
-  def new(%__MODULE__{} = headers), do: headers
+  def new(%__MODULE__{} = headers), do: %{headers | guard: "none"}
 
   def new(headers) when is_map(headers) or is_list(headers) do
     Enum.reduce(headers, %__MODULE__{}, fn
@@ -65,6 +92,12 @@ defmodule Web.Headers do
   end
 
   @doc false
+  # The headers with the guard "immutable", for a response of the Fetch
+  # Standard that the code must not change.
+  @spec __immutable__(t()) :: t()
+  def __immutable__(%__MODULE__{} = headers), do: %{headers | guard: "immutable"}
+
+  @doc false
   # `has/2` and `set/3` for a name of this library, which is in lower case.
   @spec __has_lower__(t(), String.t()) :: boolean()
   def __has_lower__(%__MODULE__{data: data}, lower_name), do: Map.has_key?(data, lower_name)
@@ -77,11 +110,14 @@ defmodule Web.Headers do
 
   @doc """
   Appends a value to a header name.
+
+  Raises `Web.TypeError` for headers with the guard `"immutable"`.
   """
   @spec append(t(), term(), term()) :: t()
   def append(%__MODULE__{data: data} = headers, name, value) do
     normalized_name = normalize_name(name)
     normalized_value = normalize_value(value)
+    :ok = check_guard!(headers)
 
     updated_data =
       Map.update(data, normalized_name, [normalized_value], fn values ->
@@ -93,10 +129,14 @@ defmodule Web.Headers do
 
   @doc """
   Removes a header.
+
+  Raises `Web.TypeError` for headers with the guard `"immutable"`.
   """
   @spec delete(t(), term()) :: t()
   def delete(%__MODULE__{data: data} = headers, name) do
-    %{headers | data: Map.delete(data, normalize_name(name))}
+    normalized_name = normalize_name(name)
+    :ok = check_guard!(headers)
+    %{headers | data: Map.delete(data, normalized_name)}
   end
 
   @doc """
@@ -132,11 +172,25 @@ defmodule Web.Headers do
 
   @doc """
   Sets a header value, replacing any existing values.
+
+  Raises `Web.TypeError` for headers with the guard `"immutable"`.
   """
   @spec set(t(), term(), term()) :: t()
   def set(%__MODULE__{data: data} = headers, name, value) do
-    %{headers | data: Map.put(data, normalize_name(name), [normalize_value(value)])}
+    normalized_name = normalize_name(name)
+    normalized_value = normalize_value(value)
+    :ok = check_guard!(headers)
+    %{headers | data: Map.put(data, normalized_name, [normalized_value])}
   end
+
+  # The steps of `append`, `delete`, and `set` of the Fetch Standard: the
+  # name and the value are validated first, then the guard "immutable"
+  # throws a `TypeError`.
+  defp check_guard!(%__MODULE__{guard: "immutable"}) do
+    raise Web.TypeError, "The headers are immutable."
+  end
+
+  defp check_guard!(_headers), do: :ok
 
   @doc """
   Converts headers into a raw list of repeated tuples.

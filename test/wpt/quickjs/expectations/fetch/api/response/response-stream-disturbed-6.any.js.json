@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "An errored stream on which cancel() has been called": "library: a different result"
-  }
-}

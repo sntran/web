@@ -13,7 +13,8 @@ defmodule Web.Internal.LazyStream do
   # A source is one of:
   #
   #   * `{:bytes, binary}`: all the bytes of a body are in the struct. No
-  #     bytes give no chunk, as in the Fetch Standard;
+  #     bytes give no chunk, and the stream process is a byte stream, as in
+  #     the Fetch Standard;
   #   * `{:chunk, binary}`: one chunk of `ReadableStream.from/1`, also when
   #     it has no bytes;
   #   * `{:view, view}`: a `Web.Uint8Array`, which is the chunk of the stream
@@ -65,23 +66,25 @@ defmodule Web.Internal.LazyStream do
         }
 
   @type state ::
-          :readable | :consumed | :canceled | :teed | {:process, pid()} | :gone
+          :readable | :consumed | :canceled | :locked | {:process, pid()} | :gone
 
   # The values of the state, in the first element of the array.
   #
   #   * readable: no read, no process.
-  #   * consumed: a read took all the bytes. The stream is closed and
-  #     disturbed, and it has no lock.
+  #   * consumed: an enumeration took all the bytes. The stream is closed
+  #     and disturbed, and it has no lock.
   #   * canceled: a cancel came before a read. The stream is closed and
   #     disturbed.
-  #   * teed: the bytes went to the two branches of a tee. The stream is
-  #     locked and disturbed, as in the Streams Standard.
+  #   * locked: the bytes went to a reader that keeps its lock: the two
+  #     branches of a tee, a body function such as `text/1`, or the proxy of
+  #     a new request. The stream is locked and disturbed, as in the Streams
+  #     Standard and the Fetch Standard.
   #   * starting: a process starts the stream process.
   #   * process: the stream process exists. The registry has it.
   @readable 0
   @consumed 1
   @canceled 2
-  @teed 3
+  @locked 3
   @starting 4
   @process 5
 
@@ -127,7 +130,7 @@ defmodule Web.Internal.LazyStream do
   Changes the state from `:readable` to `to`. Returns `:ok`, or the state
   that the stream has.
   """
-  @spec claim(t(), :consumed | :canceled | :teed) :: :ok | state()
+  @spec claim(t(), :consumed | :canceled | :locked) :: :ok | state()
   def claim(%__MODULE__{ref: ref} = lazy, to) do
     if local?(ref) do
       case :atomics.compare_exchange(ref, 1, @readable, encode(to)) do
@@ -141,12 +144,12 @@ defmodule Web.Internal.LazyStream do
 
   defp encode(:consumed), do: @consumed
   defp encode(:canceled), do: @canceled
-  defp encode(:teed), do: @teed
+  defp encode(:locked), do: @locked
 
   defp decode(_lazy, @readable), do: :readable
   defp decode(_lazy, @consumed), do: :consumed
   defp decode(_lazy, @canceled), do: :canceled
-  defp decode(_lazy, @teed), do: :teed
+  defp decode(_lazy, @locked), do: :locked
   defp decode(lazy, @starting), do: await_process(lazy, 0)
   defp decode(lazy, @process), do: lookup(lazy)
 
@@ -182,8 +185,8 @@ defmodule Web.Internal.LazyStream do
   @doc """
   Returns the stream process, and starts it if necessary. `owner` is the
   owner of a new process. A stream that a read used gives a closed stream.
-  Returns `{:error, :already_locked}` for the source of a tee, and
-  `{:error, :released}` when the process stopped.
+  Returns `{:error, :already_locked}` for a stream in the state `:locked`,
+  and `{:error, :released}` when the process stopped.
   """
   @spec process(t(), pid()) :: {:ok, pid()} | {:error, :already_locked | :released}
   def process(%__MODULE__{ref: ref} = lazy, owner) do
@@ -203,7 +206,7 @@ defmodule Web.Internal.LazyStream do
   end
 
   defp existing_process({:process, pid}), do: {:ok, pid}
-  defp existing_process(:teed), do: {:error, :already_locked}
+  defp existing_process(:locked), do: {:error, :already_locked}
   defp existing_process(_gone), do: {:error, :released}
 
   defp start(lazy, initial, owner) do
@@ -231,12 +234,12 @@ defmodule Web.Internal.LazyStream do
     {:ok, chunks} = chunks(lazy.source)
 
     Web.ReadableStream.__new__(
-      %{
-        start: fn controller ->
-          for chunk <- chunks, do: Web.ReadableStream.enqueue(controller.pid, chunk)
-          Web.ReadableStream.close(controller.pid)
-        end
-      },
+      lazy
+      |> stream_type()
+      |> Map.put(:start, fn controller ->
+        for chunk <- chunks, do: Web.ReadableStream.enqueue(controller.pid, chunk)
+        Web.ReadableStream.close(controller.pid)
+      end),
       [owner: owner],
       registry_key: lazy.ref
     )
@@ -252,14 +255,15 @@ defmodule Web.Internal.LazyStream do
 
   # The holder enqueues the chunks that it has, and then each chunk that it
   # reads. A holder that stops before the end puts the stream in the errored
-  # state. A cancel stops the holder, thus its connection does not stay.
+  # state. A cancel stops the holder, thus its connection does not stay. The
+  # stream is a byte stream, as the body of a response of the network in the
+  # Fetch Standard.
   defp start_stream(%{source: {:held, holder}} = lazy, :readable, owner) do
     stream =
       Web.ReadableStream.__new__(
-        %{cancel: fn _reason -> Process.exit(holder, :kill) end},
+        %{type: "bytes", cancel: fn _reason -> Process.exit(holder, :kill) end},
         [
           high_water_mark: @held_high_water_mark,
-          strategy: Web.ByteLengthQueuingStrategy.new(@held_high_water_mark),
           cancel_on_reader_exit: true,
           owner: owner
         ],
@@ -276,12 +280,18 @@ defmodule Web.Internal.LazyStream do
   # stream that a read used.
   defp start_stream(lazy, :closed, owner) do
     Web.ReadableStream.__new__(
-      %{start: &Web.ReadableStream.close(&1.pid)},
+      lazy |> stream_type() |> Map.put(:start, &Web.ReadableStream.close(&1.pid)),
       [owner: owner],
       registry_key: lazy.ref,
       disturbed: true
     )
   end
+
+  # The body of a request or a response is a byte stream: the Fetch
+  # Standard sets it up "with byte reading support". Thus a BYOB reader can
+  # read it. A stream of `ReadableStream.from/1` is a default stream.
+  defp stream_type(%{source: {:bytes, _binary}}), do: %{type: "bytes"}
+  defp stream_type(_lazy), do: %{}
 
   @doc false
   # The error of a body whose holder stopped before the end of the body.
@@ -297,20 +307,21 @@ defmodule Web.Internal.LazyStream do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Takes all the bytes for a body function, such as `text/1`. Returns
-  `{:ok, binary}`, `{:error, reason}` for an abort or a failure of the
-  body, `:used` for a stream that a read used, `:locked`, or
-  `{:process, pid}` when the stream has a process.
+  Takes all the bytes for a body function, such as `text/1`. The stream
+  goes to the state `:locked` before the function returns, as the reader
+  of a body function of the Fetch Standard keeps its lock.
 
-  For a source `{:held, pid}`, the call waits until the holder has all the
-  bytes.
+  Returns `{:ok, binary}`, `{:error, reason}` for an abort or a failure of
+  the body, `:held` for a source `{:held, pid}`, `:used` for a stream that
+  a read used, `:locked`, or `{:process, pid}` when the stream has a
+  process. After `:held`, `take_held/1` gives the bytes.
   """
   @spec take(t()) ::
-          {:ok, binary()} | {:error, term()} | :used | :locked | {:process, pid()}
+          {:ok, binary()} | {:error, term()} | :held | :used | :locked | {:process, pid()}
   def take(%__MODULE__{} = lazy) do
-    case claim(lazy, :consumed) do
+    case claim(lazy, :locked) do
       :ok -> take_source(lazy)
-      :teed -> :locked
+      :locked -> :locked
       {:process, pid} -> {:process, pid}
       _consumed_canceled_or_gone -> :used
     end
@@ -328,7 +339,14 @@ defmodule Web.Internal.LazyStream do
     with :ok <- check_signal(lazy), do: {:error, error}
   end
 
-  defp take_source(%{source: {:held, holder}} = lazy) do
+  defp take_source(%{source: {:held, _holder}}), do: :held
+
+  @doc """
+  Gives all the bytes of a source `{:held, pid}` after `take/1` gave
+  `:held`. The call waits until the holder has all the bytes.
+  """
+  @spec take_held(t()) :: {:ok, binary()} | {:error, term()}
+  def take_held(%__MODULE__{source: {:held, holder}} = lazy) do
     with :ok <- check_signal(lazy) do
       monitor = Process.monitor(holder)
       send(holder, {:web_body, lazy.ref, {:take, monitor, self()}})
@@ -372,7 +390,7 @@ defmodule Web.Internal.LazyStream do
         stop_holder(lazy)
         :ok
 
-      :teed ->
+      :locked ->
         :locked
 
       {:process, pid} ->
@@ -394,13 +412,30 @@ defmodule Web.Internal.LazyStream do
   @spec tee(t()) :: {:ok, [t()]} | state()
   def tee(%__MODULE__{source: {kind, _bytes} = source} = lazy)
       when kind in [:bytes, :chunk, :view, :error] do
-    case claim(lazy, :teed) do
+    case claim(lazy, :locked) do
       :ok -> {:ok, [new(source, lazy.signal), new(source, lazy.signal)]}
       state -> state
     end
   end
 
   def tee(%__MODULE__{} = lazy), do: state(lazy)
+
+  @doc """
+  The proxy of a source with its bytes in memory, with no process: the
+  step "create a proxy" of the Streams Standard for the body of a new
+  request. The stream goes to the state `:locked`, and the new stream has
+  the same bytes. Returns `{:ok, stream}`, or the state of the stream.
+  """
+  @spec proxy(t()) :: {:ok, t()} | state()
+  def proxy(%__MODULE__{source: {kind, _bytes} = source} = lazy)
+      when kind in [:bytes, :chunk, :view, :error] do
+    case claim(lazy, :locked) do
+      :ok -> {:ok, new(source, lazy.signal)}
+      state -> state
+    end
+  end
+
+  def proxy(%__MODULE__{} = lazy), do: state(lazy)
 
   # The chunks of a source of bytes: a new view for a binary, and the view of
   # the source with no copy. No bytes give no chunk, as for a body in the

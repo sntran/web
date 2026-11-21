@@ -152,7 +152,8 @@ defmodule Web.Internal.LazyStreamTest do
       body = ReadableStream.from(Uint8Array.from("view"))
       [_left, _right] = ReadableStream.tee(body)
 
-      assert %Web.TypeError{message: "ReadableStream is already locked"} = catch_exit(text(body))
+      assert ReadableStream.locked?(body)
+      assert %Web.TypeError{message: "body already used"} = catch_exit(text(body))
     end
   end
 

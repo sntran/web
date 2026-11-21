@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "keepalive flag": "library: no Web.Request.keepalive/1"
-  }
-}

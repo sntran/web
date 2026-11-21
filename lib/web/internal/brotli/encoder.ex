@@ -23,7 +23,8 @@ defmodule Web.Internal.Brotli.Encoder do
   @wbits 18
   @window (1 <<< @wbits) - 16
   @block 65_536
-  @hash_size 32_768
+  @hash_bits 15
+  @hash_size 1 <<< @hash_bits
 
   # The fixed code of the code length code lengths, section 3.5: the bits,
   # first bit in the least significant position, and the number of bits.
@@ -39,6 +40,9 @@ defmodule Web.Internal.Brotli.Encoder do
   @copy_length {{2, 0}, {3, 0}, {4, 0}, {5, 0}, {6, 0}, {7, 0}, {8, 0}, {9, 0}, {10, 1}, {12, 1},
                 {14, 2}, {18, 2}, {22, 3}, {30, 3}, {38, 4}, {54, 4}, {70, 5}, {102, 5}, {134, 6},
                 {198, 7}, {326, 8}, {582, 9}, {1094, 10}, {2118, 24}}
+
+  # The position of the highest bit that is 1 in each byte (0 for 0 and 1).
+  @log2 List.to_tuple(for value <- 0..255, do: max(length(Integer.digits(value, 2)) - 1, 0))
 
   @typedoc "The state of an encoder."
   @type t :: map()
@@ -248,7 +252,7 @@ defmodule Web.Internal.Brotli.Encoder do
   defp parse(buffer, position, stop, start, hash, last, acc) when position + 4 <= stop do
     {base, table} = hash
     <<_skip::binary-size(^position), key::32-little, _rest::binary>> = buffer
-    slot = :erlang.phash2(key, @hash_size) + 1
+    slot = hash(key)
     candidate = :atomics.get(table, slot) - 1 - base
     :atomics.put(table, slot, base + position + 1)
     distance = position - candidate
@@ -265,7 +269,7 @@ defmodule Web.Internal.Brotli.Encoder do
 
     if length >= 4 do
       next = position + length
-      add_positions(buffer, position + 1, min(next, stop - 3), hash)
+      add_positions(buffer, position + 1, min(min(next, position + 17), stop - 3), hash)
       {command, last} = command(start, position - start, length, distance, last)
       parse(buffer, next, stop, next, hash, last, [command | acc])
     else
@@ -290,11 +294,15 @@ defmodule Web.Internal.Brotli.Encoder do
 
   defp add_positions(buffer, position, stop, {base, table} = hash) when position < stop do
     <<_skip::binary-size(^position), key::32-little, _rest::binary>> = buffer
-    :atomics.put(table, :erlang.phash2(key, @hash_size) + 1, base + position + 1)
+    :atomics.put(table, hash(key), base + position + 1)
     add_positions(buffer, position + 1, stop, hash)
   end
 
   defp add_positions(_buffer, _position, _stop, _hash), do: :ok
+
+  # The slot of 4 bytes in the hash table: a multiplicative hash. The
+  # product has less than 59 bits, thus it stays a small integer.
+  defp hash(key), do: ((key * 0x2F0_A3C5 &&& 0xFFFF_FFFF) >>> (32 - @hash_bits)) + 1
 
   # The insert-and-copy length codes 0 to 127 use the last distance with no
   # distance code. The distance code 0 is also the last distance. The other
@@ -371,9 +379,9 @@ defmodule Web.Internal.Brotli.Encoder do
     {16 + 2 * (bits - 1) + top - 2, bits, value - (top <<< bits)}
   end
 
-  defp log2(value, acc \\ 0)
-  defp log2(value, acc) when value <= 1, do: acc
-  defp log2(value, acc), do: log2(value >>> 1, acc + 1)
+  # The position of the highest bit that is 1.
+  defp log2(value) when value < 256, do: elem(@log2, value)
+  defp log2(value), do: 8 + log2(value >>> 8)
 
   # ---------------------------------------------------------------------------
   # The prefix codes, section 3

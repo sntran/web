@@ -13,8 +13,10 @@ defmodule Web.Internal.ContentDecoder do
   #
   # The codings are `gzip`, `x-gzip`, `deflate`, `br`, and `zstd`. Erlang/OTP
   # 28 and later have the module `:zstd`. The decoder of `br` is
-  # `Web.Internal.Brotli.Decoder`, in Elixir. A body with a coding that the
-  # decoder does not know is not decoded, as the Fetch Standard specifies.
+  # `Web.Internal.Brotli.Decoder`, in Elixir, or the decoder of the Hex
+  # package `brotli`: see "The setting `:brotli`" below. A body with a
+  # coding that the decoder does not know is not decoded, as the Fetch
+  # Standard specifies.
   #
   # Data that is not valid, and data that ends before the end of its
   # compressed form, raise `Web.Internal.ContentDecoder.Error`. The pieces
@@ -24,6 +26,10 @@ defmodule Web.Internal.ContentDecoder do
   import Bitwise
 
   alias Web.Internal.Brotli.Decoder, as: Brotli
+
+  # The module of the Hex package `brotli` is not a dependency of the
+  # library: see `brotli_setting/0`.
+  @compile {:no_warn_undefined, :brotli_nif}
 
   defmodule Error do
     @moduledoc false
@@ -37,9 +43,62 @@ defmodule Web.Internal.ContentDecoder do
   @zstd_magic 0xFD2FB528
   @skippable_magic 0x184D2A50..0x184D2A5F
 
-  @doc "The value of the request header `accept-encoding`."
+  @doc """
+  The value of the request header `accept-encoding`. The setting `brotli:
+  :not_requested` removes `br`.
+  """
   @spec accept_encoding() :: String.t()
-  def accept_encoding, do: "gzip, deflate, br, zstd"
+  def accept_encoding do
+    case brotli_setting() do
+      :not_requested -> "gzip, deflate, zstd"
+      _decoder -> "gzip, deflate, br, zstd"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # The setting `:brotli`
+  #
+  # The Fetch Standard and the Compression Standard do not specify how fast
+  # the decoder is. The decoder of `br` in Elixir is slower than the C
+  # library of brotli. Thus the application selects:
+  #
+  #   * `:elixir` (the default): the decoder in Elixir. A request accepts
+  #     `br`.
+  #   * `:native`: the decoder of the C library, in the Hex package `brotli`
+  #     (the module `:brotli_nif`). The application adds the package to its
+  #     dependencies: the library does not depend on it. A request accepts
+  #     `br`.
+  #   * `:not_requested`: the decoder in Elixir, and a request does not
+  #     accept `br`. A server that sends `br` all the same gets the decoder
+  #     in Elixir.
+  #
+  # The format `"brotli"` of `Web.DecompressionStream` uses the same
+  # decoder as `br`.
+  # ---------------------------------------------------------------------------
+
+  @brotli_settings [:elixir, :native, :not_requested]
+
+  defp brotli_setting do
+    case Application.get_env(:web, :brotli, :elixir) do
+      :native ->
+        if Code.ensure_loaded?(:brotli_nif) and
+             function_exported?(:brotli_nif, :decoder_decompress_stream, 2) do
+          :native
+        else
+          raise ArgumentError,
+                "The setting brotli: :native of :web needs the Hex package brotli: " <>
+                  "add {:brotli, \"~> 0.3\"} to the dependencies of the application"
+        end
+
+      setting when setting in @brotli_settings ->
+        setting
+
+      setting ->
+        raise ArgumentError,
+              "The setting :brotli of :web must be :elixir, :native, or :not_requested, " <>
+                "got: #{inspect(setting)}"
+    end
+  end
 
   @doc """
   Makes the decoder for the headers of a response. Returns `nil` when the
@@ -117,16 +176,31 @@ defmodule Web.Internal.ContentDecoder do
   # A strict stage refuses data after the end of the compressed data, and an
   # empty input. An HTTP body has no such rule.
   defp brotli_stage(coding, strict?) do
-    %{
+    stage = %{
       coding: coding,
       kind: :brotli,
-      decoder: Brotli.new(),
+      decoder: nil,
       strict?: strict?,
       fed?: false,
       input: :queue.new(),
       ended?: false,
       done?: false
     }
+
+    case brotli_setting() do
+      :native ->
+        Map.merge(stage, %{
+          kind: :native_brotli,
+          decoder: :brotli_nif.decoder_create(),
+          rest: <<>>,
+          resume?: false,
+          output: <<>>,
+          finished?: false
+        })
+
+      _elixir ->
+        %{stage | decoder: Brotli.new()}
+    end
   end
 
   defp zlib_stage(coding, window_bits, strict? \\ false) do
@@ -295,6 +369,8 @@ defmodule Web.Internal.ContentDecoder do
     end
   end
 
+  defp pull_stage(%{kind: :native_brotli} = stage), do: pull_native(stage)
+
   defp pull_stage(%{kind: :zstd, done?: true} = stage), do: {:done, stage}
 
   defp pull_stage(%{kind: :zstd, remaining: <<>>} = stage) do
@@ -348,6 +424,104 @@ defmodule Web.Internal.ContentDecoder do
 
       true ->
         {:more, %{stage | input: :queue.new()}}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # The decoder of the Hex package `brotli`
+  #
+  # The functions of the module `:brotli_nif` (version 0.3) call the C
+  # library on a dirty scheduler. `decoder_decompress_stream/2` decodes into
+  # the ring buffer of the decoder. It returns `:ok` at the end of the
+  # stream, `{:more_output, unused}` when the ring buffer has output, and
+  # `{:more_input, unused}` when it needs more input, with the number of
+  # bytes of the input that it did not use. `decoder_take_output/1` gives
+  # the output of the ring buffer. Thus one call gives the size of the
+  # window (16 MiB) at most, and the stage gives it in pieces of
+  # `@piece_size` bytes. The function `brotli_decoder:stream/2` of the
+  # package gives all the output of a chunk in one binary, with no limit:
+  # the stage does not use it.
+  #
+  # `:ok` does not tell the bytes after the end of the stream. Thus the
+  # stage holds back the last byte of its input, and gives it alone. When
+  # the stream ends (`:ok`, or `decoder_is_finished/1` after the output)
+  # and the stage has input that it did not give, the data has bytes after
+  # the end. The C library frees the decoder when the garbage collector
+  # frees its reference: a close has no work.
+  # ---------------------------------------------------------------------------
+
+  defp pull_native(%{output: output} = stage) when output != <<>> do
+    # `collect/3` copies the piece: the piece does not keep the output.
+    size = min(byte_size(output), @piece_size)
+    rest = binary_part(output, size, byte_size(output) - size)
+    {:piece, binary_part(output, 0, size), %{stage | output: rest}}
+  end
+
+  # The end of the stream, as `brotli_end/1`. A pull after the end gives
+  # the end again.
+  defp pull_native(%{finished?: true} = stage) do
+    cond do
+      stage.strict? and (stage.rest != <<>> or not :queue.is_empty(stage.input)) ->
+        invalid!(stage)
+
+      stage.ended? ->
+        {:done, stage}
+
+      true ->
+        {:more, %{stage | rest: <<>>, input: :queue.new()}}
+    end
+  end
+
+  defp pull_native(%{rest: rest, resume?: resume?} = stage) when rest != <<>> or resume? do
+    {part, held} =
+      if byte_size(rest) > 1,
+        do:
+          {binary_part(rest, 0, byte_size(rest) - 1), binary_part(rest, byte_size(rest) - 1, 1)},
+        else: {rest, <<>>}
+
+    result = :brotli_nif.decoder_decompress_stream(stage.decoder, part)
+    stage = %{stage | output: take_output(stage.decoder, []), resume?: false}
+
+    case result do
+      :ok ->
+        pull_native(%{stage | rest: held, finished?: true})
+
+      # At the end of the stream, the C library first gives the output.
+      # Then it gives `:ok` for each input: thus the stage asks it.
+      {:more_output, unused} ->
+        rest = binary_part(part, byte_size(part) - unused, unused) <> held
+        finished? = :brotli_nif.decoder_is_finished(stage.decoder)
+        pull_native(%{stage | rest: rest, resume?: not finished?, finished?: finished?})
+
+      {:more_input, _unused} ->
+        pull_native(%{stage | rest: held})
+
+      :error ->
+        invalid!(stage)
+    end
+  end
+
+  defp pull_native(stage) do
+    case :queue.out(stage.input) do
+      {{:value, data}, input} ->
+        pull_native(%{stage | rest: data, input: input, fed?: true})
+
+      {:empty, _input} when stage.ended? and not stage.fed? and not stage.strict? ->
+        {:done, stage}
+
+      {:empty, _input} when stage.ended? ->
+        not_complete!(stage)
+
+      {:empty, _input} ->
+        {:more, stage}
+    end
+  end
+
+  # The output of a ring buffer that wraps comes in two parts.
+  defp take_output(decoder, acc) do
+    case :brotli_nif.decoder_take_output(decoder) do
+      <<>> -> IO.iodata_to_binary(acc)
+      output -> take_output(decoder, [acc | output])
     end
   end
 

@@ -287,6 +287,57 @@ defmodule Web.FetchContentEncodingTest do
     test "is identity for a request of a range", %{base: base} do
       assert request_header(base, headers: %{"range" => "bytes=0-10"}) == "identity"
     end
+
+    test "has no br with the setting brotli: :not_requested", %{base: base} do
+      with_brotli(:not_requested, fn ->
+        assert request_header(base, []) == "gzip, deflate, zstd"
+      end)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # The setting `:brotli`
+  # ---------------------------------------------------------------------------
+
+  defp with_brotli(setting, fun) do
+    previous = Application.fetch_env(:web, :brotli)
+    Application.put_env(:web, :brotli, setting)
+
+    try do
+      fun.()
+    after
+      case previous do
+        {:ok, value} -> Application.put_env(:web, :brotli, value)
+        :error -> Application.delete_env(:web, :brotli)
+      end
+    end
+  end
+
+  describe "the setting brotli" do
+    test ":native decodes br with the decoder of the Hex package brotli", %{base: base} do
+      Web.TestFakeBrotliNif.install()
+      on_exit(&Web.TestFakeBrotliNif.remove/0)
+      data = :binary.copy("native ", 30_000)
+
+      with_brotli(:native, fn ->
+        assert text(encoded_url(base, "br", data, split(encode("br", data), [7, 100]))) == data
+        assert Web.TestFakeBrotliNif.created() == 1
+      end)
+    end
+
+    test ":not_requested decodes a br body in Elixir all the same", %{base: base} do
+      with_brotli(:not_requested, fn ->
+        assert text(encoded_url(base, "br", "data")) == "data"
+      end)
+    end
+
+    test "a value that is not known rejects the request", %{base: base} do
+      with_brotli(:fast, fn ->
+        error = catch_exit(await(fetch(base <> "/headers")))
+        assert %TypeError{cause: %ArgumentError{message: message}} = error
+        assert message =~ "The setting :brotli of :web must be"
+      end)
+    end
   end
 
   # ---------------------------------------------------------------------------

@@ -12,6 +12,8 @@ defmodule Web.Internal.EventTarget.Store do
   # listener is left, the target has no use. The process then waits for the
   # linger time, because a different process can have the target from a
   # message, and it stops when no request came in that time.
+  #
+  # The specification is `tla/EventTarget.tla`.
 
   use GenServer
 

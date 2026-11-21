@@ -12,6 +12,8 @@ defmodule Web.TLA.AbortSignalConformanceTest do
 
   alias Web.AbortController
   alias Web.AbortSignal
+  alias Web.EventTarget
+  alias Web.Internal.EventTarget.Listeners
   alias Web.Test.SpecModel
 
   @clients [:c1, :c2]
@@ -31,34 +33,61 @@ defmodule Web.TLA.AbortSignalConformanceTest do
   end
 
   defp command do
+    client = member_of(@clients)
+
     frequency([
-      {6, tuple({constant(:subscribe), member_of(@clients)})},
-      {4, tuple({constant(:unsubscribe), member_of(@clients)})},
-      {2, constant(:abort)},
-      {2, constant(:owner_stop)},
-      {1, tuple({constant(:client_stop), member_of(@clients)})},
-      {1, constant(:pause)}
+      {6, tuple({constant(:subscribe), client})},
+      {4, tuple({constant(:unsubscribe), client})},
+      {3, tuple({constant(:use), client, member_of([:listener, :algorithm])})},
+      {2, tuple({constant(:unuse), client})},
+      {3, constant(:depend)},
+      {1, constant(:maker_stop)},
+      {1, constant(:abort)},
+      {3, constant(:owner_stop)},
+      {1, tuple({constant(:client_stop), client})},
+      {2, constant(:pause)}
     ])
   end
 
   property "the signal does each step as the specification permits" do
     check all(commands <- list_of(command(), max_length: 16), max_runs: 100) do
-      system = start_system()
+      run_commands(commands)
+    end
+  end
 
-      try do
-        Enum.reduce(commands, SpecModel.start("AbortSignal"), fn command, model ->
-          model = command |> run(model, system) |> follow_timers(system)
-          assert_same_state(model, system)
-          model
-        end)
-      after
-        stop_system(system)
-      end
+  # Lists of operations that the random lists do not often give: each one
+  # needs a rule of the lifetime.
+  test "the signal does the steps of known lists of operations as the specification permits" do
+    for commands <- [
+          [:depend, :owner_stop, :pause],
+          [{:use, :c1, :listener}, :owner_stop, :pause, {:unuse, :c1}, :pause],
+          [{:use, :c2, :algorithm}, :owner_stop, :pause, {:client_stop, :c2}, :pause],
+          [:depend, :maker_stop, :owner_stop, :pause, :pause],
+          [{:subscribe, :c1}, :depend, {:use, :c2, :listener}, :abort]
+        ] do
+      run_commands(commands)
+    end
+  end
+
+  defp run_commands(commands) do
+    system = start_system()
+
+    try do
+      Enum.reduce(commands, {SpecModel.start("AbortSignal"), system}, fn command,
+                                                                         {model, system} ->
+        {model, system} = run(command, model, system)
+        model = follow_timers(model, system)
+        assert_same_state(model, system)
+        {model, system}
+      end)
+    after
+      stop_system(system)
     end
   end
 
   # ---------------------------------------------------------------------------
-  # The real system: an owner that makes the signal, and two clients
+  # The real system: an owner that makes the signal, two clients, and the
+  # maker of the dependent signal
   # ---------------------------------------------------------------------------
 
   defp start_system do
@@ -72,40 +101,72 @@ defmodule Web.TLA.AbortSignalConformanceTest do
 
     assert_receive {:controller, controller}
     signal = controller.signal
-    clients = Map.new(@clients, fn name -> {name, spawn(fn -> client(signal, []) end)} end)
 
-    %{owner: owner, controller: controller, signal: signal, clients: clients}
+    clients =
+      Map.new(@clients, fn name -> {name, spawn(fn -> client(name, signal, [], nil) end)} end)
+
+    %{
+      owner: owner,
+      controller: controller,
+      signal: signal,
+      clients: clients,
+      maker: nil,
+      dep: nil
+    }
   end
 
   defp stop_system(system) do
     Process.exit(system.owner, :kill)
     Enum.each(system.clients, fn {_name, pid} -> Process.exit(pid, :kill) end)
+    if system.maker, do: Process.exit(system.maker, :kill)
   end
 
-  # A client keeps its subscriptions, and does one request at a time.
-  defp client(signal, subscriptions) do
+  # A client keeps its subscriptions and its use, and does one request at a
+  # time. The listener and the abort algorithm send a message to the test.
+  defp client(name, signal, subscriptions, use) do
     receive do
       {:subscribe, from} ->
         case AbortSignal.subscribe(signal) do
           {:ok, subscription} ->
             send(from, {:reply, self(), :ok})
-            client(signal, [subscription | subscriptions])
+            client(name, signal, [subscription | subscriptions], use)
 
           {:error, :aborted} ->
             send(from, {:reply, self(), :aborted})
-            client(signal, subscriptions)
+            client(name, signal, subscriptions, use)
         end
 
       {:unsubscribe, from} ->
         [subscription | rest] = subscriptions
         :ok = AbortSignal.unsubscribe(subscription)
         send(from, {:reply, self(), :ok})
-        client(signal, rest)
+        client(name, signal, rest, use)
+
+      {{:use, :listener}, from} ->
+        listener = fn -> send(from, {:used, name}) end
+        EventTarget.add_event_listener(signal, "abort", listener)
+        send(from, {:reply, self(), :ok})
+        client(name, signal, subscriptions, {:listener, listener})
+
+      {{:use, :algorithm}, from} ->
+        :ok = AbortSignal.__add_algorithm__(signal, {Kernel, :send, [from, {:used, name}]})
+        send(from, {:reply, self(), :ok})
+        client(name, signal, subscriptions, :algorithm)
+
+      {:unuse, from} ->
+        {:listener, listener} = use
+        EventTarget.remove_event_listener(signal, "abort", listener)
+        send(from, {:reply, self(), :ok})
+        client(name, signal, subscriptions, nil)
+
+      {:use_kind, from} ->
+        send(from, {:reply, self(), use})
+        client(name, signal, subscriptions, use)
 
       {:abort_seen, from} ->
         results = Enum.map(subscriptions, &AbortSignal.receive_abort(&1, 500, true))
         send(from, {:reply, self(), results})
-        client(signal, [])
+        client(name, signal, [], use)
     end
   end
 
@@ -116,7 +177,7 @@ defmodule Web.TLA.AbortSignalConformanceTest do
     receive do
       {:reply, ^pid, reply} -> reply
     after
-      2_000 -> flunk("the client #{client} gave no reply to #{request}")
+      2_000 -> flunk("the client #{client} gave no reply to #{inspect(request)}")
     end
   end
 
@@ -129,48 +190,100 @@ defmodule Web.TLA.AbortSignalConformanceTest do
 
     cond do
       to_string(client) not in state["live"] ->
-        model
+        {model, system}
 
       SpecModel.enabled?(model, "Subscribe", [client]) ->
         assert request(system, client, :subscribe) == :ok
-        SpecModel.step!(model, "Subscribe", [client])
+        {SpecModel.step!(model, "Subscribe", [client]), system}
 
-      not state["running"] ->
-        # A signal that stopped is the same as an aborted signal.
+      not state["running"] or state["aborted"] ->
+        # A signal that stopped or aborted is an aborted signal.
         assert request(system, client, :subscribe) == :aborted
-        model
+        {model, system}
 
       true ->
         # The client has the largest number of subscriptions of the model.
-        model
+        {model, system}
     end
   end
 
   defp run({:unsubscribe, client}, model, system) do
     if SpecModel.enabled?(model, "Unsubscribe", [client]) do
       assert request(system, client, :unsubscribe) == :ok
-      SpecModel.step!(model, "Unsubscribe", [client])
+      {SpecModel.step!(model, "Unsubscribe", [client]), system}
     else
-      model
+      {model, system}
+    end
+  end
+
+  defp run({:use, client, kind}, model, system) do
+    if SpecModel.enabled?(model, "Use", [client]) do
+      assert request(system, client, {:use, kind}) == :ok
+      {SpecModel.step!(model, "Use", [client]), system}
+    else
+      {model, system}
+    end
+  end
+
+  # An abort algorithm has no remove: only a listener is removed.
+  defp run({:unuse, client}, model, system) do
+    if SpecModel.enabled?(model, "Unuse", [client]) and
+         match?({:listener, _}, request(system, client, :use_kind)) do
+      assert request(system, client, :unuse) == :ok
+      {SpecModel.step!(model, "Unuse", [client]), system}
+    else
+      {model, system}
+    end
+  end
+
+  defp run(:depend, model, system) do
+    if SpecModel.enabled?(model, "Depend") and SpecModel.get(model, "maker_alive") do
+      test = self()
+
+      maker =
+        spawn(fn ->
+          send(test, {:dependent, AbortSignal.any([system.signal])})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:dependent, dep}
+      {SpecModel.step!(model, "Depend"), %{system | maker: maker, dep: dep}}
+    else
+      {model, system}
+    end
+  end
+
+  defp run(:maker_stop, model, system) do
+    if system.maker && SpecModel.enabled?(model, "MakerStop") do
+      monitor = Process.monitor(system.maker)
+      Process.exit(system.maker, :kill)
+      assert_receive {:DOWN, ^monitor, :process, _pid, :killed}
+      {SpecModel.step!(model, "MakerStop"), system}
+    else
+      {model, system}
     end
   end
 
   defp run(:abort, model, system) do
-    monitor = Process.monitor(system.signal.pid)
-    started = System.monotonic_time(:millisecond)
-    assert AbortController.abort(system.controller, :my_reason) == :ok
-    reason = AbortSignal.Reasons.get(system.signal.ref)
-    elapsed = System.monotonic_time(:millisecond) - started
-
     if SpecModel.enabled?(model, "Abort") do
-      # The process of the signal stops after its answer to the abort.
-      assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 2_000
+      signal_monitor = Process.monitor(system.signal.pid)
+      dep_monitor = system.dep && Process.monitor(system.dep.pid)
+      users = SpecModel.get(model, "users")
+      subscriptions = SpecModel.get(model, "subs")
+      dep = SpecModel.get(model, "dep")
+
+      started = System.monotonic_time(:millisecond)
+      assert AbortController.abort(system.controller, :my_reason) == :ok
+      reason = AbortSignal.Reasons.get(system.signal.ref)
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      # The steps ran before the abort returned: each listener and each
+      # abort algorithm of a client sent its message.
+      for name <- users, name = String.to_existing_atom(name), do: assert_received({:used, ^name})
 
       # The store has the reason immediately after the abort. The store can
       # remove it only after the linger time.
       if elapsed < @linger, do: assert(reason == :my_reason)
-
-      subscriptions = SpecModel.get(model, "subs")
 
       # Each client that is subscribed gets the abort, one time for each of
       # its subscriptions.
@@ -179,19 +292,33 @@ defmodule Web.TLA.AbortSignalConformanceTest do
         assert results == List.duplicate({:error, :aborted, :my_reason}, count)
       end
 
-      SpecModel.step!(model, "Abort")
+      # The processes stop after the steps of the abort.
+      assert_receive {:DOWN, ^signal_monitor, :process, _pid, _reason}, 2_000
+      model = model |> SpecModel.step!("Abort") |> SpecModel.step!("StepsEnd")
+      model = model |> SpecModel.step!("SignalStop") |> stop_dependent(dep, dep_monitor)
+      {model, system}
     else
-      Process.demonitor(monitor, [:flush])
-      model
+      {model, system}
     end
+  end
+
+  # A dependent signal that runs stops after the steps of the abort.
+  defp stop_dependent(model, "running", monitor) do
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 2_000
+    SpecModel.step!(model, "DepStop")
+  end
+
+  defp stop_dependent(model, _dep, monitor) do
+    if monitor, do: Process.demonitor(monitor, [:flush])
+    model
   end
 
   defp run(:owner_stop, model, system) do
     if SpecModel.enabled?(model, "OwnerStop") do
       Process.exit(system.owner, :kill)
-      SpecModel.step!(model, "OwnerStop")
+      {SpecModel.step!(model, "OwnerStop"), system}
     else
-      model
+      {model, system}
     end
   end
 
@@ -201,30 +328,50 @@ defmodule Web.TLA.AbortSignalConformanceTest do
       monitor = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^monitor, :process, ^pid, _reason}
-      SpecModel.step!(model, "ClientStop", [client])
+      {model |> SpecModel.step!("ClientStop", [client]) |> await_users(system), system}
     else
-      model
+      {model, system}
     end
   end
 
-  # The test waits for more than the linger time. After that time, the
-  # signal is stopped if, and only if, the specification permits the step
-  # Expire.
+  # The signal gets the stop of the client from the system: the test waits
+  # until the signal removed the client.
+  defp await_users(model, system) do
+    if SpecModel.get(model, "running"),
+      do: eventually(fn -> real_users(system) == SpecModel.get(model, "users") end)
+
+    model
+  end
+
+  # The test waits for more than the linger time. After that time, a signal
+  # with no use has stopped, if, and only if, the specification permits the
+  # step.
   defp run(:pause, model, system) do
     Process.sleep(3 * @linger)
 
-    if SpecModel.enabled?(model, "Expire") do
-      # The stop can come late on a busy machine: the test waits for it.
-      monitor = Process.monitor(system.signal.pid)
+    model =
+      if SpecModel.enabled?(model, "DepExpire") do
+        assert_down(system.dep.pid, "the dependent signal did not stop after the linger time")
+        SpecModel.step!(model, "DepExpire")
+      else
+        model
+      end
 
-      assert_receive {:DOWN, ^monitor, :process, _pid, _reason},
-                     2_000,
-                     "the signal did not stop after the linger time"
+    model =
+      if SpecModel.enabled?(model, "Expire") do
+        assert_down(system.signal.pid, "the signal did not stop after the linger time")
+        SpecModel.step!(model, "Expire")
+      else
+        model
+      end
 
-      SpecModel.step!(model, "Expire")
-    else
-      model
-    end
+    {model, system}
+  end
+
+  defp assert_down(pid, message) do
+    # The stop can come late on a busy machine: the test waits for it.
+    monitor = Process.monitor(pid)
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 2_000, message
   end
 
   # The linger time can be complete at this moment, and the store can remove
@@ -234,6 +381,11 @@ defmodule Web.TLA.AbortSignalConformanceTest do
   defp follow_timers(model, system) do
     model
     |> follow(not Process.alive?(system.signal.pid) and SpecModel.get(model, "running"), "Expire")
+    |> follow(
+      system.dep != nil and not Process.alive?(system.dep.pid) and
+        SpecModel.get(model, "dep") == "running",
+      "DepExpire"
+    )
     |> follow(not stored?(system) and SpecModel.get(model, "stored"), "Sweep")
   end
 
@@ -261,21 +413,52 @@ defmodule Web.TLA.AbortSignalConformanceTest do
            "the store #{if stored?(system), do: "has", else: "does not have"} the reason, " <>
              "but the specification has #{inspect(state)}"
 
-    if state["running"], do: assert(subscriptions(system) == state["subs"])
+    if system.dep do
+      assert Process.alive?(system.dep.pid) == state["dep"] in ["running", "aborted"]
+    end
+
+    if state["running"] do
+      real = :sys.get_state(pid)
+      assert subscriptions(system, real) == state["subs"]
+      assert real_users(system) == state["users"]
+      assert real.aborted != nil == state["aborted"]
+
+      assert Enum.map(real.dependents, & &1.pid) ==
+               if(state["dep"] == "running", do: [system.dep.pid], else: [])
+    end
   end
 
   # The number of subscriptions that the signal has for each client.
-  defp subscriptions(system) do
-    subscribers = :sys.get_state(system.signal.pid).subscribers
-
+  defp subscriptions(system, real) do
     Map.new(system.clients, fn {name, pid} ->
       count =
-        case subscribers do
+        case real.subscribers do
           %{^pid => {_monitor, count}} -> count
           _ -> 0
         end
 
       {to_string(name), count}
     end)
+  end
+
+  # The clients with a listener or an abort algorithm on the signal.
+  defp real_users(system) do
+    real = :sys.get_state(system.signal.pid)
+
+    owners =
+      MapSet.union(Listeners.owners(real.listeners), MapSet.new(real.algorithms, &elem(&1, 0)))
+
+    for {name, pid} <- system.clients,
+        MapSet.member?(owners, pid),
+        into: MapSet.new(),
+        do: to_string(name)
+  end
+
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
   end
 end

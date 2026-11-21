@@ -202,6 +202,125 @@ defmodule Web.TLA.ModelCheckTest do
         "SubscriptionsMatch"
       )
     end
+
+    test "a signal that stops at the abort, before the steps of the abort, is found" do
+      assert_violates(SpecModel.check("AbortSignal", bug("stop_at_mark")), "ServesSteps")
+    end
+
+    test "a signal that a listener or an abort algorithm does not keep is found" do
+      assert_violates(SpecModel.check("AbortSignal", bug("use_not_kept")), "KeptForUse")
+    end
+
+    test "a signal that a dependent signal does not keep is found" do
+      assert_violates(SpecModel.check("AbortSignal", bug("dependent_not_kept")), "KeptForUse")
+    end
+
+    test "a signal that stays after the steps of the abort is found" do
+      assert_violates(SpecModel.check("AbortSignal", bug("keeps_after_abort")), "AbortedStops")
+    end
+  end
+
+  describe "AbortSteps" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("AbortSteps"))
+    end
+
+    test "a dependent signal that is not aborted before the listeners run is found" do
+      assert_violates(SpecModel.check("AbortSteps", bug("dependent_late")), "DependentMarked")
+    end
+
+    test "an event before the abort algorithms is found" do
+      assert_violates(SpecModel.check("AbortSteps", bug("event_first")), "AlgorithmsFirst")
+    end
+
+    test "an event at the dependent signal before the event at the signal is found" do
+      assert_violates(SpecModel.check("AbortSteps", bug("dependent_first")), "SignalFirst")
+    end
+
+    test "a second abort that fires the event again is found" do
+      assert_violates(SpecModel.check("AbortSteps", bug("abort_twice")), "StepsOnce")
+    end
+
+    test "a signal that stops at the mark, before its listeners run, is found" do
+      assert_violates(SpecModel.check("AbortSteps", bug("stop_at_mark")), "ListenerHears")
+    end
+
+    test "a signal that stays after the stop of the process of the steps is found" do
+      assert_violates(SpecModel.check("AbortSteps", bug("ignore_caller_stop")), "AbortedStops")
+    end
+
+    test "an abort later that returns before the mark is found" do
+      assert_violates(SpecModel.check("AbortSteps", bug("later_unmarked")), "ReturnedAborted")
+    end
+
+    test "an abort that returns before its steps is found" do
+      assert_violates(
+        SpecModel.check("AbortSteps", bug("now_returns_first")),
+        "StepsBeforeReturn"
+      )
+    end
+  end
+
+  describe "AbortTimeouts" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("AbortTimeouts"))
+    end
+
+    test "a timeout that does not wait for the earlier timeouts is found" do
+      assert_violates(SpecModel.check("AbortTimeouts", bug("no_wait")), "InSequence")
+    end
+
+    test "a timeout that does not wait for an earlier timeout with the same time is found" do
+      assert_violates(SpecModel.check("AbortTimeouts", bug("strict_compare")), "InSequence")
+    end
+
+    test "a timeout that waits for a later timeout is found" do
+      assert_violates(SpecModel.check("AbortTimeouts", bug("wait_for_later")), "Aborts")
+    end
+  end
+
+  describe "EventTarget" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("EventTarget"))
+    end
+
+    test "a pass that calls a listener that came into the list during the pass is found" do
+      assert_violates(SpecModel.check("EventTarget", bug("no_clone")), "ClonedOnly")
+    end
+
+    test "a listener of a process that stopped is found" do
+      assert_violates(
+        SpecModel.check("EventTarget", bug("keep_dead_listeners")),
+        "ListenersOfLive"
+      )
+    end
+
+    test "a target that stops while it has a listener is found" do
+      assert_violates(SpecModel.check("EventTarget", bug("no_listener_rule")), "KeptForUse")
+    end
+
+    test "a target that stays with no use is found" do
+      assert_violates(SpecModel.check("EventTarget", bug("stays_unused")), "UnusedStops")
+    end
+
+    test "a dispatch with one pass is found" do
+      assert_violates(SpecModel.check("EventTarget", bug("one_pass")), "CaptureFirst")
+    end
+
+    test "a call of a listener that was removed is found" do
+      assert_violates(
+        SpecModel.check("EventTarget", bug("no_removed_check")),
+        "RemovedNotCalled"
+      )
+    end
+
+    test "a listener with once that stays in the list is found" do
+      assert_violates(SpecModel.check("EventTarget", bug("once_kept")), "OnceOnce")
+    end
+
+    test "a dispatch in the dispatch of the same event is found" do
+      assert_violates(SpecModel.check("EventTarget", bug("no_dispatch_flag")), "CalledOnce")
+    end
   end
 
   describe "MessagePort" do

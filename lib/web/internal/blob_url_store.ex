@@ -14,6 +14,14 @@ defmodule Web.Internal.BlobURLStore do
   # process that made it. The store monitors each such process, and
   # removes its entries when it stops. Thus a URL that a process forgets to
   # revoke does not stay.
+  #
+  # The design has no race of two writers: only the store writes, and it
+  # does the requests one at a time. A process that stops while its add
+  # waits in the mailbox: the store then monitors a process that stopped,
+  # and the monitor gives the stop at once. A process with a monitor that
+  # stops after an add: the stop comes after the add, because the signals
+  # from one process come in their sequence. A fetch that read the table
+  # before a revoke keeps the blob, as the File API permits.
 
   use GenServer
 

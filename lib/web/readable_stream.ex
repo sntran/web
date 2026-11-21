@@ -341,7 +341,8 @@ defmodule Web.ReadableStream do
   # lock: a different process can kill it. When it stopped before its first
   # read, no reader took the bytes, and the state is `:readable`, or
   # `{:process, pid}` for a new stream process: the step asks for the
-  # stream process again, with `again`, and takes its lock. The state ends
+  # stream process again, with `again`, and takes its lock. A start that
+  # stopped also gives `:readable`: the new ask continues it. The state ends
   # the retry: after a read or a claim, the state is `:gone` or the state of
   # the claim, and the error stays. See `tla/LazyStream.tla`.
   def __lock__(%__MODULE__{controller_pid: pid}, lock) when is_pid(pid), do: lock.(pid)

@@ -21,6 +21,14 @@ defmodule Web.TLA.LazyStreamConformanceTest do
   # of a stream process after a start that continued with no starter ends
   # with no crash report.
   #
+  # The tests of "the steps of the actors in a known sequence" do the steps
+  # of a claim or of a starter with the step functions of the code, in the
+  # sequence of a counterexample of a Bug value of the specification. The
+  # steps of the other copies, starters, and stream processes come between
+  # them, and the test compares the two states after each step. Other tests
+  # of that group look at the state during a start, and after a start that
+  # stopped.
+  #
   # The last property lets three processes do an operation on their copies
   # at the same time. The test cannot control the steps of the processes,
   # thus it checks the properties of the specification on the results.
@@ -800,6 +808,272 @@ defmodule Web.TLA.LazyStreamConformanceTest do
     {lazy, continued.controller_pid}
   end
 
+  # ---------------------------------------------------------------------------
+  # The steps of the actors in a known sequence
+  # ---------------------------------------------------------------------------
+
+  # A test cannot stop a process between two steps of one function. Thus the
+  # test does the steps of a claim or of a starter itself, with the step
+  # functions that the normal path calls one after the other, and the steps
+  # of the other actors come between them. After each step, the cell and the
+  # stream process agree with the specification.
+  describe "the steps of the actors in a known sequence" do
+    test "a claim that found a stream process that stopped looks again after a new start" do
+      lazy = LazyStream.new({:bytes, "hello"}, nil)
+
+      model =
+        start_model([{~s(Copies = {"a", "b"}), ~s(Copies = {"a", "b", "c"})} | @stop_config])
+
+      # Copy b gets a stream process, and does not read it. A process kills
+      # it: the cell has "process", and the bytes are free.
+      {:ok, first} = LazyStream.process(lazy, self())
+      kill(first)
+
+      model =
+        model
+        |> SpecModel.step!("Begin", ["b", "read"])
+        |> SpecModel.settle(internal("b", false))
+        |> SpecModel.step!("Drop", ["b"])
+        |> SpecModel.step!("StreamKill")
+
+      assert_spec_state(model, lazy)
+
+      # Copy a claims the bytes. Its look finds "process" and no stream
+      # process.
+      look = LazyStream.__look__(lazy)
+      assert look == {5, nil}
+      model = model |> SpecModel.step!("Begin", ["a", "locked"]) |> SpecModel.step!("Eval", ["a"])
+      assert SpecModel.get(model, "cpc")["a"] == "release"
+      assert_spec_state(model, lazy)
+
+      # Copy c reads: its starter starts a new stream process, and sets
+      # "process" again.
+      reader = start_copy(lazy, :process)
+      assert {:ok, second} = receive_result(reader)
+
+      model =
+        model
+        |> SpecModel.step!("Begin", ["c", "read"])
+        |> SpecModel.settle(internal("c", false))
+
+      assert SpecModel.get(model, "cpc")["c"] == "lock"
+      assert_spec_state(model, lazy)
+
+      # The step of the claim after its look: the bytes are not free now, and
+      # the claim looks again.
+      assert LazyStream.__claim_step__(lazy, :locked, look) == :again
+      model = SpecModel.step!(model, "Release", ["a"])
+      assert SpecModel.get(model, "cpc")["a"] == "ask"
+      assert_spec_state(model, lazy)
+
+      # The new look gives the stream process of copy c.
+      assert LazyStream.claim(lazy, :locked) == {:process, second}
+      model = SpecModel.step!(model, "Eval", ["a"])
+      assert SpecModel.get(model, "cpc")["a"] == "lock"
+      assert_spec_state(model, lazy)
+
+      # Copy c reads the bytes. They went out one time.
+      send(reader, :read)
+      assert receive_result(reader) == ["hello"]
+      model = model |> SpecModel.step!("Lock", ["c"]) |> SpecModel.step!("Read", ["c"])
+      assert SpecModel.get(model, "result")["c"] == "bytes"
+      assert SpecModel.get(model, "given") == 1
+      assert_spec_state(model, lazy)
+      kill(reader)
+    end
+
+    test "a starter whose copy stopped stops a start that registered itself after its first stop" do
+      lazy = LazyStream.new({:bytes, "hello"}, holding_signal([1, 3]))
+      model = start_model([])
+
+      # Copy b reads. The signal holds its starter before the start of the
+      # stream process. A process kills copy b, and then its starter. The
+      # start continues with no starter: the test does it later.
+      copy_b = start_copy(lazy, :read)
+      assert_receive {:held, starter_b, _from_b}, 2_000
+      kill(copy_b)
+      kill(starter_b)
+
+      model =
+        model
+        |> SpecModel.step!("Begin", ["b", "read"])
+        |> steps("b", ~w(Eval Register Decide))
+        |> SpecModel.step!("CopyStop", ["b"])
+        |> SpecModel.step!("StarterStop", ["b", true])
+
+      assert_spec_state(model, lazy)
+
+      # Copy a reads. Its starter starts a stream process, which registers
+      # itself, and the signal holds it in its start. The test suspends the
+      # starter, and a process kills copy a. Then the start ends.
+      copy_a = start_copy(lazy, :read)
+      assert_receive {:subscribed, 2, starter_a}, 2_000
+      assert_receive {:held, stream, from}, 2_000
+      assert parent(stream) == starter_a
+      true = :erlang.suspend_process(starter_a)
+      kill(copy_a)
+
+      model =
+        model
+        |> SpecModel.step!("Begin", ["a", "read"])
+        |> steps("a", ~w(Eval Register Decide New))
+        |> SpecModel.step!("CopyStop", ["a"])
+
+      assert_spec_state(model, lazy)
+      GenServer.reply(from, :ok)
+
+      # The test does the steps of the starter of copy a, and the start of
+      # copy b comes between them. First, the starter stops its stream
+      # process: no reader keeps it.
+      assert LazyStream.__stop_started__(stream) == :ok
+      refute Process.alive?(stream)
+      model = SpecModel.step!(model, "Check", ["a"])
+      assert_spec_state(model, lazy)
+
+      # The start of copy b continues, and registers itself in the state
+      # "starting".
+      continued = start_continued(lazy)
+      model = SpecModel.step!(model, "OrphanStart")
+      assert_spec_state(model, lazy)
+
+      # The starter sets "readable", and then it stops the stream process
+      # with no use.
+      assert LazyStream.__rollback__(lazy) == :ok
+      model = SpecModel.step!(model, "Rollback", ["a"])
+      assert_spec_state(model, lazy)
+
+      assert LazyStream.__rollback_reap__(lazy) == :ok
+      refute Process.alive?(continued)
+      kill(starter_a)
+      model = SpecModel.step!(model, "StarterReap", ["a"])
+      assert_spec_state(model, lazy)
+
+      # The bytes are free.
+      assert LazyStream.take(lazy) == {:ok, "hello"}
+    end
+
+    test "a look at the state after a start that stopped starts no process" do
+      lazy = LazyStream.new({:bytes, "hello"}, holding_signal([1]))
+      stream = %ReadableStream{lazy: lazy}
+
+      model =
+        start_model([{~s(Copies = {"a", "b"}), ~s(Copies = {"a", "b", "c"})}, @all_ops])
+
+      # Copy b reads. The signal holds its starter after the state
+      # "starting". A process kills copy b, and then its starter.
+      copy_b = start_copy(lazy, :read)
+      assert_receive {:held, starter_b, _from_b}, 2_000
+      kill(copy_b)
+      kill(starter_b)
+
+      model =
+        model
+        |> SpecModel.step!("Begin", ["b", "read"])
+        |> steps("b", ~w(Eval Register Decide))
+        |> SpecModel.step!("CopyStop", ["b"])
+        |> SpecModel.step!("StarterStop", ["b", false])
+
+      assert_spec_state(model, lazy)
+
+      # Copy a looks at the state: no process took the bytes. The functions
+      # that tell the state agree, and no process starts.
+      assert LazyStream.state(lazy) == :readable
+      refute ReadableStream.disturbed?(stream)
+      refute ReadableStream.locked?(stream)
+      refute Web.Response.body_used?(%Web.Response{body: stream})
+      assert live_keys({lazy.ref, :start}) == []
+      assert live_keys(lazy.ref) == []
+      model = model |> SpecModel.step!("Begin", ["a", "state"]) |> SpecModel.step!("Eval", ["a"])
+      assert SpecModel.get(model, "result")["a"] == "readable"
+      assert SpecModel.get(model, "sp")["a"] == "none"
+      assert_spec_state(model, lazy)
+
+      # A stream read continues the start, and gets the bytes.
+      copy_c = start_copy(lazy, :read)
+      assert receive_result(copy_c) == ["hello"]
+
+      model =
+        model
+        |> SpecModel.step!("Begin", ["c", "read"])
+        |> SpecModel.settle(internal("c", true))
+
+      assert SpecModel.get(model, "result")["c"] == "bytes"
+      assert_spec_state(model, lazy)
+      kill(copy_c)
+    end
+
+    test "a look at the state during the start of a closed stream gives consumed" do
+      lazy = LazyStream.new({:bytes, "hello"}, holding_signal([1]))
+
+      model =
+        start_model([{~s(Copies = {"a", "b"}), ~s(Copies = {"a", "b", "c"})}, @all_ops])
+
+      # Copy b cancels the stream.
+      assert LazyStream.cancel(lazy) == :ok
+
+      model =
+        model
+        |> SpecModel.step!("Begin", ["b", "canceled"])
+        |> SpecModel.settle(internal("b", false))
+
+      # Copy c reads. The signal holds its starter after the state
+      # "starting_closed".
+      copy_c = start_copy(lazy, :read)
+      assert_receive {:held, _starter_c, from}, 2_000
+
+      model =
+        model
+        |> SpecModel.step!("Begin", ["c", "read"])
+        |> steps("c", ~w(Eval Register Decide))
+
+      assert_spec_state(model, lazy)
+
+      # Copy a looks at the state: a claim used the bytes, and the stream is
+      # closed.
+      assert LazyStream.state(lazy) == :consumed
+      model = model |> SpecModel.step!("Begin", ["a", "state"]) |> SpecModel.step!("Eval", ["a"])
+      assert SpecModel.get(model, "result")["a"] == "consumed"
+      assert_spec_state(model, lazy)
+
+      # The start ends: copy c reads a closed stream.
+      GenServer.reply(from, :ok)
+      assert receive_result(copy_c) == []
+      model = SpecModel.settle(model, internal("c", true))
+      assert SpecModel.get(model, "result")["c"] == "closed"
+
+      # The lifetime rules stop a closed stream after its end, at a time that
+      # the test does not know: the test compares the cell only.
+      assert @cell[:atomics.get(lazy.ref, 1)] == SpecModel.get(model, "cell")
+      kill(copy_c)
+    end
+  end
+
+  # The start of a stream process of the bytes, with the key of the stream:
+  # the start of a starter that a process killed, which continues.
+  defp start_continued(lazy) do
+    source = %{
+      type: "bytes",
+      pull: fn controller ->
+        Web.ReadableStream.enqueue(controller.pid, Uint8Array.from("hello"))
+        Web.ReadableStream.close(controller.pid)
+      end
+    }
+
+    Web.ReadableStream.__new__(source, [high_water_mark: 0], registry_key: lazy.ref).controller_pid
+  end
+
+  # The processes that are alive and have the key. The registry removes the
+  # key some time after the stop of a process.
+  defp live_keys(key) do
+    for {pid, _value} <- Registry.lookup(LazyStream.registry(), key), Process.alive?(pid), do: pid
+  end
+
+  defp assert_spec_state(model, lazy) do
+    assert @cell[:atomics.get(lazy.ref, 1)] == SpecModel.get(model, "cell")
+    live = if stream_pid(%{lazy: lazy, node: node()}), do: 1, else: 0
+    assert live == SpecModel.get(model, "live")
+  end
+
   # The steps of the start: the call of the signal that the abort signal
   # holds.
   defp check_stop(step, victim) when step in [:starting, :registered] do
@@ -1065,7 +1339,8 @@ defmodule Web.TLA.LazyStreamConformanceTest do
   # The steps that a real operation does in the copy and in its starter.
   defp internal(name, read?) do
     actions =
-      for action <- ~w(Eval ClaimSet Reap Register Decide New Check Rollback StarterReap Wake),
+      for action <-
+            ~w(Eval ClaimSet Release Reap Register Decide New Check Rollback StarterReap Wake),
           do: {action, [name]}
 
     if read?, do: actions ++ [{"Lock", [name]}, {"Read", [name]}], else: actions

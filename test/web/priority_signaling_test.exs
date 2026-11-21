@@ -110,8 +110,8 @@ defmodule Web.PrioritySignalingTest do
     pid = stream.controller_pid
 
     while_suspended(pid, fn ->
-      # A source that is a process sends chunks and does not wait.
-      Enum.each(1..1_000, &ReadableStream.enqueue(pid, &1))
+      # A source that is a different process sends chunks and does not wait.
+      from_other_process(fn -> Enum.each(1..1_000, &ReadableStream.enqueue(pid, &1)) end)
       _cancel = ReadableStream.cancel(stream, :stop)
     end)
 
@@ -144,14 +144,21 @@ defmodule Web.PrioritySignalingTest do
     write = Task.async(fn -> Web.Promise.wait(WritableStreamDefaultWriter.write(writer, 0)) end)
     assert_receive {:write_started, sink, 0}
 
+    # A different process sends the writes, in the form of
+    # `Web.Stream.promise_call/4`: the tag tells the sender. The answers come
+    # to the test.
+    test = self()
+
     {abort, tags} =
       while_suspended(pid, fn ->
         tags =
-          for index <- 1..100_000 do
-            tag = make_ref()
-            send(pid, {:"$gen_call", {self(), tag}, {:write, writer.owner_pid, index}})
-            tag
-          end
+          from_other_process(fn ->
+            for index <- 1..100_000 do
+              tag = {:"$web_sent", self(), make_ref()}
+              send(pid, {:"$gen_call", {test, tag}, {:write, writer.owner_pid, index}})
+              tag
+            end
+          end)
 
         {WritableStreamDefaultWriter.abort(writer, :emergency_stop), tags}
       end)
@@ -172,6 +179,127 @@ defmodule Web.PrioritySignalingTest do
     assert_receive {:sink_aborted, :emergency_stop}
     assert :ok = await(abort)
     assert WritableStream.__get_slots__(pid).state == :errored
+  end
+
+  # Runs `fun` in a different process, and returns its result.
+  defp from_other_process(fun) do
+    fun |> Task.async() |> Task.await(30_000)
+  end
+
+  describe "the sequence of one sender" do
+    test "a write before an abort of the same process starts first, as in the Standard" do
+      test = self()
+
+      stream =
+        WritableStream.new(%{
+          write: fn chunk, _controller ->
+            send(test, {:write_started, self(), chunk})
+            receive(do: (:release -> :ok))
+          end,
+          abort: fn reason -> send(test, {:sink_aborted, reason}) end
+        })
+
+      writer = WritableStream.get_writer(stream)
+
+      {write, abort} =
+        while_suspended(stream.controller_pid, fn ->
+          {WritableStreamDefaultWriter.write(writer, "a"),
+           WritableStreamDefaultWriter.abort(writer, :stop)}
+        end)
+
+      # WritableStreamAbort waits for the write in flight.
+      assert_receive {:write_started, sink, "a"}
+      refute_received {:sink_aborted, _reason}
+      send(sink, :release)
+      assert await(write) == :ok
+      assert await(abort) == :ok
+      assert_received {:sink_aborted, :stop}
+    end
+
+    test "a close before an abort of the same process is in flight, and it completes" do
+      test = self()
+      stream = WritableStream.new(%{close: fn _controller -> send(test, :sink_closed) end})
+      writer = WritableStream.get_writer(stream)
+
+      {close, abort} =
+        while_suspended(stream.controller_pid, fn ->
+          {WritableStreamDefaultWriter.close(writer),
+           WritableStreamDefaultWriter.abort(writer, :stop)}
+        end)
+
+      assert await(close) == :ok
+      assert await(abort) == :ok
+      assert_received :sink_closed
+      assert WritableStream.__get_slots__(stream.controller_pid).state == :closed
+    end
+
+    test "a chunk before an error of the same process goes to the read that waits" do
+      stream = ReadableStream.new(%{})
+      pid = stream.controller_pid
+      reader = ReadableStream.get_reader(stream)
+      read = Web.ReadableStreamDefaultReader.read(reader)
+      eventually(fn -> not :queue.is_empty(ReadableStream.__get_slots__(pid).read_requests) end)
+
+      while_suspended(pid, fn ->
+        ReadableStream.enqueue(pid, "a")
+        ReadableStream.error(pid, :failed)
+      end)
+
+      assert await(read) == %{value: "a", done: false}
+      assert ReadableStream.__get_slots__(pid).state == :errored
+    end
+
+    test "an abort comes before the write of a different process" do
+      test = self()
+
+      stream =
+        WritableStream.new(%{
+          write: fn chunk, _controller -> send(test, {:write_started, chunk}) end,
+          abort: fn reason -> send(test, {:sink_aborted, reason}) end
+        })
+
+      writer = WritableStream.get_writer(stream)
+      pid = stream.controller_pid
+
+      {write, abort} =
+        while_suspended(pid, fn ->
+          write = from_other_process(fn -> WritableStreamDefaultWriter.write(writer, "a") end)
+          {write, WritableStreamDefaultWriter.abort(writer, :stop)}
+        end)
+
+      assert catch_exit(await(write)) == :stop
+      assert await(abort) == :ok
+      assert_received {:sink_aborted, :stop}
+      refute_received {:write_started, _chunk}
+    end
+
+    test "a fence that the stream handled before the priority message" do
+      stream = ReadableStream.new(%{})
+      pid = stream.controller_pid
+      {_item, alias} = Process.info(pid, {:dictionary, {Web.Stream, :priority_alias}})
+
+      # The sender sends the fence and the priority message as
+      # `Web.Stream.control_cast/2` does. The stream handles the fence first.
+      fence = make_ref()
+      send(pid, {:"$web_fence", fence})
+      assert ReadableStream.__get_slots__(pid).state == :readable
+      message = {:"$gen_cast", {:"$web_fenced", self(), fence, {:error, :failed}}}
+      :erlang.send(alias, message, [:priority])
+
+      assert ReadableStream.__get_slots__(pid).state == :errored
+      # The stream forgot the fence.
+      key = {:"$web_fence", fence}
+      assert Process.info(pid, {:dictionary, key}) == {{:dictionary, key}, :undefined}
+    end
+  end
+
+  defp eventually(fun) do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(1)
+      eventually(fun)
+    end
   end
 
   test "a signal to a stream that stopped, and to a process that is not a stream" do

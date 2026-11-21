@@ -815,7 +815,7 @@ defmodule Web.ReadableStream do
   # Such a source can run at the same time as a cancel, thus a chunk for a
   # stream that is closed or errored is discarded.
   def enqueue(pid, chunk) do
-    :gen_statem.cast(pid, {:enqueue, chunk})
+    Web.Stream.control_cast(pid, {:enqueue, chunk})
   end
 
   @doc false

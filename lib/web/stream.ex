@@ -82,6 +82,13 @@ defmodule Web.Stream do
   # process: see `start_task/2`.
   @worker_key {__MODULE__, :worker}
 
+  # The forms of the messages that keep the sequence of one sender: see
+  # "Priority messages".
+  @fence :"$web_fence"
+  @fenced :"$web_fenced"
+  @sent :"$web_sent"
+  @sequence_forms [@fence, @fenced, @sent]
+
   # ---------------------------------------------------------------------------
   # Engine data
   # ---------------------------------------------------------------------------
@@ -264,7 +271,8 @@ defmodule Web.Stream do
   # before a `close` is written before the close.
   def promise_call(pid, message, gone, mapper) when is_pid(pid) and is_function(mapper, 1) do
     caller = self()
-    tag = make_ref()
+    # The tag tells the sender of the call: see "Priority messages".
+    tag = {@sent, caller, make_ref()}
 
     promise =
       Web.Promise.detached(fn resolve, reject ->
@@ -409,12 +417,34 @@ defmodule Web.Stream do
   # Priority messages
   #
   # A cancel, an abort, and an error discard the data that the stream has.
-  # Thus they do not wait for the messages before them: the stream gets them
-  # as priority messages of Erlang/OTP, before the other messages of its
-  # mailbox. A stream with a full mailbox stops immediately.
+  # Thus they do not wait for the messages of other processes: the stream
+  # gets them as priority messages of Erlang/OTP, before the other messages
+  # of its mailbox. A stream with a full mailbox stops immediately.
   #
   # Each other message is a usual message. Thus the stream handles a `close`
   # after the chunks that the same process enqueued before it.
+  #
+  # A priority message goes before the usual messages that wait, also before
+  # the earlier messages of the same process. In the Streams Standard, the
+  # operations of one caller have their sequence: for example, `write()`
+  # starts the write of the sink before `abort()`. Thus the sender keeps its
+  # sequence with a fence:
+  #
+  #   1. The sender sends the usual message `{:"$web_fence", fence}`.
+  #   2. The sender sends the priority message, with its pid and the fence.
+  #   3. The stream gets the priority message first. It takes the usual
+  #      messages of that sender up to the fence, with a selective receive,
+  #      and handles them first. Then it handles the priority message, and
+  #      then the messages of the other processes.
+  #
+  # Erlang/OTP keeps the sequence of the signals of one sender: the fence
+  # comes before the priority message. Thus the fence is in the mailbox when
+  # the stream gets the priority message, also when the sender stopped after
+  # it. The usual messages of this module tell their sender: a cast has the
+  # form `{:"$web_sent", sender, message}`, and a call of `promise_call/4`
+  # has the sender in its tag. A message that does not tell its sender, for
+  # example a message of a different module, can come after the priority
+  # message.
   #
   # A priority message needs a priority alias of the stream process. The
   # stream keeps its alias in its process dictionary, where a sender reads
@@ -472,11 +502,18 @@ defmodule Web.Stream do
     if abortive?(message) do
       send_with_priority(pid, envelope)
     else
-      send(pid, envelope)
+      send(pid, with_sender(pid, envelope))
     end
 
     :ok
   end
+
+  # A usual cast to a stream of this node tells its sender: see "Priority
+  # messages". A call tells its sender in its tag.
+  defp with_sender(pid, {:"$gen_cast", message}) when node(pid) == node(),
+    do: {:"$gen_cast", {@sent, self(), message}}
+
+  defp with_sender(_pid, envelope), do: envelope
 
   defp abortive?({terminate, type, _reason})
        when terminate in [:terminate, :terminate_unlocked] and type in [:cancel, :abort],
@@ -491,13 +528,56 @@ defmodule Web.Stream do
 
   defp send_with_priority(pid, envelope) do
     case :erlang.process_info(pid, {:dictionary, @priority_alias}) do
-      {_item, alias} when is_reference(alias) -> :erlang.send(alias, envelope, [:priority])
+      {_item, alias} when is_reference(alias) ->
+        fence = make_ref()
+        send(pid, {@fence, fence})
+        :erlang.send(alias, fenced(envelope, fence), [:priority])
+
       # The process stopped, or it is not a stream of this version.
-      _other -> send(pid, envelope)
+      _other ->
+        send(pid, envelope)
     end
   rescue
     # The process is on a different node.
     ArgumentError -> send(pid, envelope)
+  end
+
+  defp fenced({:"$gen_call", from, message}, fence),
+    do: {:"$gen_call", from, {@fenced, self(), fence, message}}
+
+  defp fenced({:"$gen_cast", message}, fence),
+    do: {:"$gen_cast", {@fenced, self(), fence, message}}
+
+  # The messages that keep the sequence of one sender, for each state
+  # function `fun`: see "Priority messages".
+  defp in_sequence(:cast, {@sent, _sender, message}, data, fun), do: fun.(:cast, message, data)
+
+  # The stream handled the fence before the priority message came: it
+  # handled the usual messages of the sender before the fence.
+  defp in_sequence(:info, {@fence, fence}, _data, _fun) do
+    Process.put({@fence, fence}, true)
+    :keep_state_and_data
+  end
+
+  # A priority message: the stream handles the usual messages of its sender
+  # up to the fence first. The fence is in the mailbox, or the stream
+  # handled it.
+  defp in_sequence(type, {@fenced, sender, fence, message}, _data, _fun) do
+    earlier = if Process.delete({@fence, fence}), do: [], else: sender_events(sender, fence, [])
+    {:keep_state_and_data, earlier ++ [{:next_event, type, message}]}
+  end
+
+  defp sender_events(sender, fence, events) do
+    receive do
+      {@fence, ^fence} ->
+        Enum.reverse(events)
+
+      {:"$gen_call", {_replier, {@sent, ^sender, _ref}} = from, message} ->
+        sender_events(sender, fence, [{:next_event, {:call, from}, message} | events])
+
+      {:"$gen_cast", {@sent, ^sender, message}} ->
+        sender_events(sender, fence, [{:next_event, :cast, message} | events])
+    end
   end
 
   @doc false
@@ -537,20 +617,20 @@ defmodule Web.Stream do
   #   1. The caller asks the stream for its state, with a priority message.
   #      A closed or errored stream needs no abort.
   #   2. The caller signals abort. The listeners run in its process.
-  #   3. The caller waits until the stream handled the requests that the
-  #      listeners sent: they are usual messages, and the abort is a
-  #      priority message.
-  #   4. The caller sends the abort. The stream does the steps after step 2.
+  #   3. The caller sends the abort. The stream does the steps after step 2.
+  #      The abort is a priority message, and the requests that the
+  #      listeners sent are usual messages of the same process: the stream
+  #      handles them first. See "Priority messages".
   #
-  # From step 1 to step 4, the stream keeps the results of its callbacks,
+  # From step 1 to step 3, the stream keeps the results of its callbacks,
   # and handles them after the abort. In JavaScript, a write that stops
   # when the signal aborts completes in a later microtask, thus after the
   # abort. For example, a sink that stops a write when the signal aborts
   # gets its abort callback when the write is complete. A caller that stops
-  # before step 4 does not keep the stream: the stream does the steps after
+  # before step 3 does not keep the stream: the stream does the steps after
   # step 2 with no caller.
   #
-  # A stream with no signal needs only step 4, because no process can have
+  # A stream with no signal needs only step 3, because no process can have
   # a listener. The stream keeps its signal in its process dictionary, and
   # the caller reads it there with no message. Thus an abort of a stream
   # with no signal does not wait for the stream.
@@ -576,7 +656,6 @@ defmodule Web.Stream do
         case first_abort_steps(pid, first_steps, gone) do
           {:continue, window} ->
             :ok = AbortSignal.__signal_abort__(signal, reason)
-            _handled = call(pid, :handled, :ok)
             promise_call(pid, {:abort_rest, window, abort}, gone, mapper)
 
           reply ->
@@ -778,6 +857,9 @@ defmodule Web.Stream do
   # State: readable  (producers only)
   # ---------------------------------------------------------------------------
 
+  def readable(type, content, data) when elem(content, 0) in @sequence_forms,
+    do: in_sequence(type, content, data, &readable/3)
+
   def readable(type, content, data) do
     type |> do_readable(content, data) |> with_lifetime(:readable, data)
   end
@@ -824,6 +906,9 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
   # State: writable  (consumers AND producer_consumers)
   # ---------------------------------------------------------------------------
+
+  def writable(type, content, data) when elem(content, 0) in @sequence_forms,
+    do: in_sequence(type, content, data, &writable/3)
 
   def writable(type, content, data) do
     type
@@ -872,6 +957,9 @@ defmodule Web.Stream do
   # State: closing  (consumers draining writes before flush)
   # ---------------------------------------------------------------------------
 
+  def closing(type, content, data) when elem(content, 0) in @sequence_forms,
+    do: in_sequence(type, content, data, &closing/3)
+
   def closing(type, content, data) do
     type
     |> as_writer(content, data, &do_closing/3)
@@ -912,6 +1000,9 @@ defmodule Web.Stream do
 
   @doc false
   # A state function of `:gen_statem`.
+  def erroring(type, content, data) when elem(content, 0) in @sequence_forms,
+    do: in_sequence(type, content, data, &erroring/3)
+
   def erroring(type, content, data) do
     type |> as_writer(content, data, &do_erroring/3) |> with_lifetime(:erroring, data)
   end
@@ -963,6 +1054,9 @@ defmodule Web.Stream do
   # State: closed
   # ---------------------------------------------------------------------------
 
+  def closed(type, content, data) when elem(content, 0) in @sequence_forms,
+    do: in_sequence(type, content, data, &closed/3)
+
   def closed(type, content, data) do
     type |> as_writer(content, data, &do_closed/3) |> with_lifetime(:closed, data)
   end
@@ -976,6 +1070,9 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
   # State: errored
   # ---------------------------------------------------------------------------
+
+  def errored(type, content, data) when elem(content, 0) in @sequence_forms,
+    do: in_sequence(type, content, data, &errored/3)
 
   def errored(type, content, data) do
     type |> as_writer(content, data, &do_errored/3) |> with_lifetime(:errored, data)
@@ -1193,7 +1290,7 @@ defmodule Web.Stream do
     end
   end
 
-  # Step 4: the abort, and then the results that the stream kept.
+  # Step 3: the abort, and then the results that the stream kept.
   defp handle_common({:call, from}, {:abort_rest, window, request}, _state, _data) do
     {:keep_state_and_data,
      [{:next_event, {:call, from}, request}, {:next_event, :internal, {:close_window, window}}]}
@@ -1229,11 +1326,6 @@ defmodule Web.Stream do
 
   defp handle_common(:internal, {:abort_with_no_caller, _reason}, _state, _data),
     do: :keep_state_and_data
-
-  # A request with no effect. Its reply tells the caller that the stream
-  # handled each request that the caller sent before it.
-  defp handle_common({:call, from}, :handled, _state, _data),
-    do: {:keep_state_and_data, [{:reply, from, :ok}]}
 
   # A terminal event from the stream object, not from a reader or a writer.
   # The Streams Standard refuses it when the stream is locked.

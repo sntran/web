@@ -461,4 +461,79 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(SpecModel.check("PublicAbort", bug("keep_window")), "Progress")
     end
   end
+
+  describe "FormDataParser" do
+    @freeze {~s(Callers = {"get", "iter"}), ~s(Callers = {"get", "freeze"})}
+
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("FormDataParser"))
+    end
+
+    test "the design with a freeze has all its properties" do
+      assert_holds(SpecModel.check("FormDataParser", @freeze))
+    end
+
+    # The defect of 622e721: a call to a parser that stopped exited the
+    # caller with :noproc.
+    test "a call to a parser that stopped, with an exit of OTP, is found" do
+      assert_violates(SpecModel.check("FormDataParser", bug("noproc_exit")), "NoCrash")
+    end
+
+    test "a call in flight at the stop of the owner, with an exit of OTP, is found" do
+      assert_violates(SpecModel.check("FormDataParser", bug("shutdown_exit")), "NoCrash")
+    end
+
+    test "a stop that cancels the file stream, which then ends short, is found" do
+      assert_violates(SpecModel.check("FormDataParser", bug("cancel_child")), "FileIntegrity")
+    end
+
+    test "a pull of a parser that stopped, which ends the file stream short, is found" do
+      assert_violates(
+        SpecModel.check("FormDataParser", bug("close_on_lost_parser")),
+        "FileIntegrity"
+      )
+    end
+
+    # The parser waits for a source that stalls, and takes no message: the
+    # model has no step, thus the check stops the deadlock check.
+    test "a parser that takes no cancel while it waits for the source is found" do
+      result = SpecModel.check("FormDataParser", bug("blocking_read"), deadlock: false)
+      assert_violates(result, "PromptStop")
+    end
+
+    test "a query that goes past a file part that its reader did not read is found" do
+      assert_violates(SpecModel.check("FormDataParser", bug("no_discard")), "FileBeforeNext")
+    end
+
+    # The defect that the property test found: an iteration discarded the
+    # file part and read past it, and a get that waited got no answer.
+    test "a query that answers only its caller, while other calls wait, is found" do
+      assert_violates(SpecModel.check("FormDataParser", bug("serve_only_caller")), "NoLostReply")
+    end
+
+    test "a stop that gives no answer to the calls that wait is found" do
+      assert_violates(SpecModel.check("FormDataParser", bug("lost_pending")), "NoLostReply")
+    end
+
+    test "a discard that moves the iteration past an entry is found" do
+      assert_violates(
+        SpecModel.check("FormDataParser", bug("discard_skips_entry")),
+        "EntriesInOrder"
+      )
+    end
+
+    test "a stop of the owner with no terminate, which keeps the file stream, is found" do
+      assert_violates(
+        SpecModel.check("FormDataParser", bug("kill_on_owner_down")),
+        "StreamEndsWithParser"
+      )
+    end
+
+    test "a freeze that gives an error to the calls that wait is found" do
+      assert_violates(
+        SpecModel.check("FormDataParser", [bug("freeze_drops_pending"), @freeze]),
+        "NoWrongError"
+      )
+    end
+  end
 end

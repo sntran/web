@@ -47,7 +47,10 @@ defmodule Web.BodyStandardTest do
           {:web_body, _ref, {:take, monitor, from}} ->
             send(from, {monitor, {:ok, bytes}})
 
-          {:web_body, _ref, {:stream, stream}} ->
+          # The first pull of the stream process: it comes with the first
+          # read. The holder finds the stream process with the key.
+          {:web_body, ref, :pull} ->
+            [{stream, _value}] = Registry.lookup(LazyStream.registry(), ref)
             ReadableStream.enqueue(stream, Uint8Array.from(bytes))
             ReadableStream.close(stream)
         end

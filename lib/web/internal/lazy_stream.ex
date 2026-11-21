@@ -84,13 +84,13 @@ defmodule Web.Internal.LazyStream do
   #     Standard and the Fetch Standard.
   #   * starting: a starter starts a stream process that has the bytes.
   #   * starting_closed: a starter starts a closed stream process.
-  #   * process: a stream process with the bytes exists, or existed, and it
-  #     did not give them out. A stream process that stopped before its
-  #     first pull did not take the bytes from the other copies: the next
-  #     read gets them.
-  #   * taken: the stream process gave the bytes out (its first pull, or a
-  #     cancel), or it has no bytes of the struct: a closed stream, or the
-  #     stream of a holder.
+  #   * process: a stream process with the bytes exists, or existed, and no
+  #     read disturbed it. A stream process that stopped before its first
+  #     disturb did not take the bytes from the other copies: the next read
+  #     gets them.
+  #   * taken: the stream process gave the bytes out at its first disturb
+  #     (a read, a cancel, a pipe, or the step "consume body"), or it is a
+  #     closed stream.
   @readable 0
   @consumed 1
   @canceled 2
@@ -101,10 +101,6 @@ defmodule Web.Internal.LazyStream do
   @taken 7
 
   @registry Web.StreamRegistry
-
-  # A body that a process holds keeps this number of bytes before the
-  # process waits for a read. A stream from it has the same limit.
-  @held_high_water_mark 65_536
 
   @doc "The name of the registry of the stream processes."
   def registry, do: @registry
@@ -146,23 +142,42 @@ defmodule Web.Internal.LazyStream do
   the stream has.
   """
   @spec claim(t(), :consumed | :canceled | :locked) :: :ok | state()
-  def claim(%__MODULE__{ref: ref} = lazy, to) do
-    if local?(ref), do: local_claim(lazy, to), else: remote(lazy, :claim, [to], :gone)
+  def claim(%__MODULE__{} = lazy, to), do: claim(lazy, to, self())
+
+  @doc false
+  # `claim/2` for the process `keeper`, which reads a stream process that
+  # it gets: see `keep/2`.
+  def claim(%__MODULE__{ref: ref} = lazy, to, keeper) do
+    if local?(ref),
+      do: local_claim(lazy, to, keeper),
+      else: remote(lazy, :claim, [to, keeper], :gone)
   end
 
   # One compare-exchange from a cell whose bytes no process has: "readable",
   # or "process" with a stream process that stopped before it gave the
   # bytes out. A cell that changed in between gives a second try.
-  defp local_claim(lazy, to), do: claim_from(lazy, to, :atomics.get(lazy.ref, 1))
+  defp local_claim(lazy, to, keeper),
+    do: claim_from(lazy, to, keeper, :atomics.get(lazy.ref, 1))
 
-  defp claim_from(lazy, to, current) do
+  defp claim_from(lazy, to, keeper, current) do
     if bytes_free?(lazy, current) do
       changed = :atomics.compare_exchange(lazy.ref, 1, current, encode(to))
-      if changed == :ok, do: :ok, else: claim_from(lazy, to, changed)
+      if changed == :ok, do: :ok, else: claim_from(lazy, to, keeper, changed)
     else
-      with :readable <- decode(lazy, current), do: local_claim(lazy, to)
+      claim_found(lazy, to, keeper, decode(lazy, current))
     end
   end
+
+  # A stream process that stopped before a disturb: the bytes are free.
+  defp claim_found(lazy, to, keeper, :readable), do: local_claim(lazy, to, keeper)
+
+  # The caller reads the stream process: the copy keeps it.
+  defp claim_found(lazy, to, keeper, {:process, pid}) do
+    with {:ok, pid} <- keep_or(pid, keeper, fn -> local_claim(lazy, to, keeper) end),
+         do: {:process, pid}
+  end
+
+  defp claim_found(_lazy, _to, _keeper, state), do: state
 
   defp bytes_free?(_lazy, @readable), do: true
   defp bytes_free?(lazy, @process), do: live_stream(lazy) == nil
@@ -183,9 +198,9 @@ defmodule Web.Internal.LazyStream do
     decode(lazy, :atomics.get(lazy.ref, 1))
   end
 
-  # A stream process that stopped before its first pull did not take the
+  # A stream process that stopped before its first disturb did not take the
   # bytes. The cell must have the same value after the look in the
-  # registry: a pull between the two looks sets "taken".
+  # registry: a disturb between the two looks sets "taken".
   defp decode(lazy, @process) do
     case live_stream(lazy) do
       nil -> confirm(lazy, @process, :readable)
@@ -199,6 +214,43 @@ defmodule Web.Internal.LazyStream do
       pid -> {:process, pid}
     end
   end
+
+  @doc false
+  # The first disturb of the stream process: a read, a cancel, a pipe, or
+  # the step "consume body". The bytes went out for all the copies. Called
+  # in the stream process: see `Web.Stream`.
+  def __disturbed__(ref) do
+    _ = :atomics.compare_exchange(ref, 1, @process, @taken)
+    :ok
+  end
+
+  @doc false
+  # The stream process registers itself in its start, with the kind of its
+  # chunks: `:bytes` or `:closed`. A process can kill a starter in the start
+  # of its stream process, and that start continues with no starter. Thus
+  # two starts can come for one key, and a start can come after the bytes
+  # went out. Such a start returns `:taken`: the stream process stops
+  # normally in its start, with no crash report. See `tla/LazyStream.tla`.
+  def __register__(ref, kind) do
+    with {:ok, _partition} <- Registry.register(@registry, ref, nil),
+         true <- :atomics.get(ref, 1) in start_cells(kind) do
+      :ok
+    else
+      {:error, {:already_registered, _pid}} -> :taken
+      false -> with :ok <- Registry.unregister(@registry, ref), do: :taken
+    end
+  end
+
+  # A stream process of the bytes starts only while the bytes are free: the
+  # state of its start, or "process" with no stream process (the registry
+  # has no other key). A closed stream process starts in its state of start.
+  defp start_cells(:bytes), do: [@starting, @process]
+  defp start_cells(:closed), do: [@starting_closed]
+
+  @doc false
+  # The stream process that is alive, or `nil`: see
+  # `Web.Dispatcher.RequestProcess`.
+  def __stream__(%__MODULE__{} = lazy), do: live_stream(lazy)
 
   defp confirm(lazy, current, state) do
     now = :atomics.get(lazy.ref, 1)
@@ -229,10 +281,15 @@ defmodule Web.Internal.LazyStream do
   # The starter registers the key `{ref, :start}` before it changes the
   # state. Thus one starter at most works, and the copies find it. The
   # registry removes the key of a starter that stopped: the next starter
-  # continues from the state that it finds. The stream process takes the
-  # bytes at its first pull, which comes with the first read, not at its
-  # start. Thus a stream process that stops before a read takes no bytes
-  # from the other copies. See `tla/LazyStream.tla`.
+  # continues from the state that it finds.
+  #
+  # The stream process takes the bytes at its first disturb, not at its
+  # start: it sets "taken" in that step (see `__disturbed__/1`). Its first
+  # pull comes with the first read. A copy that got the process keeps it
+  # until it takes its lock or stops (see `keep_or/3`), and the lifetime
+  # rules stop a process that no read disturbed with no cancel. Thus a
+  # stream process that stops before a read takes no bytes from the other
+  # copies. See `tla/LazyStream.tla`.
   # ---------------------------------------------------------------------------
 
   @doc """
@@ -243,16 +300,21 @@ defmodule Web.Internal.LazyStream do
   bytes out.
   """
   @spec process(t(), pid()) :: {:ok, pid()} | {:error, :already_locked | :released}
-  def process(%__MODULE__{ref: ref} = lazy, owner) do
+  def process(%__MODULE__{} = lazy, owner), do: process(lazy, owner, self())
+
+  @doc false
+  # `process/2` for the process `keeper`, which takes the lock of the stream
+  # process next: see `keep/2`.
+  def process(%__MODULE__{ref: ref} = lazy, owner, keeper) do
     if local?(ref),
-      do: local_process(lazy, owner),
-      else: remote(lazy, :process, [owner], {:error, :released})
+      do: local_process(lazy, owner, keeper),
+      else: remote(lazy, :process, [owner, keeper], {:error, :released})
   end
 
   # The registry first, then the cell: a stream process registers itself
   # before a starter sets a state that is not "starting". Thus a copy gets
   # a stream process only after its start.
-  defp local_process(lazy, owner) do
+  defp local_process(lazy, owner, keeper) do
     pid = live_stream(lazy)
 
     case {:atomics.get(lazy.ref, 1), pid} do
@@ -261,17 +323,30 @@ defmodule Web.Internal.LazyStream do
 
       {starting, _pid} when starting in [@starting, @starting_closed] ->
         :ok = await_start(lazy, owner)
-        local_process(lazy, owner)
+        local_process(lazy, owner, keeper)
 
       {_current, pid} when is_pid(pid) ->
-        {:ok, pid}
+        keep_or(pid, keeper, fn -> local_process(lazy, owner, keeper) end)
 
       {@taken, nil} ->
         {:error, :released}
 
       {_readable_used_or_stopped, nil} ->
         :ok = run_starter(lazy, owner)
-        local_process(lazy, owner)
+        local_process(lazy, owner, keeper)
+    end
+  end
+
+  # The copy that got the stream process takes its lock next. The owner of
+  # the process can stop before that lock, and the lifetime rules stop a
+  # process whose owner failed and that has no lock. Thus the process keeps
+  # itself for the keeper until the keeper takes its lock or stops. A
+  # process that stopped before the keep took no bytes: `again` asks again,
+  # and finds the bytes free.
+  defp keep_or(pid, keeper, again) do
+    case Web.Stream.call(pid, {:keep, keeper}, :gone) do
+      :ok -> {:ok, pid}
+      :gone -> again.()
     end
   end
 
@@ -362,33 +437,29 @@ defmodule Web.Internal.LazyStream do
         _no_abort_or_closed -> lazy
       end
 
-    stream =
-      Web.AsyncContext.with_signal(lazy.signal, fn -> start_stream(lazy, initial, owner) end)
+    case Web.AsyncContext.with_signal(lazy.signal, fn -> start_stream(lazy, initial, owner) end) do
+      # A different stream process has the key: the start of a starter that
+      # a process killed in its start continued. This starter uses it.
+      :ignore ->
+        start(lazy, {owner, copy}, :atomics.get(lazy.ref, 1))
 
-    # The copy that asked stopped before it got the process: no reader
-    # keeps the process, and a process whose owner failed stops at once.
-    # The starter stops it, thus the next read starts a new process with
-    # the bytes.
-    if initial == :closed or Process.alive?(copy) do
-      publish(lazy, starting, stream.controller_pid)
-    else
-      Web.Stream.stop(stream.controller_pid)
-      _ = :atomics.compare_exchange(lazy.ref, 1, @starting, @readable)
-      :ok
+      # The copy that asked stopped before it got the process: no reader
+      # keeps the process, and a process whose owner failed stops at once.
+      # The starter stops it, thus the next read starts a new process with
+      # the bytes.
+      stream ->
+        if initial == :closed or Process.alive?(copy) do
+          publish(lazy, starting, stream.controller_pid)
+        else
+          Web.Stream.stop(stream.controller_pid)
+          _ = :atomics.compare_exchange(lazy.ref, 1, @starting, @readable)
+          :ok
+        end
     end
   end
 
   # The state after the start: "process" for a stream process that has the
-  # bytes, and "taken" for each other stream process. The first pull can
-  # come before this step: it set "taken".
-  defp publish(%{source: {:held, holder}} = lazy, @starting, pid) do
-    # The holder gives its bytes to the stream process. A second message,
-    # from the starter after a starter that stopped, has no effect.
-    send(holder, {:web_body, lazy.ref, {:stream, pid}})
-    _ = :atomics.compare_exchange(lazy.ref, 1, @starting, @taken)
-    :ok
-  end
-
+  # bytes, and "taken" for a closed stream process.
   defp publish(lazy, @starting, _pid) do
     _ = :atomics.compare_exchange(lazy.ref, 1, @starting, @process)
     :ok
@@ -396,14 +467,6 @@ defmodule Web.Internal.LazyStream do
 
   defp publish(lazy, @starting_closed, _pid) do
     _ = :atomics.compare_exchange(lazy.ref, 1, @starting_closed, @taken)
-    :ok
-  end
-
-  # The first pull of a stream process, or its cancel: the bytes go out.
-  # A copy gets the stream process only after its start, thus the cell has
-  # "process", or "taken" after a pull.
-  defp mark_taken(ref) do
-    _ = :atomics.compare_exchange(ref, 1, @process, @taken)
     :ok
   end
 
@@ -416,36 +479,33 @@ defmodule Web.Internal.LazyStream do
   # chunks in the stream: an abort of the signal can come at the same time.
   defp start_stream(%{source: {kind, _bytes}} = lazy, :readable, owner)
        when kind in [:bytes, :chunk, :view, :error] do
-    ref = lazy.ref
     chunks = chunks(lazy.source)
 
     source =
       lazy
       |> stream_type()
-      |> Map.put(:pull, fn controller -> pull_source(ref, chunks, controller.pid) end)
-      |> Map.put(:cancel, &discard(ref, &1))
+      |> Map.put(:pull, &pull_source(chunks, &1))
 
     high_water_mark = if match?({:ok, [_chunk | _rest]}, chunks), do: 0, else: 1
 
     Web.ReadableStream.__new__(source, [owner: owner, high_water_mark: high_water_mark],
-      registry_key: ref
+      registry_key: lazy.ref
     )
   end
 
   # The holder enqueues the chunks that it has, and then each chunk that it
-  # reads. A holder that stops before the end puts the stream in the errored
-  # state. A cancel stops the holder, thus its connection does not stay. The
-  # stream is a byte stream, as the body of a response of the network in the
-  # Fetch Standard. The starter tells the holder the stream process: see
-  # `publish/3`.
+  # reads, from the first pull. The high water mark is 0, thus the first
+  # pull comes with the first read: before it, the holder keeps its bytes,
+  # and a stream process that stops takes none. The holder keeps the bytes
+  # of the network up to its limit, as before a stream read. A holder that
+  # stops before the end puts the stream in the errored state. A cancel
+  # stops the holder, thus its connection does not stay. The stream is a
+  # byte stream, as the body of a response of the network in the Fetch
+  # Standard. See `Web.Dispatcher.RequestProcess`.
   defp start_stream(%{source: {:held, holder}} = lazy, :readable, owner) do
     Web.ReadableStream.__new__(
       %{type: "bytes", cancel: fn _reason -> Process.exit(holder, :kill) end},
-      [
-        high_water_mark: @held_high_water_mark,
-        cancel_on_reader_exit: true,
-        owner: owner
-      ],
+      [high_water_mark: 0, cancel_on_reader_exit: true, owner: owner],
       direct_pull: {:message, holder, {:web_body, lazy.ref, :pull}},
       watch_source: {holder, &incomplete_error/1},
       registry_key: lazy.ref
@@ -460,23 +520,37 @@ defmodule Web.Internal.LazyStream do
       lazy |> stream_type() |> Map.put(:pull, &Web.ReadableStream.close(&1.pid)),
       [owner: owner, high_water_mark: 1],
       registry_key: lazy.ref,
+      lazy_kind: :closed,
       disturbed: true
     )
   end
 
-  # A cancel discards the bytes. The lifetime rules also cancel a stream
-  # process whose owner stopped, with the reason `{:owner_down, reason}`: no
-  # reader got the bytes, and the next read gets them.
-  defp discard(_ref, {:owner_down, _reason}), do: :ok
-  defp discard(ref, _reason), do: mark_taken(ref)
-
-  defp pull_source(ref, {:ok, chunks}, pid) do
-    if chunks != [], do: :ok = mark_taken(ref)
-    for chunk <- chunks, do: Web.ReadableStream.enqueue(pid, chunk)
-    Web.ReadableStream.close(pid)
+  defp pull_source({:ok, chunks}, controller) do
+    for chunk <- chunks, do: Web.ReadableStream.enqueue(controller.pid, chunk)
+    close(controller)
   end
 
-  defp pull_source(_ref, {:error, error}, pid), do: Web.ReadableStream.error(pid, error)
+  defp pull_source({:error, error}, controller),
+    do: Web.ReadableStream.error(controller.pid, error)
+
+  defp close(%Web.ReadableByteStreamController{pid: pid}), do: __close__(pid)
+  defp close(controller), do: Web.ReadableStream.close(controller.pid)
+
+  @doc false
+  # The step "close" of a byte stream that the Streams Standard gives to the
+  # other Standards: the close, and the end for a read of a BYOB reader
+  # that waits. A read can come between the last chunk and the close: with
+  # no answer, it waits forever. See `Web.Dispatcher.RequestProcess`.
+  def __close__(pid) do
+    Web.ReadableStream.close(pid)
+    controller = %Web.ReadableByteStreamController{pid: pid}
+
+    with %Web.ReadableStreamBYOBRequest{} = request <-
+           Web.ReadableByteStreamController.byob_request(controller),
+         do: Web.ReadableStreamBYOBRequest.respond(request, 0)
+
+    :ok
+  end
 
   # The body of a request or a response is a byte stream: the Fetch
   # Standard sets it up "with byte reading support". Thus a BYOB reader can

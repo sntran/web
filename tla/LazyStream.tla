@@ -9,28 +9,33 @@
 (* is one more copy of this module.                                        *)
 (*                                                                         *)
 (* The operations of a copy:                                               *)
-(* * a claim changes a cell with free bytes to "consumed" (an              *)
-(* enumeration takes the bytes), to "locked" (a body function, a tee,      *)
-(* or a proxy takes the bytes, and keeps the lock), or to "canceled"       *)
-(* (a cancel), with one compare-exchange. The bytes are free in the        *)
-(* cell "readable", and in the cell "process" when the stream process      *)
-(* stopped before its first pull;                                          *)
-(* * a stream read asks for the stream process. With no stream process,    *)
-(* the copy starts a starter, a short process, and waits for its end:      *)
-(* the process of the copy can stop at each step, and the start must       *)
-(* continue. The starter takes the key {ref, :start} in the registry,      *)
-(* changes the cell to "starting" or "starting_closed" with one            *)
-(* compare-exchange, starts the stream process, which registers            *)
-(* itself, and sets "process" or "taken". A starter whose copy stopped     *)
-(* stops the new stream process and sets "readable": no reader keeps       *)
-(* that process;                                                           *)
-(* * a copy that finds "starting" waits for the end of the starter that    *)
-(* has the key (a monitor, not a time limit). With no starter, the         *)
-(* starter that set "starting" stopped: the copy starts a new starter,     *)
-(* which continues from the cell and the registry;                         *)
-(* * the stream process takes the bytes at its first pull, which comes     *)
-(* with the first read, and sets "taken". Thus a stream process that       *)
-(* stops before a read takes no bytes from the other copies.               *)
+(*   * a claim changes a cell with free bytes to "consumed" (an            *)
+(*     enumeration takes the bytes), to "locked" (a body function, a tee,  *)
+(*     or a proxy takes the bytes, and keeps the lock), or to "canceled"   *)
+(*     (a cancel), with one compare-exchange. The bytes are free in the    *)
+(*     cell "readable", and in the cell "process" when no read disturbed   *)
+(*     the stream process before its stop;                                 *)
+(*   * a stream read asks for the stream process. With no stream process,  *)
+(*     the copy starts a starter, a short process, and waits for its end:  *)
+(*     the process of the copy can stop at each step, and the start must   *)
+(*     continue. The starter takes the key {ref, :start} in the registry,  *)
+(*     changes the cell to "starting" or "starting_closed" with one        *)
+(*     compare-exchange, starts the stream process, which registers        *)
+(*     itself, and sets "process" or "taken". A starter whose copy stopped *)
+(*     stops the new stream process and sets "readable": no reader keeps   *)
+(*     that process;                                                       *)
+(*   * a copy that finds "starting" waits for the end of the starter that  *)
+(*     has the key (a monitor, not a time limit). With no starter, the     *)
+(*     starter that set "starting" stopped: the copy starts a new starter, *)
+(*     which continues from the cell and the registry;                     *)
+(*   * a copy that got the stream process keeps it until it takes its      *)
+(*     lock or stops: the lifetime rules do not stop the process for the   *)
+(*     stop of its owner while a copy waits for its lock;                  *)
+(*   * the first disturb of the stream process (a read, a cancel, a pipe,  *)
+(*     or the step "consume body") sets "taken" in the same step: a        *)
+(*     disturbed stream gives no bytes to a different reader. A stream     *)
+(*     process that stops before a disturb takes no bytes from the other   *)
+(*     copies: the lifetime rules stop it with no cancel.                  *)
 (*                                                                         *)
 (* A copy reads the cell and the registry in one step of this model. The   *)
 (* real copy reads the registry and then the cell for a stream read, and   *)
@@ -39,15 +44,19 @@
 (* cell that is not "starting", and a starter or a claim decides again     *)
 (* with the key and a compare-exchange.                                    *)
 (*                                                                         *)
-(* The lifetime rules stop a stream process when its owner stopped, or     *)
-(* after its end. A different process can also kill a starter or a stream  *)
-(* process. A copy that got the stream process, and did not lock it before *)
-(* its stop, gets "failed".                                                *)
+(* The lifetime rules stop a stream process when its owner stopped and no  *)
+(* copy keeps it, or after its end. A different process can also kill a    *)
+(* starter or a stream process. A copy that got the stream process, and    *)
+(* did not lock it before a kill of the process, gets "failed". A kill of  *)
+(* a starter in the start of its stream process can leave that start,      *)
+(* which continues with no starter: it registers itself only while no      *)
+(* stream process has the key and the bytes are free, else it stops        *)
+(* normally in its start, with no crash report.                            *)
 (*                                                                         *)
 (* The model has a body with its bytes in the struct. A body that a        *)
-(* process holds, such as a fetch body, gives its bytes to the stream      *)
-(* process when the starter tells the holder that process: its starter     *)
-(* sets "taken".                                                           *)
+(* process holds, such as a fetch body, has the same rules: the holder     *)
+(* gives its bytes to the stream process only at the first pull, which     *)
+(* comes with the first read.                                              *)
 (*                                                                         *)
 (* The constant Bug is "none" for the design. Each other value removes one *)
 (* rule of the design. The value "today" is the code before this model:    *)
@@ -58,14 +67,14 @@ EXTENDS Naturals
 
 CONSTANTS
     Copies,  \* the processes that have a copy of the struct
-    Kills,   \* the number of starters and stream processes that a process can kill
+    Ops,     \* the operations of the copies: Claims, "read", and "state"
+    Kills,   \* the number of starters that a process can kill
+    StreamKills, \* the number of stream processes that a process can kill
     Bug      \* "none", or the name of a rule to remove
 
 None == "none"
 
 Claims == {"consumed", "canceled", "locked"}
-
-Ops == Claims \cup {"read", "state"}
 
 Starting == {"starting", "starting_closed"}
 
@@ -76,10 +85,11 @@ Results == {None, "ok", "readable", "consumed", "canceled", "locked", "process",
 
 \* The steps of a copy: no operation yet, an operation to do, a wait for the
 \* end of a starter, a wait for a new cell (the bug "today"), a stream
-\* process to read, a stream process that stopped before the read, the
-\* second step of the bug "read_then_set", the end, and the stop. Each copy
-\* does one operation: a different operation is a different copy.
-Active == {"ask", "wait", "poll", "lock", "stale", "set"}
+\* process to lock and read, a lock and a read with no chunk yet, a stream
+\* process that stopped before the read, the second step of the bug
+\* "read_then_set", the end, and the stop. Each copy does one operation: a
+\* different operation is a different copy.
+Active == {"ask", "wait", "poll", "lock", "read", "stale", "set"}
 
 CopySteps == Active \cup {"idle", "done", "stopped"}
 
@@ -100,16 +110,19 @@ VARIABLES
     live,       \* the number of stream processes that are alive
     skind,      \* "bytes" or "closed": the last stream process
     sowner,     \* the copy that owns the last stream process, or None
-    pulled,     \* TRUE after the first read, or the cancel, of that process
+    pulled,     \* TRUE after the first disturb of that process: a read or a cancel
     held,       \* TRUE while a reader keeps the lock of that process
-    kills,      \* the number of starters and stream processes that a process killed
+    orphan,     \* the copy of a killed starter whose start continues, or None
+    kills,      \* the number of starters that a process killed
     given,      \* the number of times that the bytes went to a reader
     spent,      \* TRUE after the bytes went to a reader, or a cancel discarded them
+    killed,     \* the number of stream processes that a process killed
+    crashed,    \* TRUE after a start of a stream process crashed
     result      \* [Copies -> Results]: the result of the last operation
 
 copyVars == <<cpc, op, busy, seen, result>>
 starterVars == <<sp, sk, marker, epoch, kills>>
-streamVars == <<live, skind, sowner, pulled, held>>
+streamVars == <<live, skind, sowner, pulled, held, orphan, killed, crashed>>
 vars == <<cell, given, spent, copyVars, starterVars, streamVars>>
 
 Init ==
@@ -122,13 +135,14 @@ Init ==
     /\ sk = [c \in Copies |-> "bytes"]
     /\ marker = None /\ epoch = 0
     /\ live = 0 /\ skind = "bytes" /\ sowner = None /\ pulled = FALSE /\ held = FALSE
+    /\ orphan = None /\ killed = 0 /\ crashed = FALSE
     /\ kills = 0 /\ given = 0 /\ spent = FALSE
     /\ result = [c \in Copies |-> None]
 
 Today == Bug = "today"
 
 \* No process has the bytes: the cell "readable", or the cell "process" with
-\* a stream process that stopped before its first pull.
+\* a stream process that stopped before its first disturb.
 Free == \/ cell = "readable"
         \/ cell = "process" /\ live = 0 /\ Bug \notin {"today", "dead_is_gone"}
 
@@ -161,11 +175,12 @@ AwaitKey(c) ==
     /\ seen' = [seen EXCEPT ![c] = epoch]
     /\ UNCHANGED <<op, result, starterVars>>
 
-\* A stream process stops. A copy in the step "lock" has that process: it
-\* cannot lock it. With no stream process, the model forgets the last one.
+\* A stream process stops. A copy in the step "lock" or "read" has that
+\* process: it cannot read it. With no stream process, the model forgets
+\* the last one.
 Stopped ==
     /\ live' = live - 1
-    /\ cpc' = [c \in Copies |-> IF cpc[c] = "lock" THEN "stale" ELSE cpc[c]]
+    /\ cpc' = [c \in Copies |-> IF cpc[c] \in {"lock", "read"} THEN "stale" ELSE cpc[c]]
     /\ IF live = 1
        THEN skind' = "bytes" /\ sowner' = None /\ pulled' = FALSE /\ held' = FALSE
        ELSE UNCHANGED <<skind, sowner, pulled, held>>
@@ -229,7 +244,7 @@ Eval(c) ==
                     /\ UNCHANGED <<cell, given, spent, op, busy, seen, result, pulled, held>>
                [] OTHER ->
                     End(c, Found) /\ UNCHANGED <<cell, given, spent, pulled, held>>
-          /\ UNCHANGED <<starterVars, live, skind, sowner>>
+          /\ UNCHANGED <<starterVars, live, skind, sowner, orphan, killed, crashed>>
        \/ \* The state.
           /\ cell \notin Starting /\ op[c] = "state"
           /\ End(c, Found)
@@ -268,9 +283,12 @@ Timeout(c) ==
     /\ End(c, "gone")
     /\ UNCHANGED <<cell, given, spent, starterVars, streamVars>>
 
-\* The copy locks the stream process and reads it, and keeps the lock. The
-\* first pull takes the bytes and sets "taken". The bug "pull_keeps_bytes"
-\* does not set "taken".
+\* The copy locks the stream process and disturbs it: a read, or the
+\* disturb of the step "consume body" and of a pipe. The copy keeps the
+\* lock. The first disturb takes the bytes and sets "taken" in the same
+\* step: a disturbed stream gives no bytes to a different reader. The bug
+\* "pull_keeps_bytes" does not set "taken", and the bug
+\* "disturb_keeps_bytes" sets it only when the chunks come.
 Lock(c) ==
     /\ cpc[c] \in {"lock", "stale"}
     /\ CASE cpc[c] = "stale" ->
@@ -282,9 +300,20 @@ Lock(c) ==
               End(c, "closed") /\ held' = TRUE /\ UNCHANGED <<cell, given, spent, pulled>>
          [] OTHER ->
               /\ pulled' = TRUE /\ held' = TRUE /\ given' = given + 1 /\ spent' = TRUE
-              /\ cell' = IF cell = "process" /\ Bug # "pull_keeps_bytes" THEN "taken" ELSE cell
-              /\ End(c, "bytes")
-    /\ UNCHANGED <<starterVars, live, skind, sowner>>
+              /\ cell' = IF cell = "process" /\ Bug \notin {"pull_keeps_bytes",
+                                                               "disturb_keeps_bytes"}
+                         THEN "taken"
+                         ELSE cell
+              /\ cpc' = [cpc EXCEPT ![c] = "read"]
+              /\ UNCHANGED <<op, busy, seen, result>>
+    /\ UNCHANGED <<starterVars, live, skind, sowner, orphan, killed, crashed>>
+
+\* The chunks come to the copy that disturbed the stream process.
+Read(c) ==
+    /\ cpc[c] = "read"
+    /\ cell' = IF cell = "process" /\ Bug = "disturb_keeps_bytes" THEN "taken" ELSE cell
+    /\ End(c, "bytes")
+    /\ UNCHANGED <<given, spent, starterVars, streamVars>>
 
 \* A copy that has the stream process does not read it.
 Drop(c) ==
@@ -356,69 +385,119 @@ Decide(c) ==
     /\ UNCHANGED <<given, spent, copyVars, epoch, kills, streamVars>>
 
 \* The stream process starts and registers itself. Its owner is the copy.
+\* When a different stream process has the key (the start of a killed
+\* starter continued), the new process stops normally in its start, and
+\* the starter decides again. The bug "unchecked_start" writes a crash
+\* report, and the starter stops.
+StartStream(c, kind) ==
+    /\ live' = live + 1 /\ skind' = kind /\ sowner' = c /\ pulled' = FALSE /\ held' = FALSE
+
 New(c) ==
     /\ sp[c] = "new"
-    /\ sp' = [sp EXCEPT ![c] = "check"]
-    /\ live' = live + 1 /\ skind' = sk[c] /\ sowner' = c /\ pulled' = FALSE /\ held' = FALSE
-    /\ UNCHANGED <<cell, given, spent, copyVars, sk, marker, epoch, kills>>
+    /\ IF live = 0
+       THEN /\ sp' = [sp EXCEPT ![c] = "check"]
+            /\ StartStream(c, sk[c])
+            /\ UNCHANGED <<sk, marker, crashed>>
+       ELSE IF Bug = "unchecked_start"
+       THEN /\ Exit(c) /\ crashed' = TRUE
+            /\ UNCHANGED <<live, skind, sowner, pulled, held>>
+       ELSE /\ sp' = [sp EXCEPT ![c] = "decide"]
+            /\ UNCHANGED <<sk, marker, live, skind, sowner, pulled, held, crashed>>
+    /\ UNCHANGED <<cell, given, spent, copyVars, epoch, kills, orphan, killed>>
+
+\* The start of the stream process of a killed starter continues, at a
+\* later time. The process registers itself only when no stream process has
+\* the key and the bytes are free: the cell is "starting", or "process"
+\* with no stream process. Else it stops normally in its start. The bug
+\* "unchecked_start" registers with no look at the cell, and writes a crash
+\* report when a different stream process has the key.
+OrphanStart ==
+    /\ orphan # None
+    /\ orphan' = None
+    /\ IF live = 0 /\ (cell \in {"starting", "process"} \/ Bug = "unchecked_start")
+       THEN StartStream(orphan, "bytes") /\ UNCHANGED crashed
+       ELSE /\ crashed' = (crashed \/ (live > 0 /\ Bug = "unchecked_start"))
+            /\ UNCHANGED <<live, skind, sowner, pulled, held>>
+    /\ UNCHANGED <<cell, given, spent, copyVars, starterVars, killed>>
 
 \* The starter sets the state after the start. When its copy stopped, it
 \* stops the stream process of the bytes, and sets "readable": no reader
-\* keeps that process. The bug "today" has no such rule.
+\* keeps that process. The bug "today" has no such rule. The bug
+\* "held_at_start" is the body that a process holds before this model: the
+\* holder gives its bytes to the stream process at its start, and the
+\* starter sets "taken".
 Check(c) ==
     /\ sp[c] = "check"
     /\ IF sk[c] = "bytes" /\ cpc[c] = "stopped" /\ ~Today
-       THEN /\ IF live > 0 /\ sowner = c THEN Stopped ELSE UNCHANGED <<cpc, streamVars>>
+       THEN /\ IF live > 0 /\ sowner = c
+               THEN Stopped /\ UNCHANGED <<orphan, killed, crashed>>
+               ELSE UNCHANGED <<cpc, streamVars>>
             /\ cell' = IF cell = "starting" THEN "readable" ELSE cell
-       ELSE /\ cell' = CASE cell = "starting" -> "process"
+       ELSE /\ cell' = CASE cell = "starting" /\ Bug = "held_at_start" -> "taken"
+                         [] cell = "starting" -> "process"
                          [] cell = "starting_closed" -> "taken"
                          [] OTHER -> cell
             /\ UNCHANGED <<cpc, streamVars>>
     /\ Exit(c)
     /\ UNCHANGED <<given, spent, op, busy, seen, result, epoch, kills>>
 
-\* The starter of copy c stops before its end. The registry removes its key.
-StarterStop(c) ==
+\* A process kills the starter of copy c before its end. The registry
+\* removes its key. A kill in the start of the stream process of the bytes
+\* can leave that start, which continues with no starter.
+StarterStop(c, continues) ==
     /\ sp[c] \in {"register", "decide", "new", "check"} /\ ~Today
     /\ kills < Kills
+    /\ continues => sp[c] = "new" /\ sk[c] = "bytes" /\ live = 0
     /\ kills' = kills + 1
+    /\ orphan' = IF continues THEN c ELSE None
     /\ Exit(c)
-    /\ UNCHANGED <<cell, given, spent, copyVars, epoch, streamVars>>
+    /\ UNCHANGED <<cell, given, spent, copyVars, epoch, live, skind, sowner, pulled, held,
+                   killed, crashed>>
 
-\* The lifetime rules stop the stream process: its owner stopped, or it
-\* ended. The registry removes its key.
+\* A copy that got the stream process and takes its lock next keeps it, as
+\* a lock: the bug "no_keep" has no such rule. A copy that disturbed the
+\* process has its lock.
+Waiting == \E c \in Copies : cpc[c] = "lock"
+
+Reading == \E c \in Copies : cpc[c] = "read"
+
+\* The lifetime rules stop the stream process: its owner stopped and no
+\* copy keeps it, or it ended. The registry removes its key. A stream
+\* process that no read disturbed stops with no cancel.
 StreamStop ==
-    /\ live > 0
-    /\ \/ sowner \in Copies /\ cpc[sowner] = "stopped"
+    /\ live > 0 /\ ~Reading
+    /\ \/ sowner \in Copies /\ cpc[sowner] = "stopped" /\ (~Waiting \/ Bug = "no_keep")
        \/ pulled
        \/ skind = "closed"
     /\ Stopped
-    /\ UNCHANGED <<cell, given, spent, op, busy, seen, result, starterVars>>
+    /\ UNCHANGED <<cell, given, spent, op, busy, seen, result, starterVars, orphan, killed,
+                   crashed>>
 
 \* A different process kills the stream process.
 StreamKill ==
-    /\ live > 0 /\ kills < Kills
-    /\ kills' = kills + 1
+    /\ live > 0 /\ killed < StreamKills
+    /\ killed' = killed + 1
     /\ Stopped
-    /\ UNCHANGED <<cell, given, spent, op, busy, seen, result, sp, sk, marker, epoch>>
+    /\ UNCHANGED <<cell, given, spent, op, busy, seen, result, starterVars, orphan, crashed>>
 
 Next ==
     \/ \E c \in Copies :
         \/ \E o \in Ops : Begin(c, o)
         \/ Eval(c) \/ ClaimSet(c) \/ Wake(c) \/ Poll(c) \/ Timeout(c) \/ Lock(c)
-        \/ Drop(c) \/ CopyStop(c)
-        \/ Register(c) \/ Decide(c) \/ New(c) \/ Check(c) \/ StarterStop(c)
-    \/ StreamStop \/ StreamKill
+        \/ Read(c) \/ Drop(c) \/ CopyStop(c)
+        \/ Register(c) \/ Decide(c) \/ New(c) \/ Check(c)
+        \/ \E continues \in BOOLEAN : StarterStop(c, continues)
+    \/ StreamStop \/ StreamKill \/ OrphanStart
     \/ UNCHANGED vars
 
+\* The steps of copy c and of its starter. At each time, one of them at
+\* most can do a step: the copy waits during the work of its starter.
+Proc(c) ==
+    \/ Eval(c) \/ ClaimSet(c) \/ Wake(c) \/ Poll(c) \/ Lock(c) \/ Read(c)
+    \/ Register(c) \/ Decide(c) \/ New(c) \/ Check(c)
+
 \* A copy and a starter that can do a step do it. No process must stop.
-Spec ==
-    /\ Init /\ [][Next]_vars
-    /\ \A c \in Copies :
-        /\ WF_vars(Eval(c)) /\ WF_vars(ClaimSet(c)) /\ WF_vars(Wake(c))
-        /\ WF_vars(Poll(c)) /\ WF_vars(Lock(c))
-        /\ WF_vars(Register(c)) /\ WF_vars(Decide(c)) /\ WF_vars(New(c))
-        /\ WF_vars(Check(c))
+Spec == Init /\ [][Next]_vars /\ \A c \in Copies : WF_vars(Proc(c))
 
 -----------------------------------------------------------------------------
 \* Properties
@@ -435,6 +514,7 @@ TypeOK ==
     /\ live \in 0..2 /\ skind \in {"bytes", "closed"} /\ sowner \in Copies \cup {None}
     /\ pulled \in BOOLEAN /\ held \in BOOLEAN /\ kills \in 0..Kills
     /\ given \in 0..3 /\ spent \in BOOLEAN
+    /\ orphan \in Copies \cup {None} /\ killed \in 0..StreamKills /\ crashed \in BOOLEAN
 
 \* The bytes go out one time at most: to one body function, enumeration, tee,
 \* proxy, or read of the stream process.
@@ -448,8 +528,15 @@ OneProcess == live <= 1
 
 \* A copy gets "gone" or "released" only after the bytes went out: a stop of
 \* a process that had a copy does not take the bytes from the other copies.
+\* A read of the stream process fails only after the bytes went out, or
+\* after a process killed the stream process.
 NoGoneWhileBytes ==
-    \A c \in Copies : result[c] \in {"gone", "released"} => spent
+    \A c \in Copies :
+        /\ result[c] \in {"gone", "released"} => spent
+        /\ result[c] = "failed" => spent \/ killed > 0
+
+\* No start of a stream process writes a crash report.
+NoCrash == ~crashed
 
 \* Each operation of a copy that continues ends: no copy waits forever.
 ReadEnds == \A c \in Copies : cpc[c] \in Active ~> cpc[c] \in {"done", "stopped"}

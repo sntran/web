@@ -15,13 +15,19 @@ defmodule Web.TLA.LazyStreamConformanceTest do
   # time. An abort signal holds a call of a step and tells it to the test:
   # the real code asks the signal before the start of the stream process,
   # and the stream process asks it during its start, after it registered
-  # itself. The next copy must get the bytes.
+  # itself. The next copy must get the bytes. Other tests of that group: a
+  # copy that got the process keeps it after a stop of its owner, a copy
+  # that disturbed the process takes the bytes before a stop, and a start
+  # of a stream process after a start that continued with no starter ends
+  # with no crash report.
   #
   # The last property lets three processes do an operation on their copies
   # at the same time. The test cannot control the steps of the processes,
   # thus it checks the properties of the specification on the results.
   use ExUnit.Case, async: true
   use ExUnitProperties
+
+  import ExUnit.CaptureLog
 
   alias Web.AbortSignal
   alias Web.Internal.LazyStream
@@ -46,9 +52,13 @@ defmodule Web.TLA.LazyStreamConformanceTest do
 
   # The model of the random commands has one copy for each operation.
   @names Enum.map(1..8, &"c#{&1}")
+  @all_ops {~s(Ops = {"consumed", "canceled", "locked", "read"}),
+            ~s(Ops = {"consumed", "canceled", "locked", "read", "state"})}
   @model_config [
     {~s(Copies = {"a", "b"}), "Copies = {#{Enum.map_join(@names, ", ", &inspect/1)}}"},
-    {"Kills = 1", "Kills = 20"}
+    {"Kills = 1", "Kills = 20"},
+    {"StreamKills = 0", "StreamKills = 20"},
+    @all_ops
   ]
 
   # The operation of the specification for each operation of the test.
@@ -231,7 +241,7 @@ defmodule Web.TLA.LazyStreamConformanceTest do
         pid = system.copies[name]
         send(pid, :read)
         result = receive_result(pid)
-        model = SpecModel.step!(model, "Lock", [name])
+        model = model |> SpecModel.step!("Lock", [name]) |> read_step(name)
         check_result(model, name, :read, result)
         {model, record_bytes(%{system | holders: holders}, result)}
     end
@@ -274,13 +284,24 @@ defmodule Web.TLA.LazyStreamConformanceTest do
   # in the result of these functions, and does not read it.
   defp settle(model, name, operation) do
     actions = for action <- ~w(Eval Register Decide New Check Wake), do: {action, [name]}
-    actions = if operation == :read, do: actions ++ [{"Lock", [name]}], else: actions
+
+    actions =
+      if operation == :read, do: actions ++ [{"Lock", [name]}, {"Read", [name]}], else: actions
+
     model = SpecModel.settle(model, actions)
 
     if operation in [:take, :take_chunks, :tee, :proxy] and
          SpecModel.enabled?(model, "Drop", [name]),
        do: SpecModel.step!(model, "Drop", [name]),
        else: model
+  end
+
+  # The chunks come after the lock and the disturb, when the stream process
+  # did not stop.
+  defp read_step(model, name) do
+    if SpecModel.enabled?(model, "Read", [name]),
+      do: SpecModel.step!(model, "Read", [name]),
+      else: model
   end
 
   defp check_result(model, name, operation, result) do
@@ -403,13 +424,27 @@ defmodule Web.TLA.LazyStreamConformanceTest do
     test "a second copy gets no bytes after a stop of the first copy that read them" do
       check_stop(:read, :copy)
     end
+
+    test "a second copy gets no bytes after a stop of the first copy that disturbed the process" do
+      check_stop(:disturbed, :copy)
+    end
+
+    test "a second copy that got the process reads the bytes after a stop of the owner" do
+      check_keep()
+    end
+
+    test "a start of a stream process after a start that continued ends with no crash report" do
+      log = capture_log(fn -> check_second_start() end)
+      refute log =~ "already_registered"
+      refute log =~ "MatchError"
+    end
   end
 
   # The steps of the start: the call of the signal that the abort signal
   # holds.
   defp check_stop(step, victim) when step in [:starting, :registered] do
     pause = if step == :starting, do: 1, else: 2
-    lazy = LazyStream.new({:bytes, "hello"}, holding_signal(pause))
+    lazy = LazyStream.new({:bytes, "hello"}, holding_signal([pause]))
     first = start_copy(lazy, :read)
 
     # At the first call, the starter examines the signal. At the second
@@ -441,9 +476,20 @@ defmodule Web.TLA.LazyStreamConformanceTest do
         stream = %ReadableStream{controller_pid: pid}
 
         case step do
-          :got_process -> :ok
-          :locked -> ReadableStream.get_reader(stream)
-          :read -> assert read(stream) == ["hello"]
+          :got_process ->
+            :ok
+
+          :locked ->
+            ReadableStream.get_reader(stream)
+
+          # The steps of "consume body" and of a pipe: a lock, and the
+          # disturb, before the first read.
+          :disturbed ->
+            ReadableStream.get_reader(stream)
+            :ok = Web.Stream.call(pid, :disturb, :ok)
+
+          :read ->
+            assert read(stream) == ["hello"]
         end
 
         send(test, {:at_step, pid})
@@ -464,7 +510,7 @@ defmodule Web.TLA.LazyStreamConformanceTest do
     wait_until(fn -> not Process.alive?(pid) end)
     second = start_copy(lazy, :read)
 
-    if step == :read do
+    if step in [:read, :disturbed] do
       assert {:raised, "The stream is not available" <> _} = receive_result(second)
       assert_model(model_stop(step, victim), lazy, "b", "released")
     else
@@ -493,6 +539,99 @@ defmodule Web.TLA.LazyStreamConformanceTest do
   defp first_stream(:starting, _caller), do: subscriber(2)
   defp first_stream(:registered, caller), do: caller
 
+  # Copy a gets the stream process and owns it. Copy b gets it also, and
+  # takes its lock after the stop of a. The lifetime rules stop a process
+  # whose owner failed and that has no lock, but b keeps it.
+  defp check_keep do
+    lazy = LazyStream.new({:bytes, "hello"}, nil)
+    test = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, pid} = LazyStream.process(lazy, self())
+        send(test, {:at_step, pid})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:at_step, pid}, 2_000
+
+    second =
+      spawn(fn ->
+        {:ok, ^pid} = LazyStream.process(lazy, self())
+        send(test, :got_process)
+
+        receive do
+          :read -> send(test, {:result, self(), read(%ReadableStream{controller_pid: pid})})
+        end
+
+        # The copy keeps its lock.
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive :got_process, 2_000
+    kill(owner)
+
+    # The stream process handles the stop of its owner before this call.
+    _disturbed? = Web.Stream.call(pid, :disturbed?, :gone)
+    send(second, :read)
+    assert receive_result(second) == ["hello"]
+
+    model =
+      "LazyStream"
+      |> SpecModel.start(@stop_config)
+      |> SpecModel.step!("Begin", ["a", "read"])
+      |> SpecModel.settle(internal("a", false))
+      |> SpecModel.step!("Begin", ["b", "read"])
+      |> SpecModel.settle(internal("b", false))
+      |> SpecModel.step!("CopyStop", ["a"])
+
+    refute SpecModel.enabled?(model, "StreamStop")
+    model = model |> SpecModel.step!("Lock", ["b"]) |> SpecModel.step!("Read", ["b"])
+    assert_model(model, lazy, "b", "bytes")
+    kill(second)
+  end
+
+  # Copy b starts a stream read, and a process kills b and its starter
+  # before the start of the stream process. That start continues with no
+  # starter: the test starts a stream process with the key in its place,
+  # while the starter of copy a waits before its own start.
+  defp check_second_start do
+    lazy = LazyStream.new({:bytes, "hello"}, holding_signal([1, 2]))
+    copy_b = start_copy(lazy, :read)
+    assert_receive {:held, starter_b, from_b}, 2_000
+    kill(copy_b)
+    kill(starter_b)
+
+    copy_a = start_copy(lazy, :process)
+    assert_receive {:held, _starter_a, from_a}, 2_000
+
+    continued =
+      Web.ReadableStream.__new__(%{type: "bytes"}, [high_water_mark: 0], registry_key: lazy.ref)
+
+    GenServer.reply(from_b, :ok)
+    GenServer.reply(from_a, :ok)
+    assert receive_result(copy_a) == {:ok, continued.controller_pid}
+
+    model =
+      "LazyStream"
+      |> SpecModel.start(@stop_config)
+      |> SpecModel.step!("Begin", ["b", "read"])
+      |> steps("b", ~w(Eval Register Decide))
+      |> SpecModel.step!("CopyStop", ["b"])
+      |> SpecModel.step!("StarterStop", ["b", true])
+      |> SpecModel.step!("Begin", ["a", "read"])
+      |> steps("a", ~w(Eval Register Decide))
+      |> SpecModel.step!("OrphanStart")
+      |> SpecModel.settle(internal("a", false))
+
+    assert SpecModel.get(model, "cpc")["a"] == "lock"
+    refute SpecModel.get(model, "crashed")
+    assert @cell[:atomics.get(lazy.ref, 1)] == SpecModel.get(model, "cell")
+
+    assert length(Registry.lookup(LazyStream.registry(), lazy.ref)) ==
+             SpecModel.get(model, "live")
+  end
+
   # The specification does the same steps, and its result and its state
   # agree.
   defp assert_model(model, lazy, reader, expected) do
@@ -503,9 +642,13 @@ defmodule Web.TLA.LazyStreamConformanceTest do
     assert length(live) == SpecModel.get(model, "live")
   end
 
+  # The model of the tests of a stop: a process can kill a starter or a
+  # stream process one time.
+  @stop_config [{"StreamKills = 0", "StreamKills = 1"}]
+
   defp model_stop(step, victim) do
     "LazyStream"
-    |> SpecModel.start()
+    |> SpecModel.start(@stop_config)
     |> SpecModel.step!("Begin", ["a", "read"])
     |> model_until(step)
     |> model_stop_at(step, victim)
@@ -515,7 +658,9 @@ defmodule Web.TLA.LazyStreamConformanceTest do
   defp model_until(model, :starting), do: steps(model, "a", ~w(Eval Register Decide))
   defp model_until(model, :registered), do: steps(model, "a", ~w(Eval Register Decide New))
 
-  defp model_until(model, :read),
+  defp model_until(model, :read), do: SpecModel.settle(model, internal("a", true))
+
+  defp model_until(model, :disturbed),
     do: model |> SpecModel.settle(internal("a", false)) |> SpecModel.step!("Lock", ["a"])
 
   defp model_until(model, _got_process_or_locked),
@@ -525,11 +670,14 @@ defmodule Web.TLA.LazyStreamConformanceTest do
   # and a stream process after its end.
   defp model_stop_at(model, :read, :copy), do: SpecModel.step!(model, "StreamStop")
 
-  defp model_stop_at(model, step, :copy) when step in [:got_process, :locked],
+  defp model_stop_at(model, step, :copy) when step in [:got_process, :locked, :disturbed],
     do: model |> SpecModel.step!("CopyStop", ["a"]) |> SpecModel.step!("StreamStop")
 
   defp model_stop_at(model, _step, :copy), do: SpecModel.step!(model, "CopyStop", ["a"])
-  defp model_stop_at(model, _step, :starter), do: SpecModel.step!(model, "StarterStop", ["a"])
+
+  defp model_stop_at(model, _step, :starter),
+    do: SpecModel.step!(model, "StarterStop", ["a", false])
+
   defp model_stop_at(model, _step, :stream), do: SpecModel.step!(model, "StreamKill")
   defp model_stop_at(model, _step, :suspend), do: model
 
@@ -553,32 +701,32 @@ defmodule Web.TLA.LazyStreamConformanceTest do
 
   defp internal(name, read?) do
     actions = for action <- ~w(Eval Register Decide New Check Wake), do: {action, [name]}
-    if read?, do: actions ++ [{"Lock", [name]}], else: actions
+    if read?, do: actions ++ [{"Lock", [name]}, {"Read", [name]}], else: actions
   end
 
-  # An abort signal that does not abort. Its process holds the call number
-  # `pause` of a subscription, and tells it to the test, which answers it
-  # later. The process answers each other call at once.
-  defp holding_signal(pause) do
+  # An abort signal that does not abort. Its process holds the calls of a
+  # subscription with a number in `pauses`, and tells them to the test,
+  # which answers them later. The process answers each other call at once.
+  defp holding_signal(pauses) do
     test = self()
-    pid = spawn_link(fn -> signal_loop(test, pause, 1) end)
+    pid = spawn_link(fn -> signal_loop(test, pauses, 1) end)
     %AbortSignal{pid: pid, ref: make_ref()}
   end
 
-  defp signal_loop(test, pause, number) do
+  defp signal_loop(test, pauses, number) do
     receive do
       {:"$gen_call", from, {:subscribe, caller}} ->
-        if number == pause do
+        if number in pauses do
           send(test, {:held, caller, from})
         else
           send(test, {:subscribed, number, caller})
           GenServer.reply(from, :ok)
         end
 
-        signal_loop(test, pause, number + 1)
+        signal_loop(test, pauses, number + 1)
 
       {:"$gen_cast", {:unsubscribe, _pid}} ->
-        signal_loop(test, pause, number)
+        signal_loop(test, pauses, number)
     end
   end
 

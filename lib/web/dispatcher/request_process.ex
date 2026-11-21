@@ -375,11 +375,27 @@ defmodule Web.Dispatcher.RequestProcess do
     if body.ended, do: answer_take(body), else: body
   end
 
-  # A stream read: the stream gets the pieces that the process has, and then
-  # each piece when it pulls.
-  defp reader_request(body, {:stream, pid}) do
-    body = %{body | mode: :stream, stream: pid, stream_monitor: Process.monitor(pid)}
-    body |> flush_pieces() |> close_if_ended()
+  # A stream read. The first pull of the stream process comes with its first
+  # read: from that time, the stream gets the pieces that the process has,
+  # and then each piece when it pulls. Before that read, this process keeps
+  # the bytes, thus a stream process that stops takes none, and the next
+  # reader gets them. See `Web.Internal.LazyStream`.
+  defp reader_request(%{mode: :buffer} = body, :pull) do
+    case LazyStream.__stream__(body.lazy) do
+      pid when is_pid(pid) ->
+        %{body | mode: :stream, stream: pid, stream_monitor: Process.monitor(pid)}
+        |> reader_request(:pull)
+        |> close_if_ended()
+
+      # The stream process stopped after its pull: its read took the bytes,
+      # and no process can read them. The time limit of a body that no
+      # process reads stops this process. The stop comes between the pull and
+      # this look: a test cannot make it at a known time.
+      # coveralls-ignore-start
+      nil ->
+        body
+        # coveralls-ignore-stop
+    end
   end
 
   defp reader_request(%{mode: :stream, pieces: [_ | _]} = body, :pull), do: flush_pieces(body)
@@ -447,7 +463,7 @@ defmodule Web.Dispatcher.RequestProcess do
 
   defp close_if_ended(%{ended: {:ok, :done}} = body) do
     body = flush_pieces(body)
-    ReadableStream.close(body.stream)
+    LazyStream.__close__(body.stream)
     :stop
   end
 

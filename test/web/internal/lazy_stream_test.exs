@@ -34,6 +34,11 @@ defmodule Web.Internal.LazyStreamTest do
     end)
   end
 
+  # The process waits for the answer of a call.
+  defp calls?(pid) do
+    Process.info(pid, :current_function) == {:current_function, {:gen, :do_call, 4}}
+  end
+
   # The process waits for the end of a starter.
   defp waits_for_down?(pid) do
     Process.info(pid, :current_function) == {:current_function, {LazyStream, :await_down, 1}}
@@ -201,6 +206,31 @@ defmodule Web.Internal.LazyStreamTest do
       send(stream_pid, :stop)
     end
 
+    test "a claim that waits for a start gets the bytes when the new process stopped" do
+      lazy = ReadableStream.from("hello").lazy
+      test = self()
+
+      # A process in the place of a starter: it has the key and the state
+      # "starting". After the message :go, it sets "process" with no stream
+      # process: the stream process stopped before a read.
+      starter =
+        spawn(fn ->
+          {:ok, _owner} = Registry.register(LazyStream.registry(), {lazy.ref, :start}, nil)
+          :atomics.put(lazy.ref, 1, 4)
+          send(test, :starting)
+
+          receive do
+            :go -> :atomics.put(lazy.ref, 1, 5)
+          end
+        end)
+
+      assert_receive :starting
+      copy = Task.async(fn -> LazyStream.take(lazy) end)
+      wait_until(fn -> waits_for_down?(copy.pid) end)
+      send(starter, :go)
+      assert Task.await(copy) == {:ok, "hello"}
+    end
+
     test "a starter that finds the key of a different starter waits for its end" do
       stream = ReadableStream.from("hello")
       lazy = stream.lazy
@@ -225,6 +255,32 @@ defmodule Web.Internal.LazyStreamTest do
       assert {:ok, pid} = Task.await(copy)
       assert LazyStream.state(lazy) == {:process, pid}
       assert read_all(ReadableStream.get_reader(stream)) == ["hello"]
+    end
+
+    test "a copy asks again when the stream process stops before the copy keeps it" do
+      stream = ReadableStream.from("hello")
+      {:ok, pid} = ReadableStream.__process__(stream)
+
+      # The stream process does not answer: the keep of the second copy
+      # waits. Then the process stops before the keep.
+      :erlang.suspend_process(pid)
+      copy = Task.async(fn -> LazyStream.take(stream.lazy) end)
+      wait_until(fn -> calls?(copy.pid) end)
+      Process.exit(pid, :kill)
+
+      # No read disturbed the process: the claim gets the bytes.
+      assert Task.await(copy) == {:ok, "hello"}
+    end
+
+    test "a start of a stream process after the bytes went out stops in its start" do
+      stream = ReadableStream.from("hello")
+      assert text(stream) == "hello"
+
+      assert Web.ReadableStream.__new__(%{type: "bytes"}, [], registry_key: stream.lazy.ref) ==
+               :ignore
+
+      assert Registry.lookup(LazyStream.registry(), stream.lazy.ref) == []
+      assert LazyStream.state(stream.lazy) == :locked
     end
 
     test "a copy continues the start of a starter that stopped before the stream process" do
@@ -267,6 +323,19 @@ defmodule Web.Internal.LazyStreamTest do
       reader = ReadableStream.get_reader(stream)
       assert catch_exit(Web.await(ReadableStreamDefaultReader.closed(reader))) == error
       assert catch_exit(Web.await(ReadableStreamDefaultReader.read(reader))) == error
+    end
+  end
+
+  describe "the close of a byte stream" do
+    test "gives the end to a read of a BYOB reader that waits" do
+      stream = ReadableStream.new(%{type: "bytes"})
+      controller = %Web.ReadableByteStreamController{pid: stream.controller_pid}
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      read = Web.ReadableStreamBYOBReader.read(reader, Uint8Array.new(Web.ArrayBuffer.new(8)))
+      wait_until(fn -> Web.ReadableByteStreamController.byob_request(controller) != nil end)
+
+      assert LazyStream.__close__(stream.controller_pid) == :ok
+      assert %{done: true} = Web.await(read)
     end
   end
 

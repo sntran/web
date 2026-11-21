@@ -272,9 +272,32 @@ defmodule Web.Dispatcher.HTTPProcessTest do
       eventually(fn -> stopped?([request]) end)
     end
 
-    test "stops its process when the stream stops while the process waits for a pull" do
-      # The part of the body that came is larger than the queue of the
-      # stream: the process waits. The rest of the body does not come.
+    test "continues for its stream after the stop of the process that called fetch" do
+      port =
+        HTTPServer.start_link([
+          "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata",
+          {:sleep, 200},
+          "more"
+        ])
+
+      {task, request} = start_fetch(Request.new("http://localhost:#{port}/"))
+      assert {:ok, resp} = await_fetch(task)
+
+      # The first read starts the stream mode of the process of the request.
+      reader = ReadableStream.get_reader(resp.body)
+      assert %{value: chunk} = Web.await(Web.ReadableStreamDefaultReader.read(reader))
+      assert Web.Uint8Array.to_binary(chunk) == "data"
+
+      Process.exit(task.pid, :kill)
+      assert %{value: rest} = Web.await(Web.ReadableStreamDefaultReader.read(reader))
+      assert Web.Uint8Array.to_binary(rest) == "more"
+      eventually(fn -> stopped?([request]) end)
+    end
+
+    test "stops its process when the stream stops after its first read" do
+      # The process gives the part of the body that came to the stream at
+      # the first read, and waits for a pull. The rest of the body does not
+      # come.
       body = :binary.copy("x", 200_000)
 
       port =
@@ -285,15 +308,70 @@ defmodule Web.Dispatcher.HTTPProcessTest do
         ])
 
       {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
-      _reader = ReadableStream.get_reader(resp.body)
-      {:ok, stream} = ReadableStream.__process__(resp.body)
+      reader = ReadableStream.get_reader(resp.body)
+      assert %{value: _chunk} = Web.await(Web.ReadableStreamDefaultReader.read(reader))
 
-      # The queue of the stream is full: the process waits for a pull.
-      eventually(fn -> ReadableStream.get_desired_size(stream) <= 0 end)
-
-      Process.exit(stream, :kill)
+      Process.exit(reader.controller_pid, :kill)
 
       eventually(fn -> stopped?([request]) end)
+    end
+
+    test "keeps the bytes for the next reader when the stream stops before a read" do
+      port =
+        HTTPServer.start_link([
+          "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata",
+          {:sleep, 200},
+          "more"
+        ])
+
+      {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
+      test = self()
+
+      # A different process with a copy of the response gets the stream
+      # process, and stops with a failure before a read. The lifetime rules
+      # stop the stream process: its owner failed.
+      copy =
+        spawn(fn ->
+          {:ok, stream} = ReadableStream.__process__(resp.body)
+          send(test, {:stream, stream})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:stream, stream}
+      Process.exit(copy, :kill)
+      eventually(fn -> not Process.alive?(stream) end)
+
+      # No read took the bytes: the process of the request keeps them.
+      assert Process.alive?(request)
+      assert Web.await(Web.Response.text(resp)) == "datamore"
+    end
+
+    test "keeps the bytes for the next reader when a reader stops before its first read" do
+      port =
+        HTTPServer.start_link([
+          "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\ndata",
+          {:sleep, 200},
+          "more"
+        ])
+
+      {resp, request} = fetch_with_process(Request.new("http://localhost:#{port}/"))
+      test = self()
+
+      reader =
+        spawn(fn ->
+          reader = ReadableStream.get_reader(resp.body)
+          send(test, {:locked, reader.controller_pid})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:locked, stream}
+      Process.exit(reader, :kill)
+
+      # The stream releases the lock of a reader that stopped before a read,
+      # and does not cancel: the process of the request keeps the bytes.
+      eventually(fn -> not ReadableStream.locked?(stream) end)
+      assert Process.alive?(request)
+      assert Web.await(Web.Response.text(resp)) == "datamore"
     end
   end
 

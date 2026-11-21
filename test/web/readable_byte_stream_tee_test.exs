@@ -312,6 +312,34 @@ defmodule Web.ReadableByteStreamTeeTest do
       assert_receive {:DOWN, ^monitor, :process, ^tee, reason}
       assert reason in [:normal, :noproc]
     end
+
+    test "before the tee handles a pull of a default read after a BYOB read ends the branches" do
+      {stream, controller, left, right} = tee()
+      tee = tee_process(stream)
+      monitor = Process.monitor(tee)
+
+      # A BYOB read of a branch: the tee takes a BYOB reader of the source.
+      byob = ReadableStream.get_reader(left, mode: "byob")
+      ref = start_read(fn -> BYOBReader.read(byob, view(2)) end)
+      :ok = Request.respond(await_request(controller), "ab")
+      assert {:fulfilled, %{value: _view}} = read_result(ref)
+
+      # The other branch has the same bytes. Its next default read needs a
+      # default reader of the source, and the source stops before the tee
+      # handles the pull.
+      reader = ReadableStream.get_reader(right)
+      assert %{value: chunk} = await(Reader.read(reader))
+      assert bytes(chunk) == "ab"
+      true = :erlang.suspend_process(tee)
+      ref = start_read(fn -> Reader.read(reader) end)
+      await_message(tee)
+      Process.exit(stream.controller_pid, :kill)
+      true = :erlang.resume_process(tee)
+
+      assert {:rejected, %Web.TypeError{}} = read_result(ref)
+      assert_receive {:DOWN, ^monitor, :process, ^tee, reason}
+      assert reason in [:normal, :noproc]
+    end
   end
 
   describe "an error" do

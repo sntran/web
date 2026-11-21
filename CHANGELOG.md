@@ -101,6 +101,19 @@ All notable changes to this project are documented in this file.
   `:native` with no package, raise `ArgumentError`.
 - `tla/TransformStream.tla`: the backpressure of the two sides of a
   transform stream, and one call of the finish of the transformer.
+- The TLA+ specifications `tla/PipeTo.tla` (the loop of a pipe),
+  `tla/PriorityMessages.tla` (a priority message and the sequence of its
+  sender), `tla/TransformLifetime.tla` (the lock of one side of a transform
+  stream keeps the two sides), `tla/LazyStream.tla` (the state that the
+  copies of a body in memory share), `tla/ByteTee.tla` (the tee of a byte
+  stream), `tla/AbortSteps.tla` and `tla/AbortTimeouts.tla` (the steps
+  "signal abort", and the timeouts of one process), `tla/EventTarget.tla`
+  (the listeners, a dispatch, and the lifetime of a target), and
+  `tla/FormDataParser.tla` (the live parser of a multipart form).
+  `tla/AbortSignal.tla` has the listeners and the dependent signals, and
+  `tla/SharedConnection.tla` has a socket that closed before the client
+  knows it. Each one has a conformance test or a property test on the real
+  code, and each known defect is one value of its constant `Bug`.
 - `Web.fetch/2` decodes a response body with the header
   `Content-Encoding`, as the Fetch Standard specifies: `gzip`, `x-gzip`,
   `deflate` (the zlib format, or raw deflate data), `br`, and `zstd`. A
@@ -115,11 +128,14 @@ All notable changes to this project are documented in this file.
   is kept.
 
 - A cancel, an abort, and an error of a stream are priority messages of
-  Erlang/OTP 28: the stream gets them before the other messages of its
-  mailbox. With 5000 requests in the mailbox, an abort took 24.6 ms
-  before. It now takes 2 ms with 50000 requests. A close stays a usual
-  message, thus it comes after the chunks that the same process sent
-  before it.
+  Erlang/OTP 28: the stream gets them before the messages of the other
+  processes in its mailbox, and after the earlier messages of the same
+  process. Thus `write/2` and then `abort/2` from one process writes first,
+  as in JavaScript. The sender sends a usual fence message before the
+  priority message, and the stream takes the messages of the sender up to
+  the fence first. With 5000 requests in the mailbox, an abort took
+  24.6 ms before. It now takes approximately 1.3 ms with 50000 requests of
+  a different process.
 - The package is tested on Elixir 1.20 with Erlang/OTP 29, and on
   Elixir 1.19 with Erlang/OTP 28. The code compiles with no warning on the
   two versions.
@@ -176,7 +192,7 @@ All notable changes to this project are documented in this file.
   library through a port. The library can call a JavaScript function, such
   as the `pull` of a source, and a promise of the library is a promise of
   JavaScript. The runner answers a call when the processes of the run are
-  at rest, thus the result of each test is the same in each run. 19577 of
+  at rest, thus the result of each test is the same in each run. 19579 of
   20405 tests pass. The lists of the tests that do
   not pass, with the group of their cause, are in
   `test/wpt/quickjs/expectations/`. QuickJS is a tool of the tests only: the
@@ -383,7 +399,7 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - The streams follow more steps of the Streams Standard. In the WPT runner,
-  1028 of 1157 stream tests pass, where 737 passed:
+  1030 of 1157 stream tests pass, where 737 passed:
   - A byte stream transfers the buffer of a chunk, of a view that a BYOB
     read gives, and of a new view of a response. `respond/2` and
     `respond_with_new_view/2` raise `Web.TypeError` or `Web.RangeError` as
@@ -513,6 +529,16 @@ All notable changes to this project are documented in this file.
   limit of the callback.
 - The TLA+ specifications `tla/PipeAbort.tla` and `tla/PublicAbort.tla`,
   with a property test of the abort of a pipe on the real code.
+- A `Web.ReadableStreamBYOBReader` has its own lock, as the default reader
+  has. A reader that released its lock gets a `Web.TypeError` for a read
+  and a cancel, a second `release_lock/1` has no effect, and `closed/1`
+  gives the same promise until a release rejects it. A BYOB reader struct
+  that you make yourself is not a reader of the stream.
+- `Web.TransformStream.new/2` returns when the two sides have the end of a
+  `start` that gives a value or a settled promise. Before, a cancel just
+  after the constructor could find the writable side "erroring".
+- The tee of a byte stream takes the current BYOB request of a branch when
+  it starts a read, as pull1Algorithm and pull2Algorithm specify.
 - A `Web.WritableStreamDefaultWriter` has its own lock, as a reader has. A
   writer that released its lock gets `Web.TypeError` for each operation.
   `ready` and `closed` give the same promise until the Standard replaces
@@ -1190,6 +1216,18 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- The live parser of a multipart `Web.FormData`, with the defects that
+  `tla/FormDataParser.tla` found:
+  - A `get` that waits for a field gets its answer when an iteration or a
+    freeze goes past a file part. Before, it waited forever.
+  - `Web.FormData.cancel/2`, an abort of the signal, and a stop of the
+    owner stop the parser at once, also while the source gives no data.
+  - The stream of a file part gets an error when the parse stops before
+    the end of the part: the reason of the abort, or a `Web.TypeError`.
+    Before, a reader could get the end of a short file. A file part that
+    an iteration or a freeze goes past gets a `Web.TypeError`.
+  - A stop of the owner runs the end of the parser: the file stream ends,
+    and a call raises `Web.TypeError`, not an exit.
 - With `[:http2]`, a request whose write fails because the server closed
   the socket, before the client read the close, goes again on a new
   connection: the server did not get it. Before, it failed with the error

@@ -124,21 +124,27 @@ the file in 0.07 s.
 mix run bench/clogged_abort_latency.exs
 ```
 
-The script puts write requests into the mailbox of a writable stream, then
-aborts the stream. It measures the time to the call of the function
-`abort` of the sink.
+The script puts the write requests of a different process into the
+mailbox of a writable stream, then aborts the stream. It measures the time
+to the call of the function `abort` of the sink.
 
-| Requests in the mailbox | Time (median of 9) |
+| Requests in the mailbox | Time (median, three runs) |
 | --- | --- |
-| 1000 | 75–84 µs |
-| 50000 | 74–90 µs |
-| 200000 | 98–115 µs |
+| 1000 | 83–111 µs |
+| 50000 | 1273–1354 µs |
+| 200000 | 4898–4972 µs |
 
 An abort is a priority message of Erlang/OTP: the stream gets it before the
-requests, and the time does not change with the number of requests. Before
-version 0.5.0, the stream handled each request first: with 5000 requests
-the abort took 24.6 ms, and the time increased with the square of the
-number of requests.
+requests of the other processes. It must not pass the earlier messages of
+its own sender, for example a `write` before the abort: the sender thus
+sends a usual fence message before the priority message, and the stream
+takes the messages of that sender up to the fence first. To find the fence,
+the stream examines its mailbox, thus the time increases with the number
+of requests, by approximately 25 ns for each request. With no fence, the
+time stayed at 75–115 µs, but a `write` and then an `abort` of one process
+lost the write. Before version 0.5.0, the stream handled each request
+first: with 5000 requests the abort took 24.6 ms, and the time increased
+with the square of the number of requests.
 
 ## Compression
 

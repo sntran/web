@@ -704,13 +704,13 @@ systems, and examine its SHA-256 hash.
 | `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11885 | 16 | 0 | 2 | 198 |
 | `URL` and `URLSearchParams` | 4869 | 4867 | 2 | 0 | 0 | 0 |
 | `URLPattern` | 373 | 373 | 0 | 0 | 0 | 0 |
-| The streams, the readers, the writers, and the strategies | 1157 | 1028 | 109 | 5 | 0 | 15 |
+| The streams, the readers, the writers, and the strategies | 1157 | 1030 | 109 | 1 | 0 | 17 |
 | `CompressionStream` and `DecompressionStream` | 318 | 309 | 1 | 0 | 0 | 8 |
 | `Request`, `Response`, and the body | 697 | 521 | 119 | 5 | 2 | 50 |
 | `Blob`, `File`, and `FormData` | 527 | 402 | 51 | 3 | 0 | 71 |
 | `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 71 | 5 | 0 | 0 | 0 |
 
-19577 of 20405 tests pass. The tests that are not in the scope of the library
+19579 of 20405 tests pass. The tests that are not in the scope of the library
 use `XMLHttpRequest` or `FileReader`, the guard of the forbidden headers of a
 browser, the shared memory of JavaScript, or the conversion of JavaScript of
 a value to a string. The library will not have them: `Web.fetch/2` and the
@@ -736,10 +736,6 @@ later microtask (53 stream tests). A timer of the library runs in real time,
 also while JavaScript runs: the result of a test of `AbortSignal.timeout()`
 can change from run to run. The differences of the library are:
 
-* A `ReadableStreamBYOBReader` has no lock of its own, as the default
-  reader has: a second `release_lock/1` of a reader that released its lock
-  releases the next reader of the same process, and `closed/1` gives a new
-  promise at each call (2 tests).
 * A body accepts a binary of Elixir as a chunk of bytes. The Standard
   accepts only a `Uint8Array` (5 tests).
 * A `Request` does not keep the blob of a blob URL: a revoke before the
@@ -778,6 +774,15 @@ easy to make and hard to find with an example test:
 | `TransformStream.tla` | The backpressure of the two sides, and one finish of the transformer. |
 | `PipeAbort.tla`      | The sink `abort` of a pipe starts before the cancel of the source. |
 | `PublicAbort.tla`    | The listeners of an abort run in the caller, in the sequence of the Standard. |
+| `PipeTo.tla`         | The loop of a pipe: the flow control, the propagation, the shutdown, and the locks. |
+| `PriorityMessages.tla` | A priority message goes before the messages of other senders, never before the messages of its sender. |
+| `TransformLifetime.tla` | A lock of one side of a transform stream keeps the two sides. |
+| `LazyStream.tla`     | The copies of a body in memory share one state: the bytes go out one time. |
+| `ByteTee.tla`        | The tee of a byte stream: each read of a branch ends, and no buffer is lost. |
+| `AbortSteps.tla`     | The steps "signal abort": the dependent signals, the algorithms, then the events. |
+| `AbortTimeouts.tla`  | The timeouts of one process abort in their sequence. |
+| `EventTarget.tla`    | The listeners of a target, a dispatch, and the lifetime of the target. |
+| `FormDataParser.tla` | The live parser of a multipart form: each call gets an answer, and a file part ends. |
 | `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
 | `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |
 | `ConnectionPool.tla` | The connections of an origin, and the slots of a counting governor: the limit, the queue, and the stops. |

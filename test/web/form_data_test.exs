@@ -46,6 +46,26 @@ defmodule Web.FormDataTest do
     assert Web.TestBytes.join(Web.File.stream(file)) == "hello file"
   end
 
+  test "parse gives a file the type text/plain when its part has no Content-Type" do
+    boundary = "----type-boundary"
+
+    payload =
+      multipart_payload(boundary, [
+        %{name: "plain", filename: "a.txt", value: "a"},
+        %{name: "empty", filename: "b.bin", content_type: "", value: "b"},
+        %{name: "typed", filename: "c.bin", content_type: "Image/PNG", value: "c"}
+      ])
+
+    form = Web.FormData.parse(payload, boundary)
+
+    # The Fetch Standard, `formData()`: the type is the value of the header
+    # `Content-Type`, and `text/plain` when the part has no such header.
+    assert [["plain", plain], ["empty", empty], ["typed", typed]] = Enum.to_list(form)
+    assert {plain.name, plain.type} == {"a.txt", "text/plain"}
+    assert {empty.name, empty.type} == {"b.bin", ""}
+    assert {typed.name, typed.type} == {"c.bin", "image/png"}
+  end
+
   test "parse raises on malformed multipart payload" do
     assert_raise Web.TypeError, ~r/missing opening boundary/, fn ->
       Web.FormData.parse("bad multipart", "boundary")

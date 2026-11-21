@@ -957,13 +957,16 @@ defmodule Web.FormData do
         {:error, %TypeError{} = reason} ->
           {:error, reason}
 
+        # The steps of `formData()` of the Fetch Standard: the type of a
+        # file is the value of the header `Content-Type` of the part, or
+        # `text/plain` when the part has no such header.
         headers when is_map(headers) ->
           with disposition when is_binary(disposition) <-
                  Map.get(headers, "content-disposition") ||
                    {:error,
                     TypeError.exception("Malformed multipart body: missing content-disposition")},
                {:ok, %{name: name, filename: filename}} <- parse_content_disposition(disposition) do
-            {:ok, build_part_info(name, filename, Map.get(headers, "content-type", ""))}
+            {:ok, build_part_info(name, filename, Map.get(headers, "content-type", "text/plain"))}
           else
             {:error, %TypeError{} = reason} -> {:error, reason}
           end

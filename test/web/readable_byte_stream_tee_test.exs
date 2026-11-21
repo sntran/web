@@ -313,22 +313,23 @@ defmodule Web.ReadableByteStreamTeeTest do
       assert reason in [:normal, :noproc]
     end
 
-    test "before the tee handles a default pull after a BYOB read ends the two branches" do
+    test "before the tee handles a pull of a default read after a BYOB read ends the branches" do
       {stream, controller, left, right} = tee()
       tee = tee_process(stream)
       monitor = Process.monitor(tee)
 
-      # A BYOB read of the left branch gives the tee a BYOB reader.
+      # A BYOB read of a branch: the tee takes a BYOB reader of the source.
       byob = ReadableStream.get_reader(left, mode: "byob")
       ref = start_read(fn -> BYOBReader.read(byob, view(2)) end)
-      request = await_request(controller)
-      :ok = Request.respond(request, 1)
-      assert {:fulfilled, %{done: false}} = read_result(ref)
+      :ok = Request.respond(await_request(controller), "ab")
+      assert {:fulfilled, %{value: _view}} = read_result(ref)
 
-      # The default read of the right branch takes the chunk. Its next
-      # pull comes to the tee before the stop of the source.
+      # The other branch has the same bytes. Its next default read needs a
+      # default reader of the source, and the source stops before the tee
+      # handles the pull.
       reader = ReadableStream.get_reader(right)
-      assert %{done: false} = await(Reader.read(reader))
+      assert %{value: chunk} = await(Reader.read(reader))
+      assert bytes(chunk) == "ab"
       true = :erlang.suspend_process(tee)
       ref = start_read(fn -> Reader.read(reader) end)
       await_message(tee)

@@ -215,14 +215,19 @@ defmodule Web.ReadableStream do
     start_fn = source_start(underlying_source)
     stream_opts = Keyword.put(stream_opts, :has_start, is_function(start_fn))
 
-    {:ok, pid} =
-      Web.Stream.__start__(__MODULE__, stream_opts, pid_source(underlying_source) ++ internal)
+    case Web.Stream.__start__(__MODULE__, stream_opts, pid_source(underlying_source) ++ internal) do
+      {:ok, pid} ->
+        if start_fn do
+          Web.Stream.run_start(pid, start_fn, controller_for(stream_type, pid))
+        end
 
-    if start_fn do
-      Web.Stream.run_start(pid, start_fn, controller_for(stream_type, pid))
+        %__MODULE__{controller_pid: pid}
+
+      # The stream process of a stream with no process: a different stream
+      # process has its key. See `Web.Internal.LazyStream`.
+      :ignore ->
+        :ignore
     end
-
-    %__MODULE__{controller_pid: pid}
   end
 
   # A source that is a process gets the message `{:pull, stream}` from the

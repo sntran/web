@@ -290,14 +290,17 @@ defmodule Web.Dispatcher.TCPTest do
       assert_receive :tcp_client_closed, 3_000
     end
 
-    test "the stop of the owner of the reader closes the socket" do
+    test "the stop of the owner of a reader that reads closes the socket" do
       port = TCPServer.start_link([{:sleep, 200}, "data"], false, false, self())
       {:ok, resp} = TCP.fetch(Request.new("tcp://localhost:#{port}"))
       parent = self()
 
+      # The read disturbs the stream: the stream has no bytes for a
+      # different reader, and the stop of its reader cancels it.
       reader_owner =
         spawn(fn ->
-          _reader = ReadableStream.get_reader(resp.body)
+          reader = ReadableStream.get_reader(resp.body)
+          _read = Web.ReadableStreamDefaultReader.read(reader)
           send(parent, :reader_locked)
 
           receive do

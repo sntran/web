@@ -206,7 +206,13 @@ defmodule Web.Stream do
     owner_ref: nil,
     owner_down_reason: nil,
     linger: 5_000,
-    lifetime_timer: nil
+    lifetime_timer: nil,
+    # The key of a stream with no process, when this process is its stream
+    # process: see `Web.Internal.LazyStream`.
+    lazy_key: nil,
+    # The copies of a stream with no process that got this process and take
+    # its lock next: monitor => pid. See "Lifetime".
+    keepers: %{}
   ]
 
   # ---------------------------------------------------------------------------
@@ -241,7 +247,9 @@ defmodule Web.Stream do
   #   * `:watch_source` — `{pid, error_fun}`: a stop of `pid` before the end
   #     of the stream puts the stream in the errored state.
   #   * `:registry_key` — the stream registers itself with this key: see
-  #     `Web.Internal.LazyStream`.
+  #     `Web.Internal.LazyStream`. With `:lazy_kind` (`:bytes`, the default,
+  #     or `:closed`), the stream starts only when the state of that stream
+  #     with no process permits it: else `__start__/3` returns `:ignore`.
   #   * `:disturbed` — the stream starts disturbed.
   def __start__(module, opts, internal) when is_atom(module) and is_list(internal) do
     snapshot = Snapshot.take()
@@ -832,11 +840,18 @@ defmodule Web.Stream do
       disturbed: Keyword.get(internal, :disturbed, false),
       source_watch: watch_source(Keyword.get(internal, :watch_source)),
       direct_pull: Keyword.get(internal, :direct_pull),
-      transform: transform_side(Keyword.get(opts, :transform))
+      transform: transform_side(Keyword.get(opts, :transform)),
+      lazy_key: Keyword.get(internal, :registry_key)
     }
 
-    register(Keyword.get(internal, :registry_key))
+    # A different stream process has the key, or the start is old: this
+    # process stops normally, and its starter uses the state that it finds.
+    if register(data.lazy_key, Keyword.get(internal, :lazy_kind, :bytes)) == :ok,
+      do: init_states(type, extra_actions, data, snapshot),
+      else: :ignore
+  end
 
+  defp init_states(type, extra_actions, data, snapshot) do
     {initial_state, default_actions} =
       case type do
         :producer ->
@@ -882,12 +897,8 @@ defmodule Web.Stream do
   # The copies of a stream with no process find this process with the key:
   # see `Web.Internal.LazyStream`. The registry removes the key when the
   # process stops.
-  defp register(nil), do: :ok
-
-  defp register(key) do
-    {:ok, _owner} = Registry.register(LazyStream.registry(), key, nil)
-    :ok
-  end
+  defp register(nil, _kind), do: :ok
+  defp register(key, kind), do: LazyStream.__register__(key, kind)
 
   @impl true
   @doc "Terminates a stream engine process with a unified terminal event."
@@ -1264,6 +1275,7 @@ defmodule Web.Stream do
 
       reader_mode when reader_mode in [:default, :byob] ->
         ref = Process.monitor(pid)
+        data = drop_keeper(data, pid)
 
         {:keep_state, %{data | reader_pid: pid, reader_ref: ref, reader_mode: reader_mode},
          [
@@ -1575,6 +1587,14 @@ defmodule Web.Stream do
   # Query helpers
   defp handle_common({:call, from}, :disturbed?, _state, data) do
     {:keep_state_and_data, [{:reply, from, data.disturbed}]}
+  end
+
+  # A copy of a stream with no process got this process, and takes its lock
+  # next. The process stays for the copy until the copy takes its lock or
+  # stops: see `unread_linger/1`.
+  defp handle_common({:call, from}, {:keep, pid}, _state, data) do
+    keepers = Map.put(data.keepers, Process.monitor(pid), pid)
+    {:keep_state, %{data | keepers: keepers}, [{:reply, from, :ok}]}
   end
 
   # ReadableStreamPipeTo sets [[disturbed]] of the source before its first
@@ -1997,6 +2017,9 @@ defmodule Web.Stream do
 
   defp handle_common(:info, {:DOWN, ref, :process, _pid, reason}, state, data) do
     cond do
+      is_map_key(data.keepers, ref) ->
+        {:keep_state, %{data | keepers: Map.delete(data.keepers, ref)}}
+
       ref == data.reader_ref ->
         maybe_cancel_on_reader_exit(reason, state, data)
 
@@ -3068,6 +3091,13 @@ defmodule Web.Stream do
 
   defp owner_rule(data), do: owner_rule_end(data)
 
+  # The stream process of a stream with no process that no read disturbed:
+  # its bytes stay in the struct, or with the process that holds them. The
+  # process stops with no cancel, and the next reader gets the bytes. See
+  # `Web.Internal.LazyStream`.
+  defp owner_rule_end(%{lazy_key: key, disturbed: false} = data) when key != nil,
+    do: {:stop, :normal, data}
+
   # No process can read the chunks in the queue. Discard them, thus the
   # stream stops immediately after the terminal event.
   defp owner_rule_end(data) do
@@ -3891,6 +3921,7 @@ defmodule Web.Stream do
     case transition(result, state, data) do
       {next_state, new_data, actions} ->
         notify_peer_lock(data, new_data)
+        notify_disturbed(data, new_data)
         clear_writable_size(next_state, new_data)
         {new_data, synced?} = sync_writer_promises(next_state, new_data)
         {new_data, settled?} = settle_closed_promise(next_state, new_data)
@@ -4283,9 +4314,11 @@ defmodule Web.Stream do
   # stream that waits for the answer of the handshake has no timer.
   defp unread_linger(%{transform: %{ending: true}}), do: nil
 
+  # A copy of a stream with no process that got the process and did not
+  # take its lock yet keeps the process, as a lock.
   defp unread_linger(data) do
     cond do
-      locked?(data) -> nil
+      locked?(data) or data.keepers != %{} -> nil
       owner_failed?(data) -> 0
       owner_down?(data) -> handoff_linger(data.linger)
       true -> nil
@@ -4319,6 +4352,23 @@ defmodule Web.Stream do
 
   defp peer_locked?(%{transform: %{peer_locked: locked}}), do: locked
   defp peer_locked?(_data), do: false
+
+  # The first disturb of the stream process of a stream with no process
+  # takes the bytes for all the copies: a disturbed stream gives no bytes to
+  # a different reader. See `Web.Internal.LazyStream`.
+  defp notify_disturbed(%{disturbed: false}, %{disturbed: true, lazy_key: key}) when key != nil,
+    do: LazyStream.__disturbed__(key)
+
+  defp notify_disturbed(_old, _new), do: :ok
+
+  # The keeper `pid` took its lock.
+  defp drop_keeper(%{keepers: keepers} = data, _pid) when keepers == %{}, do: data
+
+  defp drop_keeper(data, pid) do
+    {dropped, kept} = Map.split_with(data.keepers, fn {_monitor, keeper} -> keeper == pid end)
+    Enum.each(dropped, fn {monitor, _keeper} -> Process.demonitor(monitor, [:flush]) end)
+    %{data | keepers: kept}
+  end
 
   defp notify_peer_lock(%{transform: %{peer: peer}} = old, new) when is_pid(peer) do
     if lock_fields(old) != lock_fields(new) do
@@ -4636,8 +4686,10 @@ defmodule Web.Stream do
   end
 
   # The process that holds the reader lock stopped: the lock is free.
+  # A reader of a stream with no process that stopped before its first read
+  # took no bytes: the stream releases the lock, and does not cancel.
   defp maybe_cancel_on_reader_exit(reason, state, %{cancel_on_reader_exit: true} = data)
-       when state not in [:closed, :errored] do
+       when state not in [:closed, :errored] and (is_nil(data.lazy_key) or data.disturbed) do
     handle_termination(:cancel, {:reader_down, reason}, release_stopped_reader(data))
   end
 

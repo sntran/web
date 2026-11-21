@@ -26,8 +26,8 @@ The script reads 512 MiB in chunks of 64 KiB with `Enum`.
 
 | Source | MiB each second | Chunks each second | Increase of memory |
 | --- | --- | --- | --- |
-| A readable stream from `ReadableStream.from/1` | 6358–6665 | 101729–106647 | 0.9 MiB |
-| The stream through one transform stream | 1223–1558 | 19568–24928 | 0.3–0.6 MiB |
+| A readable stream from `ReadableStream.from/1` | 4999–5089 | 79987–81422 | 0.9–1.1 MiB |
+| The stream through one transform stream | 2005–2340 | 32086–37442 | 0.5–0.6 MiB |
 | A response body of `fetch`, from a server on the machine | 992–1310 | 468–2046 | 1.5–31 MiB |
 
 The memory does not increase with the number of bytes. The body of
@@ -38,12 +38,16 @@ did not free yet, and it changes much from run to run. The code before
 the changes of the body gave the same range, 1.5–25 MiB.
 
 A `TransformStream` has two processes, one for each side, as the Streams
-Standard gives each side its own state. Each chunk thus has one more
-message, from the readable side to the writable side, for the change of
-the backpressure. In 8 rounds in turns with the build before the change,
-the stream through one transform stream gave 1223–1558 MiB each second
-(median 1503), where it gave 1629–2063 (median 1768): approximately 15 %
-less. The readable stream had the same median in the two builds.
+Standard gives each side its own state. The two sides share
+[[backpressure]] in one `:atomics` cell: a change of the backpressure costs
+no message, and a pull sends one message only when the writable side holds
+a write. A transform stream with no function `transform` runs no worker:
+the writable side sends each chunk to the readable side. An identity
+transform thus costs 13 messages for each chunk, where it cost 17. In 5
+rounds in turns with the build before these changes, the stream through one
+transform stream gave 2104–2319 MiB each second (median 2182), where it
+gave 1396–1559 (median 1496). The readable stream had the same range in the
+two builds.
 
 The streams follow the pull rules of the Streams Standard:
 
@@ -59,11 +63,12 @@ The streams follow the pull rules of the Streams Standard:
     for one pull, such as the body of a `fetch` response, thus gives many
     chunks for each message. A pipe reads one chunk each time the
     destination is ready, as the Streams Standard specifies. With 20000
-    small chunks, a pipe through a `TransformStream` takes 38–41 µs for each
-    chunk, where it took 32–33 µs when the two sides were one process: each
-    chunk has one more message. With 2000 chunks of 16 KiB through a
-    `TextEncoderStream` and a `TextDecoderStream`, a pipe takes 7–12 % more
-    time.
+    small chunks, a pipe through a `TransformStream` takes 24–29 µs for each
+    chunk (median 26.7), where it took 40–42 µs with a message for each
+    change of the backpressure, and 31–34 µs when the two sides were one
+    process. With 2000 chunks of 16 KiB through a `TextEncoderStream` and a
+    `TextDecoderStream`, the time does not change: the encode and the decode
+    are most of it.
 
 Version 0.5.0 runs the callbacks of a stream in one worker process for the
 life of the stream. Before, each callback started a task through one
@@ -76,7 +81,7 @@ The cost of each element, for one process that reads 20000 small elements:
 | --- | --- | --- |
 | `ReadableStream.from` read with `Enum` | 26–32 µs | 7.1–7.8 µs |
 | `ReadableStream.new` with a `pull` that enqueues one chunk, read with `Enum` | — | 9–11 µs |
-| `from` through one `TransformStream` | 87 µs | 38–39 µs (31–34 µs with one process for the two sides) |
+| `from` through one `TransformStream` | 87 µs | 24–29 µs |
 | `Web.Promise.new` and `Web.await` | — | 7.8–8.5 µs |
 | A message to a process and its answer (for comparison) | 2.3 µs | 2.5 µs |
 | Elixir `Stream` in one process (for comparison) | 0.07 µs | 0.07 µs |

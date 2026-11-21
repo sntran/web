@@ -704,13 +704,13 @@ systems, and examine its SHA-256 hash.
 | `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11885 | 16 | 0 | 2 | 198 |
 | `URL` and `URLSearchParams` | 4869 | 4867 | 2 | 0 | 0 | 0 |
 | `URLPattern` | 373 | 373 | 0 | 0 | 0 | 0 |
-| The streams, the readers, the writers, and the strategies | 1157 | 1025 | 108 | 9 | 0 | 15 |
+| The streams, the readers, the writers, and the strategies | 1157 | 1028 | 109 | 5 | 0 | 15 |
 | `CompressionStream` and `DecompressionStream` | 318 | 309 | 1 | 0 | 0 | 8 |
 | `Request`, `Response`, and the body | 697 | 521 | 119 | 5 | 2 | 50 |
 | `Blob`, `File`, and `FormData` | 527 | 402 | 51 | 3 | 0 | 71 |
 | `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 71 | 5 | 0 | 0 | 0 |
 
-19570 of 20405 tests pass. The tests that are not in the scope of the library
+19577 of 20405 tests pass. The tests that are not in the scope of the library
 use `XMLHttpRequest` or `FileReader`, the guard of the forbidden headers of a
 browser, the shared memory of JavaScript, or the conversion of JavaScript of
 a value to a string. The library will not have them: `Web.fetch/2` and the
@@ -732,14 +732,14 @@ have yet: the server of WPT, the conversion to an async sequence of
 string of Elixir is UTF-8, thus a lone surrogate of JavaScript cannot come to
 the library. The runner answers a call when the library is at rest. Thus the
 library can do a step before the call returns, where JavaScript does it in a
-later microtask (28 stream tests). A timer of the library runs in real time,
+later microtask (53 stream tests). A timer of the library runs in real time,
 also while JavaScript runs: the result of a test of `AbortSignal.timeout()`
 can change from run to run. The differences of the library are:
 
-* The listeners of the signal of a `WritableStream` controller run in a new
-  process after the abort steps of the stream, because the stream process
-  must answer other processes. In JavaScript, a listener runs in the abort
-  steps, and can call `abort()` or `close()` again (4 tests).
+* A `ReadableStreamBYOBReader` has no lock of its own, as the default
+  reader has: a second `release_lock/1` of a reader that released its lock
+  releases the next reader of the same process, and `closed/1` gives a new
+  promise at each call (2 tests).
 * A body accepts a binary of Elixir as a chunk of bytes. The Standard
   accepts only a `Uint8Array` (5 tests).
 * A `Request` does not keep the blob of a blob URL: a revoke before the
@@ -776,6 +776,8 @@ easy to make and hard to find with an example test:
 | `Promise.tla`        | One promise: it settles one time, and it stops.            |
 | `StreamLifetime.tla` | When a stream process stops, and when it must stay.        |
 | `TransformStream.tla` | The backpressure of the two sides, and one finish of the transformer. |
+| `PipeAbort.tla`      | The sink `abort` of a pipe starts before the cancel of the source. |
+| `PublicAbort.tla`    | The listeners of an abort run in the caller, in the sequence of the Standard. |
 | `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
 | `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |
 | `ConnectionPool.tla` | The connections of an origin, and the slots of a counting governor: the limit, the queue, and the stops. |

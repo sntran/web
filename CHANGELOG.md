@@ -176,7 +176,7 @@ All notable changes to this project are documented in this file.
   library through a port. The library can call a JavaScript function, such
   as the `pull` of a source, and a promise of the library is a promise of
   JavaScript. The runner answers a call when the processes of the run are
-  at rest, thus the result of each test is the same in each run. 19570 of
+  at rest, thus the result of each test is the same in each run. 19577 of
   20405 tests pass. The lists of the tests that do
   not pass, with the group of their cause, are in
   `test/wpt/quickjs/expectations/`. QuickJS is a tool of the tests only: the
@@ -383,7 +383,7 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - The streams follow more steps of the Streams Standard. In the WPT runner,
-  1012 of 1157 stream tests pass, where 737 passed:
+  1028 of 1157 stream tests pass, where 737 passed:
   - A byte stream transfers the buffer of a chunk, of a view that a BYOB
     read gives, and of a new view of a response. `respond/2` and
     `respond_with_new_view/2` raise `Web.TypeError` or `Web.RangeError` as
@@ -494,6 +494,25 @@ All notable changes to this project are documented in this file.
   takes 27.5 µs for each small chunk, where it took 41.3 µs, and gives
   approximately 2100 MiB of chunks of 64 KiB each second, where it gave
   1400. See `BENCHMARKS.md`.
+- The abort of a pipe follows the sequence of ReadableStreamPipeTo: the
+  sink `abort` of the destination starts, and returns, before the source
+  gets its `cancel`. When the destination has a write or a close in flight,
+  the cancel comes first, as in JavaScript. Before, the two callbacks ran
+  at the same time, and on a busy machine the `cancel` could come first. A
+  pipe now waits for the sink `abort` before the cancel, at most for the
+  time limit of a callback. The priority messages of Erlang/OTP 28 cannot
+  give this sequence: they change the sequence of the messages in one
+  mailbox only, not the work of two processes.
+- `Web.WritableStream.abort/2` and `Web.WritableStreamDefaultWriter.abort/2`
+  run the listeners of the signal of the controller in the calling process,
+  in the abort steps, as WritableStreamAbort specifies. A listener can call
+  `abort/2` or `close/1` again, with the result of the Standard. A stream
+  with no signal costs no more messages. An abort that the library starts,
+  for example the abort of a pipe, runs the listeners in a new process. A
+  listener that awaits a result of the same stream waits until the time
+  limit of the callback.
+- The TLA+ specifications `tla/PipeAbort.tla` and `tla/PublicAbort.tla`,
+  with a property test of the abort of a pipe on the real code.
 - A `Web.WritableStreamDefaultWriter` has its own lock, as a reader has. A
   writer that released its lock gets `Web.TypeError` for each operation.
   `ready` and `closed` give the same promise until the Standard replaces

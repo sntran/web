@@ -3,11 +3,32 @@ defmodule Web.WPT.QuickJS.FetchTest do
   # `Response`, and the body mixin, with no change, in QuickJS against the
   # library. See `Web.Test.QuickJS.Bridge`, and `Web.Test.QuickJS.WPT` for the
   # lists of expected results.
-  use ExUnit.Case, async: true
+  #
+  # A stream or a promise of the library stops when the linger time of the
+  # application goes by after its end, because the BEAM does not collect a
+  # process. A page of JavaScript keeps each object that it refers to. Some
+  # files of this suite make their streams when the script loads, and use
+  # them in a later test: on a busy machine, more than the default linger
+  # time of 5 s goes by. Thus this module sets the linger time to the time
+  # limit of a run. The setting applies to the application, thus the module
+  # cannot run at the same time as other tests.
+  use ExUnit.Case, async: false
 
   # A file of WPT can have thousands of tests, and WPT gives some files a
   # long time limit (`META: timeout=long`).
   @moduletag timeout: 300_000
+
+  setup_all do
+    previous = Application.fetch_env(:web, :linger)
+    Application.put_env(:web, :linger, 300_000)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, linger} -> Application.put_env(:web, :linger, linger)
+        :error -> Application.delete_env(:web, :linger)
+      end
+    end)
+  end
 
   alias Web.Test.QuickJS.WPT
 

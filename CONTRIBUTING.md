@@ -121,6 +121,11 @@ connections of an origin, and the reads of a socket.
 - The result of each test must be the same in each run. The bridge answers
   a call, and sends the settled promises, only when the processes of the
   run are at rest. A new kind of message to the bridge must keep this rule.
+- A stream or a promise of the library stops when the linger time goes by
+  after its end, and a page of JavaScript keeps each object. A suite with
+  files that make their objects when the script loads, and use them in a
+  later test, sets the linger time to the time limit of the run, with
+  `async: false`. See `test/wpt/quickjs/fetch_test.exs`.
 - When a change of the library corrects a difference, run
   `WPT_UPDATE=1 mix test test/wpt/quickjs`, and examine the change of the
   lists before you commit it.

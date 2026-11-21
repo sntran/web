@@ -1190,6 +1190,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- With `[:http2]`, a request whose write fails because the server closed
+  the socket, before the client read the close, goes again on a new
+  connection: the server did not get it. Before, it failed with the error
+  of the write (for example `:enotconn`), and the next requests went to the
+  same connection and failed too. The connection now closes at such a
+  write, and its other requests get their errors.
 - A BYOB read of a branch of a tee of a byte stream ends when the source
   is canceled during the read of the tee, for example when the owner of the
   source stops. The cancel drops the buffer of the read, thus the read ends

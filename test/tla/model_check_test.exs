@@ -587,6 +587,13 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(SpecModel.check("SharedConnection", bug("no_limit")), "StreamsBounded")
     end
 
+    test "a request whose write fails on a closed socket, and that gives the error, is found" do
+      assert_violates(
+        SpecModel.check("SharedConnection", bug("fail_written")),
+        "ErrorOnlyAfterFailure"
+      )
+    end
+
     test "a request in the queue that fails at a GOAWAY is found" do
       assert_violates(
         SpecModel.check("SharedConnection", bug("fail_queued")),

@@ -562,6 +562,26 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
       assert_receive {:DOWN, ^ref, :process, ^mux, :normal}, 2_000
     end
 
+    test "sends a request again on a new connection when its write fails on a closed socket",
+         context do
+      held = fetch(context.base <> "/hold")
+      [handler] = held(1)
+      mux = multiplex(context)
+      ref = Process.monitor(mux)
+
+      # The socket closes with no message to the process of the connection:
+      # the process still thinks that the connection is open, and the write
+      # of the next request fails. The server did not get that request, thus
+      # it goes again. The server can have processed the request on the
+      # network: it gets the error.
+      :erlang.port_close(Mint.HTTP.get_socket(:sys.get_state(mux).conn))
+
+      assert await(Response.text(await(fetch(context.base <> "/")))) == "ok"
+      assert %TypeError{cause: %Mint.TransportError{reason: :closed}} = catch_exit(await(held))
+      assert_receive {:DOWN, ^ref, :process, ^mux, :normal}, 2_000
+      send(handler, :release)
+    end
+
     test "gives the error of the process of the connection when it stops", context do
       promise = fetch(context.base <> "/hold")
       [handler] = held(1)

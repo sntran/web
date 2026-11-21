@@ -143,7 +143,7 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
         queue: :queue.in(ref, state.queue)
     }
 
-    {:noreply, start_queued(state)}
+    state |> start_queued() |> noreply()
   end
 
   def handle_info({:body, ref, chunk}, state) do
@@ -199,12 +199,17 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
   defp noreply(state), do: {:noreply, state}
 
   # The requests in the queue start while the server allows more streams.
+  # A write that failed closed the connection: its requests get their
+  # errors, and the process stops.
   defp start_queued(state) do
     with {{:value, ref}, queue} <- :queue.out(state.queue),
          true <- stream_allowed?(state) do
       %{state | queue: queue} |> open_stream(Map.fetch!(state.entries, ref)) |> start_queued()
     else
-      _no -> state
+      _no ->
+        if Mint.HTTP.open?(state.conn, :read),
+          do: state,
+          else: fail_all(state, %Mint.TransportError{reason: :closed})
     end
   end
 
@@ -232,13 +237,18 @@ defmodule Web.Dispatcher.HTTP.Multiplex do
         |> put_entry(entry)
         |> write(entry)
 
-      # The client refuses a request only on a connection that closed, and
-      # `start_queued/1` starts no request on such a connection.
-      # coveralls-ignore-start
-      {:error, conn, reason} ->
-        send(entry.pid, {entry.ref, :events, [{:error, reason}]})
+      # The write of the request failed: the server closed the socket, and
+      # the close is not in the mailbox yet. The server did not get the
+      # request, thus it goes again on a new connection. `stream_allowed?/1`
+      # gives no request to a connection that Mint knows closed or full, and
+      # a write has no time limit: each error here is the error of the
+      # transport. Mint keeps the connection open after it: the process
+      # closes it, and `start_queued/1` gives the other requests their
+      # errors.
+      {:error, conn, %Mint.TransportError{}} ->
+        send(entry.pid, {entry.ref, :events, [{:error, @unprocessed}]})
+        {:ok, conn} = Mint.HTTP.close(conn)
         %{state | conn: conn} |> remove(entry)
-        # coveralls-ignore-stop
     end
   end
 

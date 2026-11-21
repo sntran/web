@@ -81,6 +81,10 @@ defmodule Web.AbortSignal do
   same or a shorter time, abort in the sequence in which the process made
   them.
 
+  The specifications are `tla/AbortSignal.tla` (the lifetime of a signal),
+  `tla/AbortSteps.tla` (the steps of an abort), and `tla/AbortTimeouts.tla`
+  (the sequence of the timeouts).
+
   ## Examples
 
       iex> controller = Web.AbortController.new()
@@ -162,12 +166,10 @@ defmodule Web.AbortSignal do
     timeout_reason = DOMException.timeout_error()
     earlier = earlier_timeouts(controller.signal.pid, ms)
 
-    Process.send_after(
-      controller.signal.pid,
-      {:abort_signal_timeout, timeout_reason, earlier},
-      ms
-    )
-
+    # The signal keeps the earlier timeouts before its timer starts. See
+    # `tla/AbortTimeouts.tla`.
+    :ok = GenServer.call(controller.signal.pid, {:timeout_after, earlier})
+    Process.send_after(controller.signal.pid, {:abort_signal_timeout, timeout_reason}, ms)
     controller.signal
   end
 
@@ -690,6 +692,9 @@ defmodule Web.AbortSignal do
 
   def handle_call(:sources, _from, state), do: reply({:ok, state.sources}, state)
 
+  def handle_call({:timeout_after, earlier}, _from, state),
+    do: reply(:ok, Map.put(state, :timeout_after, earlier))
+
   def handle_call({:set_sources, sources}, _from, state),
     do: reply(:ok, %{state | sources: sources})
 
@@ -744,16 +749,13 @@ defmodule Web.AbortSignal do
     {:stop, {:shutdown, {:aborted, reason}}, state}
   end
 
-  @doc false
-  def handle_info({:abort_signal_timeout, reason}, state) do
-    handle_info({:abort_signal_timeout, reason, []}, state)
-  end
-
   # The time of `timeout/1` is complete. The process of the signal answers
   # the listeners: a new process aborts the signal, after the earlier
   # timeouts of the same process.
-  def handle_info({:abort_signal_timeout, reason, earlier}, state) do
+  @doc false
+  def handle_info({:abort_signal_timeout, reason}, state) do
     signal = %__MODULE__{pid: self(), ref: state.ref}
+    earlier = Map.get(state, :timeout_after, [])
 
     _pid =
       spawn(fn ->

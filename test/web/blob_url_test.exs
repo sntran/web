@@ -4,6 +4,7 @@ defmodule Web.BlobURLTest do
   use ExUnitProperties
 
   alias Web.Blob
+  alias Web.Internal.BlobURLStore
   alias Web.URL
 
   @uuid ~r/^blob:null\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
@@ -87,6 +88,99 @@ defmodule Web.BlobURLTest do
 
     assert {:error, :blob_url_not_found} =
              Web.Dispatcher.Blob.fetch(Web.Request.new("https://example.com/"))
+  end
+
+  describe "the lifetime of a blob URL" do
+    # The store does the requests one at a time. The test suspends it, and
+    # puts the add of a process and the stop of that process in its mailbox
+    # in a known sequence.
+    test "a process that stops while its add waits gets no URL" do
+      store = Process.whereis(BlobURLStore)
+      test = self()
+
+      # The process has a URL: the store monitors it.
+      {maker, monitor} =
+        spawn_monitor(fn ->
+          send(test, {:first, URL.create_object_url(Blob.new(["a"]))})
+          send(test, {:second_url, "blob:null/" <> Base.encode16(:crypto.strong_rand_bytes(4))})
+
+          receive do
+            {:add, url} -> BlobURLStore.add(url, Blob.new(["b"]))
+          end
+        end)
+
+      assert_receive {:first, first}
+      assert_receive {:second_url, second}
+
+      true = :erlang.suspend_process(store)
+
+      try do
+        send(maker, {:add, second})
+        await_add(store, maker)
+        Process.exit(maker, :kill)
+        assert_receive {:DOWN, ^monitor, :process, ^maker, :killed}
+      after
+        :erlang.resume_process(store)
+      end
+
+      # The store did the add: the call of the test comes after it.
+      _state = :sys.get_state(store)
+
+      eventually(fn ->
+        BlobURLStore.resolve(first) == nil and
+          BlobURLStore.resolve(second) == nil
+      end)
+    end
+
+    test "a process with no URL that stops while its add waits gets no URL" do
+      store = Process.whereis(BlobURLStore)
+      url = "blob:null/" <> Base.encode16(:crypto.strong_rand_bytes(4))
+      true = :erlang.suspend_process(store)
+
+      try do
+        {maker, monitor} =
+          spawn_monitor(fn -> BlobURLStore.add(url, Blob.new(["a"])) end)
+
+        await_add(store, maker)
+        Process.exit(maker, :kill)
+        assert_receive {:DOWN, ^monitor, :process, ^maker, :killed}
+      after
+        :erlang.resume_process(store)
+      end
+
+      # The store did the add: the call of the test comes after it.
+      _state = :sys.get_state(store)
+
+      eventually(fn -> BlobURLStore.resolve(url) == nil end)
+    end
+  end
+
+  # Waits until the mailbox of the store has the add of the process. Other
+  # tests can use the store at the same time.
+  defp await_add(store, maker, attempts \\ 200) do
+    {:messages, messages} = Process.info(store, :messages)
+
+    cond do
+      Enum.any?(
+        messages,
+        &match?({:"$gen_call", {^maker, _tag}, {:add, _url, _blob, _owner}}, &1)
+      ) ->
+        :ok
+
+      attempts == 0 ->
+        flunk("the mailbox of the store does not have the add")
+
+      true ->
+        Process.sleep(5) && await_add(store, maker, attempts - 1)
+    end
+  end
+
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
   end
 
   describe "a request with a Range header" do

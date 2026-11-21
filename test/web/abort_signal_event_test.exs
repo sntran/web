@@ -311,28 +311,41 @@ defmodule Web.AbortSignalEventTest do
   end
 
   describe "AbortSignal.timeout/1" do
-    # `timeout/1` gives the timer the earlier timeouts of the process. The
-    # test sends the message of the timer itself: thus no time limit is in
-    # the test.
+    # The time of each timeout is long: the test sends the message of the
+    # timer itself. Thus no time limit is in the test.
     test "a new process runs the listeners, after the earlier timeouts of the process" do
       me = self()
-      first = AbortController.new()
-      second = AbortController.new()
+      first = AbortSignal.timeout(1_000_000)
+      second = AbortSignal.timeout(1_000_000)
+      longer = AbortSignal.timeout(2_000_000)
+      shorter = AbortSignal.timeout(999_999)
 
-      EventTarget.add_event_listener(second.signal, "abort", fn event ->
+      # A timeout waits for the earlier timeouts with the same or a shorter
+      # time.
+      assert :sys.get_state(second.pid).timeout_after == [first.pid]
+
+      assert Enum.sort(:sys.get_state(longer.pid).timeout_after) ==
+               Enum.sort([first.pid, second.pid])
+
+      assert :sys.get_state(shorter.pid).timeout_after == []
+
+      EventTarget.add_event_listener(second, "abort", fn event ->
         send(me, {:second, AbortSignal.reason(event.target)})
       end)
 
       # The time of the second signal is complete, but the first signal did
       # not abort yet: the second one waits for it.
-      :erlang.trace(second.signal.pid, true, [:procs])
-      send(second.signal.pid, {:abort_signal_timeout, :timeout, [first.signal.pid]})
+      :erlang.trace(second.pid, true, [:procs])
+      send(second.pid, {:abort_signal_timeout, :timeout})
       assert_receive {:trace, _signal, :spawn, waiter, _call}
       await_function(waiter, {AbortSignal, :await_stop, 1})
-      refute AbortSignal.aborted?(second.signal)
+      refute AbortSignal.aborted?(second)
 
-      :ok = AbortController.abort(first)
+      send(first.pid, {:abort_signal_timeout, :first})
       assert_receive {:second, :timeout}
+      assert AbortSignal.reason(first) == :first
+
+      Enum.each([longer, shorter], &Process.exit(&1.pid, :kill))
     end
   end
 

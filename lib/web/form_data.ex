@@ -236,12 +236,17 @@ defmodule Web.FormData do
     "multipart/form-data; boundary=" <> boundary
   end
 
+  # The steps "create an entry" of the XMLHttpRequest Standard. A file with a
+  # new name is a new File object with the same bytes and the same time of
+  # the last change.
   defp normalize_value(_name, %File{} = file, filename) when is_binary(filename) do
-    %{file | filename: filename}
+    %{file | id: make_ref(), filename: filename}
   end
 
   defp normalize_value(_name, %File{} = file, _filename), do: file
 
+  # A blob that is not a file becomes a new File object with the same bytes,
+  # with the name "blob" or the given name.
   defp normalize_value(name, %Web.Blob{} = blob, filename) do
     File.new(blob.parts,
       name: name,

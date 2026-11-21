@@ -1,7 +1,10 @@
 defmodule Web.BlobTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   alias Web.Blob
+
+  doctest Web.File
 
   test "new/2 computes size and normalizes type" do
     blob = Blob.new(["hello", " ", "world"], type: "Text/Plain")
@@ -187,5 +190,132 @@ defmodule Web.BlobTest do
     assert Web.Uint8Array.to_binary(bytes) == ~s({"id":1})
 
     assert {:ok, ~s({"id":1})} = Blob.text(blob)
+  end
+
+  describe "the rules of the File API" do
+    property "the type is ASCII lowercase, or empty with a character outside U+0020 to U+007E" do
+      check all(type <- string(:utf8, max_length: 12)) do
+        printable? = String.to_charlist(type) |> Enum.all?(&(&1 in 0x20..0x7E))
+        expected = if printable?, do: String.downcase(type, :ascii), else: ""
+
+        assert Blob.new([], type: type).type == expected
+        assert Blob.slice(Blob.new(["a"]), 0, 1, type).type == expected
+        assert Web.File.new([], type: type).type == expected
+      end
+    end
+
+    test "the type has no lowercase of Unicode" do
+      assert Blob.new([], type: "İmage/gif").type == ""
+      assert Blob.new([], type: "TEXT/Plain;Charset=UTF-8").type == "text/plain;charset=utf-8"
+    end
+
+    property "slice/4 gives the bytes of the steps slice blob" do
+      check all(
+              parts <- list_of(binary(max_length: 6), max_length: 4),
+              start <- one_of([constant(nil), integer(-30..30)]),
+              finish <- one_of([constant(nil), integer(-30..30)])
+            ) do
+        bytes = IO.iodata_to_binary(parts)
+        size = byte_size(bytes)
+        relative = fn index -> if index < 0, do: max(size + index, 0), else: min(index, size) end
+        from = relative.(start || 0)
+        to = if finish == nil, do: size, else: relative.(finish)
+        expected = binary_part(bytes, from, max(to - from, 0))
+
+        blob = Blob.new(Enum.map(parts, &Blob.new([&1])))
+        assert Blob.to_binary(Blob.slice(blob, start, finish)) == expected
+      end
+    end
+
+    test "slice/1 gives all the bytes, with no type" do
+      sliced = Blob.slice(Blob.new(["abc"], type: "text/plain"))
+
+      assert {sliced.size, sliced.type, Blob.to_binary(sliced)} == {3, "", "abc"}
+    end
+
+    test "a file is a blob: its bytes, its slices, and its streams" do
+      file = Web.File.new(["héllo"], filename: "a.txt", type: "text/plain")
+      blob = Blob.new([file, "!"])
+
+      assert Blob.to_binary(blob) == "héllo!"
+      assert {:ok, "héllo"} = Blob.text(file)
+      assert Blob.to_binary(Blob.slice(file, 1)) == "éllo"
+      assert file |> Blob.stream() |> Web.TestBytes.join() == "héllo"
+      assert file |> Blob.text_stream() |> Enum.join() == "héllo"
+    end
+
+    test "a file from a stream gives the bytes of the stream" do
+      stream = Web.ReadableStream.from(["ab", "c"])
+      file = Web.File.new([], filename: "s.bin", stream: stream, size: nil)
+
+      assert {:ok, "abc"} = Blob.text(file)
+    end
+
+    test "stream/1 is a byte stream: a reader of the mode byob reads it" do
+      bytes = :binary.copy("x", 70_000)
+      reader = Blob.new([bytes]) |> Blob.stream() |> Web.ReadableStream.get_reader(mode: "byob")
+
+      read = fn read ->
+        view = Web.Uint8Array.new(Web.ArrayBuffer.new(50_000))
+
+        case Web.await(Web.ReadableStreamBYOBReader.read(reader, view)) do
+          %{done: true} -> []
+          %{value: value} -> [Web.Uint8Array.to_binary(value) | read.(read)]
+        end
+      end
+
+      chunks = read.(read)
+      assert IO.iodata_to_binary(chunks) == bytes
+      assert length(chunks) > 1
+
+      # A chunk has the bytes of one part. A part of a nested blob is a part.
+      nested = Blob.new(["", Blob.new(["ab", Blob.new(["c"])]), "d"])
+
+      assert nested |> Blob.stream() |> Enum.map(&Web.Uint8Array.to_binary/1) ==
+               ["ab", "c", "d"]
+    end
+
+    test "text_stream/1 decodes UTF-8 and ignores the charset of the type" do
+      blob =
+        Blob.new([<<0xEF, 0xBB, 0xBF>>, "a", <<0xC3>>, <<0xA9, 0xFF>>],
+          type: "text/plain;charset=latin1"
+        )
+
+      assert blob |> Blob.text_stream() |> Enum.join() == "aé\uFFFD"
+      assert Blob.new([]) |> Blob.text_stream() |> Enum.to_list() == []
+    end
+  end
+
+  describe "File" do
+    test "new/2 has the time of the last change: the option, or the time now" do
+      before = System.os_time(:millisecond)
+      file = Web.File.new(["a"])
+
+      assert file.last_modified >= before
+      assert file.last_modified <= System.os_time(:millisecond)
+      assert Web.File.new([], last_modified: -5).last_modified == -5
+    end
+
+    test "FormData makes a new File for a blob, and for a file with a new name" do
+      blob = Blob.new(["a"], type: "text/plain")
+      file = Web.File.new(["b"], filename: "b.txt", last_modified: 123)
+
+      form =
+        Web.FormData.new()
+        |> Web.FormData.append("blob", blob)
+        |> Web.FormData.append("named", blob, "named.txt")
+        |> Web.FormData.append("file", file)
+        |> Web.FormData.append("renamed", file, "c.txt")
+
+      assert %Web.File{filename: "blob", type: "text/plain", size: 1} =
+               Web.FormData.get(form, "blob")
+
+      assert %Web.File{filename: "named.txt"} = Web.FormData.get(form, "named")
+      assert Web.FormData.get(form, "file") == file
+
+      renamed = Web.FormData.get(form, "renamed")
+      assert %Web.File{filename: "c.txt", last_modified: 123} = renamed
+      refute renamed.id == file.id
+    end
   end
 end

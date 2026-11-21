@@ -8,6 +8,9 @@ defmodule Web.Test.QuickJS.WPT do
   # each test that does not pass, with the group of its cause. A test that is
   # not in the list must pass. A test in the list that passes is also an
   # error: remove it from the list, as the library now follows the Standard.
+  # The exception is a test with a group of `@unstable`: its result can
+  # change from run to run, thus it can pass or fail, and it stays in the
+  # list.
   #
   # With the environment variable `WPT_UPDATE=1`, a run writes the lists
   # again from its results.
@@ -19,6 +22,11 @@ defmodule Web.Test.QuickJS.WPT do
   @microtask "runner: the library does the steps of a later microtask before the call returns"
   @one_state "library: a transform stream has one state for its two sides"
   @new_error "runner: an error of the library is a new object each time"
+
+  # The groups of the tests whose result can change from run to run, for a
+  # cause that the runner cannot remove. Such a test can pass or fail.
+  @real_time "runner: a timer of the library runs in real time between two statements of JavaScript"
+  @unstable [@real_time]
 
   @doc "Runs the WPT file at `path`, and compares the results with the list."
   def check!(path) do
@@ -58,7 +66,7 @@ defmodule Web.Test.QuickJS.WPT do
   end
 
   defp problem(name, "PASS", _message, failures) do
-    if Map.has_key?(failures, name),
+    if Map.has_key?(failures, name) and failures[name] not in @unstable,
       do: "  passes now, remove it from the list: #{name}",
       else: nil
   end
@@ -82,9 +90,13 @@ defmodule Web.Test.QuickJS.WPT do
   # The list has one line for each test, in the sequence of the names: a
   # change of the library shows as a small change of the file.
   defp write!(path, run) do
+    # A test with an unstable result is in the list also when it passes.
     failures =
-      for name <- run.order, {status, message} = run.results[name], status != "PASS" do
-        {name, cause(path, name, message)}
+      for name <- run.order,
+          {status, message} = run.results[name],
+          cause = cause(path, name, message),
+          status != "PASS" or cause in @unstable do
+        {name, cause}
       end
 
     target = file(path)
@@ -146,7 +158,34 @@ defmodule Web.Test.QuickJS.WPT do
        @no_view_type},
       {:test, "streams/readable-byte-streams/read-min.any.js", ~r/Uint16Array|DataView/,
        @no_view_type}
-    ] ++ microtask_causes() ++ base_causes()
+    ] ++ microtask_causes() ++ file_api_dom_causes() ++ base_causes()
+  end
+
+  # The rules of the File API, of `FormData`, and of the DOM Standard.
+  defp file_api_dom_causes do
+    [
+      # The timers of the library run in real time, also while JavaScript
+      # runs: a short timeout can end before the next statement of the test,
+      # for example before the statement that sets `onabort`. In a browser,
+      # a timer fires only after the statements of the current task.
+      {:test, "dom/abort/timeout.any.js", ~r/./, @real_time},
+      {:test, "dom/abort/abort-signal-any.any.js", ~r/AbortSignal\.timeout\(\)/, @real_time},
+      # The global object of the runner is not an `EventTarget`.
+      {:test, "dom/events/EventTarget-removeEventListener.any.js",
+       "removing a null event listener should succeed",
+       "runner: the global object is not an EventTarget"},
+      # A library has no document, thus no origin: the origin of a blob URL
+      # is opaque, its serialization is "null". The test expects the origin
+      # of the page of WPT.
+      {:test, "FileAPI/url/url-format.any.js", ~r/origin|parses correctly/,
+       "scope: a library has no document, thus a blob URL has an opaque origin"},
+      # The URL parser of the Standard resolves the blob URL entry of a
+      # `blob:` URL, thus a `Request` keeps the blob also after a revoke.
+      # `Web.URL` and `Web.Request` do not keep it: the dispatcher reads the
+      # store when the fetch starts.
+      {:test, "FileAPI/url/url-with-fetch.any.js", ~r/^Revoke blob URL after creating Request/,
+       "library: a Request does not keep the blob of its blob URL"}
+    ]
   end
 
   # The Streams Standard reacts to the end of `start` and of `pull`, and to

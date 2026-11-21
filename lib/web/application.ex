@@ -22,6 +22,8 @@ defmodule Web.Application do
       # sockets.
       {DynamicSupervisor, name: Web.HandleSupervisor, strategy: :one_for_one},
       Web.AbortSignal.Reasons,
+      # The blob URL store of `Web.URL.create_object_url/1`.
+      Web.Internal.BlobURLStore,
       # The stream processes of the streams that started with no process:
       # see `Web.Internal.LazyStream`.
       {Registry,

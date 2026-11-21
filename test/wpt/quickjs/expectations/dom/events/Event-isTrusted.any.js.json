@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Event-isTrusted": "library: a different result"
-  }
-}

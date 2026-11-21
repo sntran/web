@@ -61,8 +61,25 @@ defmodule Web.AbortSignal do
   Signals are usually created through `Web.AbortController.new/0`.
 
   A signal that is not aborted is a small process. It stops when the process
-  that made it stops and no process is subscribed to it. The reason of an
-  aborted signal stays available for the linger time (`config :web, linger: ms`).
+  that made it stops and no process is subscribed to it, has a listener on
+  it, or depends on it. The reason of an aborted signal stays available for
+  the linger time (`config :web, linger: ms`).
+
+  ## Events
+
+  A signal is an event target, as `AbortSignal : EventTarget` of the DOM
+  Standard: the functions of `Web.EventTarget` accept it. When the signal
+  aborts, it fires the event `abort`. `onabort/2` sets the event handler of
+  that event.
+
+  The process that aborts the signal runs the listeners, before
+  `Web.AbortController.abort/2` returns, as the steps "signal abort"
+  specify. The signals of `any/1` that depend on the signal are aborted
+  before the first listener runs, and their listeners run after the
+  listeners of the signal. A new process runs the listeners of a signal of
+  `timeout/1`. The signals of `timeout/1` that one process made, with the
+  same or a shorter time, abort in the sequence in which the process made
+  them.
 
   ## Examples
 
@@ -88,8 +105,12 @@ defmodule Web.AbortSignal do
 
   alias Web.AbortSignal.Reasons
   alias Web.DOMException
+  alias Web.Internal.EventTarget.Dispatch
+  alias Web.Internal.EventTarget.Listeners
+  alias Web.Internal.EventTarget.Store
 
   @handoff_linger 5_000
+  @timeouts_key {__MODULE__, :timeouts}
 
   defstruct aborted: false, reason: nil, pid: nil, ref: nil
 
@@ -139,12 +160,37 @@ defmodule Web.AbortSignal do
   def timeout(ms) do
     controller = Web.AbortController.new()
     timeout_reason = DOMException.timeout_error()
-    Process.send_after(controller.signal.pid, {:abort_signal_timeout, timeout_reason}, ms)
+    earlier = earlier_timeouts(controller.signal.pid, ms)
+
+    Process.send_after(
+      controller.signal.pid,
+      {:abort_signal_timeout, timeout_reason, earlier},
+      ms
+    )
+
     controller.signal
+  end
+
+  # The steps "run steps after a timeout" wait for the timeouts of the same
+  # global that started before, with the same or a shorter time. The
+  # global of a process is the process: its dictionary has the timeouts
+  # that it made, while they run.
+  defp earlier_timeouts(pid, ms) do
+    pending =
+      for {other, time} <- Process.get(@timeouts_key, []),
+          Process.alive?(other),
+          do: {other, time}
+
+    Process.put(@timeouts_key, [{pid, ms} | pending])
+    for {other, time} <- pending, time <= ms, do: other
   end
 
   @doc """
   Returns a signal that aborts when any provided signal aborts.
+
+  The new signal depends on each signal of the list, as the steps "create
+  a dependent abort signal" specify: the abort of a signal of the list
+  aborts the new signal before the listeners of the abort run.
 
   ## Examples
 
@@ -157,18 +203,53 @@ defmodule Web.AbortSignal do
   """
   def any(signals) do
     case Enum.find_value(signals, &any_abort_result/1) do
-      {:aborted, reason} ->
-        abort(reason)
-
-      nil ->
-        controller = Web.AbortController.new()
-
-        spawn_link(fn ->
-          wait_for_any_abort(signals, controller)
-        end)
-
-        controller.signal
+      {:aborted, reason} -> abort(reason)
+      nil -> new_dependent(signals)
     end
+  end
+
+  defp new_dependent(signals) do
+    controller = Web.AbortController.new()
+    result = controller.signal
+    {signal_sources, other_sources} = Enum.split_with(signals, &process_signal?/1)
+
+    sources = signal_sources |> Enum.flat_map(&sources_of/1) |> Enum.uniq_by(& &1.pid)
+    :ok = GenServer.call(result.pid, {:set_sources, sources}, :infinity)
+    Enum.each(sources, &add_dependent(&1, result))
+
+    # A pid or a token is not a signal of the DOM Standard: a process waits
+    # for its abort.
+    case Enum.reject(other_sources, &is_nil/1) do
+      [] -> :ok
+      others -> spawn_link(fn -> wait_for_any_abort(others, controller) end)
+    end
+
+    result
+  end
+
+  defp process_signal?(%__MODULE__{pid: pid}) when is_pid(pid), do: true
+  defp process_signal?(_signal), do: false
+
+  # A signal that depends on other signals gives its sources: the new
+  # signal depends on them, not on it.
+  defp sources_of(signal) do
+    case GenServer.call(signal.pid, :sources, :infinity) do
+      {:ok, nil} -> [signal]
+      {:ok, sources} -> sources
+    end
+  catch
+    :exit, _reason -> [signal]
+  end
+
+  defp add_dependent(source, result) do
+    case GenServer.call(source.pid, {:add_dependent, result}, :infinity) do
+      :ok -> :ok
+      {:aborted, reason} -> __signal_abort__(result, reason)
+    end
+  catch
+    # The process of the source stopped: it aborted, or it had no use. A
+    # signal whose process stopped is aborted.
+    :exit, _reason -> __signal_abort__(result, reason(source))
   end
 
   def start_link do
@@ -185,9 +266,141 @@ defmodule Web.AbortSignal do
     state =
       state
       |> Map.delete(:owner)
-      |> Map.merge(%{owner_ref: Process.monitor(owner), owner_down?: false})
+      |> Map.merge(%{
+        owner_ref: Process.monitor(owner),
+        owner_down?: false,
+        # The listeners of the event `abort`, and the abort algorithms of
+        # the listeners of other targets. Each one belongs to a process:
+        # `monitors` has a monitor for each of these processes.
+        listeners: Listeners.new(),
+        algorithms: [],
+        monitors: %{},
+        # The signals of `any/1` that depend on this signal, with a
+        # monitor, and the signals that this signal depends on.
+        dependents: [],
+        dependent_monitors: %{},
+        sources: nil,
+        # `{:aborted, reason}` after the abort. The process stops when the
+        # process that aborts it ran the listeners.
+        aborted: nil,
+        aborter_ref: nil
+      })
 
     {:ok, state}
+  end
+
+  @doc """
+  Returns the event handler of the event `abort`, as the attribute
+  `onabort`, or `nil`.
+  """
+  @spec onabort(t()) :: Web.EventTarget.callback() | nil
+  def onabort(%__MODULE__{pid: pid}) when is_pid(pid),
+    do: Store.request(pid, {:get_handler, "abort"}, nil)
+
+  def onabort(%__MODULE__{}), do: nil
+
+  @doc """
+  Sets the event handler of the event `abort`, as the setter of the
+  attribute `onabort`. The value `nil` removes it. A signal that aborted
+  fires no event again.
+  """
+  @spec onabort(t(), Web.EventTarget.callback() | nil) :: t()
+  def onabort(%__MODULE__{pid: pid} = signal, callback)
+      when is_pid(pid) and
+             (is_nil(callback) or is_function(callback, 0) or is_function(callback, 1)) do
+    _ok = Store.request(pid, {:set_handler, "abort", callback}, :ok)
+    signal
+  end
+
+  def onabort(%__MODULE__{} = signal, callback)
+      when is_nil(callback) or is_function(callback, 0) or is_function(callback, 1),
+      do: signal
+
+  @doc false
+  # The steps "add an algorithm": the abort of the signal calls `apply/3`
+  # with the module, the function, and the arguments. Returns `:aborted`
+  # for a signal that aborted: the algorithm does not run.
+  @spec __add_algorithm__(t(), {module(), atom(), list()}) :: :ok | :aborted
+  def __add_algorithm__(%__MODULE__{pid: pid}, {_module, _function, _args} = algorithm)
+      when is_pid(pid) do
+    GenServer.call(pid, {:add_algorithm, algorithm}, :infinity)
+  catch
+    :exit, _reason -> :aborted
+  end
+
+  def __add_algorithm__(%__MODULE__{}, _algorithm), do: :aborted
+
+  @doc false
+  # The steps "signal abort", in the calling process: the signal and the
+  # signals that depend on it are aborted, then the abort algorithms and the
+  # listeners of each one run, before this function returns.
+  @spec __signal_abort__(t(), term()) :: :ok
+  def __signal_abort__(%__MODULE__{pid: pid} = signal, reason) when is_pid(pid) do
+    case mark_aborted(pid, {:abort, reason}) do
+      {:ok, algorithms, dependents} -> run_abort_steps(signal, algorithms, dependents)
+      :already -> :ok
+    end
+  end
+
+  def __signal_abort__(%__MODULE__{}, _reason), do: :ok
+
+  @doc false
+  # The steps "signal abort" for a process that must answer other processes
+  # while the listeners run, such as the process of a stream: the signals
+  # are aborted before this function returns, and a new process runs the
+  # abort algorithms and the listeners.
+  @spec __signal_abort_later__(t(), term()) :: :ok
+  def __signal_abort_later__(%__MODULE__{pid: pid} = signal, reason) when is_pid(pid) do
+    # The new process is the process that aborts the signal: the signal
+    # stops when it stops.
+    runner =
+      spawn(fn ->
+        receive do
+          {:abort_steps, algorithms, dependents} ->
+            run_abort_steps(signal, algorithms, dependents)
+
+          :already ->
+            :ok
+        end
+      end)
+
+    case mark_aborted(pid, {:abort, reason, runner}) do
+      {:ok, algorithms, dependents} -> send(runner, {:abort_steps, algorithms, dependents})
+      :already -> send(runner, :already)
+    end
+
+    :ok
+  end
+
+  def __signal_abort_later__(%__MODULE__{}, _reason), do: :ok
+
+  defp mark_aborted(pid, request) do
+    GenServer.call(pid, request, :infinity)
+  catch
+    # The process of the signal stopped: it aborted, or it had no use.
+    :exit, _reason -> :already
+  end
+
+  # The steps "run the abort steps" for the signal, then for each signal
+  # that depends on it. Each process stops after its steps.
+  defp run_abort_steps(signal, algorithms, dependents) do
+    run_abort_steps(signal, algorithms)
+
+    Enum.each(dependents, fn {dependent, dependent_algorithms} ->
+      run_abort_steps(dependent, dependent_algorithms)
+    end)
+  after
+    GenServer.cast(signal.pid, :abort_done)
+
+    Enum.each(dependents, fn {dependent, _algorithms} ->
+      GenServer.cast(dependent.pid, :abort_done)
+    end)
+  end
+
+  defp run_abort_steps(signal, algorithms) do
+    Enum.each(algorithms, fn {module, function, args} -> apply(module, function, args) end)
+    _result = Dispatch.dispatch(signal, Web.Event.__create__("abort"), signal.pid, trusted: true)
+    :ok
   end
 
   @doc false
@@ -196,8 +409,10 @@ defmodule Web.AbortSignal do
   def subscribe(%__MODULE__{aborted: true}), do: {:error, :aborted}
 
   def subscribe(%__MODULE__{pid: pid, ref: ref}) when is_pid(pid) and is_reference(ref) do
-    :ok = GenServer.call(pid, {:subscribe, self()})
-    {:ok, %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: Process.monitor(pid)}}
+    case GenServer.call(pid, {:subscribe, self()}) do
+      :ok -> {:ok, %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: Process.monitor(pid)}}
+      {:error, :aborted} -> {:error, :aborted}
+    end
   catch
     # The process of the signal stopped: the signal aborted, or it had no
     # more use.
@@ -302,29 +517,23 @@ defmodule Web.AbortSignal do
   def reason(_), do: nil
 
   @doc """
-  Raises the reason of the signal when the signal has already aborted.
-
-  A reason that is not an exception is put in a `Web.DOMException` with the
-  name `AbortError`.
+  Raises the reason of the signal when the signal has already aborted, as
+  `throwIfAborted()`: "throw this's abort reason". The reason is the error
+  itself, also when it is not an exception: `catch :error, reason` gives
+  it.
   """
   @spec throw_if_aborted(t() | nil) :: :ok
   def throw_if_aborted(nil), do: :ok
 
   def throw_if_aborted(%__MODULE__{aborted: true, reason: reason}) do
-    raise_reason(reason)
+    :erlang.error(reason)
   end
 
   def throw_if_aborted(%__MODULE__{} = signal) do
     case any_abort_result(signal) do
-      {:aborted, reason} -> raise_reason(reason)
+      {:aborted, reason} -> :erlang.error(reason)
       nil -> :ok
     end
-  end
-
-  defp raise_reason(reason) when is_exception(reason), do: raise(reason)
-
-  defp raise_reason(reason) do
-    raise DOMException, name: "AbortError", message: inspect(reason)
   end
 
   @doc false
@@ -397,6 +606,10 @@ defmodule Web.AbortSignal do
   end
 
   @doc false
+  def handle_call({:subscribe, _subscriber}, _from, %{aborted: {:aborted, _reason}} = state) do
+    {:reply, {:error, :aborted}, state}
+  end
+
   def handle_call({:subscribe, subscriber}, _from, %{subscribers: subscribers} = state) do
     # A process can subscribe more than one time. The count shows how many
     # subscriptions it has.
@@ -409,15 +622,103 @@ defmodule Web.AbortSignal do
     {:reply, :ok, %{state | subscribers: Map.put(subscribers, subscriber, entry)}}
   end
 
-  @doc false
-  def handle_call({:abort, reason}, _from, %{ref: ref, subscribers: subscribers} = state) do
-    remember_reason(ref, reason)
+  # The steps "signal abort", steps 1 to 4: the process that aborts the
+  # signal gets the abort algorithms of the signal, and the signals that
+  # depend on it, with their algorithms. It runs them, and then the
+  # process stops.
+  def handle_call({:abort, reason}, {aborter, _tag}, state),
+    do: handle_call({:abort, reason, aborter}, nil, state)
 
-    Enum.each(Map.keys(subscribers), fn subscriber ->
-      send(subscriber, {:abort, ref, reason})
+  def handle_call({:abort, _reason, _aborter}, _from, %{aborted: {:aborted, _}} = state) do
+    {:reply, :already, state}
+  end
+
+  def handle_call({:abort, reason, aborter}, _from, state) do
+    {algorithms, state} = mark(state, reason, aborter)
+
+    dependents =
+      Enum.flat_map(state.dependents, fn dependent ->
+        case mark_dependent(dependent, reason, aborter) do
+          {:ok, dependent_algorithms} -> [{dependent, dependent_algorithms}]
+          :already -> []
+        end
+      end)
+
+    {:reply, {:ok, algorithms, dependents}, state}
+  end
+
+  def handle_call({:abort_dependent, _reason, _aborter}, _from, %{aborted: {:aborted, _}} = state) do
+    {:reply, :already, state}
+  end
+
+  def handle_call({:abort_dependent, reason, aborter}, _from, state) do
+    {algorithms, state} = mark(state, reason, aborter)
+    {:reply, {:ok, algorithms}, state}
+  end
+
+  # The listeners: see `Web.Internal.EventTarget.Listeners`.
+  def handle_call({:listeners, request}, {client, _tag}, state) do
+    {reply, listeners} = Listeners.handle(state.listeners, request, client)
+    reply(reply, monitor_owners(%{state | listeners: listeners}))
+  end
+
+  def handle_call({:add_algorithm, _algorithm}, _from, %{aborted: {:aborted, _}} = state) do
+    {:reply, :aborted, state}
+  end
+
+  def handle_call({:add_algorithm, algorithm}, {client, _tag}, state) do
+    state = %{state | algorithms: state.algorithms ++ [{client, algorithm}]}
+    reply(:ok, monitor_owners(state))
+  end
+
+  def handle_call({:add_dependent, _dependent}, _from, %{aborted: {:aborted, reason}} = state) do
+    {:reply, {:aborted, reason}, state}
+  end
+
+  # `any/1` adds each new signal one time: the list of its sources has no
+  # duplicate.
+  def handle_call({:add_dependent, %__MODULE__{pid: pid} = dependent}, _from, state) do
+    reply(:ok, %{
+      state
+      | dependents: state.dependents ++ [dependent],
+        dependent_monitors: Map.put(state.dependent_monitors, pid, Process.monitor(pid))
+    })
+  end
+
+  def handle_call(:sources, _from, %{aborted: {:aborted, _}} = state),
+    do: {:reply, {:ok, nil}, state}
+
+  def handle_call(:sources, _from, state), do: reply({:ok, state.sources}, state)
+
+  def handle_call({:set_sources, sources}, _from, state),
+    do: reply(:ok, %{state | sources: sources})
+
+  # The steps "signal abort", step 2: the reason. The subscribers get the
+  # abort now. The process that aborts the signal stops it after the
+  # listeners.
+  defp mark(state, reason, aborter) do
+    remember_reason(state.ref, reason)
+
+    Enum.each(Map.keys(state.subscribers), fn subscriber ->
+      send(subscriber, {:abort, state.ref, reason})
     end)
 
-    {:stop, {:shutdown, {:aborted, reason}}, :ok, state}
+    algorithms = Enum.map(state.algorithms, fn {_client, algorithm} -> algorithm end)
+
+    state = %{
+      state
+      | aborted: {:aborted, reason},
+        algorithms: [],
+        aborter_ref: Process.monitor(aborter)
+    }
+
+    {algorithms, monitor_owners(state)}
+  end
+
+  defp mark_dependent(dependent, reason, aborter) do
+    GenServer.call(dependent.pid, {:abort_dependent, reason, aborter}, :infinity)
+  catch
+    :exit, _reason -> :already
   end
 
   @doc false
@@ -438,20 +739,29 @@ defmodule Web.AbortSignal do
     noreply(%{state | subscribers: subscribers})
   end
 
-  @doc false
-  def handle_cast({:abort, reason}, %{ref: ref, subscribers: subscribers} = state) do
-    remember_reason(ref, reason)
-
-    Enum.each(Map.keys(subscribers), fn subscriber ->
-      send(subscriber, {:abort, ref, reason})
-    end)
-
+  # The process that aborted the signal ran its listeners.
+  def handle_cast(:abort_done, %{aborted: {:aborted, reason}} = state) do
     {:stop, {:shutdown, {:aborted, reason}}, state}
   end
 
   @doc false
   def handle_info({:abort_signal_timeout, reason}, state) do
-    handle_cast({:abort, reason}, state)
+    handle_info({:abort_signal_timeout, reason, []}, state)
+  end
+
+  # The time of `timeout/1` is complete. The process of the signal answers
+  # the listeners: a new process aborts the signal, after the earlier
+  # timeouts of the same process.
+  def handle_info({:abort_signal_timeout, reason, earlier}, state) do
+    signal = %__MODULE__{pid: self(), ref: state.ref}
+
+    _pid =
+      spawn(fn ->
+        Enum.each(earlier, &await_stop/1)
+        __signal_abort__(signal, reason)
+      end)
+
+    {:noreply, state}
   end
 
   # The linger time is complete, and no message came in that time.
@@ -461,33 +771,73 @@ defmodule Web.AbortSignal do
   end
 
   @doc false
-  def handle_info({:DOWN, owner_ref, :process, _owner, _reason}, %{owner_ref: owner_ref} = state) do
-    noreply(%{state | owner_down?: true})
+  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+    cond do
+      ref == Map.get(state, :owner_ref) ->
+        noreply(%{state | owner_down?: true})
+
+      ref == Map.get(state, :aborter_ref) ->
+        {:aborted, reason} = state.aborted
+        {:stop, {:shutdown, {:aborted, reason}}, state}
+
+      match?(%{^pid => {^ref, _count}}, state.subscribers) ->
+        noreply(%{state | subscribers: Map.delete(state.subscribers, pid)})
+
+      Map.get(Map.get(state, :monitors, %{}), pid) == ref ->
+        listeners = Listeners.remove_owner(state.listeners, pid)
+        algorithms = Enum.reject(state.algorithms, &(elem(&1, 0) == pid))
+        noreply(monitor_owners(%{state | listeners: listeners, algorithms: algorithms}))
+
+      Map.get(Map.get(state, :dependent_monitors, %{}), pid) == ref ->
+        noreply(%{
+          state
+          | dependents: Enum.reject(state.dependents, &(&1.pid == pid)),
+            dependent_monitors: Map.delete(state.dependent_monitors, pid)
+        })
+
+      true ->
+        noreply(state)
+    end
   end
 
-  @doc false
-  def handle_info(
-        {:DOWN, monitor_ref, :process, subscriber, _reason},
-        %{subscribers: subscribers} = state
-      ) do
-    subscribers =
-      case Map.get(subscribers, subscriber) do
-        {^monitor_ref, _count} -> Map.delete(subscribers, subscriber)
-        _ -> subscribers
-      end
+  defp await_stop(pid) do
+    ref = Process.monitor(pid)
 
-    noreply(%{state | subscribers: subscribers})
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    end
   end
 
-  # A signal with no owner and no subscriber has no use. It waits for the
-  # linger time, because a different process can have the signal from a
-  # message, and then it stops.
+  # The processes that own a listener or an abort algorithm.
+  defp monitor_owners(state) do
+    owners =
+      MapSet.union(Listeners.owners(state.listeners), MapSet.new(state.algorithms, &elem(&1, 0)))
+
+    monitors =
+      Enum.reduce(owners, state.monitors, fn pid, acc ->
+        Map.put_new_lazy(acc, pid, fn -> Process.monitor(pid) end)
+      end)
+
+    {gone, kept} = Map.split_with(monitors, fn {pid, _ref} -> not MapSet.member?(owners, pid) end)
+    Enum.each(gone, fn {_pid, ref} -> Process.demonitor(ref, [:flush]) end)
+    %{state | monitors: kept}
+  end
+
+  # A signal with no owner, no subscriber, no listener, and no signal that
+  # depends on it has no use. It waits for the linger time, because a
+  # different process can have the signal from a message, and then it
+  # stops.
+  defp reply(reply, state) do
+    if unused?(state), do: {:reply, reply, state, unused_linger()}, else: {:reply, reply, state}
+  end
+
   defp noreply(state) do
     if unused?(state), do: {:noreply, state, unused_linger()}, else: {:noreply, state}
   end
 
   defp unused?(state) do
-    Map.get(state, :owner_down?, false) and map_size(state.subscribers) == 0
+    Map.get(state, :owner_down?, false) and map_size(state.subscribers) == 0 and
+      Map.get(state, :monitors, %{}) == %{} and Map.get(state, :dependents, []) == []
   end
 
   defp unused_linger do
@@ -543,8 +893,6 @@ defmodule Web.AbortSignal do
     end
   end
 
-  defp start_any_abort_waiter(nil, _coordinator, _address), do: :ok
-
   defp start_any_abort_waiter(signal, coordinator, address) do
     spawn(fn ->
       coordinator_monitor = Process.monitor(coordinator)
@@ -566,39 +914,12 @@ defmodule Web.AbortSignal do
             end
 
           {:error, :aborted} ->
-            maybe_forward_any_abort(signal, address)
+            :ok
         end
       after
         Process.demonitor(coordinator_monitor, [:flush])
       end
     end)
-  end
-
-  defp maybe_forward_any_abort(signal, address) do
-    case any_abort_result(signal) do
-      {:aborted, reason} -> send(address, {:abort_signal_any, address, reason})
-      nil -> :ok
-    end
-  end
-
-  defp wait_for_subscription_or_coordinator(
-         %{type: :abort_signal, pid: pid, ref: ref, monitor_ref: monitor_ref},
-         coordinator,
-         coordinator_monitor
-       ) do
-    receive do
-      {:abort, ^ref, reason} ->
-        {:aborted, reason}
-
-      {:DOWN, ^monitor_ref, :process, ^pid, {:shutdown, {:aborted, reason}}} ->
-        {:aborted, reason}
-
-      {:DOWN, ^monitor_ref, :process, ^pid, _exit_reason} ->
-        {:aborted, default_reason()}
-
-      {:DOWN, ^coordinator_monitor, :process, ^coordinator, _reason} ->
-        :ok
-    end
   end
 
   defp wait_for_subscription_or_coordinator(
@@ -633,5 +954,21 @@ defmodule Web.AbortSignal do
       {:DOWN, ^coordinator_monitor, :process, ^coordinator, _reason} ->
         :ok
     end
+  end
+end
+
+defimpl Web.EventTarget.Protocol, for: Web.AbortSignal do
+  def add_event_listener(signal, type, callback, options) do
+    :ok = Web.EventTarget.__add__(signal.pid, type, callback, options)
+    signal
+  end
+
+  def remove_event_listener(signal, type, callback) do
+    :ok = Web.EventTarget.__remove__(signal.pid, type, callback, false)
+    signal
+  end
+
+  def dispatch_event(signal, event) do
+    {signal, Web.EventTarget.__dispatch__(signal, signal.pid, event)}
   end
 end

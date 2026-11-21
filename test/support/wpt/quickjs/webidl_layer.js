@@ -462,14 +462,29 @@
       return number;
     }
 
-    if (Number.isNaN(number) || !Number.isFinite(number)) return clamp && Number.isFinite(number) ? number : 0;
-    if (clamp) return Math.min(Math.max(Math.round(number), min), max);
+    if (Number.isNaN(number)) return 0;
+    if (clamp) return roundHalfToEven(Math.min(Math.max(number, min), max));
+    if (!Number.isFinite(number)) return 0;
 
     number = Math.trunc(number);
+    // The size of a 64-bit type is not exact as a double: the modulo is
+    // exact with a BigInt.
+    if (name === "long long") return Number(BigInt.asIntN(64, BigInt(number))) || 0;
+    if (name === "unsigned long long") return Number(BigInt.asUintN(64, BigInt(number))) || 0;
     const size = max - min + 1;
     number = ((number % size) + size) % size;
     if (min < 0 && number > max) number -= size;
     return number === 0 ? 0 : number;
+  }
+
+  // [Clamp] rounds to the nearest integer, and to the even integer when the
+  // value lies halfway between two, as WebIDL specifies. The result is +0,
+  // not -0.
+  function roundHalfToEven(number) {
+    const floor = Math.floor(number);
+    const fraction = number - floor;
+    const result = fraction > 0.5 || (fraction === 0.5 && floor % 2 !== 0) ? floor + 1 : floor;
+    return result === 0 ? 0 : result;
   }
 
   function resolve(idlType) {
@@ -778,11 +793,21 @@
 
   // The bridge gives the same handle again only for a struct that refers to
   // a process (`interned`): the layer keeps only those objects.
+  // The attributes with [LegacyUnforgeable] of each interface.
+  const unforgeable = new Map();
+
+  function addUnforgeable(object, className) {
+    for (let c = className; c; c = (definitions.get(c) || {}).inheritance) {
+      for (const [key, descriptor] of unforgeable.get(c) || []) Object.defineProperty(object, key, descriptor);
+    }
+  }
+
   function wrap(handle, className, interned) {
     if (wrappers.has(handle)) return wrappers.get(handle);
     const cls = classes.get(className);
     const object = Object.create(cls ? cls.prototype : Object.prototype);
     platform.set(object, { handle, cls: className });
+    addUnforgeable(object, className);
     if (interned) wrappers.set(handle, object);
     return object;
   }
@@ -1240,6 +1265,7 @@
       });
       const object = Object.create(new.target.prototype);
       platform.set(object, { handle: result.$h, cls: name });
+      addUnforgeable(object, name);
       if (result.$i === 1) wrappers.set(result.$h, object);
       return object;
     };
@@ -1280,6 +1306,17 @@
       }));
     }
 
+    // A constant is a property of the interface object and of the
+    // prototype, as WebIDL specifies.
+    for (const m of members) {
+      if (m.type === "const") {
+        const value = m.value.type === "number" ? Number(m.value.value) : m.value.value;
+        for (const target of [cls, cls.prototype]) {
+          Object.defineProperty(target, m.name, { value, writable: false, enumerable: true, configurable: false });
+        }
+      }
+    }
+
     for (const m of members) {
       if (m.type === "attribute" && resolve(m.idlType).idlType === "Function") {
         // One function for the interface, as the Standard of the queuing
@@ -1312,7 +1349,15 @@
             call({ i: name, k: "setter", m: m.name, self, a: [convert(m.idlType, value, m.extAttrs || [])] });
           };
         }
-        Object.defineProperty(m.special === "static" ? cls : cls.prototype, m.name, descriptor);
+        if ((m.extAttrs || []).some((a) => a.name === "LegacyUnforgeable")) {
+          // An attribute with [LegacyUnforgeable] is a property of each
+          // object, with the same getter, as WebIDL specifies: see
+          // `addUnforgeable`.
+          if (!unforgeable.has(name)) unforgeable.set(name, []);
+          unforgeable.get(name).push([m.name, Object.assign(descriptor, { configurable: false })]);
+        } else {
+          Object.defineProperty(m.special === "static" ? cls : cls.prototype, m.name, descriptor);
+        }
       }
 
       if (m.special === "stringifier" || (m.type === "attribute" && m.special === "stringifier")) {
@@ -1365,5 +1410,23 @@
     return cls;
   }
 
-  globalThis.__webidl = { install, makeError };
+  // An operation of a mixin of the global object, such as `fetch` of
+  // `WindowOrWorkerGlobalScope`: a function that converts its arguments and
+  // calls the library, as a static operation of an interface does.
+  function globalOperation(mixin, opName) {
+    const overloads = definitions.get(mixin).members.filter((m) => m.type === "operation" && m.name === opName);
+    const fn = promiseSteps(longest(overloads).idlType, function (...values) {
+      const definition = select(overloads, values);
+      const args = convertArguments(mixin, opName, definition.arguments, values);
+      const result = call({
+        i: mixin, k: "static", m: opName, a: args, n: declared(definition.arguments),
+        p: resolve(definition.idlType).generic === "Promise",
+      }, values);
+      return fromLibrary(definition.idlType, result);
+    });
+    Object.defineProperty(fn, "name", { value: opName });
+    return fn;
+  }
+
+  globalThis.__webidl = { install, makeError, globalOperation };
 })();

@@ -15,10 +15,9 @@
 #     `Web.EventTarget.add_event_listener/3`. `signal.onabort = f` is
 #     `Web.AbortSignal.onabort(signal, f)`, the form of the event handlers
 #     of `Web.MessagePort` and `Web.BroadcastChannel`.
-#   - A listener can run in a different process. Thus a listener sends a
-#     message to the test process, and the test process does the checks.
-#     When the event must fire before `abort` returns, the test uses
-#     `assert_received`, which does not wait.
+#   - A listener sends a message to the test process, and the test process
+#     does the checks. The event fires before `abort` returns: the test
+#     uses `assert_received`, which does not wait.
 #   - `assert_throws_exactly(value, f)` is `catch_error/1`: Erlang can raise
 #     each term as an error, and `catch_error/1` gives that term.
 #
@@ -27,10 +26,6 @@
 #     DOMException": Elixir has no `undefined`. The call with no reason is
 #     in "aborting AbortController without reason creates an \"AbortError\"
 #     DOMException".
-#
-# Parts of the ported tests that are not ported:
-#   - In "the abort event should have the right properties", the check of
-#     `isTrusted`. `Web.Event` has no field for it.
 
 defmodule Web.WPT.DOM.AbortEventTest do
   use ExUnit.Case, async: true
@@ -43,20 +38,12 @@ defmodule Web.WPT.DOM.AbortEventTest do
     Code.ensure_loaded?(AbortSignal) and function_exported?(AbortSignal, :reason, 1)
   end
 
-  # `signal.onabort = callback`. The library has no `onabort/2`. `apply/3`
-  # calls it when the test runs, thus the compiler gives no warning.
-  defp set_onabort(signal, callback) do
-    # credo:disable-for-next-line Credo.Check.Refactor.Apply
-    apply(AbortSignal, :onabort, [signal, callback])
-  end
+  # `signal.onabort = callback`.
+  defp set_onabort(signal, callback), do: AbortSignal.onabort(signal, callback)
 
-  # The library: `Web.AbortSignal` is not an event target. It has no
-  # implementation of `Web.EventTarget.Protocol`, and an abort fires no
-  # event.
   # The DOM Standard: "interface AbortSignal : EventTarget". The steps "run
   # the abort steps", step 3: "Fire an event named abort at signal". The
   # "signal abort" algorithm runs these steps before it returns.
-  @tag :wpt_failure
   test "AbortController abort() should fire event synchronously" do
     c = AbortController.new()
     s = c.signal
@@ -97,13 +84,10 @@ defmodule Web.WPT.DOM.AbortEventTest do
            "value of controller.signal should still not have changed"
   end
 
-  # The library: `Web.AbortSignal` has no `onabort` event handler, and an
-  # abort fires no event.
   # The DOM Standard: AbortSignal has "attribute EventHandler onabort". The
   # steps "run the abort steps", step 3: "Fire an event named abort at
   # signal". The "signal abort" algorithm, step 1: "If signal is aborted,
   # then return", thus a second abort fires no event.
-  @tag :wpt_failure
   test "controller.abort() should do nothing the second time it is called" do
     controller = AbortController.new()
     signal = controller.signal
@@ -122,11 +106,9 @@ defmodule Web.WPT.DOM.AbortEventTest do
     refute_receive :abort_handler_called, 100, "event handler should not have been called again"
   end
 
-  # The library: `Web.AbortSignal` has no `onabort` event handler.
   # The DOM Standard: AbortSignal has "attribute EventHandler onabort".
   # The event fires one time only, when the signal aborts. Thus a handler
   # that is set after the abort is not called.
-  @tag :wpt_failure
   test "event handler should not be called if added after controller.abort()" do
     controller = AbortController.new()
     test_pid = self()
@@ -140,13 +122,10 @@ defmodule Web.WPT.DOM.AbortEventTest do
     refute_receive :unreached, 100, "event handler should not be called"
   end
 
-  # The library: `Web.AbortSignal` has no `onabort` event handler, and an
-  # abort fires no event.
   # The DOM Standard: AbortSignal has "attribute EventHandler onabort". The
   # steps "run the abort steps", step 3: "Fire an event named abort at
   # signal". "Fire an event" makes an event with the type "abort", with the
   # signal as target, with `bubbles` false, and with `isTrusted` true.
-  @tag :wpt_failure
   test "the abort event should have the right properties" do
     controller = AbortController.new()
     signal = controller.signal
@@ -160,6 +139,7 @@ defmodule Web.WPT.DOM.AbortEventTest do
     assert event.type == "abort", "event type should be abort"
     assert event.target == signal, "event target should be signal"
     refute event.bubbles, "event should not bubble"
+    assert event.is_trusted, "event should be trusted"
   end
 
   test "AbortController abort(reason) should set signal.reason" do
@@ -240,13 +220,9 @@ defmodule Web.WPT.DOM.AbortEventTest do
            "abort.reason should not be changed by throwIfAborted()"
   end
 
-  # The library: when the reason is not an exception, `throw_if_aborted/1`
-  # raises a `Web.DOMException` "AbortError" with the reason in its message.
-  # The function documentation gives this behavior.
   # The DOM Standard, the throwIfAborted() method steps: "throw this's abort
   # reason, if this is aborted". Erlang can raise each term as an error
-  # (`:erlang.error/1`), thus the library can raise the reason itself.
-  @tag :wpt_failure
+  # (`:erlang.error/1`), thus the library raises the reason itself.
   test "throwIfAborted() should throw primitive abort.reason if signal aborted" do
     signal = AbortSignal.abort("hello")
 

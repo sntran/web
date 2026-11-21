@@ -1,11 +1,8 @@
 {
   "harness": "OK",
   "failures": {
-    "Blob URL parses correctly": "library: no Web.URL.create_object_url/1",
-    "Blob URL starts with \"blob:\"": "library: no Web.URL.create_object_url/1",
-    "Blob URL starts with \"blob:\" for Files": "library: no Web.URL.create_object_url/1",
-    "Generated Blob URLs are unique": "library: no Web.URL.create_object_url/1",
-    "Origin of Blob URL matches our origin": "library: no Web.URL.create_object_url/1",
-    "Origin of Blob URL matches our origin for Files": "library: no Web.URL.create_object_url/1"
+    "Blob URL parses correctly": "scope: a library has no document, thus a blob URL has an opaque origin",
+    "Origin of Blob URL matches our origin": "scope: a library has no document, thus a blob URL has an opaque origin",
+    "Origin of Blob URL matches our origin for Files": "scope: a library has no document, thus a blob URL has an opaque origin"
   }
 }

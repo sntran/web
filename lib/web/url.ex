@@ -1085,6 +1085,81 @@ defmodule Web.URL do
       true -> "/" <> path
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Blob URLs, as the File API specifies: "partial interface URL"
+  # ---------------------------------------------------------------------------
+
+  alias Web.Internal.BlobURLStore
+
+  @doc """
+  Makes a blob URL for a `Web.Blob` or a `Web.File`, as
+  `URL.createObjectURL(obj)` of the File API. `Web.fetch/2` of the URL
+  gives the bytes and the type of the blob.
+
+  The URL is `"blob:null/"` and a UUID. A library has no document, thus
+  its origin is opaque: its serialization is `"null"`, as for a document
+  with an opaque origin in a browser.
+
+  The URL belongs to the calling process: when that process stops, the
+  URL is revoked, as the File API revokes the URLs of a document that
+  goes away.
+
+  ## Examples
+
+      iex> url = Web.URL.create_object_url(Web.Blob.new(["hello"]))
+      iex> String.starts_with?(url, "blob:null/")
+      true
+      iex> Web.URL.revoke_object_url(url)
+      :ok
+  """
+  @spec create_object_url(Web.Blob.t() | Web.File.t()) :: String.t()
+  def create_object_url(%blob_type{} = blob) when blob_type in [Web.Blob, Web.File] do
+    url = "blob:null/" <> uuid()
+    :ok = BlobURLStore.add(url, blob)
+    url
+  end
+
+  def create_object_url(object) do
+    raise Web.TypeError, "The object of a blob URL must be a Blob, got: #{inspect(object)}"
+  end
+
+  @doc """
+  Revokes a blob URL, as `URL.revokeObjectURL(url)` of the File API. A
+  fetch of the URL then fails. A URL that is not a blob URL in the store,
+  for example a URL with a fragment, has no effect.
+  """
+  @spec revoke_object_url(String.t()) :: :ok
+  def revoke_object_url(url) when is_binary(url) do
+    with %__MODULE__{protocol: "blob:"} = record <- parse(url),
+         blob when blob != nil <- __blob_url_entry__(record) do
+      BlobURLStore.remove(href(record))
+    else
+      _not_an_entry -> :ok
+    end
+  end
+
+  @doc false
+  # The blob URL entry of a URL, as the steps "resolve a blob URL" give
+  # it: the object, or `nil`.
+  @spec __blob_url_entry__(t()) :: Web.Blob.t() | Web.File.t() | nil
+  def __blob_url_entry__(%__MODULE__{protocol: "blob:"} = url) do
+    url |> href() |> String.split("#", parts: 2) |> hd() |> BlobURLStore.resolve()
+  end
+
+  def __blob_url_entry__(%__MODULE__{}), do: nil
+
+  # A UUID of version 4, as RFC 4122 specifies.
+  defp uuid do
+    <<a::48, _version::4, b::12, _variant::2, c::62>> = :crypto.strong_rand_bytes(16)
+    <<u0::32, u1::16, u2::16, u3::16, u4::48>> = <<a::48, 4::4, b::12, 2::2, c::62>>
+
+    [u0, u1, u2, u3, u4]
+    |> Enum.zip([8, 4, 4, 4, 12])
+    |> Enum.map_join("-", fn {value, size} ->
+      value |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(size, "0")
+    end)
+  end
 end
 
 defimpl String.Chars, for: Web.URL do

@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "Adding a null event listener should succeed": "library: no Web.EventTarget.new/0"
-  }
-}

@@ -1,11 +1,7 @@
 {
-  "harness": "ERROR",
+  "harness": "OK",
   "failures": {
-    "Appending a path should cause fetch to fail": "library: no Web.URL.create_object_url/1",
-    "Appending a query string should cause fetch to fail": "library: no Web.URL.create_object_url/1",
-    "Blob URLs can be used in fetch": "library: no Web.URL.create_object_url/1",
-    "Only exact matches should revoke URLs, using fetch": "library: no Web.URL.create_object_url/1",
-    "fetch of a revoked URL should fail": "library: no Web.URL.create_object_url/1",
-    "fetch with a fragment should succeed": "library: no Web.URL.create_object_url/1"
+    "Revoke blob URL after creating Request, then clone Request, will fetch": "library: a Request does not keep the blob of its blob URL",
+    "Revoke blob URL after creating Request, will fetch": "library: a Request does not keep the blob of its blob URL"
   }
 }

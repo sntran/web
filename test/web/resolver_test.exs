@@ -28,6 +28,14 @@ defmodule Web.ResolverTest do
     assert Resolver.resolve("unknown_uri_scheme_no_colon") == Web.Dispatcher.HTTP
   end
 
+  property "resolves a blob URL to the dispatcher of blob URLs" do
+    check all(path <- string(:alphanumeric)) do
+      assert Resolver.resolve("blob:null/#{path}") == Web.Dispatcher.Blob
+      assert Resolver.resolve("BLOB:#{path}") == Web.Dispatcher.Blob
+      assert Resolver.resolve(URL.new("blob:null/#{path}")) == Web.Dispatcher.Blob
+    end
+  end
+
   test "resolves URL structs for rclone and unknown protocols" do
     assert Resolver.resolve(URL.new("my_s3:path/to/file")) == Web.Dispatcher.TCP
     assert Resolver.resolve(URL.new("foo://example.com")) == Web.Dispatcher.HTTP

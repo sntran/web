@@ -120,6 +120,10 @@ defmodule Web.Test.QuickJS.Bridge do
     "WritableStreamDefaultWriter" => Web.WritableStreamDefaultWriter
   }
 
+  # The operations of the global object that the runner gives to the
+  # library: `fetch` of a blob URL.
+  @globals %{"WindowOrWorkerGlobalScope" => Web}
+
   # The objects of the library that have no interface in the WebIDL files,
   # and are not globals: the default asynchronous iterator of WebIDL. Its
   # name is the class string of its prototype.
@@ -141,8 +145,6 @@ defmodule Web.Test.QuickJS.Bridge do
   @values [
     Web.ByteLengthQueuingStrategy,
     Web.CountQueuingStrategy,
-    Web.CustomEvent,
-    Web.Event,
     Web.FormData,
     Web.Headers,
     Web.Request,
@@ -639,7 +641,10 @@ defmodule Web.Test.QuickJS.Bridge do
   # ---------------------------------------------------------------------------
 
   defp start_call(id, %{"i" => interface, "k" => kind} = message) do
-    module = Map.get(@interfaces, interface) || Map.fetch!(@iterators, interface)
+    module =
+      Map.get(@interfaces, interface) || Map.get(@globals, interface) ||
+        Map.fetch!(@iterators, interface)
+
     sync_buffers(message["bs"])
     args = message |> Map.get("a", []) |> Enum.map(&decode/1) |> refresh_buffers()
     self = with %{"$h" => handle} <- message["self"], do: refresh_buffers(fetch_handle(handle))
@@ -922,6 +927,9 @@ defmodule Web.Test.QuickJS.Bridge do
   defp adapt("Response", "operation", "clone", self, []),
     do: {:ok, {:clone, Web.Response.clone(self)}}
 
+  defp adapt("WindowOrWorkerGlobalScope", "static", "fetch", _self, [input | init]),
+    do: {:ok, Web.fetch(absolute(input), options(init))}
+
   defp adapt("Blob", "constructor", _member, _self, [parts | rest]),
     do: {:ok, Web.Blob.new(parts || [], options(rest))}
 
@@ -940,13 +948,29 @@ defmodule Web.Test.QuickJS.Bridge do
   defp adapt("CustomEvent", "constructor", _member, _self, [type | init]),
     do: {:ok, Web.CustomEvent.new(type, options(init))}
 
-  # A boolean in place of the options is the option `capture`.
+  # A boolean in place of the options is the option `capture`. A callback
+  # that is `null` is `nil` in the library.
   defp adapt("EventTarget", "operation", "addEventListener", self, [type, callback | rest]) do
-    {:ok, Web.EventTarget.add_event_listener(self, type, callback, listener_options(rest))}
+    {:ok,
+     Web.EventTarget.add_event_listener(self, type, nullable(callback), listener_options(rest))}
   end
 
-  defp adapt("EventTarget", "operation", "removeEventListener", self, [type, callback | _rest]),
-    do: {:ok, Web.EventTarget.remove_event_listener(self, type, callback)}
+  defp adapt("EventTarget", "operation", "removeEventListener", self, [type, callback | rest]) do
+    {:ok,
+     Web.EventTarget.remove_event_listener(self, type, nullable(callback), listener_options(rest))}
+  end
+
+  # `dispatch_event/2` gives the target and the boolean of the Standard.
+  defp adapt("EventTarget", "operation", "dispatchEvent", self, [event]),
+    do: {:ok, elem(Web.EventTarget.dispatch_event(self, event), 1)}
+
+  # `throw_if_aborted/1` raises the reason as an error of Erlang, also a
+  # reason that is not an exception. JavaScript throws that value.
+  defp adapt("AbortSignal", "operation", "throwIfAborted", self, []) do
+    {:ok, Web.AbortSignal.throw_if_aborted(self)}
+  catch
+    :error, reason when not is_exception(reason) -> throw(reason)
+  end
 
   # The base URL of a pattern is an option of the library. In a map of the
   # parts of a pattern, the library reads the key `:baseURL`.
@@ -985,6 +1009,9 @@ defmodule Web.Test.QuickJS.Bridge do
 
   defp options([%{} = init | _rest]), do: Map.to_list(init)
   defp options(_init), do: []
+
+  defp nullable(:null), do: nil
+  defp nullable(value), do: value
 
   defp listener_options([capture | _rest]) when is_boolean(capture), do: %{capture: capture}
   defp listener_options([%{} = options | _rest]), do: options
@@ -1438,20 +1465,32 @@ defmodule Web.Test.QuickJS.Bridge do
 
   defp new_handle(%module{} = value) do
     interned = get(:interned)
+    key = intern_key(value)
 
-    case Map.fetch(interned, value) do
+    case Map.fetch(interned, key) do
       {:ok, handle} ->
+        # An event gets the fields of a dispatch, such as its target: the
+        # handle has the newest struct.
+        if key != value, do: put(:handles, Map.put(get(:handles), handle, value))
         handle
 
       :error ->
         handle = get(:next_handle)
         put(:next_handle, handle + 1)
         put(:handles, Map.put(get(:handles), handle, value))
-        if module not in @values, do: put(:interned, Map.put(interned, value, handle))
+        if module not in @values, do: put(:interned, Map.put(interned, key, handle))
         hold_buffers(value)
         handle
     end
   end
+
+  # An event has an identity of its own, its flags: the event that a
+  # listener gets is the event of the dispatch, with a target.
+  defp intern_key(%module{flags: flags})
+       when module in [Web.Event, Web.CustomEvent] and flags != nil,
+       do: {:event, flags}
+
+  defp intern_key(value), do: value
 
   defp decode(%{"$h" => handle}), do: fetch_handle(handle)
   defp decode(%{"$ab" => entry}), do: decode_buffer(entry)

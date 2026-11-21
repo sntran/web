@@ -349,7 +349,8 @@ defmodule Web.Internal.StructuredData do
         name: file.name,
         filename: file.filename,
         type: file.type,
-        size: file.size
+        size: file.size,
+        last_modified: file.last_modified
       ]
 
       {%Node{type: :file, key: key, data: {parts, data}}, ctx}

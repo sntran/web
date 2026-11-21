@@ -43,7 +43,13 @@ defmodule Web.AbortController do
   end
 
   @doc """
-  Aborts the controller's signal.
+  Aborts the controller's signal, as `abort(reason)`. The default reason is
+  a `Web.DOMException` with the name `AbortError`.
+
+  The listeners of the event `abort` of the signal, and of the signals of
+  `Web.AbortSignal.any/1` that depend on it, run in the calling process
+  before this function returns, as the DOM Standard specifies. A second
+  abort does nothing.
 
   ## Examples
 
@@ -51,19 +57,23 @@ defmodule Web.AbortController do
       iex> Web.AbortController.abort(controller, :manual_cancel)
       :ok
   """
-  def abort(
-        %__MODULE__{signal: %Web.AbortSignal{pid: pid}},
-        reason \\ Web.DOMException.abort_error()
-      ) do
-    if Process.alive?(pid) do
-      try do
-        GenServer.call(pid, {:abort, reason}, :infinity)
-      catch
-        :exit, _ -> :ok
-      end
+  def abort(%__MODULE__{signal: signal}, reason \\ Web.DOMException.abort_error()) do
+    if library_process?() do
+      Web.AbortSignal.__signal_abort_later__(signal, reason)
+    else
+      Web.AbortSignal.__signal_abort__(signal, reason)
     end
+  end
 
-    :ok
+  # A process of the library, such as the process of a stream, answers
+  # other processes at each time: it does not run the code of a user. The
+  # signal is aborted before `abort/2` returns, and a new process runs the
+  # listeners.
+  defp library_process? do
+    case Process.get(:"$initial_call") do
+      {module, _function, _arity} -> String.starts_with?(Atom.to_string(module), "Elixir.Web.")
+      _other -> false
+    end
   end
 
   defp make_signal_ref(pid) do

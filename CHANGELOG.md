@@ -1153,6 +1153,9 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A parsed `Web.FormData` whose parser stopped, for example after an abort
+  of its body, raises `Web.TypeError` for a field that the parser did not
+  read, as a stream that is gone does. It exited with `:noproc` before.
 - A change of a `Web.URLSearchParams` of a URL runs the "update steps" of
   the URL Standard: a change that gives an empty serialization removes the
   `?` of the URL, and a change on a URL with no query gives the URL a

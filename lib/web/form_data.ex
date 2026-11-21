@@ -1490,6 +1490,16 @@ defmodule Web.FormData do
     defp unwrap!(_kind, {:error, %TypeError{} = reason}), do: raise(reason)
     defp unwrap!(_kind, {:error, reason}), do: exit(reason)
 
+    # The parser stopped before the call: its form is not available, as a
+    # stream that is gone (see `Web.Stream.call/3`). A body that fails is a
+    # `TypeError` in the Fetch Standard.
+    defp normalize_call_exit({reason, {:gen_statem, :call, _args}})
+         when reason in [:noproc, :normal] do
+      TypeError.exception(
+        "The form data is not available. Its body ended, or its parser stopped."
+      )
+    end
+
     defp normalize_call_exit(reason) do
       if is_tuple(reason) and tuple_size(reason) == 2 and is_tuple(elem(reason, 0)) and
            tuple_size(elem(reason, 0)) == 2 and elem(elem(reason, 0), 0) == :shutdown,

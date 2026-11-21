@@ -800,6 +800,26 @@ defmodule Web.FormDataTest do
     assert_eventually(fn -> not Process.alive?(stream.controller_pid) end)
   end
 
+  test "a form whose parser stopped raises TypeError for a field that it did not read" do
+    boundary = "stopped-parser-boundary"
+
+    {stream, _tracker} =
+      boundary
+      |> multipart_payload([
+        %{name: "first", value: "a"},
+        %{name: "second", value: "b"}
+      ])
+      |> byte_chunks()
+      |> tracked_source()
+
+    form = Web.FormData.parse(stream, boundary, signal: :stop_signal)
+    send(form.coordinator, {:abort, :stop_signal, :stopped})
+    assert_eventually(fn -> not Process.alive?(form.coordinator) end)
+
+    assert_raise Web.TypeError, ~r/not available/, fn -> Web.FormData.get(form, "second") end
+    assert_raise Web.TypeError, ~r/not available/, fn -> Enum.to_list(form) end
+  end
+
   test "token signals abort the coordinator and child stream" do
     boundary = "token-signal-boundary"
     file_body = String.duplicate("p", 128)
@@ -1171,7 +1191,7 @@ defmodule Web.FormDataTest do
     assert {:error, %Web.TypeError{message: "discard read failed"}} = Task.await(waiter)
   end
 
-  test "calling a dead coordinator exits the caller" do
+  test "calling a dead coordinator raises TypeError in the caller" do
     boundary = "dead-coordinator-boundary"
 
     form =
@@ -1181,7 +1201,7 @@ defmodule Web.FormDataTest do
       |> Web.FormData.parse(boundary)
 
     assert :ok = Web.FormData.cancel(form, :normal)
-    assert {:noproc, _} = catch_exit(Web.FormData.get(form, "field"))
+    assert_raise Web.TypeError, ~r/not available/, fn -> Web.FormData.get(form, "field") end
   end
 
   test "cancel with nil or normal reason does not cancel the upstream source" do

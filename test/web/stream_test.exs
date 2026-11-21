@@ -1192,6 +1192,98 @@ defmodule Web.StreamTest do
     end
   end
 
+  # A process that saw the stop of a lock holder can call the stream before
+  # the stream gets the `:DOWN` message of that holder: Erlang keeps the
+  # order of the signals of one sender only. The tests put the call first:
+  # the test suspends the stream, sends its call, and then stops the
+  # holder.
+  describe "the lock of a process that stopped" do
+    test "does not refuse a reader lock" do
+      stream = Web.ReadableStream.new(%{})
+      holder = hold(fn -> Web.ReadableStream.get_reader(stream) end)
+
+      assert {:ok, lock} = call_before_down(stream.controller_pid, holder, {:get_reader, self()})
+      assert is_reference(lock)
+      assert Web.ReadableStream.locked?(stream)
+    end
+
+    test "does not refuse a writer lock" do
+      stream = Web.WritableStream.new(%{})
+      holder = hold(fn -> Web.WritableStream.get_writer(stream) end)
+      request = {:get_writer, self(), :writer}
+
+      assert {:ok, lock} = call_before_down(stream.controller_pid, holder, request)
+      assert is_reference(lock)
+      assert Web.WritableStream.locked?(stream)
+    end
+
+    test "is not a reader lock" do
+      stream = Web.ReadableStream.new(%{})
+      holder = hold(fn -> Web.ReadableStream.get_reader(stream) end)
+
+      assert call_before_down(stream.controller_pid, holder, {:locked?, :reader}) == false
+    end
+
+    test "is not a writer lock" do
+      stream = Web.WritableStream.new(%{})
+      holder = hold(fn -> Web.WritableStream.get_writer(stream) end)
+
+      assert call_before_down(stream.controller_pid, holder, {:locked?, :writer}) == false
+    end
+
+    test "gives the reason of the stop to a stream that cancels at the stop of its reader" do
+      test = self()
+
+      stream =
+        Web.ReadableStream.__new__(
+          %{cancel: fn reason -> send(test, {:canceled, reason}) end},
+          [cancel_on_reader_exit: true],
+          []
+        )
+
+      holder =
+        hold(fn ->
+          reader = Web.ReadableStream.get_reader(stream)
+          # A read disturbs the stream: the stop of the reader cancels it.
+          _read = Web.ReadableStreamDefaultReader.read(reader)
+        end)
+
+      assert call_before_down(stream.controller_pid, holder, {:locked?, :reader}) == false
+      assert_receive {:canceled, {:reader_down, :normal}}
+    end
+  end
+
+  # A process that takes a lock with `lock`, and stops at the message
+  # `:stop`.
+  defp hold(lock) do
+    test = self()
+
+    holder =
+      spawn(fn ->
+        _lock = lock.()
+        send(test, {:held, self()})
+        receive do: (:stop -> :ok)
+      end)
+
+    assert_receive {:held, ^holder}
+    holder
+  end
+
+  # Sends `request` to the stream as a call, and then stops the holder. The
+  # stream is suspended between the two steps: it gets the call before the
+  # `:DOWN` message of the holder.
+  defp call_before_down(stream, holder, request) do
+    monitor = Process.monitor(holder)
+    true = :erlang.suspend_process(stream)
+    tag = make_ref()
+    send(stream, {:"$gen_call", {self(), tag}, request})
+    send(holder, :stop)
+    assert_receive {:DOWN, ^monitor, :process, ^holder, :normal}
+    true = :erlang.resume_process(stream)
+    assert_receive {^tag, reply}, 2_000
+    reply
+  end
+
   describe "Web.Stream coverage gaps" do
     test "control_call exits when the target dies before replying" do
       pid =

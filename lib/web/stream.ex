@@ -1284,9 +1284,15 @@ defmodule Web.Stream do
     end
   end
 
-  defp handle_common({:call, from}, {:get_reader, _pid, _mode}, _state, data)
+  defp handle_common({:call, from}, {:get_reader, _pid, _mode} = request, _state, data)
        when data.type in [:producer, :producer_consumer] do
-    {:keep_state_and_data, [{:reply, from, {:error, :already_locked}}]}
+    after_stopped_holder(
+      data.reader_pid,
+      data.reader_ref,
+      from,
+      request,
+      {:error, :already_locked}
+    )
   end
 
   # Read a chunk
@@ -1491,9 +1497,15 @@ defmodule Web.Stream do
     {:keep_state, data, [{:reply, from, {:ok, ref}}]}
   end
 
-  defp handle_common({:call, from}, {:get_writer, _pid, _kind}, _state, data)
+  defp handle_common({:call, from}, {:get_writer, _pid, _kind} = request, _state, data)
        when data.type in [:consumer, :producer_consumer] do
-    {:keep_state_and_data, [{:reply, from, {:error, :already_locked}}]}
+    after_stopped_holder(
+      data.writer_pid,
+      data.writer_ref,
+      from,
+      request,
+      {:error, :already_locked}
+    )
   end
 
   # Ready (backpressure signal for writers)
@@ -1624,12 +1636,14 @@ defmodule Web.Stream do
   end
 
   # The two sides of a transform stream have separate locks.
-  defp handle_common({:call, from}, {:locked?, :reader}, _state, data) do
-    {:keep_state_and_data, [{:reply, from, is_pid(data.reader_pid)}]}
+  # A lock of a process that stopped is not a lock: see
+  # `after_stopped_holder/5`.
+  defp handle_common({:call, from}, {:locked?, :reader} = request, _state, data) do
+    after_stopped_holder(data.reader_pid, data.reader_ref, from, request, is_pid(data.reader_pid))
   end
 
-  defp handle_common({:call, from}, {:locked?, :writer}, _state, data) do
-    {:keep_state_and_data, [{:reply, from, is_pid(data.writer_pid)}]}
+  defp handle_common({:call, from}, {:locked?, :writer} = request, _state, data) do
+    after_stopped_holder(data.writer_pid, data.writer_ref, from, request, is_pid(data.writer_pid))
   end
 
   defp handle_common({:call, from}, :backpressure?, _state, data) do
@@ -4704,6 +4718,29 @@ defmodule Web.Stream do
     |> Map.put(:reader_ref, nil)
     |> Map.put(:reader_mode, nil)
   end
+
+  # The lock of a process that stopped. A process that saw the stop (for
+  # example with its own monitor) can send a call that comes before the
+  # `:DOWN` message of the lock: Erlang keeps the order of the signals of
+  # one sender only. The `:DOWN` message comes, because the stream monitors
+  # the holder. Thus the stream takes that message, does the usual steps of
+  # the stop with its true reason, and then does the call again. A holder
+  # that is alive, or on a different node, gives `reply`.
+  defp after_stopped_holder(holder, ref, from, request, reply)
+       when is_pid(holder) and node(holder) == node() do
+    if Process.alive?(holder) do
+      {:keep_state_and_data, [{:reply, from, reply}]}
+    else
+      receive do
+        {:DOWN, ^ref, :process, ^holder, _reason} = down ->
+          {:keep_state_and_data,
+           [{:next_event, :info, down}, {:next_event, {:call, from}, request}]}
+      end
+    end
+  end
+
+  defp after_stopped_holder(_holder, _ref, from, _request, reply),
+    do: {:keep_state_and_data, [{:reply, from, reply}]}
 
   defp handle_terminate_request(type, reason, state, data) do
     {_result, transition} = terminate_request_with_result(type, reason, state, data)

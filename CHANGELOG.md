@@ -1239,6 +1239,13 @@ All notable changes to this project are documented in this file.
   counterexamples (the ABA of the claim, and a stream process that
   starts during the rollback of a starter). Each test fails with the old
   behavior.
+- A lock of a process that stopped does not refuse a new lock, and
+  `locked?` is false for it. A process that saw that stop, for example
+  with its own monitor, can call the stream before the stream gets the
+  `:DOWN` message of the holder: Erlang keeps the order of the signals of
+  one sender only. Before, the call got "already locked". Now the stream
+  finds that the holder is not alive, takes its `:DOWN` message, does the
+  usual steps of the stop with the true reason, and then does the call.
 - When the owner of a transform stream fails, a side ends only when no
   lock of the two sides exists: the side asks the other side, which
   decides in its own process. Before, a lock that a process took at the

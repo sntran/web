@@ -15,6 +15,30 @@ defmodule Web.Internal.LazyStreamTest do
 
   defp text(body), do: Web.await(Web.Response.text(%Web.Response{body: body}))
 
+  defp stop(pid) do
+    ref = Process.monitor(pid)
+    Web.Stream.stop(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+  end
+
+  # A process that registers itself as the stream process of `lazy`, and
+  # tells it to `parent`.
+  defp fake_stream(lazy, parent) do
+    spawn(fn ->
+      {:ok, _owner} = Registry.register(LazyStream.registry(), lazy.ref, nil)
+      send(parent, :registered)
+
+      receive do
+        :stop -> :ok
+      end
+    end)
+  end
+
+  # The process waits for the end of a starter.
+  defp waits_for_down?(pid) do
+    Process.info(pid, :current_function) == {:current_function, {LazyStream, :await_down, 1}}
+  end
+
   defp wait_until(fun, attempts \\ 200) do
     cond do
       fun.() -> :ok
@@ -96,14 +120,36 @@ defmodule Web.Internal.LazyStreamTest do
       assert Enum.map(right, &Uint8Array.to_binary/1) == ["hello"]
     end
 
-    test "is not available when its process stopped" do
+    test "gives the bytes to the next read when its process stopped before a read" do
       stream = ReadableStream.from("hello")
       {:ok, pid} = ReadableStream.__process__(stream)
-      ref = Process.monitor(pid)
-      Web.Stream.stop(pid)
-      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+      stop(pid)
+
+      # No read came: the process took no bytes from the other copies.
+      assert LazyStream.state(stream.lazy) == :readable
+      refute ReadableStream.disturbed?(stream)
+      assert {:ok, new_pid} = ReadableStream.__process__(stream)
+      assert new_pid != pid
+      assert read_all(ReadableStream.get_reader(stream)) == ["hello"]
+    end
+
+    test "gives the bytes to a claim when its process stopped before a read" do
+      stream = ReadableStream.from("hello")
+      {:ok, pid} = ReadableStream.__process__(stream)
+      stop(pid)
+
+      assert text(stream) == "hello"
+      assert LazyStream.state(stream.lazy) == :locked
+    end
+
+    test "is not available when its process stopped after a read" do
+      stream = ReadableStream.from("hello")
+      reader = ReadableStream.get_reader(stream)
+      assert read_all(reader) == ["hello"]
+      stop(reader.controller_pid)
 
       assert LazyStream.state(stream.lazy) == :gone
+      assert ReadableStream.disturbed?(stream)
       assert ReadableStream.__process__(stream) == {:error, :released}
       assert_raise Web.TypeError, ~r/not available/, fn -> ReadableStream.get_reader(stream) end
 
@@ -112,32 +158,115 @@ defmodule Web.Internal.LazyStreamTest do
       assert LazyStream.state(stream.lazy) == :gone
     end
 
-    test "a copy waits while a different process starts the stream process" do
+    test "a cancel of its process takes the bytes" do
       stream = ReadableStream.from("hello")
+      {:ok, pid} = ReadableStream.__process__(stream)
+      Web.await(ReadableStream.cancel(stream))
+      stop(pid)
+
+      assert LazyStream.state(stream.lazy) == :gone
+    end
+
+    test "a copy waits for the end of the starter that has the key" do
+      lazy = ReadableStream.from("hello").lazy
       test = self()
 
-      # The array has the state "starting". A different process registers
-      # a process after some time, and sets the state "process".
-      :atomics.put(stream.lazy.ref, 1, 4)
-
+      # A process in the place of a starter: it has the key and the state
+      # "starting". After the message :go, a second process registers
+      # itself as the stream process, and the first one sets "process".
       starter =
         spawn(fn ->
-          # A slow start: the copy must wait while the state is "starting".
-          Process.sleep(5)
-          {:ok, _owner} = Registry.register(LazyStream.registry(), stream.lazy.ref, nil)
-          :atomics.put(stream.lazy.ref, 1, 5)
-          send(test, :registered)
+          {:ok, _owner} = Registry.register(LazyStream.registry(), {lazy.ref, :start}, nil)
+          :atomics.put(lazy.ref, 1, 4)
+          send(test, :starting)
 
           receive do
-            :stop -> :ok
+            :go ->
+              send(test, {:stream, fake_stream(lazy, self())})
+
+              receive do
+                :registered -> :atomics.put(lazy.ref, 1, 5)
+              end
           end
         end)
 
-      assert LazyStream.state(stream.lazy) == {:process, starter}
-      # The starter sends the message after it sets the state. Thus the
-      # test must wait for the message.
+      assert_receive :starting
+      copy = Task.async(fn -> LazyStream.state(lazy) end)
+
+      # The copy waits for the end of the starter, with no time limit.
+      wait_until(fn -> waits_for_down?(copy.pid) end)
+      send(starter, :go)
+      assert_receive {:stream, stream_pid}
+      assert Task.await(copy) == {:process, stream_pid}
+      send(stream_pid, :stop)
+    end
+
+    test "a starter that finds the key of a different starter waits for its end" do
+      stream = ReadableStream.from("hello")
+      lazy = stream.lazy
+      test = self()
+
+      holder =
+        spawn(fn ->
+          {:ok, _owner} = Registry.register(LazyStream.registry(), {lazy.ref, :start}, nil)
+          send(test, :registered)
+
+          receive do
+            :go -> :ok
+          end
+        end)
+
       assert_receive :registered
-      send(starter, :stop)
+      copy = Task.async(fn -> LazyStream.process(lazy, test) end)
+      wait_until(fn -> waits_for_down?(copy.pid) end)
+      assert LazyStream.state(lazy) == :readable
+
+      send(holder, :go)
+      assert {:ok, pid} = Task.await(copy)
+      assert LazyStream.state(lazy) == {:process, pid}
+      assert read_all(ReadableStream.get_reader(stream)) == ["hello"]
+    end
+
+    test "a copy continues the start of a starter that stopped before the stream process" do
+      stream = ReadableStream.from("hello")
+
+      # The cell has "starting", and no process has the key.
+      :atomics.put(stream.lazy.ref, 1, 4)
+      assert {:ok, pid} = ReadableStream.__process__(stream)
+      assert LazyStream.state(stream.lazy) == {:process, pid}
+      assert read_all(ReadableStream.get_reader(stream)) == ["hello"]
+    end
+
+    test "a copy sets the state of a stream process whose starter stopped" do
+      lazy = ReadableStream.from("hello").lazy
+
+      # The stream process registered itself, and its starter stopped before
+      # it set "process".
+      stream_pid = fake_stream(lazy, self())
+      assert_receive :registered
+      :atomics.put(lazy.ref, 1, 4)
+
+      assert LazyStream.state(lazy) == {:process, stream_pid}
+      assert :atomics.get(lazy.ref, 1) == 5
+      send(stream_pid, :stop)
+    end
+  end
+
+  describe "a body with no bytes" do
+    test "closes its stream process at the start, with no read" do
+      stream = ReadableStream.__bytes__("")
+      assert stream.controller_pid == nil
+      reader = ReadableStream.get_reader(stream)
+      assert Web.await(ReadableStreamDefaultReader.closed(reader)) == :ok
+      assert read_all(reader) == []
+    end
+
+    test "gives its error to its stream process at the start, with no read" do
+      error = %Web.TypeError{message: "the connection failed"}
+      stream = %ReadableStream{lazy: LazyStream.new({:error, error}, nil)}
+      reader = ReadableStream.get_reader(stream)
+      assert catch_exit(Web.await(ReadableStreamDefaultReader.closed(reader))) == error
+      assert catch_exit(Web.await(ReadableStreamDefaultReader.read(reader))) == error
     end
   end
 

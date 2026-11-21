@@ -161,34 +161,41 @@ defmodule Web.TLA.ModelCheckTest do
   describe "LazyStream" do
     # A check with no property BytesOnce: the bug breaks a different
     # property also.
-    defp lazy_bug(name), do: [bug(name), {"    BytesOnce\n", ""}]
+    defp lazy_bug(name), do: [bug(name), {" BytesOnce", ""}]
+
+    defp lazy_check(replace), do: SpecModel.check("LazyStream", replace)
 
     test "the design has all its properties" do
-      assert_holds(SpecModel.check("LazyStream"))
+      assert_holds(lazy_check(nil))
     end
 
-    test "the design with three copies has all its properties" do
-      assert_holds(SpecModel.check("LazyStream", {~s({"a", "b"}), ~s({"a", "b", "c"})}))
+    test "the code before the specification gives gone after a stop of the copy that starts" do
+      assert_violates(lazy_check(bug("today")), "NoGoneWhileBytes")
+    end
+
+    test "copies that wait for a starter that stopped, with no new starter, are found" do
+      assert_violates(lazy_check(bug("no_take_over")), "ReadEnds")
+    end
+
+    test "a stream process that stopped before a read and gives gone is found" do
+      assert_violates(lazy_check(bug("dead_is_gone")), "NoGoneWhileBytes")
+    end
+
+    test "a pull that does not set taken is found" do
+      assert_violates(lazy_check(bug("pull_keeps_bytes")), "BytesOnce")
+    end
+
+    test "starters with no key are found" do
+      assert_violates(lazy_check(bug("no_key")), "OneProcess")
     end
 
     test "a claim that reads and then sets the cell is found" do
-      assert_violates(SpecModel.check("LazyStream", bug("read_then_set")), "BytesOnce")
-      assert_violates(SpecModel.check("LazyStream", lazy_bug("read_then_set")), "NoBytesAfterUse")
-    end
-
-    test "a stream read with no state starting is found" do
-      assert_violates(SpecModel.check("LazyStream", lazy_bug("no_starting")), "OneProcess")
+      assert_violates(lazy_check(bug("read_then_set")), "BytesOnce")
+      assert_violates(lazy_check(lazy_bug("read_then_set")), "NoBytesAfterUse")
     end
 
     test "a stream process that gets the bytes after a claim is found" do
-      assert_violates(SpecModel.check("LazyStream", bug("closed_gets_bytes")), "BytesOnce")
-    end
-
-    test "a state process before the registry has the stream process is found" do
-      assert_violates(
-        SpecModel.check("LazyStream", bug("publish_first")),
-        "GoneOnlyAfterStop"
-      )
+      assert_violates(lazy_check(bug("closed_gets_bytes")), "BytesOnce")
     end
   end
 

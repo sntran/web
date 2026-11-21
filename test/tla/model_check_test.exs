@@ -190,6 +190,10 @@ defmodule Web.TLA.ModelCheckTest do
       assert_holds(lazy_check(@stream_kill))
     end
 
+    test "the design with a look at the state has all its properties" do
+      assert_holds(lazy_check([{@all_ops, ~s(Ops = {"consumed", "read", "state"})}]))
+    end
+
     test "the code before the specification gives gone after a stop of the copy that starts" do
       assert_violates(lazy_bug("today"), "NoGoneWhileBytes")
     end
@@ -255,6 +259,15 @@ defmodule Web.TLA.ModelCheckTest do
     test "a claim from the state process, which a new stream process can have again, is found" do
       locked_or_read = {@all_ops, ~s(Ops = {"locked", "read"})}
       assert_violates(lazy_bug("process_claim", [locked_or_read | @stream_kill]), "BytesOnce")
+    end
+
+    test "a starter that sets readable and does not stop a stream process with no use is found" do
+      assert_violates(lazy_bug("rollback_no_reap", [@only_read]), "UselessStops")
+    end
+
+    test "a look at the state that continues a start that stopped is found" do
+      read_or_state = {@all_ops, ~s(Ops = {"read", "state"})}
+      assert_violates(lazy_bug("state_takes_over", [read_or_state]), "StateHasNoEffect")
     end
   end
 

@@ -126,10 +126,13 @@ defmodule Web.Internal.LazyStream do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Returns the state of the stream. A stream that has a process gives
-  `{:process, pid}`, and `:gone` when that process stopped after it gave
-  the bytes out. A stream process that stopped before it gave the bytes
-  out gives `:readable`: the next read gets the bytes.
+  Returns the state of the stream, with no change. A stream that has a
+  process gives `{:process, pid}`, and `:gone` when that process stopped
+  after it gave the bytes out. A stream process that stopped before it
+  gave the bytes out, and a start of a stream process that did not end,
+  give `:readable`: no process took the bytes. A start of a closed stream
+  process gives `:consumed`: a claim used the bytes, and the stream is
+  closed.
   """
   @spec state(t()) :: state()
   def state(%__MODULE__{ref: ref} = lazy) do
@@ -153,38 +156,74 @@ defmodule Web.Internal.LazyStream do
       else: remote(lazy, :claim, [to, keeper], :gone)
   end
 
-  # One compare-exchange from "readable". A cell that changed in between
-  # gives a second try. The claim then stops a stream process with no use:
-  # see `stop_unused/1`.
-  defp local_claim(lazy, to, keeper),
-    do: claim_from(lazy, to, keeper, :atomics.get(lazy.ref, 1))
-
-  defp claim_from(lazy, to, keeper, @readable) do
-    changed = :atomics.compare_exchange(lazy.ref, 1, @readable, encode(to))
-    if changed == :ok, do: stop_unused(lazy), else: claim_from(lazy, to, keeper, changed)
+  # The steps of a claim: the look, the step after the look, and the stop
+  # of a stream process with no use. A step that gives `:again` gives a new
+  # look. See `tla/LazyStream.tla`.
+  defp local_claim(lazy, to, keeper) do
+    case __claim_step__(lazy, to, __look__(lazy)) do
+      :ok -> __claim_reap__(lazy)
+      :again -> local_claim(lazy, to, keeper)
+      # The caller reads the stream process: the copy keeps it.
+      {:process, pid} -> keep_claim(lazy, to, keeper, pid)
+      state -> state
+    end
   end
 
-  defp claim_from(lazy, to, keeper, current),
-    do: claim_found(lazy, to, keeper, decode(lazy, current))
-
-  # A stream process that stopped before a disturb: the bytes are free. The
-  # cell has "process", and a starter can start a new stream process and
-  # set "process" again between a look of the claim and its compare-exchange:
-  # the claim would take the bytes of that new process. Thus a short process
-  # with the key sets "readable" (no starter works while it has the key), and
-  # the claim takes the bytes from "readable".
-  defp claim_found(lazy, to, keeper, :readable) do
-    :ok = run_keyed(lazy, fn -> release(lazy) end)
-    local_claim(lazy, to, keeper)
-  end
-
-  # The caller reads the stream process: the copy keeps it.
-  defp claim_found(lazy, to, keeper, {:process, pid}) do
+  defp keep_claim(lazy, to, keeper, pid) do
     with {:ok, pid} <- keep_or(pid, keeper, fn -> local_claim(lazy, to, keeper) end),
          do: {:process, pid}
   end
 
-  defp claim_found(_lazy, _to, _keeper, state), do: state
+  @doc false
+  # The look of a claim: the cell, and then the stream process of the
+  # registry, or `nil`.
+  def __look__(%__MODULE__{} = lazy) do
+    current = :atomics.get(lazy.ref, 1)
+    {current, live_stream(lazy)}
+  end
+
+  @doc false
+  # The step of a claim after its look `{cell, pid}`. Returns `:ok` when the
+  # claim took the bytes, `:again` for a new look, or the state.
+  #
+  # From "readable", one compare-exchange. A cell that changed gives a new
+  # look.
+  def __claim_step__(lazy, to, {@readable, _pid}) do
+    changed = :atomics.compare_exchange(lazy.ref, 1, @readable, encode(to))
+    if changed == :ok, do: :ok, else: :again
+  end
+
+  # A stream process that stopped before a disturb: the bytes are free. A
+  # starter can start a new stream process and set "process" again after
+  # the look: a compare-exchange from "process" would take the bytes of
+  # that new process. Thus a short process with the key sets "readable"
+  # when the registry has no stream process (no starter works while it has
+  # the key), and the claim looks again.
+  def __claim_step__(lazy, _to, {@process, nil}) do
+    :ok = run_keyed(lazy, fn -> release(lazy) end)
+    :again
+  end
+
+  # A start: the claim waits for its end, or continues the work of a
+  # starter that stopped.
+  def __claim_step__(lazy, _to, {starting, _pid})
+      when starting in [@starting, @starting_closed] do
+    :ok = await_start(lazy, Web.Promise.owner())
+    :again
+  end
+
+  # A stream process: the caller reads it. A process that stopped after the
+  # look gives a new look: see `keep_or/3`.
+  def __claim_step__(_lazy, _to, {current, pid})
+      when is_pid(pid) and current in [@process, @taken],
+      do: {:process, pid}
+
+  def __claim_step__(lazy, _to, {current, _pid}), do: decode(lazy, current)
+
+  @doc false
+  # The claim that took the bytes stops a stream process with no use: see
+  # `stop_unused/1`.
+  def __claim_reap__(lazy), do: stop_unused(lazy)
 
   defp encode(:consumed), do: @consumed
   defp encode(:canceled), do: @canceled
@@ -195,10 +234,17 @@ defmodule Web.Internal.LazyStream do
   defp decode(_lazy, @canceled), do: :canceled
   defp decode(_lazy, @locked), do: :locked
 
-  # A copy that finds the state "starting" waits for the end of the start.
+  # A start: the state has no change. No process took the bytes, and the
+  # stream process of the start has them when the registry has it. A start
+  # that stopped, with no starter, stays: a claim, a stream read, or the
+  # lock step continues it. A closed stream process starts after a claim
+  # used the bytes: the stream is closed and disturbed, and it has no lock.
   defp decode(lazy, current) when current in [@starting, @starting_closed] do
-    :ok = await_start(lazy, Web.Promise.owner())
-    decode(lazy, :atomics.get(lazy.ref, 1))
+    case {current, live_stream(lazy)} do
+      {_starting, pid} when is_pid(pid) -> {:process, pid}
+      {@starting, nil} -> :readable
+      {@starting_closed, nil} -> :consumed
+    end
   end
 
   # A stream process that stopped before its first disturb did not take the
@@ -294,9 +340,10 @@ defmodule Web.Internal.LazyStream do
   # The process of a copy can stop at each step: it is a process of the
   # user. Thus the copy does not start the stream process itself. A short
   # process, the starter, starts it and stops. The copy that asks for the
-  # stream process, and each copy that finds the state "starting", monitor
-  # the starter: the end of the starter tells them to read the state again.
-  # No copy waits for a time limit.
+  # stream process, and each claim and stream read that finds the state
+  # "starting", monitor the starter: the end of the starter tells them to
+  # read the state again. No copy waits for a time limit. A look at the
+  # state (`state/1`) does not wait, and starts no starter.
   #
   # The starter registers the key `{ref, :start}` before it changes the
   # state. Thus one starter at most works, and the copies find it. The
@@ -484,12 +531,32 @@ defmodule Web.Internal.LazyStream do
         if initial == :closed or Process.alive?(copy) do
           publish(lazy, starting, stream.controller_pid)
         else
-          Web.Stream.stop(stream.controller_pid)
-          _ = :atomics.compare_exchange(lazy.ref, 1, @starting, @readable)
-          stop_unused(lazy)
+          :ok = __stop_started__(stream.controller_pid)
+          :ok = __rollback__(lazy)
+          __rollback_reap__(lazy)
         end
     end
   end
+
+  # The steps of a starter whose copy stopped: the stop of its stream
+  # process, the state "readable", and the stop of a stream process with no
+  # use. A start that continued after a kill of a different starter can
+  # register itself between the first two steps. See `tla/LazyStream.tla`.
+
+  @doc false
+  def __stop_started__(pid) do
+    Web.Stream.stop(pid)
+    :ok
+  end
+
+  @doc false
+  def __rollback__(lazy) do
+    _ = :atomics.compare_exchange(lazy.ref, 1, @starting, @readable)
+    :ok
+  end
+
+  @doc false
+  def __rollback_reap__(lazy), do: stop_unused(lazy)
 
   # The state after the start: "process" for a stream process that has the
   # bytes, and "taken" for a closed stream process.

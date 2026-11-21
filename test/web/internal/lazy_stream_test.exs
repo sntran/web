@@ -1,5 +1,6 @@
 defmodule Web.Internal.LazyStreamTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   alias Web.Internal.LazyStream
   alias Web.ReadableStream
@@ -22,16 +23,25 @@ defmodule Web.Internal.LazyStreamTest do
   end
 
   # A process that registers itself as the stream process of `lazy`, and
-  # tells it to `parent`.
+  # tells it to `parent`. It answers each call, such as the keep of a copy,
+  # with `:ok`.
   defp fake_stream(lazy, parent) do
     spawn(fn ->
       {:ok, _owner} = Registry.register(LazyStream.registry(), lazy.ref, nil)
       send(parent, :registered)
-
-      receive do
-        :stop -> :ok
-      end
+      fake_loop()
     end)
+  end
+
+  defp fake_loop do
+    receive do
+      {:"$gen_call", from, _request} ->
+        GenServer.reply(from, :ok)
+        fake_loop()
+
+      :stop ->
+        :ok
+    end
   end
 
   # The process waits for the answer of a call.
@@ -196,9 +206,12 @@ defmodule Web.Internal.LazyStreamTest do
         end)
 
       assert_receive :starting
-      copy = Task.async(fn -> LazyStream.state(lazy) end)
 
-      # The copy waits for the end of the starter, with no time limit.
+      # The state has no change: no process took the bytes.
+      assert LazyStream.state(lazy) == :readable
+      copy = Task.async(fn -> LazyStream.take(lazy) end)
+
+      # A claim waits for the end of the starter, with no time limit.
       wait_until(fn -> waits_for_down?(copy.pid) end)
       send(starter, :go)
       assert_receive {:stream, stream_pid}
@@ -310,9 +323,41 @@ defmodule Web.Internal.LazyStreamTest do
       assert_receive :registered
       :atomics.put(lazy.ref, 1, 4)
 
+      # The state tells the process, with no change. A stream read sets the
+      # state.
       assert LazyStream.state(lazy) == {:process, stream_pid}
+      assert :atomics.get(lazy.ref, 1) == 4
+      assert LazyStream.process(lazy, self()) == {:ok, stream_pid}
       assert :atomics.get(lazy.ref, 1) == 5
       send(stream_pid, :stop)
+    end
+
+    # The cell of a start that stopped, the state of the bytes, and the
+    # chunks of a later read.
+    @stopped_starts [
+      {4, :readable, false, ["hello"]},
+      {6, :consumed, true, []}
+    ]
+
+    property "a look at the state after a start that stopped starts no process" do
+      check all({cell, state, disturbed?, chunks} <- member_of(@stopped_starts)) do
+        stream = ReadableStream.from("hello")
+
+        # The cell has the value of a start, no process has the key, and the
+        # registry has no stream process.
+        :atomics.put(stream.lazy.ref, 1, cell)
+
+        assert LazyStream.state(stream.lazy) == state
+        assert ReadableStream.disturbed?(stream) == disturbed?
+        refute ReadableStream.locked?(stream)
+        assert Web.Response.body_used?(%Web.Response{body: stream}) == disturbed?
+        assert Registry.lookup(LazyStream.registry(), stream.lazy.ref) == []
+        assert Registry.lookup(LazyStream.registry(), {stream.lazy.ref, :start}) == []
+        assert :atomics.get(stream.lazy.ref, 1) == cell
+
+        # A stream read continues the start.
+        assert read_all(ReadableStream.get_reader(stream)) == chunks
+      end
     end
   end
 

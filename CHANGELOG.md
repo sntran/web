@@ -1229,6 +1229,16 @@ All notable changes to this project are documented in this file.
   give, for example after a start that continued, stops. `tla/LazyStream.tla`
   has each of these cases as a value of `Bug`, also a claim that could take
   the bytes of a new stream process (ABA), which the model check found.
+- A look at the state of a body in memory (`disturbed?`, `locked?`, and
+  `body_used`) changes nothing, and starts no process. Before, a look
+  during a start that stopped started a new starter. A start gives
+  "not disturbed" until its stream process has a read, and a start of a
+  closed stream gives "disturbed". `tla/LazyStream.tla` has the old
+  behavior as a value of `Bug`, and a new invariant finds it. Tests do
+  the steps of a claim and of a starter in the sequence of the model
+  counterexamples (the ABA of the claim, and a stream process that
+  starts during the rollback of a starter). Each test fails with the old
+  behavior.
 - When the owner of a transform stream fails, a side ends only when no
   lock of the two sides exists: the side asks the other side, which
   decides in its own process. Before, a lock that a process took at the

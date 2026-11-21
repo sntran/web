@@ -777,7 +777,7 @@ easy to make and hard to find with an example test:
 | `PipeTo.tla`         | The loop of a pipe: the flow control, the propagation, the shutdown, and the locks. |
 | `PriorityMessages.tla` | A priority message goes before the messages of other senders, never before the messages of its sender. |
 | `TransformLifetime.tla` | A lock of one side of a transform stream keeps the two sides: a side ends only after a handshake with the other side. |
-| `LazyStream.tla`     | The copies of a body in memory share one state: the bytes go out one time, and a copy that stops does not take them. |
+| `LazyStream.tla`     | The copies of a body in memory share one state: the bytes go out one time, and a copy that stops does not take them. A look at the state changes nothing. |
 | `ByteTee.tla`        | The tee of a byte stream: each read of a branch ends, and no buffer is lost. |
 | `AbortSteps.tla`     | The steps "signal abort": the dependent signals, the algorithms, then the events. |
 | `AbortTimeouts.tla`  | The timeouts of one process abort in their sequence. |

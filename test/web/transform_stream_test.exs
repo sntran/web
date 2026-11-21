@@ -47,6 +47,27 @@ defmodule Web.TransformStreamTest do
     end
   end
 
+  # The owner makes the stream, and then waits. The test stops it.
+  defp owned_transform do
+    test = self()
+
+    owner =
+      spawn(fn ->
+        send(test, {:made, TransformStream.new()})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:made, transform}
+    {owner, transform}
+  end
+
+  # The call of the default transform from the writable side. Its tag names
+  # the writable side.
+  defp transform_write_of?({:"$gen_call", {pid, {:"$web_sent", pid, ref}}, request}, pid),
+    do: is_reference(ref) and match?({:transform_write, _chunk}, request)
+
+  defp transform_write_of?(_message, _pid), do: false
+
   # The trace messages of the messages that `pid` got.
   defp received_messages(pid) do
     :erlang.trace(pid, false, [:receive])
@@ -381,6 +402,7 @@ defmodule Web.TransformStreamTest do
 
     test "costs no message when it changes, and one message for each held write" do
       transform = TransformStream.new()
+      readable = transform.readable.controller_pid
       writable = transform.writable.controller_pid
       writer = WritableStream.get_writer(transform.writable)
       reader = ReadableStream.get_reader(transform.readable)
@@ -406,7 +428,9 @@ defmodule Web.TransformStreamTest do
       releases =
         writable
         |> received_messages()
-        |> Enum.count(&(&1 == {:"$gen_cast", {:transform_backpressure, false}}))
+        |> Enum.count(
+          &match?({:"$gen_cast", {:"$web_sent", ^readable, {:transform_backpressure, false}}}, &1)
+        )
 
       assert releases == 1
     end
@@ -468,6 +492,54 @@ defmodule Web.TransformStreamTest do
       assert Enum.take(result, 3) == [1, 2, 3]
       Process.sleep(100)
       assert :counters.get(counter, 1) <= pulled_with_no_reader + 6
+    end
+  end
+
+  describe "the lock rule of the two sides" do
+    test "a side that asked grants no lock until the answer, and ends when the other side stops" do
+      {owner, transform} = owned_transform()
+      readable = transform.readable.controller_pid
+      writable = transform.writable.controller_pid
+
+      # The owner fails: the readable side has no linger time, and no lock.
+      # It asks the writable side, which does not answer.
+      :erlang.suspend_process(writable)
+      Process.exit(owner, :kill)
+      eventually(fn -> slots(transform).transform.ending end)
+
+      # The request names its sender, thus a priority message of the same
+      # side cannot pass it.
+      {:messages, messages} = Process.info(writable, :messages)
+      ask = {:transform_end, :ask, {:owner_down, :killed}}
+      assert {:"$gen_cast", {:"$web_sent", readable, ask}} in messages
+
+      # A request for a lock waits in the readable side.
+      reader = Task.async(fn -> ReadableStream.get_reader(transform.readable) end)
+      eventually(fn -> length(slots(transform).transform.deferred) == 1 end)
+      assert Task.yield(reader, 0) == nil
+
+      # The writable side stops before its answer. The readable side ends by
+      # the owner rule, and then it grants the lock of the request.
+      Process.exit(writable, :kill)
+      assert %Reader{} = Task.await(reader)
+      assert %{state: :closed, transform: %{ending: false, deferred: []}} = slots(transform)
+    end
+
+    test "each message between the two sides names its sender" do
+      transform = TransformStream.new()
+      readable = transform.readable.controller_pid
+      writable = transform.writable.controller_pid
+      :erlang.trace(readable, true, [:receive])
+
+      writer = WritableStream.get_writer(transform.writable)
+      eventually(fn -> slots(transform).transform.peer_locked end)
+      read = Reader.read(ReadableStream.get_reader(transform.readable))
+      assert await(Writer.write(writer, :chunk)) == :ok
+      assert await(read) == %{value: :chunk, done: false}
+
+      messages = received_messages(readable)
+      assert {:"$gen_cast", {:"$web_sent", writable, {:transform_peer_locked, true}}} in messages
+      assert Enum.any?(messages, &transform_write_of?(&1, writable))
     end
   end
 

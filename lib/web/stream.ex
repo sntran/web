@@ -379,6 +379,7 @@ defmodule Web.Stream do
   # JavaScript, the reactions to that start come before the reaction to
   # each later operation. Thus the later operations find the processes
   # started. See `tla/TransformStream.tla`.
+
   def run_start(pids, start_fn, controller, opts \\ [])
 
   def run_start(pids, start_fn, controller, opts) when is_list(pids) do
@@ -464,7 +465,8 @@ defmodule Web.Stream do
     :transform_error_if_needed,
     :transform_finish,
     :transform_finished,
-    :transform_write
+    :transform_write,
+    :transform_end
   ]
 
   # The requests of `Web.ReadableByteStreamController` and
@@ -1153,6 +1155,20 @@ defmodule Web.Stream do
   defp handle_common(:cast, {:error, reason}, state, %{transform: %{side: :readable}} = data),
     do: handle_transform(:cast, {:error, reason}, state, data)
 
+  # A side of a transform stream that asked the other side for the end of
+  # the two sides grants no lock until the answer: see "The lock rule of the
+  # two sides". The request waits in the side, and the side handles it
+  # after the answer.
+  defp handle_common(
+         {:call, _from} = type,
+         {request, _pid, _mode} = content,
+         _state,
+         %{transform: %{ending: true} = transform} = data
+       )
+       when request in [:get_reader, :get_writer] do
+    {:keep_state, put_transform(data, deferred: [{type, content} | transform.deferred])}
+  end
+
   # Reader lock acquisition
   defp handle_common({:call, from}, {:get_reader, pid}, state, data)
        when data.type in [:producer, :producer_consumer] do
@@ -1786,6 +1802,12 @@ defmodule Web.Stream do
     {:keep_state, %{data | abort_window: %{window | held: [message | window.held]}}}
   end
 
+  # The reply of the readable side to the default transform. The tag of the
+  # call names its sender: see `run_write_task/2`.
+  defp handle_common(:info, {{@sent, _sender, ref}, result}, state, data)
+       when is_reference(ref),
+       do: handle_common(:info, {ref, result}, state, data)
+
   # The result of a callback: `{ref, result}` from the worker.
   defp handle_common(:info, {ref, result}, state, data) when is_reference(ref) do
     # The worker stays: remove the monitor of this callback.
@@ -1832,7 +1854,9 @@ defmodule Web.Stream do
 
   # The process of the other side of a transform stream stopped: its lock
   # does not keep this side. The default transform that it did not answer
-  # fails: see `run_write_task/2`.
+  # fails: see `run_write_task/2`. A side that asked for the end of the two
+  # sides gets no answer: it ends, as the other side has no lock. See "The
+  # lock rule of the two sides".
   defp handle_common(
          :info,
          {:DOWN, ref, :process, _pid, _reason},
@@ -1842,13 +1866,16 @@ defmodule Web.Stream do
        when is_reference(ref) do
     data = put_transform(data, peer_ref: nil, peer_locked: false)
 
-    case data.active_task do
-      %{enqueue: true, ref: task} ->
-        handle_common(:info, {task, {:error, enqueue_refusal_error(:closed)}}, state, data)
+    result =
+      case data.active_task do
+        %{enqueue: true, ref: task} ->
+          handle_common(:info, {task, {:error, enqueue_refusal_error(:closed)}}, state, data)
 
-      _other ->
-        {:keep_state, data}
-    end
+        _other ->
+          {:keep_state, data}
+      end
+
+    if data.transform.ending, do: end_after_answer(result, state, data), else: result
   end
 
   # The process of the ambient AbortSignal stopped with no abort. A signal
@@ -1949,10 +1976,7 @@ defmodule Web.Stream do
     if state in [:closed, :errored] do
       {:stop, :normal, data}
     else
-      # No process can read the chunks in the queue. Discard them, thus the
-      # stream stops immediately after the terminal event.
-      data = %{data | queue: :queue.new(), total_queued_size: 0}
-      handle_termination(owner_down_type(data), data.owner_down_reason, data)
+      owner_rule(data)
     end
   end
 
@@ -2880,6 +2904,33 @@ defmodule Web.Stream do
   # A stream process never waits for the other stream process. The reply of
   # the default transform comes to the writable side as a usual message.
   # Only the workers wait for the replies of the two processes.
+  #
+  # Each message between the two processes names its sender: see "Priority
+  # messages". Thus a priority message of one side does not pass the usual
+  # messages that the side sent before it.
+  #
+  # The lock rule of the two sides
+  #
+  # For the lifetime rules, the two sides are one stream: a lock of one side
+  # keeps the two sides. Each side keeps a copy of the lock of the other
+  # side: see `notify_peer_lock/2`. The copy can be late, because a lock of
+  # the other side can be in a message. Thus an active side that the owner
+  # rule ends asks the other side first, and the other side decides in its
+  # own process (the handshake):
+  #
+  #   1. At the end of its linger time, the side sends
+  #      `{:transform_end, :ask, reason}`. Until the answer, it grants no
+  #      lock: a request for a lock waits in the side.
+  #   2. The other side answers `:denied` when it has a lock. Else it ends
+  #      by the owner rule, and answers `:agreed`. A complete side agrees.
+  #   3. The side ends when the other side agrees, or when the other side
+  #      stopped. After a denial it stays: the lock message came before the
+  #      denial, thus its copy keeps it until that lock changes.
+  #
+  # Thus a side ends by the owner rule only when no lock of the two sides
+  # exists. Each request and each answer is a usual message, and each side
+  # handles each message: no side waits for the other side. See
+  # `tla/TransformLifetime.tla`.
   # ---------------------------------------------------------------------------
 
   @backpressure_off 0
@@ -2895,12 +2946,16 @@ defmodule Web.Stream do
     cell
   end
 
+  # `ending` is `true` while the side waits for the answer of the
+  # handshake, and `deferred` has the requests for a lock that wait.
   defp transform_side({:readable, writable, cell}) do
     %{
       side: :readable,
       peer: writable,
       peer_ref: Process.monitor(writable),
       peer_locked: false,
+      ending: false,
+      deferred: [],
       cell: cell,
       finish: nil,
       cleared: false
@@ -2909,13 +2964,55 @@ defmodule Web.Stream do
 
   # `enqueue` is `true` for the default transform.
   defp transform_side({:writable, cell, enqueue}) do
-    %{side: :writable, peer: nil, peer_ref: nil, peer_locked: false, cell: cell, enqueue: enqueue}
+    %{
+      side: :writable,
+      peer: nil,
+      peer_ref: nil,
+      peer_locked: false,
+      ending: false,
+      deferred: [],
+      cell: cell,
+      enqueue: enqueue
+    }
   end
 
   defp transform_side(nil), do: nil
 
   defp put_transform(%{transform: transform} = data, changes) do
     %{data | transform: Map.merge(transform, Map.new(changes))}
+  end
+
+  # The owner rule for a stream that is not complete, at the end of its
+  # linger time. An active side of a transform stream asks the other side
+  # first: see "The lock rule of the two sides".
+  defp owner_rule(%{transform: %{peer_ref: ref} = transform} = data) when is_reference(ref) do
+    control_cast(transform.peer, {:transform_end, :ask, data.owner_down_reason})
+    {:keep_state, put_transform(data, ending: true)}
+  end
+
+  defp owner_rule(data), do: owner_rule_end(data)
+
+  # No process can read the chunks in the queue. Discard them, thus the
+  # stream stops immediately after the terminal event.
+  defp owner_rule_end(data) do
+    data = %{data | queue: :queue.new(), total_queued_size: 0}
+    handle_termination(owner_down_type(data), data.owner_down_reason, data)
+  end
+
+  # The end of a side by the owner rule, after the handshake. A complete
+  # side has no work. A closed side with chunks discards them, as a cancel.
+  defp owner_rule_finish(state, data),
+    do: if(final?(state, data), do: {:keep_state, data}, else: owner_rule_end(data))
+
+  # The handshake is complete: the requests for a lock that waited come
+  # now, in their sequence.
+  defp end_after_answer(result, state, data) do
+    {next_state, new_data, actions} = transition(result, state, data)
+    deferred = Enum.reverse(new_data.transform.deferred)
+    events = for {type, content} <- deferred, do: {:next_event, type, content}
+
+    {:next_state, next_state, put_transform(new_data, ending: false, deferred: []),
+     actions ++ events}
   end
 
   # TransformStreamSetBackpressure, on the readable side. The backpressure
@@ -2928,7 +3025,7 @@ defmodule Web.Stream do
 
   defp transform_backpressure(%{transform: %{cell: cell} = transform} = data, false) do
     if :atomics.exchange(cell, 1, @backpressure_off) == @backpressure_held do
-      :gen_statem.cast(transform.peer, {:transform_backpressure, false})
+      control_cast(transform.peer, {:transform_backpressure, false})
     end
 
     data
@@ -3051,6 +3148,28 @@ defmodule Web.Stream do
         {:keep_state_and_data, [{:reply, from, {:error, refusal}}]}
     end
   end
+
+  # The handshake of the lock rule: the other side asks for the end of the
+  # two sides. This side decides in its own process: see "The lock rule of
+  # the two sides". A lock of a complete side keeps nothing. The side that
+  # asks gives the reason of the stop of the owner: this side can get its
+  # own monitor message later.
+  defp handle_transform(:cast, {:transform_end, :ask, reason}, state, data) do
+    if own_lock?(data) and not final?(state, data) do
+      control_cast(data.transform.peer, {:transform_end, :denied})
+      {:keep_state, data}
+    else
+      control_cast(data.transform.peer, {:transform_end, :agreed})
+      owner_rule_finish(state, %{data | owner_down_reason: data.owner_down_reason || reason})
+    end
+  end
+
+  # The answer of the handshake.
+  defp handle_transform(:cast, {:transform_end, :agreed}, state, data),
+    do: end_after_answer(owner_rule_finish(state, data), state, data)
+
+  defp handle_transform(:cast, {:transform_end, :denied}, state, data),
+    do: end_after_answer({:keep_state, data}, state, data)
 
   # TransformStreamDefaultControllerPerformTransform with the default
   # transform, from the writable side: see `run_write_task/2`. The reply is
@@ -3196,7 +3315,11 @@ defmodule Web.Stream do
     ref = make_ref()
 
     if transform.peer_ref,
-      do: send(transform.peer, {:"$gen_call", {self(), ref}, {:transform_write, chunk}}),
+      do:
+        send(
+          transform.peer,
+          {:"$gen_call", {self(), {@sent, self(), ref}}, {:transform_write, chunk}}
+        ),
       else: send(self(), {ref, {:error, enqueue_refusal_error(:closed)}})
 
     task = %{ref: ref, pid: transform.peer, external: true, enqueue: true}
@@ -4080,7 +4203,10 @@ defmodule Web.Stream do
     end
   end
 
-  # The stream has work, or chunks that are not read.
+  # The stream has work, or chunks that are not read. A side of a transform
+  # stream that waits for the answer of the handshake has no timer.
+  defp unread_linger(%{transform: %{ending: true}}), do: nil
+
   defp unread_linger(data) do
     cond do
       locked?(data) -> nil
@@ -4106,8 +4232,9 @@ defmodule Web.Stream do
   # The two sides of a transform stream are one stream for these rules: a
   # lock of one side keeps the two sides. Each side tells the other side when
   # its own lock changes: see `notify_peer_lock/2`. Each side monitors the
-  # other side: a stop of the other side clears its lock. See
-  # `tla/TransformLifetime.tla`.
+  # other side: a stop of the other side clears its lock. An active side
+  # ends by the owner rule only after the handshake of "The lock rule of the
+  # two sides". See `tla/TransformLifetime.tla`.
   defp locked?(data), do: own_lock?(data) or peer_locked?(data)
 
   defp own_lock?(data) do
@@ -4120,7 +4247,7 @@ defmodule Web.Stream do
   defp notify_peer_lock(%{transform: %{peer: peer}} = old, new) when is_pid(peer) do
     if lock_fields(old) != lock_fields(new) do
       locked = own_lock?(new)
-      if own_lock?(old) != locked, do: :gen_statem.cast(peer, {:transform_peer_locked, locked})
+      if own_lock?(old) != locked, do: control_cast(peer, {:transform_peer_locked, locked})
     end
 
     :ok

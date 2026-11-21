@@ -398,4 +398,56 @@ defmodule Web.TLA.ModelCheckTest do
       )
     end
   end
+
+  describe "PipeAbort" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("PipeAbort"))
+    end
+
+    test "a pipe that sends the cancel with the abort is found" do
+      assert_violates(SpecModel.check("PipeAbort", bug("parallel")), "AbortFirst")
+    end
+
+    test "a notice that the worker sends to the pipe is found" do
+      assert_violates(SpecModel.check("PipeAbort", bug("direct_notice")), "NoLateNotice")
+    end
+
+    test "a notice after the reply at the time limit is found" do
+      assert_violates(SpecModel.check("PipeAbort", bug("relay_unchecked")), "NoLateNotice")
+    end
+
+    test "a pipe that waits only for the notice is found" do
+      assert_violates(SpecModel.check("PipeAbort", bug("keeps_waiting")), "Progress")
+    end
+
+    # A state where the source has its cancel while the write is in flight
+    # is possible in the design, and not with the bug.
+    test "a destination that sends no notice while a write is in flight is found" do
+      cancel_waits = {"    NoLateNotice\n", "    NoLateNotice\n    CancelWaitsForWrite\n"}
+      assert_violates(SpecModel.check("PipeAbort", [cancel_waits]), "CancelWaitsForWrite")
+      assert_holds(SpecModel.check("PipeAbort", [bug("no_early_notice"), cancel_waits]))
+    end
+  end
+
+  describe "PublicAbort" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("PublicAbort"))
+    end
+
+    test "an abort that comes before the requests of the listeners is found" do
+      assert_violates(SpecModel.check("PublicAbort", bug("no_barrier")), "CloseFirst")
+    end
+
+    test "an abort as a usual message is found: a later priority message comes before it" do
+      assert_violates(SpecModel.check("PublicAbort", bug("usual_rest")), "ErrorAfter")
+    end
+
+    test "a result of the worker that the stream handles before the abort is found" do
+      assert_violates(SpecModel.check("PublicAbort", bug("no_hold")), "ResultAfter")
+    end
+
+    test "a window that stays after the stop of the caller is found" do
+      assert_violates(SpecModel.check("PublicAbort", bug("keep_window")), "Progress")
+    end
+  end
 end

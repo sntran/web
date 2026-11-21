@@ -332,8 +332,8 @@ defmodule Web.Internal.ReadableStreamPipe do
       else: shutdown(state, {:cancel, error}, {:error, error})
   end
 
-  # The abort algorithm of the signal: an abort of the destination and a
-  # cancel of the source, at the same time.
+  # The abort algorithm of the signal: an abort of the destination, and
+  # then a cancel of the source. The pipe waits for the two actions.
   defp abort_algorithm(state, reason) do
     actions =
       Enum.reject(
@@ -374,17 +374,22 @@ defmodule Web.Internal.ReadableStreamPipe do
 
   # Starts the action. Returns the tags of the calls, each with the function
   # that changes its answer into `:ok` or `{:error, reason}`.
-  defp start_actions(state, {:all, actions}),
-    do: Enum.flat_map(actions, &start_actions(state, &1))
+  #
+  # The actions of the abort algorithm start in their sequence. Each action
+  # starts when the action before it did the steps that the Standard does
+  # before it returns: see "The abort action of a pipe" in `Web.Stream`.
+  defp start_actions(state, {:all, actions}) do
+    Enum.flat_map(actions, fn action ->
+      state |> start_actions(action) |> Enum.map(&await_steps/1)
+    end)
+  end
+
+  # The destination checks its state: see `Web.Stream`.
+  defp start_actions(%{dest: nil}, {:abort_if_writable, _reason}), do: []
 
   defp start_actions(state, {:abort_if_writable, reason}) do
-    case slots(state.dest) do
-      %{state: dest_state} when dest_state in [:writable, :closing] ->
-        start_actions(state, {:abort, reason})
-
-      _other ->
-        []
-    end
+    tag = request(state.dest, {:pipe_abort, self(), reason})
+    [{tag, state.dest_monitor, &Function.identity/1, :steps}]
   end
 
   defp start_actions(state, {:cancel_if_readable, reason}) do
@@ -407,7 +412,7 @@ defmodule Web.Internal.ReadableStreamPipe do
     dest = slots(state.dest)
 
     cond do
-      dest_errored?(dest) -> [{:rejected, dest_stored_error(dest)}]
+      dest_errored?(dest) -> [{:settled, {:error, dest_stored_error(dest)}}]
       dest_closing?(dest) -> []
       true -> [{request(state.dest, {:close, self()}), state.dest_monitor, &close_result/1}]
     end
@@ -421,16 +426,40 @@ defmodule Web.Internal.ReadableStreamPipe do
   defp close_result({:error, {:errored, reason}}), do: {:error, reason}
   defp close_result(_closed), do: :ok
 
+  # Waits until the destination did the first steps of its abort: it sends
+  # `{:abort_steps_done, tag}`, or the reply of the abort. A stream that
+  # stopped did all its steps. The pipe takes each other message when it
+  # comes, as `collect/2` does: an answer to an earlier request, or the stop
+  # of the signal or of the source.
+  defp await_steps({tag, monitor, result, :steps} = action) do
+    receive do
+      {:abort_steps_done, ^tag} -> {tag, monitor, result}
+      {^tag, reply} -> {:settled, result.(reply)}
+      {:DOWN, ^monitor, :process, _pid, _reason} -> {:settled, :ok}
+      {other, _reply} when is_reference(other) -> await_steps(action)
+      {:DOWN, _other, :process, _pid, _reason} -> await_steps(action)
+    end
+  end
+
+  defp await_steps(action), do: action
+
   # The result of all the actions: `:ok`, or the first rejection in the
   # sequence of the actions. The pipe waits for each action, thus the result
   # does not depend on which stream answers first. It takes each answer when
   # it comes: a message that waits in the mailbox is work for the process.
-  defp wait_all([{:rejected, reason}]), do: {:error, reason}
-
   defp wait_all(actions) do
-    results = collect(actions, %{})
-    Enum.find_value(actions, :ok, fn {tag, _monitor, _result} -> error(results[tag]) end)
+    results = collect(actions, settled_results(actions))
+    Enum.find_value(actions, :ok, &error(result_of(&1, results)))
   end
+
+  # An action that has its result before the wait: a close of a destination
+  # that is errored, or an abort that a stream answered at once.
+  defp settled_results(actions) do
+    for {{:settled, result}, index} <- Enum.with_index(actions), into: %{}, do: {index, result}
+  end
+
+  defp result_of({:settled, result}, _results), do: result
+  defp result_of({tag, _monitor, _result}, results), do: Map.fetch!(results, tag)
 
   defp collect(actions, results) when map_size(results) == length(actions), do: results
 

@@ -1216,6 +1216,29 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A body in memory gives its bytes to the next reader when a copy of the
+  body stops during a stream read, or when its stream process stops before
+  its first read: no reader took the bytes. Before, the other copies
+  waited 5 s, and then got "not available". A copy that asked for the
+  stream process keeps it until it takes its lock. The steps "consume
+  body" disturb the stream and take the bytes in one step. A second start
+  of a stream process ends with no crash report. `tla/LazyStream.tla` has
+  each of these cases as a value of `Bug`.
+- When the owner of a transform stream fails, a side ends only when no
+  lock of the two sides exists: the side asks the other side, which
+  decides in its own process. Before, a lock that a process took at the
+  same moment on the other side could be missed. `tla/TransformLifetime.tla`
+  has the handshake, with the old behavior as a value of `Bug`.
+- Each message to a stream that can wait before a priority message of the
+  same process names its sender: the calls with no wait of the pipe, of
+  the tees, and of the `Web.FormData` parser, the end of a pull of a
+  source that is a process, the error of an enumerable, and the messages
+  between the two sides of a transform stream.
+- The tee of a byte stream ends its two branches when its source stopped
+  before the tee handled a pull. Before, the tee process failed with a
+  `MatchError`.
+- A BYOB read that comes between the last chunk of a body and its close
+  ends at the close. Before, it could wait forever.
 - The live parser of a multipart `Web.FormData`, with the defects that
   `tla/FormDataParser.tla` found:
   - A `get` that waits for a field gets its answer when an iteration or a

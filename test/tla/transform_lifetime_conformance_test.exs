@@ -43,6 +43,7 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
       {1, tuple({constant(:proc_stop), proc})},
       {1, constant(:close)},
       {2, tuple({constant(:read_all), proc})},
+      {2, tuple({constant(:failing_owner), side})},
       {2, constant(:pause)}
     ])
   end
@@ -56,8 +57,7 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
 
         {model, system} =
           Enum.reduce(commands, {model, system}, fn command, {model, system} ->
-            {model, system} = run(command, model, system)
-            {follow(model, system), system}
+            step(command, model, system)
           end)
 
         finish(model, system)
@@ -140,16 +140,30 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
   # One operation, on the real stream and on the specification
   # ---------------------------------------------------------------------------
 
+  # The test waits for more than the linger time. After that time, the
+  # sides did each timer step that the specification permits.
+  defp step(:pause, model, system) do
+    Process.sleep(4 * @linger)
+    {timers_done(follow(model, system), system), system}
+  end
+
+  # The real operation gives the steps of the specification. The hidden
+  # steps can come before them and after them: see `follow/3`.
+  defp step(command, model, system) do
+    {steps, system} = run(command, model, system)
+    {follow(model, system, steps), system}
+  end
+
   defp run({:lock, proc, side}, model, system) do
     args = [to_string(proc), to_string(side)]
 
     with true <- SpecModel.enabled?(model, "Lock", args),
          {:ok, handle} <- attempt(system, proc, fn -> take_lock(system.transform, side) end) do
-      {SpecModel.step!(model, "Lock", args), put_in(system.handles[{proc, side}], handle)}
+      {[{"Lock", args}], put_in(system.handles[{proc, side}], handle)}
     else
       # The side stopped at the end of its linger time: the hidden steps
       # give that state.
-      _not_enabled_or_stopped -> {model, system}
+      _not_enabled_or_stopped -> {[], system}
     end
   end
 
@@ -159,9 +173,9 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
     if SpecModel.enabled?(model, "Unlock", args) do
       handle = Map.fetch!(system.handles, {proc, side})
       _result = attempt(system, proc, fn -> release(handle) end)
-      {SpecModel.step!(model, "Unlock", args), system}
+      {[{"Unlock", args}], system}
     else
-      {model, system}
+      {[], system}
     end
   end
 
@@ -171,9 +185,9 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
       monitor = Process.monitor(pid)
       send(pid, :stop)
       assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
-      {SpecModel.step!(model, "ProcStop", [to_string(proc)]), system}
+      {[{"ProcStop", [to_string(proc)]}], system}
     else
-      {model, system}
+      {[], system}
     end
   end
 
@@ -184,8 +198,8 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
     # A close that fails came after the end of a side: the hidden steps give
     # that state.
     if SpecModel.enabled?(model, "Close") and close(model, system) == :ok,
-      do: {SpecModel.step!(model, "Close"), system},
-      else: {model, system}
+      do: {[{"Close", []}], system},
+      else: {[], system}
   end
 
   defp run({:read_all, proc}, model, system) do
@@ -196,17 +210,70 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
         attempt(system, proc, fn -> {await(Reader.read(reader)), await(Reader.read(reader))} end)
 
       assert result == {%{value: :chunk, done: false}, %{value: nil, done: true}}
-      {SpecModel.step!(model, "ReadAll", [to_string(proc)]), system}
+      {[{"ReadAll", [to_string(proc)]}], system}
     else
-      {model, system}
+      {[], system}
     end
   end
 
-  # The test waits for more than the linger time. After that time, the
-  # sides did each timer step that the specification permits.
-  defp run(:pause, model, system) do
-    Process.sleep(4 * @linger)
-    {timers_done(follow(model, system), system), system}
+  # The owner fails while the other process takes the lock of one side. The
+  # side of the lock gets the request for the lock, and then the stop of
+  # the owner. The other side gets the stop of the owner before the message
+  # of the lock. An owner that failed gives no linger time, thus that side
+  # comes to the owner rule while its copy of the lock is late. The
+  # handshake keeps the two sides.
+  defp run({:failing_owner, side}, model, system) do
+    args = ["other", to_string(side)]
+    state = SpecModel.to_map(model)
+
+    if SpecModel.enabled?(model, "Lock", args) and "owner" in state["live"] and
+         Enum.all?(state["running"], fn {_side, running} -> running end) do
+      locked = system.pids[to_string(side)]
+      other = system.pids[other_side(side)]
+      owner = system.procs.owner
+      :erlang.suspend_process(locked)
+      :erlang.suspend_process(other)
+
+      send(system.procs.other, {:run, fn -> take_lock(system.transform, side) end})
+      await_message(locked, &lock_request?/1)
+
+      monitor = Process.monitor(owner)
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^owner, :killed}
+      await_message(locked, &match?({:DOWN, _ref, :process, ^owner, _reason}, &1))
+      await_message(other, &match?({:DOWN, _ref, :process, ^owner, _reason}, &1))
+
+      # The side of the lock grants the lock, and then it gets the stop of
+      # the owner: the call `observe_side/2` comes after them.
+      :erlang.resume_process(locked)
+      assert_receive {:result, {:ok, handle}}, 2_000
+      observe_side(to_string(side), system)
+      :erlang.resume_process(other)
+
+      {[{"Lock", args}, {"ProcStop", ["owner"]}], put_in(system.handles[{:other, side}], handle)}
+    else
+      {[], system}
+    end
+  end
+
+  defp other_side(:readable), do: "writable"
+  defp other_side(:writable), do: "readable"
+
+  defp lock_request?({:"$gen_call", _from, request}) when is_tuple(request),
+    do: elem(request, 0) in [:get_reader, :get_writer]
+
+  defp lock_request?(_message), do: false
+
+  # Waits until the mailbox of the process has a message for which `fun`
+  # gives true. The process can be suspended.
+  defp await_message(pid, fun, attempts \\ 400) do
+    {:messages, messages} = Process.info(pid, :messages)
+
+    cond do
+      Enum.any?(messages, fun) -> :ok
+      attempts == 0 -> flunk("the message did not come")
+      true -> Process.sleep(5) && await_message(pid, fun, attempts - 1)
+    end
   end
 
   defp close(model, system) do
@@ -238,8 +305,8 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
   defp finish(model, system) do
     model =
       Enum.reduce(@procs, model, fn proc, model ->
-        {model, _system} = run({:proc_stop, proc}, model, system)
-        {model, _system} = run(:pause, follow(model, system), system)
+        {model, _system} = step({:proc_stop, proc}, model, system)
+        {model, _system} = step(:pause, model, system)
         model
       end)
 
@@ -271,27 +338,29 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
   # The hidden steps
   # ---------------------------------------------------------------------------
 
-  # Finds the states that the hidden steps give from the model, and returns
-  # a state that has the state of the real sides, with no message in the
-  # inboxes: the real messages come in some microseconds. The real sides
-  # can be in a step: the test looks again some times.
-  defp follow(model, system, attempts \\ 100) do
+  # Finds the states that the steps of the operation, in their sequence,
+  # and the hidden steps before and between and after them give from the
+  # model. Returns a state that has the state of the real sides, with no
+  # message in the inboxes: the real messages come in some microseconds.
+  # The real sides can be in a step: the test looks again some times.
+  defp follow(model, system, steps \\ [], attempts \\ 100) do
     observed = observe(system)
 
     states =
-      model
-      |> reachable()
-      |> Enum.filter(&(inbox_length(&1) == 0 and matches?(&1, observed)))
+      for {state, []} <- reachable({model, steps}),
+          inbox_length(state) == 0 and matches?(state, observed),
+          do: state
 
     case states do
       [] when attempts > 0 ->
         Process.sleep(5)
-        follow(model, system, attempts - 1)
+        follow(model, system, steps, attempts - 1)
 
       [] ->
         flunk(
           "the specification permits no state of the real sides: " <>
-            "#{inspect(observed)}, from #{inspect(SpecModel.to_map(model))}"
+            "#{inspect(observed)}, from #{inspect(SpecModel.to_map(model))} " <>
+            "with the steps #{inspect(steps)}"
         )
 
       [state | _others] ->
@@ -299,24 +368,34 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
     end
   end
 
-  defp reachable(model), do: reachable([model], MapSet.new([key(model)]), [model])
+  defp reachable(start), do: reachable([start], MapSet.new([key(start)]), [start])
 
   defp reachable([], _seen, found), do: found
 
-  defp reachable([model | rest], seen, found) do
-    next =
+  defp reachable([{model, steps} | rest], seen, found) do
+    hidden =
       for {action, args} <- @hidden,
           SpecModel.enabled?(model, action, args),
-          state = SpecModel.step!(model, action, args),
-          not MapSet.member?(seen, key(state)),
-          do: state
+          do: {SpecModel.step!(model, action, args), steps}
 
-    next = Enum.uniq_by(next, &key/1)
+    next =
+      case steps do
+        [{action, args} | later] ->
+          if SpecModel.enabled?(model, action, args),
+            do: [{SpecModel.step!(model, action, args), later} | hidden],
+            else: hidden
+
+        [] ->
+          hidden
+      end
+      |> Enum.reject(&MapSet.member?(seen, key(&1)))
+      |> Enum.uniq_by(&key/1)
+
     seen = Enum.reduce(next, seen, &MapSet.put(&2, key(&1)))
     reachable(rest ++ next, seen, found ++ next)
   end
 
-  defp key(model), do: SpecModel.to_map(model)
+  defp key({model, steps}), do: {SpecModel.to_map(model), steps}
 
   defp inbox_length(model) do
     model |> SpecModel.get("inbox") |> Map.values() |> Enum.map(&length/1) |> Enum.sum()
@@ -334,9 +413,10 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
         :stopped ->
           not state["running"][side]
 
-        %{phase: phase, lock: lock, copy: copy} ->
+        %{phase: phase, lock: lock, copy: copy, ending: ending} ->
           state["running"][side] and state["phase"][side] == phase and
-            state["lock"][side] == lock and state["copy"][side] == copy
+            state["lock"][side] == lock and state["copy"][side] == copy and
+            state["asking"][side] == ending
       end
     end)
   end
@@ -363,7 +443,8 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
         %{
           phase: phase(side, slots),
           lock: lock_name(side, slots, system),
-          copy: slots.transform.peer_locked
+          copy: slots.transform.peer_locked,
+          ending: slots.transform.ending
         }
 
       _stopped ->

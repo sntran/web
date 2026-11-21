@@ -27,7 +27,8 @@ defmodule Web.Test.QuickJS.WPT do
   # cause that the runner cannot remove. Such a test can pass or fail.
   @real_time "runner: a timer of the library runs in real time between two statements of JavaScript"
   @slow_calls "runner: each call waits until the library is at rest, and the test allows 200 ms for some calls"
-  @unstable [@real_time, @slow_calls]
+  @deferred_race "runner: a deferred call of the layer and the next statement of JavaScript race"
+  @unstable [@real_time, @slow_calls, @deferred_race]
 
   @doc "Runs the WPT file at `path`, and compares the results with the list."
   def check!(path) do
@@ -153,6 +154,14 @@ defmodule Web.Test.QuickJS.WPT do
   # The rules, in their sequence: the first rule that gives a group wins.
   defp causes do
     [
+      # The read of next() makes the stream pull again. In JavaScript the
+      # pull runs before read() returns. In the runner, the call of that
+      # pull is deferred, and does not hold the answer of the read: the
+      # cancel of return() can come first. On a busy machine, the pull
+      # sometimes comes first (2 to 3 runs of 40, also before round 5). The
+      # same race is in the variant with no await.
+      {:test, "streams/readable-streams/async-iterator.any.js",
+       ~r/^next\(\) that succeeds; return\(\)( \[no awaiting\])?$/, @deferred_race},
       # The views of the library are `Web.Uint8Array` values. A BYOB read
       # into a view with elements of more than one byte, or into a
       # `DataView`, needs a view type of that kind.

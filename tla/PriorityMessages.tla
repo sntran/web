@@ -13,6 +13,11 @@
 (* message of a channel comes to the mailbox at a time that the model does  *)
 (* not fix. S can stop at each step.                                        *)
 (*                                                                          *)
+(* Each usual message tells its sender: the stream finds the messages of S  *)
+(* by their sender. A message with no sender comes from a process that sends *)
+(* no priority message to the stream, and the stream handles it after the    *)
+(* abort.                                                                    *)
+(*                                                                          *)
 (* The constant Bug is "none" for the design. Each other value removes one  *)
 (* rule of the design. "no_fence" is the design before the fence.           *)
 EXTENDS Naturals, Sequences
@@ -99,7 +104,11 @@ OComes ==
 IsS(x) == x = "S1"
 Any(x) == x # "F"
 Before == SubSeq(box, 2, Index(box, "F") - 1)
-Earlier == IF Bug = "take_all" THEN Select(Before, Any) ELSE Select(Before, IsS)
+\* With Bug "no_sender", the write of S does not tell its sender: the stream
+\* cannot find it, and handles it after the abort.
+Earlier == CASE Bug = "take_all" -> Select(Before, Any)
+             [] Bug = "no_sender" -> <<>>
+             [] OTHER -> Select(Before, IsS)
 Rest == Select(Tail(box), LAMBDA x : x # "F" /\ ~Has(Earlier, x))
 
 \* The stream handles the first message of its mailbox. For the abort, it

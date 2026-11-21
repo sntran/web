@@ -561,12 +561,12 @@ defmodule Web.ReadableStream do
 
         case produce_chunk(state.enumerable, stream) do
           {:more, enumerable} ->
-            send(stream, {ref, :pulled})
+            Web.Stream.__send_info__(stream, {ref, :pulled})
             enumerator_loop(%{state | enumerable: enumerable})
 
           # The enumerable is complete, or it failed, or a cancel stopped it.
           :ended ->
-            send(stream, {ref, :pulled})
+            Web.Stream.__send_info__(stream, {ref, :pulled})
         end
 
       # The cancel callback of the stream sends `:stop`. The enumerator also
@@ -602,7 +602,7 @@ defmodule Web.ReadableStream do
       # The stream gets the error as the error of a pull: an exception for a
       # raise, and the value for a throw or an exit.
       {:raised, kind, reason, stacktrace} ->
-        :gen_statem.cast(stream, {:error, Exception.normalize(kind, reason, stacktrace)})
+        Web.Stream.__usual_cast__(stream, {:error, Exception.normalize(kind, reason, stacktrace)})
         :ended
     end
   end

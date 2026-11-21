@@ -1416,6 +1416,11 @@ defmodule Web.FormDataTest do
     capture_log(fn ->
       assert {:error, _reason} =
                Web.FormData.Parser.start_link(stream, "owner-crash-boundary", owner: 123)
+
+      # The helper fails on purpose. The emulator gives its report to the
+      # process `logger_proxy`, which logs it later: the report comes in
+      # this capture when that process handled the messages that it has now.
+      _state = :sys.get_state(:logger_proxy)
     end)
   end
 

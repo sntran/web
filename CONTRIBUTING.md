@@ -184,7 +184,11 @@ Examine the output of each run for a crash report of a process of the
 library (`[error] GenServer ... terminating`, or an exception of a
 process). Such a crash can fail no test, for example at the end of a test
 when the processes stop in a different sequence. It is a defect: find its
-sequence, and write a test that makes that sequence.
+sequence, and write a test that makes that sequence. A test that makes a
+process fail on purpose captures the report with `capture_log/1`, and waits
+in the capture until the logger has it: the emulator gives the report of a
+plain process to `logger_proxy`, which logs it later
+(`:sys.get_state(:logger_proxy)`).
 
 ## Benchmarks
 

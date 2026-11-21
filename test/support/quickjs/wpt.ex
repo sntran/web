@@ -159,6 +159,16 @@ defmodule Web.Test.QuickJS.WPT do
       {:test, "streams/readable-byte-streams/general.any.js", ~r/Uint16Array|Uint32Array/,
        @no_view_type},
       {:test, "streams/readable-byte-streams/read-min.any.js", ~r/Uint16Array|DataView/,
+       @no_view_type},
+      # These two tests read into a `Uint16Array` and a `BigUint64Array`, but
+      # their names do not tell it. With a byte view, the first read fills
+      # its view with one byte, and the byobRequest of the pull is null. The
+      # second test checks the type of the view of the result.
+      {:test, "streams/readable-byte-streams/general.any.js",
+       "ReadableStream with byte source: cancel() with partially filled pending pull() request",
+       @no_view_type},
+      {:test, "streams/readable-byte-streams/patched-global.any.js",
+       "Patched then() sees byobRequest after filling all pending pull-into descriptors",
        @no_view_type}
     ] ++ microtask_causes() ++ file_api_dom_causes() ++ base_causes()
   end

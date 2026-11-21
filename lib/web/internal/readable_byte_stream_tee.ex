@@ -5,9 +5,12 @@ defmodule Web.Internal.ReadableByteStreamTee do
   #
   # One process holds the reader lock of the source and keeps the state of
   # the algorithm. The two branches are byte streams. The `pull` callback of
-  # a branch gives the BYOB request of the branch to this process, and the
-  # `cancel` callback records the cancel. The two callbacks do not wait.
+  # a branch sends a pull to this process, and the `cancel` callback records
+  # the cancel. The two callbacks do not wait.
   #
+  #   * pull1Algorithm and pull2Algorithm take the BYOB request of the branch
+  #     when they run: here, when this process starts the read. A BYOB
+  #     request of the time of the message can be old: its read ended.
   #   * A pull of a branch with no BYOB request reads the source with a
   #     default reader. The chunk goes to the two branches: the second
   #     branch gets a copy.
@@ -52,10 +55,9 @@ defmodule Web.Internal.ReadableByteStreamTee do
   @spec attach(pid(), pid(), pid()) :: :ok
   def attach(tee, branch1, branch2), do: GenServer.call(tee, {:attach, branch1, branch2})
 
-  # The pull algorithm of a branch, with the BYOB request of the branch at
-  # the time of the pull.
-  @spec pull(pid(), index(), ReadableStreamBYOBRequest.t() | nil) :: :ok
-  def pull(tee, index, request), do: GenServer.cast(tee, {:pull, index, request})
+  # The pull algorithm of a branch.
+  @spec pull(pid(), index()) :: :ok
+  def pull(tee, index), do: GenServer.cast(tee, {:pull, index})
 
   # The cancel algorithm of a branch: see `Web.Internal.ReadableStreamTee`.
   @spec cancel(pid(), index(), term()) :: Web.Promise.t()
@@ -138,15 +140,15 @@ defmodule Web.Internal.ReadableByteStreamTee do
     {:noreply, state}
   end
 
-  def handle_cast({:pull, index, _request}, %{read: {_id, _kind}} = state) do
+  def handle_cast({:pull, index}, %{read: {_id, _kind}} = state) do
     {:noreply, %{state | read_again: MapSet.put(state.read_again, index)}}
   end
 
   # A pull is a message, thus it can come after a read that gave the branch
   # its bytes. The process reads only for a branch that still wants bytes.
-  def handle_cast({:pull, index, request}, state) do
+  def handle_cast({:pull, index}, state) do
     if branch_wants_chunk?(state, index) do
-      {:noreply, pull_branch(index, request, state)}
+      {:noreply, pull_branch(index, state)}
     else
       {:noreply, state}
     end
@@ -180,11 +182,13 @@ defmodule Web.Internal.ReadableByteStreamTee do
   # The pulls
   # ---------------------------------------------------------------------------
 
-  # pull1Algorithm and pull2Algorithm.
-  defp pull_branch(_index, nil, state), do: pull_with_default_reader(state)
-
-  defp pull_branch(index, %ReadableStreamBYOBRequest{} = request, state) do
-    pull_with_byob_reader(index, request, state)
+  # pull1Algorithm and pull2Algorithm, with the BYOB request of the branch
+  # of now.
+  defp pull_branch(index, state) do
+    case ReadableByteStreamController.byob_request(controller(state, index)) do
+      nil -> pull_with_default_reader(state)
+      %ReadableStreamBYOBRequest{} = request -> pull_with_byob_reader(index, request, state)
+    end
   end
 
   defp pull_with_default_reader(state) do
@@ -303,8 +307,7 @@ defmodule Web.Internal.ReadableByteStreamTee do
         %{state | read_again: MapSet.new()}
 
       index ->
-        request = ReadableByteStreamController.byob_request(controller(state, index))
-        pull_branch(index, request, %{state | read_again: MapSet.delete(state.read_again, index)})
+        pull_branch(index, %{state | read_again: MapSet.delete(state.read_again, index)})
     end
   end
 

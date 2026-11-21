@@ -41,6 +41,21 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "ByteTee" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("ByteTee"))
+    end
+
+    # The two defects that tests found in the tee of a byte stream.
+    test "a tee that forgets a pull during a read is found" do
+      assert_violates(SpecModel.check("ByteTee", bug("lost_pull")), "ReadsEnd")
+    end
+
+    test "a tee that loses the buffer that a cancel of the source dropped is found" do
+      assert_violates(SpecModel.check("ByteTee", bug("respond_dropped")), "NoLostBuffer")
+    end
+  end
+
   describe "TransformStream" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("TransformStream"))

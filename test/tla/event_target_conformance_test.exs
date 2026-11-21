@@ -281,15 +281,6 @@ defmodule Web.TLA.EventTargetConformanceTest do
     end
   end
 
-  # The store gets the stop of p1 from the system: the test waits until the
-  # store removed its listeners.
-  defp await_removal(model, system) do
-    if SpecModel.get(model, "running"),
-      do: eventually(fn -> real_list(system) == expected_list(model, system) end)
-
-    model
-  end
-
   defp run(:owner_stop, model, system) do
     if SpecModel.enabled?(model, "OwnerStop") do
       Process.exit(system.owner, :kill)
@@ -315,6 +306,15 @@ defmodule Web.TLA.EventTargetConformanceTest do
     else
       model
     end
+  end
+
+  # The store gets the stop of p1 from the system: the test waits until the
+  # store removed its listeners.
+  defp await_removal(model, system) do
+    if SpecModel.get(model, "running"),
+      do: eventually(fn -> real_list(system) == expected_list(model, system) end)
+
+    model
   end
 
   # The linger time can be complete at this moment.

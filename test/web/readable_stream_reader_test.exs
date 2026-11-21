@@ -77,6 +77,19 @@ defmodule Web.ReadableStreamReaderTest do
       :ok = Reader.release_lock(reader)
       refute ReadableStream.locked?(stream)
     end
+
+    test "gets the error of the stream, or a TypeError after the release, from closed" do
+      {stream, controller} = readable()
+      :ok = ReadableStream.get_reader(stream.controller_pid)
+      reader = %Reader{controller_pid: stream.controller_pid}
+      closed = Reader.closed(reader)
+      :ok = Reader.release_lock(reader)
+      assert %Web.TypeError{} = rejection(closed)
+
+      :ok = ReadableStream.get_reader(stream.controller_pid)
+      Controller.error(controller, :failed)
+      assert rejection(Reader.closed(reader)) == :failed
+    end
   end
 
   describe "the cancel of an errored stream" do

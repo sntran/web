@@ -211,8 +211,12 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
 
   defp close(model, system) do
     case SpecModel.get(model, "lock")["writable"] do
+      # A close that fails is not an error of the test: see `run(:close, _, _)`.
       "none" ->
-        await(WritableStream.close(system.transform.writable))
+        case Web.Promise.wait(WritableStream.close(system.transform.writable)) do
+          {:fulfilled, :ok} -> :ok
+          {:rejected, reason} -> {:error, reason}
+        end
 
       holder ->
         proc = String.to_existing_atom(holder)

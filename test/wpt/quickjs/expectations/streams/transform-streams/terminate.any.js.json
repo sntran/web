@@ -1,7 +1,7 @@
 {
   "harness": "OK",
   "failures": {
-    "controller.error() after controller.terminate() with queued chunk should error the readable": "library: a transform stream has one state for its two sides",
-    "controller.error() after controller.terminate() without queued chunk should do nothing": "library: a transform stream has one state for its two sides"
+    "controller.error() after controller.terminate() with queued chunk should error the readable": "runner: the library does the steps of a later microtask before the call returns",
+    "controller.error() after controller.terminate() without queued chunk should do nothing": "runner: the library does the steps of a later microtask before the call returns"
   }
 }

@@ -41,6 +41,34 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "TransformStream" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("TransformStream"))
+    end
+
+    test "the design with a readable high water mark of 1 has all its properties" do
+      assert_holds(SpecModel.check("TransformStream", {"HWM = 0", "HWM = 1"}))
+    end
+
+    test "a second call of the transformer at the end is found" do
+      assert_violates(
+        SpecModel.check("TransformStream", bug("no_finish_promise")),
+        "FinishOnce"
+      )
+    end
+
+    test "a readable side that does not turn its backpressure on is found" do
+      assert_violates(
+        SpecModel.check("TransformStream", bug("no_backpressure_on")),
+        "QueueBound"
+      )
+    end
+
+    test "a write that waits after the end of the backpressure is found" do
+      assert_violates(SpecModel.check("TransformStream", bug("no_release")), "Progress")
+    end
+  end
+
   describe "StreamLifetime" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("StreamLifetime"))

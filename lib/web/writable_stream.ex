@@ -177,16 +177,18 @@ defmodule Web.WritableStream do
   # The kind `:pipe` is for the writer lock of a pipe. Such a lock does not
   # keep the stream after its owner stopped.
   def get_writer(pid, kind) when is_pid(pid) and kind in [:writer, :pipe] do
-    case Web.Stream.call(pid, {:get_writer, self(), kind}, {:error, :released}) do
-      :ok -> :ok
+    case lock_writer(pid, kind) do
+      {:ok, _lock} -> :ok
       {:error, reason} -> {:error, reason}
     end
   end
 
+  # The writer keeps the reference of its lock: see
+  # `Web.WritableStreamDefaultWriter`.
   def get_writer(%__MODULE__{controller_pid: pid}, kind) do
-    case get_writer(pid, kind) do
-      :ok ->
-        %WritableStreamDefaultWriter{controller_pid: pid, owner_pid: self()}
+    case lock_writer(pid, kind) do
+      {:ok, lock} ->
+        %WritableStreamDefaultWriter{controller_pid: pid, owner_pid: self(), lock: lock}
 
       {:error, :already_locked} ->
         raise TypeError, "WritableStream is already locked"
@@ -194,6 +196,12 @@ defmodule Web.WritableStream do
       {:error, :released} ->
         raise TypeError, "The stream is not available. It ended, or its owner stopped."
     end
+  end
+
+  # Takes the writer lock for this process. Returns `{:ok, lock}` with the
+  # reference of the lock, or `{:error, reason}`.
+  defp lock_writer(pid, kind) do
+    Web.Stream.call(pid, {:get_writer, self(), kind}, {:error, :released})
   end
 
   def write(pid, chunk) when is_pid(pid) do

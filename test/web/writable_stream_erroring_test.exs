@@ -9,6 +9,9 @@ defmodule Web.WritableStreamErroringTest do
   import Web, only: [await: 1]
 
   alias Web.CountQueuingStrategy
+  alias Web.Promise
+  alias Web.ReadableStream
+  alias Web.ReadableStreamDefaultReader, as: Reader
   alias Web.TransformStream
   alias Web.TypeError
   alias Web.WritableStream
@@ -311,13 +314,19 @@ defmodule Web.WritableStreamErroringTest do
       end
     end
 
-    test "is nil on an errored stream, also after the release of the lock" do
+    test "is nil on an errored stream, and raises a TypeError after the release of the lock" do
       stream = WritableStream.new()
       writer = WritableStream.get_writer(stream)
       assert :ok = await(Writer.abort(writer, :stop))
       assert Writer.desired_size(writer) == nil
+
+      # The writer has no stream after the release, as in the Streams
+      # Standard.
       assert :ok = Writer.release_lock(writer)
-      assert Writer.desired_size(writer) == nil
+
+      assert_raise TypeError, "This writer is no longer locked.", fn ->
+        Writer.desired_size(writer)
+      end
     end
   end
 
@@ -358,7 +367,7 @@ defmodule Web.WritableStreamErroringTest do
   end
 
   describe "the writable side of a transform stream" do
-    test "an abort stops the transform that is in progress" do
+    test "an abort waits for the transform in flight, and then calls the function cancel" do
       test = self()
 
       transform =
@@ -366,8 +375,12 @@ defmodule Web.WritableStreamErroringTest do
           %{
             transform: fn _chunk, _controller ->
               send(test, {:transform, self()})
-              Process.sleep(:infinity)
-            end
+
+              receive do
+                :continue -> :ok
+              end
+            end,
+            cancel: fn reason -> send(test, {:cancel, reason}) end
           },
           readable_strategy: CountQueuingStrategy.new(1)
         )
@@ -375,11 +388,21 @@ defmodule Web.WritableStreamErroringTest do
       writer = WritableStream.get_writer(transform.writable)
       write = Writer.write(writer, :chunk)
       assert_receive {:transform, worker}
-      monitor = Process.monitor(worker)
+      abort = Writer.abort(writer, :stop)
 
-      assert :ok = await(Writer.abort(writer, :stop))
-      assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
-      assert rejection(write) == :stop
+      # This call comes after the abort from the same process. The writable
+      # side is erroring: the abort waits for the write in flight, as
+      # WritableStreamStartErroring specifies.
+      assert WritableStream.__get_slots__(transform.writable.controller_pid).state == :erroring
+      assert ReadableStream.__get_slots__(transform.readable.controller_pid).state == :readable
+      assert Promise.peek(abort) == :pending
+      refute_received {:cancel, _reason}
+
+      send(worker, :continue)
+      assert await(write) == :ok
+      assert await(abort) == :ok
+      assert_received {:cancel, :stop}
+      assert rejection(Reader.read(ReadableStream.get_reader(transform.readable))) == :stop
     end
   end
 end

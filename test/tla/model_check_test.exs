@@ -136,6 +136,40 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "LazyStream" do
+    # A check with no property BytesOnce: the bug breaks a different
+    # property also.
+    defp lazy_bug(name), do: [bug(name), {"    BytesOnce\n", ""}]
+
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("LazyStream"))
+    end
+
+    test "the design with three copies has all its properties" do
+      assert_holds(SpecModel.check("LazyStream", {~s({"a", "b"}), ~s({"a", "b", "c"})}))
+    end
+
+    test "a claim that reads and then sets the cell is found" do
+      assert_violates(SpecModel.check("LazyStream", bug("read_then_set")), "BytesOnce")
+      assert_violates(SpecModel.check("LazyStream", lazy_bug("read_then_set")), "NoBytesAfterUse")
+    end
+
+    test "a stream read with no state starting is found" do
+      assert_violates(SpecModel.check("LazyStream", lazy_bug("no_starting")), "OneProcess")
+    end
+
+    test "a stream process that gets the bytes after a claim is found" do
+      assert_violates(SpecModel.check("LazyStream", bug("closed_gets_bytes")), "BytesOnce")
+    end
+
+    test "a state process before the registry has the stream process is found" do
+      assert_violates(
+        SpecModel.check("LazyStream", bug("publish_first")),
+        "GoneOnlyAfterStop"
+      )
+    end
+  end
+
   describe "AbortSignal" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("AbortSignal"))

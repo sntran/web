@@ -2,10 +2,11 @@ defmodule Web.Internal.ContentDecoderTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
+  alias Web.Internal.Brotli.Encoder, as: Brotli
   alias Web.Internal.ContentDecoder, as: Decoder
   alias Web.Internal.ContentDecoder.Error
 
-  @codings ["gzip", "x-gzip", "deflate", "raw deflate", "zstd", "deflate, gzip"]
+  @codings ["gzip", "x-gzip", "deflate", "raw deflate", "br", "zstd", "deflate, gzip", "gzip, br"]
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -15,8 +16,15 @@ defmodule Web.Internal.ContentDecoderTest do
   defp encode("x-gzip", data), do: :zlib.gzip(data)
   defp encode("deflate", data), do: :zlib.compress(data)
   defp encode("raw deflate", data), do: :zlib.zip(data)
+  defp encode("br", data), do: brotli(data)
   defp encode("zstd", data), do: Web.TestZstd.compress(data)
   defp encode("deflate, gzip", data), do: data |> :zlib.compress() |> :zlib.gzip()
+  defp encode("gzip, br", data), do: data |> :zlib.gzip() |> brotli()
+
+  defp brotli(data) do
+    {first, encoder} = Brotli.push(Brotli.new(), data)
+    first <> Brotli.finish(encoder)
+  end
 
   defp header("raw deflate"), do: "deflate"
   defp header(coding), do: coding
@@ -69,8 +77,8 @@ defmodule Web.Internal.ContentDecoderTest do
   # ---------------------------------------------------------------------------
 
   describe "new/1" do
-    test "knows gzip, x-gzip, deflate, and zstd" do
-      for coding <- ["gzip", "x-gzip", "deflate", "zstd", "deflate, gzip"] do
+    test "knows gzip, x-gzip, deflate, br, and zstd" do
+      for coding <- ["gzip", "x-gzip", "deflate", "br", "zstd", "deflate, gzip"] do
         assert [_stage | _rest] = decoder(coding)
       end
     end
@@ -79,9 +87,9 @@ defmodule Web.Internal.ContentDecoderTest do
       assert Decoder.new([{"content-type", "text/plain"}]) == nil
       assert Decoder.new([{"content-encoding", "identity"}]) == nil
       assert Decoder.new([{"content-encoding", " , "}]) == nil
-      assert Decoder.new([{"content-encoding", "br"}]) == nil
+      assert Decoder.new([{"content-encoding", "compress"}]) == nil
       # One coding that the decoder does not know: no decoding.
-      assert Decoder.new([{"content-encoding", "gzip, br"}]) == nil
+      assert Decoder.new([{"content-encoding", "gzip, compress"}]) == nil
     end
 
     test "reads each header line, with no case and no space" do
@@ -90,7 +98,7 @@ defmodule Web.Internal.ContentDecoderTest do
     end
 
     test "the request header has the codings that the decoder knows" do
-      assert Decoder.accept_encoding() == "gzip, deflate, zstd"
+      assert Decoder.accept_encoding() == "gzip, deflate, br, zstd"
     end
   end
 
@@ -155,6 +163,58 @@ defmodule Web.Internal.ContentDecoderTest do
     end
   end
 
+  describe "the formats of the Compression Standard" do
+    test "brotli needs data, and refuses data after the end" do
+      assert_raise Error, "The brotli data is not complete.", fn ->
+        decode(Decoder.format("brotli"), [])
+      end
+
+      encoded = encode("br", "data")
+
+      for chunks <- [[encoded <> "x"], [encoded, "x"]] do
+        assert_raise Error, "The brotli data is not valid.", fn ->
+          decode(Decoder.format("brotli"), chunks)
+        end
+      end
+
+      assert decode(Decoder.format("brotli"), split(encoded, [1, 2, 3])) == "data"
+    end
+
+    # The Compression Standard enqueues the output of a chunk before the
+    # error for the data after the end.
+    test "a pull gives the output before the error for data after the end" do
+      for {format, encoded} <- [{"gzip", :zlib.gzip("data")}, {"brotli", encode("br", "data")}] do
+        stages = Decoder.push(Decoder.format(format), encoded <> "x")
+        assert {:piece, "data", failed} = Decoder.pull(stages)
+
+        # The decoder keeps the error: it takes no more input.
+        assert Decoder.push(failed, "more") == failed
+        assert Decoder.finish(failed) == failed
+        assert_raise Error, ~r/is not valid/, fn -> Decoder.pull(failed) end
+        assert Decoder.close(failed) == :ok
+      end
+    end
+
+    test "the error keeps the zlib handle, and a close closes it" do
+      stages = Decoder.push(Decoder.format("deflate-raw"), :zlib.zip("data") <> "x")
+      [%{zlib: zlib}] = stages
+      assert {:piece, "data", failed} = Decoder.pull(stages)
+      assert Decoder.close(failed) == :ok
+      assert_raise ErlangError, fn -> :zlib.inflateReset(zlib) end
+    end
+  end
+
+  describe "the coding br of an HTTP body" do
+    test "drops the data after the end, as the zlib codings do" do
+      encoded = encode("br", "data")
+      assert decode(decoder("br"), [encoded <> "x", "more data"]) == "data"
+    end
+
+    test "with no data is an empty body" do
+      assert decode(decoder("br"), []) == ""
+    end
+  end
+
   describe "close/1" do
     test "closes the zlib handles of a decoder that did not end" do
       stages = Decoder.push(Decoder.format("gzip"), :zlib.gzip("data"))
@@ -177,6 +237,7 @@ defmodule Web.Internal.ContentDecoderTest do
       assert decode_error("gzip", "not gzip data").message == "The gzip data is not valid."
       assert decode_error("deflate", "xx not deflate").message == "The deflate data is not valid."
       assert decode_error("zstd", "not zstd data").message == "The data is not a zstd frame."
+      assert decode_error("br", <<0x11>>).message == "The br data is not valid."
     end
 
     test "data that is cut raises at the end" do

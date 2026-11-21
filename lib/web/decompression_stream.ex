@@ -3,7 +3,8 @@ defmodule Web.DecompressionStream do
   WHATWG-compliant `DecompressionStream`.
 
   Decompresses a stream of binary data using the specified format, backed by
-  Erlang's native `:zlib` module.
+  Erlang's native `:zlib` module. The format `"brotli"` has a decoder in
+  Elixir: Erlang/OTP has no brotli.
 
   The stream gives its output in chunks of approximately 64 KiB, and makes
   the next chunk only when its readable side has space. Thus a small
@@ -14,6 +15,7 @@ defmodule Web.DecompressionStream do
 
   ## Supported formats
 
+    * `"brotli"` — brotli decompression (RFC 7932)
     * `"gzip"` — gzip decompression (window bits 31)
     * `"deflate"` — zlib-wrapped deflate (window bits 15)
     * `"deflate-raw"` — raw deflate without zlib wrapper (window bits −15)
@@ -52,13 +54,13 @@ defmodule Web.DecompressionStream do
           writable: Web.WritableStream.t()
         }
 
-  @valid_formats ~w[gzip deflate deflate-raw]
+  @valid_formats ~w[brotli gzip deflate deflate-raw]
 
   @doc """
   Creates a new `DecompressionStream` for the given `format`.
 
-  Raises `Web.TypeError` if `format` is not one of `"gzip"`, `"deflate"`, or
-  `"deflate-raw"`.
+  Raises `Web.TypeError` if `format` is not one of `"brotli"`, `"gzip"`,
+  `"deflate"`, or `"deflate-raw"`.
   """
   @spec new(String.t()) :: t()
   def new(format) when format in @valid_formats do

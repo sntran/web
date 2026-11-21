@@ -6,7 +6,11 @@ defmodule Web.FetchContentEncodingTest do
   use ExUnitProperties
   use Web
 
+  import Bitwise
+
+  alias Web.Internal.Brotli.Encoder, as: Brotli
   alias Web.Internal.ContentDecoder
+  alias Web.TestBrotliWriter, as: B
 
   @table __MODULE__
 
@@ -63,8 +67,41 @@ defmodule Web.FetchContentEncodingTest do
   defp encode("x-gzip", data), do: :zlib.gzip(data)
   defp encode("deflate", data), do: :zlib.compress(data)
   defp encode("raw deflate", data), do: :zlib.zip(data)
+  defp encode("br", data), do: brotli(data)
   defp encode("zstd", data), do: Web.TestZstd.compress(data)
   defp encode("deflate, gzip", data), do: data |> :zlib.compress() |> :zlib.gzip()
+  defp encode("gzip, br", data), do: data |> :zlib.gzip() |> brotli()
+
+  defp brotli(data) do
+    {first, encoder} = Brotli.push(Brotli.new(), data)
+    first <> Brotli.finish(encoder)
+  end
+
+  # A brotli stream of `count` meta-blocks of 16 MiB of zeros. The first
+  # command inserts a zero and copies at the distance 1, and the others copy
+  # at the last distance.
+  defp brotli_zeros(count) do
+    size = 1 <<< 24
+    {literal, _literals} = B.simple([0], 256)
+    {command, commands} = B.simple([399, 391], 704)
+    {distance, distances} = B.simple([16, 0], 64)
+
+    blocks =
+      for block <- 1..count do
+        first? = block == 1
+
+        [
+          B.header(block == count, size),
+          B.one_of_each(literal, command, distance),
+          if(first?,
+            do: [B.symbol(commands, 399), {size - 1 - 2118, 24}, B.symbol(distances, 16), {0, 1}],
+            else: [B.symbol(commands, 391), {size - 2118, 24}, B.symbol(distances, 0)]
+          )
+        ]
+      end
+
+    B.bytes([B.window(16), blocks])
+  end
 
   defp header("raw deflate"), do: "deflate"
   defp header(coding), do: coding
@@ -107,7 +144,16 @@ defmodule Web.FetchContentEncodingTest do
     test "has the decoded body, and its headers with no change", %{base: base} do
       data = :crypto.strong_rand_bytes(10_000) <> :binary.copy("text ", 10_000)
 
-      for coding <- ["gzip", "x-gzip", "deflate", "raw deflate", "zstd", "deflate, gzip"] do
+      for coding <- [
+            "gzip",
+            "x-gzip",
+            "deflate",
+            "raw deflate",
+            "br",
+            "zstd",
+            "deflate, gzip",
+            "gzip, br"
+          ] do
         encoded = encode(coding, data)
         response = await(fetch(encoded_url(base, coding, data)))
 
@@ -120,7 +166,9 @@ defmodule Web.FetchContentEncodingTest do
     test "with a coding that the library does not know has the body with no change", %{
       base: base
     } do
-      url = serve(base, %{headers: [{"content-encoding", "br"}], chunks: {:full, "raw bytes"}})
+      url =
+        serve(base, %{headers: [{"content-encoding", "compress"}], chunks: {:full, "raw bytes"}})
+
       assert text(url) == "raw bytes"
     end
 
@@ -155,6 +203,18 @@ defmodule Web.FetchContentEncodingTest do
       assert cause.message == "The zstd data is not complete."
     end
 
+    test "with the coding br that is not valid or is cut gives a TypeError", %{base: base} do
+      url = serve(base, %{headers: [{"content-encoding", "br"}], chunks: {:full, <<0x11>>}})
+      assert %TypeError{cause: cause} = catch_exit(text(url))
+      assert cause.message == "The br data is not valid."
+
+      encoded = encode("br", :crypto.strong_rand_bytes(4_000))
+      cut = binary_part(encoded, 0, byte_size(encoded) - 4)
+      url = serve(base, %{headers: [{"content-encoding", "br"}], chunks: {:full, cut}})
+      assert %TypeError{cause: cause} = catch_exit(text(url))
+      assert cause.message == "The br data is not complete."
+    end
+
     test "with no body is not decoded", %{base: base} do
       url = encoded_url(base, "gzip", "data")
       assert %Response{status: 200, body: nil} = await(fetch(url, method: "HEAD"))
@@ -184,6 +244,27 @@ defmodule Web.FetchContentEncodingTest do
       assert bytes == 256 * 1_048_576
       assert peak - start < 64 * 1_048_576
     end
+
+    test "of a large body with the coding br is read with flat memory", %{base: base} do
+      # 256 MiB of zeros in 16 meta-blocks of 16 MiB: each meta-block has one
+      # copy at the distance 1.
+      url =
+        serve(base, %{
+          headers: [{"content-encoding", "br"}],
+          chunks: {:full, brotli_zeros(16)}
+        })
+
+      :erlang.garbage_collect()
+      start = :erlang.memory(:binary)
+
+      {bytes, peak} =
+        Enum.reduce(await(fetch(url)).body, {0, 0}, fn chunk, {bytes, peak} ->
+          {bytes + chunk.byte_length, max(peak, :erlang.memory(:binary))}
+        end)
+
+      assert bytes == 256 * 1_048_576
+      assert peak - start < 64 * 1_048_576
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -196,7 +277,7 @@ defmodule Web.FetchContentEncodingTest do
     end
 
     test "has the codings that the library decodes", %{base: base} do
-      assert request_header(base, []) == "gzip, deflate, zstd"
+      assert request_header(base, []) == "gzip, deflate, br, zstd"
     end
 
     test "keeps the value of the caller", %{base: base} do
@@ -215,7 +296,7 @@ defmodule Web.FetchContentEncodingTest do
   property "a compressed body in chunks of each size gives the input", %{base: base} do
     check all(
             data <- binary(max_length: 50_000),
-            coding <- member_of(["gzip", "deflate", "raw deflate", "zstd", "deflate, gzip"]),
+            coding <- member_of(["gzip", "deflate", "raw deflate", "br", "zstd", "deflate, gzip"]),
             sizes <- list_of(integer(1..8_192), max_length: 12),
             max_runs: 50
           ) do

@@ -267,6 +267,13 @@ defmodule Web.Test.QuickJS.WPT do
       # a usual buffer in the library.
       {:test, "compression/compression-bad-chunks.any.js", ~r/shared|SharedArrayBuffer/,
        "scope: the BEAM has no shared memory"},
+      # The Compression Standard sets up a `TransformStream` with the
+      # readable high water mark 0: the transform of a chunk waits for a
+      # read. The compression streams of the library have the high water
+      # mark 1. Thus the output goes into the queue before the read, and the
+      # error for the data after the end resets the queue.
+      {:test, "compression/decompression-extra-input.any.js", ~r/with extra pad/,
+       "library: the readable side of a compression stream has the high water mark 1, not 0"},
       # `Response.json()` serializes a JavaScript value. The library gets a
       # reference to a JavaScript object, and a lone surrogate becomes
       # U+FFFD before it comes to the library.

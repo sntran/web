@@ -5,7 +5,7 @@ defmodule Web.CompressionStandardTest do
   use ExUnitProperties
   use Web
 
-  @formats ~w[gzip deflate deflate-raw]
+  @formats ~w[brotli gzip deflate deflate-raw]
 
   # Gives the chunks of the readable side as binaries.
   defp through(chunks, transform) do
@@ -139,11 +139,11 @@ defmodule Web.CompressionStandardTest do
   end
 
   describe "the format" do
-    test "must be one of the three formats of the Standard" do
+    test "must be one of the four formats of the Standard" do
       for make <- [&CompressionStream.new/1, &DecompressionStream.new/1] do
         for format <- @formats, do: assert(%{readable: _, writable: _} = make.(format))
 
-        for format <- ["brotli", "GZIP", "", :gzip, nil],
+        for format <- ["br", "BROTLI", "GZIP", "", :gzip, nil],
             do: assert_raise(TypeError, fn -> make.(format) end)
       end
     end

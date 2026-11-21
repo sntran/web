@@ -3,7 +3,8 @@ defmodule Web.CompressionStream do
   WHATWG-compliant `CompressionStream`.
 
   Compresses a stream of binary data using the specified format, backed by
-  Erlang's native `:zlib` module.
+  Erlang's native `:zlib` module. The format `"brotli"` has an encoder in
+  Elixir: Erlang/OTP has no brotli.
 
   ## The zlib handle
 
@@ -13,6 +14,9 @@ defmodule Web.CompressionStream do
 
   ## Supported formats
 
+    * `"brotli"` — brotli compression (RFC 7932), with a simple encoder: one
+      prefix code for each alphabet, and repeated strings of 4 bytes or more
+      in a window of 256 KiB
     * `"gzip"` — gzip compression (window bits 31)
     * `"deflate"` — zlib-wrapped deflate (window bits 15)
     * `"deflate-raw"` — raw deflate without zlib wrapper (window bits −15)
@@ -38,6 +42,7 @@ defmodule Web.CompressionStream do
 
   require Logger
 
+  alias Web.Internal.Brotli.Encoder
   alias Web.Internal.Bytes
   alias Web.ReadableStreamDefaultController
   alias Web.TypeError
@@ -50,17 +55,17 @@ defmodule Web.CompressionStream do
           writable: Web.WritableStream.t()
         }
 
-  @valid_formats ~w[gzip deflate deflate-raw]
+  @valid_formats ~w[brotli gzip deflate deflate-raw]
 
   @doc """
   Creates a new `CompressionStream` for the given `format`.
 
-  Raises `Web.TypeError` if `format` is not one of `"gzip"`, `"deflate"`, or
-  `"deflate-raw"`.
+  Raises `Web.TypeError` if `format` is not one of `"brotli"`, `"gzip"`,
+  `"deflate"`, or `"deflate-raw"`.
   """
   @spec new(String.t()) :: t()
   def new(format) when format in @valid_formats do
-    {:ok, pid} = start_link(window_bits: window_bits_for(format))
+    {:ok, pid} = start_link(format: format)
 
     %__MODULE__{
       readable: %Web.ReadableStream{controller_pid: pid},
@@ -82,7 +87,7 @@ defmodule Web.CompressionStream do
 
   @impl Web.Stream
   def start(_pid, opts) do
-    {:producer_consumer, %{window_bits: Keyword.fetch!(opts, :window_bits), zlib: nil}}
+    {:producer_consumer, %{format: Keyword.fetch!(opts, :format), zlib: nil, brotli: nil}}
   end
 
   # The callbacks run in the worker process of the stream: the handle opens
@@ -91,30 +96,27 @@ defmodule Web.CompressionStream do
   def write(chunk, ctrl, state) do
     bin = to_binary!(chunk, "CompressionStream")
     maybe_log_runtime_event("write", byte_size(bin))
-    zlib = zlib(state)
+    {chunks, state} = compress(state, bin)
 
-    # A deflate of bytes cannot fail.
-    for c <- :zlib.deflate(zlib, bin) do
+    for c <- chunks do
       ReadableStreamDefaultController.wait_for_capacity(ctrl)
       ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
     end
 
-    {:ok, %{state | zlib: zlib}}
+    {:ok, state}
   end
 
   @impl Web.Stream
   def flush(ctrl, state) do
     maybe_log_runtime_event("flush", 0)
-    zlib = zlib(state)
-    final_chunks = :zlib.deflate(zlib, <<>>, :finish)
-    :zlib.close(zlib)
+    {final_chunks, state} = compress_end(state)
 
     # The last chunks do not wait for the reader, thus the close of the
     # writable side does not need a reader, as in the Streams Standard.
     for c <- final_chunks,
         do: ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(c))
 
-    {:ok, %{state | zlib: nil}}
+    {:ok, state}
   end
 
   # A cancel or an abort runs in the worker too: the handle closes at once.
@@ -127,9 +129,31 @@ defmodule Web.CompressionStream do
     ErlangError -> :ok
   end
 
-  defp zlib(%{zlib: nil, window_bits: window_bits}) do
+  # A deflate of bytes cannot fail. The brotli encoder gives no output until
+  # it has a block, or until the end.
+  defp compress(%{format: "brotli"} = state, bin) do
+    {out, encoder} = Encoder.push(state.brotli || Encoder.new(), bin)
+    {if(out == <<>>, do: [], else: [out]), %{state | brotli: encoder}}
+  end
+
+  defp compress(state, bin) do
+    zlib = zlib(state)
+    {:zlib.deflate(zlib, bin), %{state | zlib: zlib}}
+  end
+
+  defp compress_end(%{format: "brotli"} = state),
+    do: {[Encoder.finish(state.brotli || Encoder.new())], %{state | brotli: nil}}
+
+  defp compress_end(state) do
+    zlib = zlib(state)
+    final_chunks = :zlib.deflate(zlib, <<>>, :finish)
+    :zlib.close(zlib)
+    {final_chunks, %{state | zlib: nil}}
+  end
+
+  defp zlib(%{zlib: nil, format: format}) do
     zlib = :zlib.open()
-    :ok = :zlib.deflateInit(zlib, :default, :deflated, window_bits, 8, :default)
+    :ok = :zlib.deflateInit(zlib, :default, :deflated, window_bits_for(format), 8, :default)
     zlib
   end
 

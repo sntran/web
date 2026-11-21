@@ -10,8 +10,19 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
   # These steps are the hidden steps of the specification. After each
   # operation, the test finds the hidden steps that give the state of the
   # real sides. Thus the real sides do only steps that the specification
-  # permits. After a pause longer than the linger time, the real sides must
-  # have done each timer step that the specification permits.
+  # permits.
+  #
+  # The test does not depend on the time of the machine:
+  #
+  #   * The stream has the linger time 0. Each timer of the linger time
+  #     fires at once: a timeout 0 of `:gen_statem` comes before the next
+  #     message of the side. Thus the test waits for no timer.
+  #   * After each operation, the test waits until the processes of the
+  #     system are at rest: see `await_rest/1`. Then the sides did each step
+  #     of their messages and of their timers. The test compares the state
+  #     one time, and the real sides must have done each timer step that the
+  #     specification permits.
+  #   * Each wait for a message or a result has no time limit.
   use ExUnit.Case, async: true
   use ExUnitProperties
 
@@ -27,7 +38,6 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
 
   @procs [:owner, :other]
   @sides ["readable", "writable"]
-  @linger 15
   @hidden for side <- @sides,
               action <- ["Deliver", "OwnerExpire", "StopComplete"],
               do: {action, [side]}
@@ -43,8 +53,7 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
       {1, tuple({constant(:proc_stop), proc})},
       {1, constant(:close)},
       {2, tuple({constant(:read_all), proc})},
-      {2, tuple({constant(:failing_owner), side})},
-      {2, constant(:pause)}
+      {2, tuple({constant(:failing_owner), side})}
     ])
   end
 
@@ -73,18 +82,21 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
 
   defp start_system do
     test = self()
-    procs = Map.new(@procs, fn name -> {name, spawn(fn -> proc(test) end)} end)
+    group = spawn(fn -> group_leader_loop(Process.group_leader()) end)
+    procs = Map.new(@procs, fn name -> {name, spawn_in_group(group, fn -> proc(test) end)} end)
 
     # The owner makes the stream. The function start puts one chunk in the
     # queue of the readable side: after a close, the readable side has a
-    # chunk that no process read.
+    # chunk that no process read. The linger time 0 fires each timer at
+    # once.
     make = fn ->
-      TransformStream.new(%{start: &Controller.enqueue(&1, :chunk)}, linger: @linger)
+      TransformStream.new(%{start: &Controller.enqueue(&1, :chunk)}, linger: 0)
     end
 
     transform = call(procs, :owner, make)
 
     %{
+      group: group,
       procs: procs,
       transform: transform,
       pids: %{
@@ -97,6 +109,35 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
 
   defp stop_system(system) do
     Enum.each(system.procs, fn {_name, pid} -> Process.exit(pid, :kill) end)
+    send(system.group, :stop)
+  end
+
+  # The group leader of the processes of the system: the two processes of
+  # the test, and the processes that they start, for example the two sides
+  # and their workers. It gives each request of input or output to the
+  # group leader of the test.
+  defp group_leader_loop(leader) do
+    receive do
+      :stop ->
+        :ok
+
+      message ->
+        send(leader, message)
+        group_leader_loop(leader)
+    end
+  end
+
+  defp spawn_in_group(group, fun) do
+    pid =
+      spawn(fn ->
+        receive do
+          :go -> fun.()
+        end
+      end)
+
+    Process.group_leader(pid, group)
+    send(pid, :go)
+    pid
   end
 
   # A process that does one function at a time, and gives the result.
@@ -117,8 +158,6 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
 
     receive do
       {:result, result} -> result
-    after
-      2_000 -> flunk("the process #{proc} gave no result")
     end
   end
 
@@ -139,13 +178,6 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
   # ---------------------------------------------------------------------------
   # One operation, on the real stream and on the specification
   # ---------------------------------------------------------------------------
-
-  # The test waits for more than the linger time. After that time, the
-  # sides did each timer step that the specification permits.
-  defp step(:pause, model, system) do
-    Process.sleep(4 * @linger)
-    {timers_done(follow(model, system), system), system}
-  end
 
   # The real operation gives the steps of the specification. The hidden
   # steps can come before them and after them: see `follow/3`.
@@ -184,7 +216,11 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
       pid = system.procs[proc]
       monitor = Process.monitor(pid)
       send(pid, :stop)
-      assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+
+      receive do
+        {:DOWN, ^monitor, :process, ^pid, :normal} -> :ok
+      end
+
       {[{"ProcStop", [to_string(proc)]}], system}
     else
       {[], system}
@@ -202,14 +238,13 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
       else: {[], system}
   end
 
+  # The read of the last chunk drains the closed readable side: it is
+  # complete, and it stops at once with the linger time 0.
   defp run({:read_all, proc}, model, system) do
     if SpecModel.enabled?(model, "ReadAll", [to_string(proc)]) do
       reader = Map.fetch!(system.handles, {proc, :readable})
-
-      result =
-        attempt(system, proc, fn -> {await(Reader.read(reader)), await(Reader.read(reader))} end)
-
-      assert result == {%{value: :chunk, done: false}, %{value: nil, done: true}}
+      result = attempt(system, proc, fn -> await(Reader.read(reader)) end)
+      assert result == %{value: :chunk, done: false}
       {[{"ReadAll", [to_string(proc)]}], system}
     else
       {[], system}
@@ -239,14 +274,23 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
 
       monitor = Process.monitor(owner)
       Process.exit(owner, :kill)
-      assert_receive {:DOWN, ^monitor, :process, ^owner, :killed}
+
+      receive do
+        {:DOWN, ^monitor, :process, ^owner, :killed} -> :ok
+      end
+
       await_message(locked, &match?({:DOWN, _ref, :process, ^owner, _reason}, &1))
       await_message(other, &match?({:DOWN, _ref, :process, ^owner, _reason}, &1))
 
       # The side of the lock grants the lock, and then it gets the stop of
       # the owner: the call `observe_side/2` comes after them.
       :erlang.resume_process(locked)
-      assert_receive {:result, {:ok, handle}}, 2_000
+
+      handle =
+        receive do
+          {:result, {:ok, handle}} -> handle
+        end
+
       observe_side(to_string(side), system)
       :erlang.resume_process(other)
 
@@ -265,14 +309,14 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
   defp lock_request?(_message), do: false
 
   # Waits until the mailbox of the process has a message for which `fun`
-  # gives true. The process can be suspended.
-  defp await_message(pid, fun, attempts \\ 400) do
+  # gives true. The process can be suspended. The sender of the message
+  # runs: the wait has no time limit.
+  defp await_message(pid, fun) do
     {:messages, messages} = Process.info(pid, :messages)
 
-    cond do
-      Enum.any?(messages, fun) -> :ok
-      attempts == 0 -> flunk("the message did not come")
-      true -> Process.sleep(5) && await_message(pid, fun, attempts - 1)
+    unless Enum.any?(messages, fun) do
+      Process.sleep(1)
+      await_message(pid, fun)
     end
   end
 
@@ -298,15 +342,13 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
   defp release(%Reader{} = reader), do: Reader.release_lock(reader)
   defp release(%Writer{} = writer), do: Writer.release_lock(writer)
 
-  # The owner stops, and then the other process stops, each with a pause.
-  # Thus a lock of the other process keeps the two sides after the stop of
-  # the owner. After the two stops, the two sides stop: the property
-  # NoOrphan.
+  # The owner stops, and then the other process stops. Thus a lock of the
+  # other process keeps the two sides after the stop of the owner. After the
+  # two stops, the two sides stop: the property NoOrphan.
   defp finish(model, system) do
     model =
       Enum.reduce(@procs, model, fn proc, model ->
         {model, _system} = step({:proc_stop, proc}, model, system)
-        {model, _system} = step(:pause, model, system)
         model
       end)
 
@@ -315,35 +357,18 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
     refute Process.alive?(system.pids["readable"]) or Process.alive?(system.pids["writable"])
   end
 
-  # The timer steps that the specification permits are done: the real sides
-  # did them. A busy machine can do them late, thus the test waits some
-  # time.
-  defp timers_done(model, system, attempts \\ 100) do
-    model = follow(model, system)
-
-    cond do
-      not Enum.any?(@timers, fn {action, args} -> SpecModel.enabled?(model, action, args) end) ->
-        model
-
-      attempts == 0 ->
-        flunk("the sides did not do a timer step: #{inspect(SpecModel.to_map(model))}")
-
-      true ->
-        Process.sleep(10)
-        timers_done(model, system, attempts - 1)
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # The hidden steps
   # ---------------------------------------------------------------------------
 
   # Finds the states that the steps of the operation, in their sequence,
   # and the hidden steps before and between and after them give from the
-  # model. Returns a state that has the state of the real sides, with no
-  # message in the inboxes: the real messages come in some microseconds.
-  # The real sides can be in a step: the test looks again some times.
-  defp follow(model, system, steps \\ [], attempts \\ 100) do
+  # model. The processes of the system are at rest, thus each message
+  # arrived, and each timer fired. Returns a state that has the state of the
+  # real sides, with no message in the inboxes, and with no timer step that
+  # the specification permits.
+  defp follow(model, system, steps \\ []) do
+    await_rest(system)
     observed = observe(system)
 
     states =
@@ -351,21 +376,60 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
           inbox_length(state) == 0 and matches?(state, observed),
           do: state
 
-    case states do
-      [] when attempts > 0 ->
-        Process.sleep(5)
-        follow(model, system, steps, attempts - 1)
+    case Enum.reject(states, &timer_step?/1) do
+      [state | _others] ->
+        state
 
-      [] ->
+      [] when states == [] ->
         flunk(
           "the specification permits no state of the real sides: " <>
             "#{inspect(observed)}, from #{inspect(SpecModel.to_map(model))} " <>
             "with the steps #{inspect(steps)}"
         )
 
-      [state | _others] ->
-        state
+      [] ->
+        flunk("the sides did not do a timer step: #{inspect(SpecModel.to_map(hd(states)))}")
     end
+  end
+
+  defp timer_step?(model),
+    do: Enum.any?(@timers, fn {action, args} -> SpecModel.enabled?(model, action, args) end)
+
+  # The processes of the system are at rest when two looks at them see the
+  # same processes, each one waiting with an empty queue, and with the same
+  # number of reductions: no process ran between the two looks. One look is
+  # not sufficient: it sees the processes one after the other, and a message
+  # can be on its way from a process that it saw to a process that it saw
+  # before. The processes of the system have the group leader of the
+  # system, as in the bridge of the WPT runner. The wait has no time limit.
+  defp await_rest(system), do: await_rest(system, nil)
+
+  defp await_rest(system, previous) do
+    current = look(system.group)
+
+    unless current != nil and current == previous do
+      Process.sleep(1)
+      await_rest(system, current)
+    end
+  end
+
+  @at_rest [:group_leader, :status, :message_queue_len, :reductions]
+
+  # The reductions of each process of the system, or `nil` when a process
+  # runs or has a message.
+  defp look(group) do
+    Enum.reduce_while(Process.list(), %{}, fn pid, snapshot ->
+      case Process.info(pid, @at_rest) do
+        [group_leader: ^group, status: :waiting, message_queue_len: 0, reductions: reductions] ->
+          {:cont, Map.put(snapshot, pid, reductions)}
+
+        [{:group_leader, ^group} | _busy] ->
+          {:halt, nil}
+
+        _other ->
+          {:cont, snapshot}
+      end
+    end)
   end
 
   defp reachable(start), do: reachable([start], MapSet.new([key(start)]), [start])

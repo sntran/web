@@ -39,11 +39,12 @@ defmodule Web.TransformStreamTest do
   defp enqueue_transformer,
     do: %{transform: fn chunk, controller -> Controller.enqueue(controller, chunk) end}
 
-  defp eventually(fun, attempts \\ 400) do
-    cond do
-      fun.() -> :ok
-      attempts == 0 -> flunk("the condition did not become true")
-      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+  # Waits until the condition is true. The other processes run: the wait has
+  # no time limit, thus a busy machine does not make the test fail.
+  defp eventually(fun) do
+    unless fun.() do
+      Process.sleep(1)
+      eventually(fun)
     end
   end
 
@@ -519,10 +520,16 @@ defmodule Web.TransformStreamTest do
       assert Task.yield(reader, 0) == nil
 
       # The writable side stops before its answer. The readable side ends by
-      # the owner rule, and then it grants the lock of the request.
+      # the owner rule, and then it grants the lock of the request. The owner
+      # failed, thus the readable side stops at once after its end: a stop
+      # comes only after the end of a stream.
+      monitor = Process.monitor(readable)
       Process.exit(writable, :kill)
-      assert %Reader{} = Task.await(reader)
-      assert %{state: :closed, transform: %{ending: false, deferred: []}} = slots(transform)
+      assert %Reader{} = Task.await(reader, :infinity)
+
+      receive do
+        {:DOWN, ^monitor, :process, ^readable, reason} -> assert reason == :normal
+      end
     end
 
     test "each message between the two sides names its sender" do

@@ -183,17 +183,26 @@ defmodule Web.ReadableByteStreamTeeTest do
     end
 
     test "that a cancel of the stream ends, ends the two branches" do
-      {stream, _controller, left, right} = tee()
+      {stream, controller, left, right} = tee()
       left_reader = ReadableStream.get_reader(left, mode: "byob")
       right_reader = ReadableStream.get_reader(right, mode: "byob")
       left_ref = start_read(fn -> BYOBReader.read(left_reader, view(2)) end)
+
+      # The BYOB read of the tee waits in the stream: the cancel ends it
+      # with no chunk.
+      _request = await_request(controller)
       right_ref = start_read(fn -> BYOBReader.read(right_reader, view(2)) end)
 
       # A cancel with no lock check: the cancel of a reader.
       :ok = await(ReadableStream.cancel(stream.controller_pid, :stop))
 
-      assert {:fulfilled, %{done: true}} = read_result(left_ref)
-      assert {:fulfilled, %{done: true}} = read_result(right_ref)
+      # The cancel dropped the buffer of the read of the stream: the left
+      # read ends with a new buffer of the same size.
+      assert {:fulfilled, %{value: left_value, done: true}} = read_result(left_ref)
+      assert ArrayBuffer.byte_length(left_value.buffer) == 2
+      assert left_value.byte_length == 0
+      assert {:fulfilled, %{value: right_value, done: true}} = read_result(right_ref)
+      assert ArrayBuffer.byte_length(right_value.buffer) == 2
     end
   end
 

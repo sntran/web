@@ -1153,6 +1153,11 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A BYOB read of a branch of a tee of a byte stream ends when the source
+  is canceled during the read of the tee, for example when the owner of the
+  source stops. The cancel drops the buffer of the read, thus the read ends
+  with a view of 0 bytes in a new buffer of the same size. Before, the read
+  waited forever.
 - A parsed `Web.FormData` whose parser stopped, for example after an abort
   of its body, raises `Web.TypeError` for a field that the parser did not
   read, as a stream that is gone does. It exited with `:noproc` before.

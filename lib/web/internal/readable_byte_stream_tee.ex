@@ -30,6 +30,7 @@ defmodule Web.Internal.ReadableByteStreamTee do
 
   use GenServer
 
+  alias Web.ArrayBuffer
   alias Web.ReadableByteStreamController
   alias Web.ReadableStream
   alias Web.ReadableStreamBYOBRequest
@@ -271,9 +272,17 @@ defmodule Web.Internal.ReadableByteStreamTee do
     if active?(state, index), do: ReadableStream.close(branch(state, index))
     if active?(state, other), do: ReadableStream.close(branch(state, other))
 
-    with {:done, %Uint8Array{} = chunk} <- done,
-         true <- active?(state, index),
-         do: respond_with_new_view(request, chunk)
+    case done do
+      {:done, %Uint8Array{} = chunk} ->
+        if active?(state, index), do: respond_with_new_view(request, chunk)
+
+      # No chunk: the source was canceled during the read. In the Standard,
+      # only the tee cancels its source, after the cancel of the two
+      # branches, thus no branch is active here. The library can also cancel
+      # the source, for example when its owner stops.
+      :done ->
+        if active?(state, index), do: end_dropped_request(state, index)
+    end
 
     respond_with_zero(state, other)
     {:noreply, complete(state)}
@@ -308,6 +317,17 @@ defmodule Web.Internal.ReadableByteStreamTee do
          %ReadableStreamBYOBRequest{} = request <-
            ReadableByteStreamController.byob_request(controller(state, index)) do
       safely(fn -> ReadableStreamBYOBRequest.respond(request, 0) end)
+    end
+  end
+
+  # The buffer of the BYOB request went to the read of the source, and the
+  # cancel of the source dropped it. The request ends as a read of a closed
+  # stream: with a view of 0 bytes, in a new buffer of the same size.
+  defp end_dropped_request(state, index) do
+    with %ReadableStreamBYOBRequest{view: view} = request <-
+           ReadableByteStreamController.byob_request(controller(state, index)) do
+      buffer = ArrayBuffer.new(view.buffer.byte_length)
+      respond_with_new_view(request, Uint8Array.new(buffer, view.byte_offset, 0))
     end
   end
 

@@ -248,8 +248,16 @@ defmodule Web.WritableStream do
     Web.Stream.control_call(pid, {:close, owner_pid})
   end
 
+  # The listeners of the signal of the controller run in the calling
+  # process, as for the abort of a writer.
   def abort(%__MODULE__{controller_pid: pid}, reason) do
-    terminate_unlocked(pid, :abort, reason)
+    Web.Stream.__abort__(
+      pid,
+      {{:abort_first_steps, nil, reason}, {:terminate_unlocked, :abort, reason}},
+      reason,
+      :ok,
+      &unlocked_result(:abort, &1)
+    )
   end
 
   def abort(pid, reason) when is_pid(pid) do
@@ -272,16 +280,30 @@ defmodule Web.WritableStream do
   end
 
   defp terminate_unlocked(pid, type, reason) do
-    Web.Stream.promise_call(pid, {:terminate_unlocked, type, reason}, :ok, fn
-      :ok -> {:ok, :ok}
-      {:error, :locked} -> {:error, TypeError.exception("Cannot #{type} a locked stream.")}
-      {:error, :closing} -> {:error, TypeError.exception("The stream is closing.")}
-      {:error, :closed} -> {:error, TypeError.exception("The stream is closed.")}
-      {:error, :errored} -> {:error, TypeError.exception("The stream is errored.")}
-      {:error, {:errored, reason}} -> {:error, reason}
-      {:error, thrown} -> {:error, thrown}
-    end)
+    Web.Stream.promise_call(
+      pid,
+      {:terminate_unlocked, type, reason},
+      :ok,
+      &unlocked_result(type, &1)
+    )
   end
+
+  defp unlocked_result(_type, :ok), do: {:ok, :ok}
+
+  defp unlocked_result(type, {:error, :locked}),
+    do: {:error, TypeError.exception("Cannot #{type} a locked stream.")}
+
+  defp unlocked_result(_type, {:error, :closing}),
+    do: {:error, TypeError.exception("The stream is closing.")}
+
+  defp unlocked_result(_type, {:error, :closed}),
+    do: {:error, TypeError.exception("The stream is closed.")}
+
+  defp unlocked_result(_type, {:error, :errored}),
+    do: {:error, TypeError.exception("The stream is errored.")}
+
+  defp unlocked_result(_type, {:error, {:errored, reason}}), do: {:error, reason}
+  defp unlocked_result(_type, {:error, thrown}), do: {:error, thrown}
 
   @doc false
   def __get_slots__(pid) when is_pid(pid) do

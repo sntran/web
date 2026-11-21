@@ -122,12 +122,26 @@ defmodule Web.PipeRulesTest do
           true
 
         [current_function: {ReadableStreamPipe, name, _arity}, message_queue_len: 0] ->
-          name in [:loop, :collect]
+          name in [:loop, :collect, :await_steps]
 
         _busy ->
           false
       end
     end)
+  end
+
+  # A sink whose abort callback tells the test, and returns when the test
+  # sends `:return`.
+  defp waiting_abort(test) do
+    %{
+      abort: fn reason ->
+        send(test, {:abort, self(), reason})
+
+        receive do
+          :return -> :ok
+        end
+      end
+    }
   end
 
   describe "closing must be propagated backward" do
@@ -557,6 +571,160 @@ defmodule Web.PipeRulesTest do
     end
   end
 
+  # The abort algorithm of the signal does WritableStreamAbort of the
+  # destination, and then ReadableStreamCancel of the source. The sink gets
+  # its abort before the source gets its cancel, when the destination can
+  # abort at once. See "The abort action of a pipe" in `Web.Stream`.
+  describe "the sequence of the actions of the signal" do
+    test "the source gets its cancel when the abort callback of the sink returned" do
+      test = self()
+      {source, _controller} = source(test)
+      {dest, _sink} = sink(test, waiting_abort(test))
+      abort_controller = AbortController.new()
+
+      pipe = ReadableStream.pipe_to(source, dest, signal: abort_controller.signal)
+      pipe_pid = pipe_process(source)
+      waits_for_read(source)
+
+      assert :ok = AbortController.abort(abort_controller, :stop)
+      assert_receive {:abort, worker, :stop}
+
+      # The pipe waits for the answer of the destination, and it sent no
+      # cancel. The call to the source comes after the requests of the pipe.
+      idle(pipe_pid)
+      assert slots(source).state == :readable
+      refute_received {:cancel, _reason}
+
+      send(worker, :return)
+      assert_receive {:cancel, :stop}
+      assert rejection(pipe) == :stop
+    end
+
+    test "the source gets its cancel while the promise of the abort callback is pending" do
+      test = self()
+      {source, _controller} = source(test)
+
+      abort = fn reason ->
+        {promise, resolve, _reject} = Web.Promise.with_resolvers()
+        send(test, {:abort, resolve, reason})
+        promise
+      end
+
+      {dest, _sink} = sink(test, %{abort: abort})
+
+      pipe = ReadableStream.pipe_to(source, dest, signal: AbortSignal.abort(:stop))
+      assert_receive {:abort, resolve, :stop}
+      assert_receive {:cancel, :stop}
+      assert pending?(pipe)
+
+      resolve.(:ok)
+      assert rejection(pipe) == :stop
+    end
+
+    test "a destination that did not start: the source gets its cancel first" do
+      test = self()
+      {source, _controller} = source(test)
+      {start, resolve, _reject} = Web.Promise.with_resolvers()
+
+      dest =
+        WritableStream.new(%{
+          start: fn _controller -> start end,
+          abort: fn reason -> send(test, {:abort, reason}) end
+        })
+
+      pipe = ReadableStream.pipe_to(source, dest, signal: AbortSignal.abort(:stop))
+      assert_receive {:cancel, :stop}
+      refute_received {:abort, _reason}
+
+      # The abort of the sink waits for the start, as in the Standard.
+      resolve.(:ok)
+      assert rejection(pipe) == :stop
+      assert_received {:abort, :stop}
+    end
+
+    test "a destination with a write in flight: the source gets its cancel first" do
+      test = self()
+      {source, _controller} = source(test)
+      {dest, _sink} = sink(test)
+
+      writer = WritableStream.get_writer(dest)
+      write = Writer.write(writer, "a")
+      assert_receive {:write, worker, "a"}
+      assert :ok = Writer.release_lock(writer)
+
+      pipe = ReadableStream.pipe_to(source, dest, signal: AbortSignal.abort(:stop))
+      assert_receive {:cancel, :stop}
+      refute_received {:abort, _reason}
+
+      # The abort of the sink waits for the write in flight.
+      send(worker, {:result, :ok})
+      assert await(write) == :ok
+      assert rejection(pipe) == :stop
+      assert_received {:abort, :stop}
+    end
+
+    test "a destination that stops during its abort callback: the pipe cancels the source" do
+      test = self()
+      {source, _controller} = source(test)
+      {dest, _sink} = sink(test, waiting_abort(test))
+
+      pipe = ReadableStream.pipe_to(source, dest, signal: AbortSignal.abort(:stop))
+      assert_receive {:abort, _worker, :stop}
+
+      Process.exit(dest.controller_pid, :kill)
+      assert_receive {:cancel, :stop}
+      assert rejection(pipe) == :stop
+    end
+
+    test "an abort callback that does not return: the source gets its cancel after the time limit" do
+      test = self()
+      {source, _controller} = source(test)
+      sink = %{abort: fn _reason -> receive(do: (:never -> :ok)) end}
+      {:ok, dest} = WritableStream.start_link(underlying_sink: sink, timeout_ms: 50)
+
+      pipe = ReadableStream.pipe_to(source, dest, signal: AbortSignal.abort(:stop))
+      assert %TypeError{cause: {:task_timeout, :abort}} = rejection(pipe)
+      assert_received {:cancel, :stop}
+    end
+
+    test "an abort callback that returns after its time limit sends no notice to the pipe" do
+      test = self()
+
+      {source, _controller} =
+        source(test, %{
+          cancel: fn reason ->
+            send(test, {:cancel, self(), reason})
+            receive(do: (:return -> :ok))
+          end
+        })
+
+      {:ok, dest} = WritableStream.start_link(underlying_sink: waiting_abort(test))
+
+      pipe = ReadableStream.pipe_to(source, dest, signal: AbortSignal.abort(:stop))
+      pipe_pid = pipe_process(source)
+      assert_receive {:abort, worker, :stop}
+
+      # The time limit ends before the stream gets the return of the
+      # callback: the stream answers the pipe first. The test sends the
+      # message of the timer of the callback.
+      task_ref = WritableStream.__get_slots__(dest).task_ref
+      true = :erlang.suspend_process(dest)
+      send(dest, {:task_timeout, task_ref})
+      send(worker, :return)
+      in_mailbox(dest, &match?({:abort_callback_returned, _from}, &1))
+      true = :erlang.resume_process(dest)
+
+      # The pipe got the answer, and then cancelled the source. It has no
+      # message while it waits for the cancel.
+      assert_receive {:cancel, cancel_worker, :stop}
+      idle(pipe_pid)
+      assert {:messages, []} = Process.info(pipe_pid, :messages)
+
+      send(cancel_worker, :return)
+      assert %TypeError{cause: {:task_timeout, :abort}} = rejection(pipe)
+    end
+  end
+
   describe "a stream that stops" do
     test "the destination: the pipe cancels the source" do
       test = self()
@@ -587,6 +755,28 @@ defmodule Web.PipeRulesTest do
 
       Process.exit(dest.controller_pid, :kill)
       assert rejection(pipe) == :boom
+    end
+
+    test "the destination while the abort of the signal waits for the writes" do
+      test = self()
+      {source, controller} = source(test)
+      {dest, _sink} = sink(test)
+      abort_controller = AbortController.new()
+
+      pipe = ReadableStream.pipe_to(source, dest, signal: abort_controller.signal)
+      pipe_pid = pipe_process(source)
+      assert :ok = Source.enqueue(controller, "a")
+      assert_receive {:write, _worker, "a"}
+
+      assert :ok = AbortController.abort(abort_controller, :stop)
+      settled(source, pipe_pid)
+      assert pending?(pipe)
+
+      # The destination stopped: the pipe only cancels the source.
+      Process.exit(dest.controller_pid, :kill)
+      assert rejection(pipe) == :stop
+      assert_received {:cancel, :stop}
+      refute_received {:abort, _reason}
     end
 
     test "the destination before the close of the source: a stopped destination is closed" do

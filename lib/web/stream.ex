@@ -157,6 +157,12 @@ defmodule Web.Stream do
     pending_close_request: nil,
     # The caller of an abort, until the abort callback of the sink is complete.
     pending_abort_request: nil,
+    # The pipe that waits until the abort callback of the sink returned:
+    # see "The abort action of a pipe".
+    abort_notice: nil,
+    # A public abort that runs the listeners of the signal of the
+    # controller: see "The abort of a writable stream by a public function".
+    abort_window: nil,
     # The [[pendingAbortRequest]] of a writable stream that is erroring:
     # `{callers, reason, was_already_erroring}`. See `writable_abort/4`.
     abort_request: nil,
@@ -457,6 +463,8 @@ defmodule Web.Stream do
        do: true
 
   defp abortive?({:abort, _owner, _reason}), do: true
+  defp abortive?({:abort_first_steps, _owner, _reason}), do: true
+  defp abortive?({:abort_rest, _window, message}), do: abortive?(message)
   defp abortive?({:as_writer, _lock, message}), do: abortive?(message)
   defp abortive?({:error, _reason}), do: true
   defp abortive?(_message), do: false
@@ -494,6 +502,88 @@ defmodule Web.Stream do
         exit({reason, {__MODULE__, :control_call, [pid, message]}})
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # The abort of a writable stream by a public function
+  #
+  # WritableStreamAbort signals abort on the signal of the controller in its
+  # step 2. The listeners of the signal run at once, before the steps that
+  # change the stream. A listener can write, close, or abort the stream
+  # again, and the Streams Standard gives the result. The stream process
+  # must answer other processes, thus it does not run the listeners. A
+  # public abort does steps 1 and 2 in the calling process, as
+  # `Web.AbortController.abort/2` does:
+  #
+  #   1. The caller asks the stream for its state, with a priority message.
+  #      A closed or errored stream needs no abort.
+  #   2. The caller signals abort. The listeners run in its process.
+  #   3. The caller waits until the stream handled the requests that the
+  #      listeners sent: they are usual messages, and the abort is a
+  #      priority message.
+  #   4. The caller sends the abort. The stream does the steps after step 2.
+  #
+  # From step 1 to step 4, the stream keeps the results of its callbacks,
+  # and handles them after the abort. In JavaScript, a write that stops
+  # when the signal aborts completes in a later microtask, thus after the
+  # abort. For example, a sink that stops a write when the signal aborts
+  # gets its abort callback when the write is complete. A caller that stops
+  # before step 4 does not keep the stream: the stream does the steps after
+  # step 2 with no caller.
+  #
+  # A stream with no signal needs only step 4, because no process can have
+  # a listener. The stream keeps its signal in its process dictionary, and
+  # the caller reads it there with no message. Thus an abort of a stream
+  # with no signal does not wait for the stream.
+  #
+  # An abort that this library starts, for example the abort of a pipe,
+  # does all the steps in the stream process. A new process runs the
+  # listeners: see `abort_signal/2`.
+  # ---------------------------------------------------------------------------
+
+  @abort_signal_key {__MODULE__, :abort_signal}
+
+  @doc false
+  # WritableStreamAbort for `Web.WritableStream.abort/2` and the abort of a
+  # writer. `first_steps` is the request `{:abort_first_steps, owner,
+  # reason}`, and `abort` is the request of the abort, each in the form of
+  # the caller. `gone` and `mapper` are the arguments of `promise_call/4`.
+  def __abort__(pid, {first_steps, abort}, reason, gone, mapper) when is_pid(pid) do
+    case abort_signal_of(pid) do
+      nil ->
+        promise_call(pid, abort, gone, mapper)
+
+      signal ->
+        case first_abort_steps(pid, first_steps, gone) do
+          {:continue, window} ->
+            :ok = AbortSignal.__signal_abort__(signal, reason)
+            _handled = call(pid, :handled, :ok)
+            promise_call(pid, {:abort_rest, window, abort}, gone, mapper)
+
+          reply ->
+            settled_promise(mapper.(reply))
+        end
+    end
+  end
+
+  defp abort_signal_of(pid) do
+    case :erlang.process_info(pid, {:dictionary, @abort_signal_key}) do
+      {_item, %AbortSignal{} = signal} -> signal
+      _other -> nil
+    end
+  rescue
+    # The process is on a different node.
+    ArgumentError -> nil
+  end
+
+  defp first_abort_steps(pid, request, gone) do
+    control_call(pid, request)
+  catch
+    # The stream stopped after the caller read its signal.
+    :exit, {_reason, {__MODULE__, :control_call, _args}} -> gone
+  end
+
+  defp settled_promise({:ok, value}), do: Web.Promise.resolve(value)
+  defp settled_promise({:error, reason}), do: Web.Promise.reject(reason)
 
   # ---------------------------------------------------------------------------
   # :gen_statem callbacks
@@ -1060,6 +1150,71 @@ defmodule Web.Stream do
     end
   end
 
+  # Step 1 of WritableStreamAbort, and the check of the lock, for a public
+  # abort: see "The abort of a writable stream by a public function". The
+  # owner is `nil` for an abort of the stream object. A writer that released
+  # its lock gets its answer from `as_writer/4`. The first caller opens the
+  # window in which the stream keeps the results of its callbacks.
+  defp handle_common({:call, from}, {:abort_first_steps, pid, reason}, state, data) do
+    cond do
+      pid != data.writer_pid ->
+        {:keep_state_and_data, [{:reply, from, {:error, :locked}}]}
+
+      state in [:closed, :errored] ->
+        {:keep_state_and_data, [{:reply, from, :ok}]}
+
+      data.abort_window != nil ->
+        {:keep_state_and_data, [{:reply, from, {:continue, nil}}]}
+
+      true ->
+        {caller, _tag} = from
+        window = %{id: make_ref(), monitor: Process.monitor(caller), reason: reason, held: []}
+        {:keep_state, %{data | abort_window: window}, [{:reply, from, {:continue, window.id}}]}
+    end
+  end
+
+  # Step 4: the abort, and then the results that the stream kept.
+  defp handle_common({:call, from}, {:abort_rest, window, request}, _state, _data) do
+    {:keep_state_and_data,
+     [{:next_event, {:call, from}, request}, {:next_event, :internal, {:close_window, window}}]}
+  end
+
+  defp handle_common(:internal, {:close_window, id}, _state, %{abort_window: %{id: id}} = data) do
+    %{monitor: monitor, held: held} = data.abort_window
+    Process.demonitor(monitor, [:flush])
+    actions = for message <- Enum.reverse(held), do: {:next_event, :info, message}
+    {:keep_state, %{data | abort_window: nil}, actions}
+  end
+
+  defp handle_common(:internal, {:close_window, _id}, _state, _data), do: :keep_state_and_data
+
+  # The caller stopped before it sent the abort.
+  defp handle_common(
+         :info,
+         {:DOWN, ref, :process, _pid, _reason},
+         _state,
+         %{abort_window: %{monitor: ref} = window}
+       ) do
+    {:keep_state_and_data,
+     [
+       {:next_event, :internal, {:abort_with_no_caller, window.reason}},
+       {:next_event, :internal, {:close_window, window.id}}
+     ]}
+  end
+
+  defp handle_common(:internal, {:abort_with_no_caller, reason}, state, %{type: :consumer} = data)
+       when state in [:writable, :closing, :erroring] do
+    writable_abort(nil, reason, state, data)
+  end
+
+  defp handle_common(:internal, {:abort_with_no_caller, _reason}, _state, _data),
+    do: :keep_state_and_data
+
+  # A request with no effect. Its reply tells the caller that the stream
+  # handled each request that the caller sent before it.
+  defp handle_common({:call, from}, :handled, _state, _data),
+    do: {:keep_state_and_data, [{:reply, from, :ok}]}
+
   # A terminal event from the stream object, not from a reader or a writer.
   # The Streams Standard refuses it when the stream is locked.
   defp handle_common({:call, from}, {:terminate_unlocked, type, reason}, state, data)
@@ -1218,11 +1373,14 @@ defmodule Web.Stream do
 
   # The signal of the controller of a writable stream, as the attribute
   # `signal` of the Streams Standard. The stream makes it for the first
-  # request, thus a stream that does not use it has no process for it.
+  # request, thus a stream that does not use it has no process for it. A
+  # public abort reads the signal in the process dictionary: see "The abort
+  # of a writable stream by a public function".
   defp handle_common({:call, from}, :abort_signal, _state, data) do
     case data.abort_controller do
       nil ->
         controller = Web.AbortController.new()
+        Process.put(@abort_signal_key, controller.signal)
         {:keep_state, %{data | abort_controller: controller}, [{:reply, from, controller.signal}]}
 
       {:aborted, reason} ->
@@ -1318,6 +1476,30 @@ defmodule Web.Stream do
        )
        when state in [:writable, :closing, :erroring] do
     writable_abort(from, reason, state, data)
+  end
+
+  # The abort action of a pipe: see "The abort action of a pipe".
+  defp handle_common({:call, from}, {:pipe_abort, pid, reason}, state, data)
+       when state in [:writable, :closing] do
+    noticed = %{data | abort_notice: from}
+    result = handle_abort(from, pid, reason, state, noticed)
+    {next_state, data, actions} = transition(result, state, noticed)
+    {:next_state, next_state, send_abort_notice(data), actions}
+  end
+
+  # "If dest.[[state]] is "writable", return ! WritableStreamAbort(dest,
+  # error). Otherwise, return a promise resolved with undefined."
+  defp handle_common({:call, from}, {:pipe_abort, _pid, _reason}, _state, _data),
+    do: {:keep_state_and_data, [{:reply, from, :ok}]}
+
+  # The abort callback of the sink returned: the pipe can cancel its source.
+  # A pipe that has the reply of its abort gets no notice.
+  defp handle_common(:info, {:abort_callback_returned, from}, _state, data) do
+    if from in List.wrap(data.pending_abort_request) do
+      send_abort_notice(%{data | abort_notice: from})
+    end
+
+    :keep_state_and_data
   end
 
   # A cancel or an abort from a caller that waits for the result. The stream
@@ -1470,6 +1652,18 @@ defmodule Web.Stream do
     else
       :keep_state_and_data
     end
+  end
+
+  # The result of a callback while a public abort runs the listeners of the
+  # signal: the stream handles it after the abort.
+  defp handle_common(
+         :info,
+         {ref, _result} = message,
+         _state,
+         %{abort_window: %{} = window} = data
+       )
+       when is_reference(ref) and ref == data.task_ref do
+    {:keep_state, %{data | abort_window: %{window | held: [message | window.held]}}}
   end
 
   # The result of a callback: `{ref, result}` from the worker.
@@ -2376,6 +2570,7 @@ defmodule Web.Stream do
   # ---------------------------------------------------------------------------
 
   # WritableStreamAbort. All the callers of an abort get the same result.
+  # An abort with no caller has the caller `nil`.
   defp writable_abort(from, reason, state, data) do
     data = abort_signal(data, reason)
 
@@ -2384,13 +2579,13 @@ defmodule Web.Stream do
         {callers, abort_reason, was_already_erroring} = data.abort_request
 
         {:keep_state,
-         %{data | abort_request: {[from | callers], abort_reason, was_already_erroring}}}
+         %{data | abort_request: {List.wrap(from) ++ callers, abort_reason, was_already_erroring}}}
 
       state == :erroring ->
-        {:keep_state, %{data | abort_request: {[from], nil, true}}}
+        {:keep_state, %{data | abort_request: {List.wrap(from), nil, true}}}
 
       true ->
-        start_erroring(reason, %{data | abort_request: {[from], reason, false}}, [])
+        start_erroring(reason, %{data | abort_request: {List.wrap(from), reason, false}}, [])
     end
   end
 
@@ -2492,6 +2687,40 @@ defmodule Web.Stream do
   end
 
   defp settle_abort_request(data, _reply), do: {data, []}
+
+  # ---------------------------------------------------------------------------
+  # The abort action of a pipe
+  #
+  # The abort algorithm of the signal of ReadableStreamPipeTo has two actions
+  # in a sequence: WritableStreamAbort of the destination, and then
+  # ReadableStreamCancel of the source. In JavaScript, WritableStreamAbort
+  # calls the abort callback of the sink before it returns, when the stream
+  # started and has no write or close in flight. Thus the sink gets its
+  # abort before the source gets its cancel.
+  #
+  # The callbacks of the two streams run in two workers. Thus the pipe sends
+  # the cancel only when the destination tells it that WritableStreamAbort
+  # did the steps that JavaScript does before it returns. The destination
+  # sends `{:abort_steps_done, tag}`, with the tag of the request:
+  #
+  #   * at once, when the abort callback does not run now. For example, the
+  #     stream did not start, or a write or a close is in flight;
+  #   * when the abort callback returned a value, also a promise that is
+  #     pending. The worker tells the stream, and the stream tells the pipe.
+  #     Thus the notice comes before the reply of the abort: one process
+  #     sends the two messages.
+  #
+  # The reply of the abort without a notice tells the pipe the same, and no
+  # notice comes after it. For example, the callback did not return in its
+  # time limit.
+  # ---------------------------------------------------------------------------
+
+  defp send_abort_notice(%{abort_notice: nil} = data), do: data
+
+  defp send_abort_notice(%{abort_notice: {pid, tag}} = data) do
+    send(pid, {:abort_steps_done, tag})
+    %{data | abort_notice: nil}
+  end
 
   # ---------------------------------------------------------------------------
   # The two sides of a transform stream
@@ -2916,9 +3145,12 @@ defmodule Web.Stream do
   # An abort of a writable stream aborts the signal of its controller.
   # The stream process must answer other processes while the listeners of
   # the signal run: the signal is aborted before the call returns, and a new
-  # process runs the listeners.
+  # process runs the listeners. A public abort signals abort before it sends
+  # the abort, thus this step has no effect then. A later public abort does
+  # not ask for the state of the stream.
   defp abort_signal(%{abort_controller: %Web.AbortController{} = controller} = data, reason) do
     :ok = Web.AbortSignal.__signal_abort_later__(controller.signal, reason)
+    Process.delete(@abort_signal_key)
     data
   end
 
@@ -2932,6 +3164,8 @@ defmodule Web.Stream do
     data = if type == :abort, do: abort_signal(data, reason), else: data
     module = data.module
     impl_state = data.impl_state
+    stream = self()
+    notice = if type == :abort, do: data.abort_notice
 
     task =
       start_task(
@@ -2944,6 +3178,10 @@ defmodule Web.Stream do
               if function_exported?(module, :terminate, 2) do
                 module.terminate({type, reason}, impl_state)
               end
+
+            # The stream tells the pipe that waits: see "The abort action
+            # of a pipe".
+            if notice, do: send(stream, {:abort_callback_returned, notice})
 
             # Only a promise that rejects is a failure. Each other value
             # that the callback returns has no effect.
@@ -2962,7 +3200,7 @@ defmodule Web.Stream do
         data.async_context
       )
 
-    set_active_task(data, task, :abort)
+    set_active_task(%{data | abort_notice: nil}, task, :abort)
   end
 
   # ---------------------------------------------------------------------------

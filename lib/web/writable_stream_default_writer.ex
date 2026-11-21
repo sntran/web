@@ -49,13 +49,19 @@ defmodule Web.WritableStreamDefaultWriter do
 
   @doc """
   Aborts the stream and notifies the underlying sink.
+
+  The listeners of the event `abort` of the signal of the controller run in
+  the calling process before this function returns, as the Streams Standard
+  specifies.
   """
   def abort(%__MODULE__{controller_pid: pid, owner_pid: owner_pid} = writer, reason) do
     # A value that the abort callback of the sink throws is the rejection
     # reason, with no change.
-    Web.Stream.promise_call(
+    Web.Stream.__abort__(
       pid,
-      as_writer(writer, {:abort, owner_pid, reason}),
+      {as_writer(writer, {:abort_first_steps, owner_pid, reason}),
+       as_writer(writer, {:abort, owner_pid, reason})},
+      reason,
       {:error, :released},
       fn
         :ok ->

@@ -370,6 +370,13 @@ defmodule Web.Test.QuickJS.WPT do
       {:test, "streams/writable-streams/aborting.any.js",
        ~r/^(Aborting a WritableStream (before it starts|prevents further writes after any|puts it in an errored state|causes any outstanding write)|Closing but then immediately aborting|promises returned from other writer methods should be rejected when writer abort\(\) happens during sink start|WritableStream if sink's abort throws, the promise returned by multiple writer\.abort\(\)s is the same|when calling abort\(\) twice on the same stream)/,
        @microtask},
+      # The stream of this test has started when `getWriter()` returns: the
+      # close of the listener of the signal is in flight, and it completes.
+      # In JavaScript, the start is complete in a later microtask: the close
+      # waits, and the abort rejects it. `test/web/writable_stream_abort_listener_test.exs`
+      # has the two cases.
+      {:test, "streams/writable-streams/aborting.any.js",
+       "recursive close() call from abort() aborting signal (not started)", @microtask},
       {:test, "streams/writable-streams/close.any.js",
        ~r/^(when close is called on a WritableStream in writable state, ready should return a fulfilled promise|releaseLock\(\) should not change the result of sync close\(\)|close\(\) on an erroring stream should reject)$/,
        @microtask},

@@ -161,39 +161,59 @@ defmodule Web.AbortSignalEventTest do
     assert AbortSignal.reason(signal) == :why
   end
 
-  test "the process of a stream aborts its signal, and a new process runs the listeners" do
+  # A writable stream whose controller signal has the listener `listener`.
+  defp stream_with_listener(listener) do
     me = self()
 
     stream =
       Web.WritableStream.new(%{
         start: fn controller ->
           signal = Web.WritableStreamDefaultController.signal(controller)
-
-          # The listener waits, then calls the stream. If the process of the
-          # stream ran the listener, the stream could not answer.
-          EventTarget.add_event_listener(signal, "abort", fn ->
-            send(me, {:listener, self()})
-
-            receive do
-              {:call, pid} -> send(me, {:locked, Web.WritableStream.locked?(pid)})
-            end
-          end)
-
+          EventTarget.add_event_listener(signal, "abort", listener)
           send(me, {:signal, signal})
         end
       })
 
     assert_receive {:signal, signal}
+    {stream, signal}
+  end
+
+  test "a public abort of a writable stream runs the listeners in the calling process" do
+    me = self()
+    {stream, signal} = stream_with_listener(fn -> send(me, {:listener, self()}) end)
 
     promise = Web.WritableStream.abort(stream, :why)
+    # The listener ran before the abort returned.
+    assert_received {:listener, ^me}
+    assert AbortSignal.reason(signal) == :why
+    assert Web.Promise.await(promise) == :ok
+  end
+
+  test "the process of a stream aborts its signal for an abort of the library, and a new process runs the listeners" do
+    me = self()
+
+    # The listener waits, then calls the stream. If the process of the
+    # stream ran the listener, the stream could not answer.
+    {stream, signal} =
+      stream_with_listener(fn ->
+        send(me, {:listener, self()})
+
+        receive do
+          {:call, pid} -> send(me, {:locked, Web.WritableStream.locked?(pid)})
+        end
+      end)
+
+    # A pipe with a signal that aborted aborts the stream.
+    source = Web.ReadableStream.new()
+    pipe = Web.ReadableStream.pipe_to(source, stream, signal: AbortSignal.abort(:why))
     assert_receive {:listener, listener}
-    refute listener == stream.controller_pid
+    refute listener in [me, stream.controller_pid]
     assert AbortSignal.aborted?(signal)
     assert AbortSignal.reason(signal) == :why
 
     send(listener, {:call, stream.controller_pid})
-    assert_receive {:locked, false}
-    assert Web.Promise.await(promise) == :ok
+    assert_receive {:locked, _locked}
+    assert catch_exit(Web.Promise.await(pipe)) == :why
 
     assert AbortSignal.__signal_abort_later__(AbortSignal.abort(), :x) == :ok
     assert AbortSignal.__signal_abort__(AbortSignal.abort(), :x) == :ok

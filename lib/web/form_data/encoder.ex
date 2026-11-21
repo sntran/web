@@ -21,13 +21,13 @@ defmodule Web.FormData.Encoder do
   end
 
   # A part with a file: the headers, the bytes of the file, and the end of
-  # the part.
+  # the part. The parameter `filename` is the name of the file.
   defp part(boundary, name, %File{} = file) do
     headers =
       IO.iodata_to_binary([
         ["--", boundary, "\r\n"],
         ["Content-Disposition: form-data; name=\"", escape(normalize_newlines(name)), "\""],
-        ["; filename=\"", escape(file.filename || "blob"), "\"\r\n"],
+        ["; filename=\"", escape(file.name), "\"\r\n"],
         ["Content-Type: ", content_type(file), "\r\n\r\n"]
       ])
 

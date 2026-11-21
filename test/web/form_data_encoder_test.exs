@@ -18,11 +18,11 @@ defmodule Web.FormDataEncoderTest do
 
   defp encode(form), do: form |> Encoder.encode() |> Enum.join()
 
-  # Reads the entries of a form. A file becomes `{:file, filename, type, bytes}`.
+  # Reads the entries of a form. A file becomes `{:file, name, type, bytes}`.
   defp entries(form) do
     Enum.map(form, fn
       [name, %Web.File{} = file] ->
-        {name, {:file, file.filename, file.type, Web.TestBytes.join(Web.File.stream(file))}}
+        {name, {:file, file.name, file.type, Web.TestBytes.join(Web.File.stream(file))}}
 
       [name, value] ->
         {name, value}
@@ -33,7 +33,7 @@ defmodule Web.FormDataEncoderTest do
 
   describe "the encoding" do
     test "gives the parts of the HTML Standard, for a string and for a file" do
-      file = Web.File.new(["file ", "bytes"], filename: "notes.txt", type: "text/plain")
+      file = Web.File.new(["file ", "bytes"], "notes.txt", type: "text/plain")
       form = form([{"field", "value"}, {"upload", file}])
 
       assert encode(form) ==
@@ -47,6 +47,14 @@ defmodule Web.FormDataEncoderTest do
                  "\r\n" <>
                  "file bytes\r\n" <>
                  "--test-boundary--\r\n"
+    end
+
+    test "gives the name of the file of each entry as the parameter filename" do
+      file = Web.File.new(["x"], "old.txt", type: "text/plain")
+      encoded = encode(form([{"same", file}, {"new", file, "new.txt"}]))
+
+      assert encoded =~ ~s(name="same"; filename="old.txt"\r\n)
+      assert encoded =~ ~s(name="new"; filename="new.txt"\r\n)
     end
 
     test "gives only the last boundary for a form with no entries" do
@@ -68,7 +76,7 @@ defmodule Web.FormDataEncoderTest do
     end
 
     test "escapes a quotation mark and a line end in a name and in a file name" do
-      file = Web.File.new(["x"], filename: "a\"b\nc\rd.txt")
+      file = Web.File.new(["x"], "a\"b\nc\rd.txt")
       encoded = encode(form([{"q\"uote", file}]))
 
       # A line end of a file name is not changed to CR LF. It is only escaped.
@@ -77,14 +85,14 @@ defmodule Web.FormDataEncoderTest do
 
     test "does not change the bytes of a file" do
       bytes = <<0, 255, ?\r, ?\n, ?-, ?-, 13, 10, 10>>
-      file = Web.File.new([bytes], filename: "data.bin")
+      file = Web.File.new([bytes], "data.bin")
 
       assert encode(form([{"upload", file}])) =~ "\r\n\r\n" <> bytes <> "\r\n--test-boundary--"
     end
 
     test "reads the stream of a file chunk by chunk" do
       stream = ReadableStream.from(["ab", Uint8Array.from("cd"), ArrayBuffer.new("ef")])
-      file = Web.File.new([], filename: "stream.txt", stream: stream, size: nil)
+      file = %{Web.File.new([], "stream.txt") | stream: stream, size: nil}
       chunks = Enum.to_list(Encoder.encode(form([{"upload", file}])))
 
       assert Enum.slice(chunks, 1, 3) == ["ab", "cd", "ef"]
@@ -120,7 +128,7 @@ defmodule Web.FormDataEncoderTest do
       assert request.body_source == form
 
       # A file with a stream can be read only one time.
-      stream_file = Web.File.new([], filename: "s", stream: ReadableStream.from(["x"]))
+      stream_file = %{Web.File.new([], "s") | stream: ReadableStream.from(["x"])}
 
       request =
         Request.new("https://example.com/", method: "POST", body: form([{"f", stream_file}]))
@@ -135,8 +143,7 @@ defmodule Web.FormDataEncoderTest do
     end
 
     test "gives the same entries when it is parsed" do
-      file =
-        Web.File.new([<<0, 1, 2>>, "text"], filename: "a \"b\".bin", type: "application/x-test")
+      file = Web.File.new([<<0, 1, 2>>, "text"], "a \"b\".bin", type: "application/x-test")
 
       form =
         form([
@@ -161,8 +168,8 @@ defmodule Web.FormDataEncoderTest do
     end
 
     test "keeps each backslash of a name and of a file name" do
-      file = Web.File.new(["x"], filename: "C:\\dir\\file.txt")
-      unc = Web.File.new(["y"], filename: "\\\\server\\share\\")
+      file = Web.File.new(["x"], "C:\\dir\\file.txt")
+      unc = Web.File.new(["y"], "\\\\server\\share\\")
       form = form([{"dir\\name", "value"}, {"upload", file}, {"end\\", "w"}, {"unc\\", unc}])
 
       assert round_trip(form) == [
@@ -227,7 +234,7 @@ defmodule Web.FormDataEncoderTest do
         form =
           Enum.reduce(entries, FormData.new(), fn
             {name, {:file, filename, type, bytes}}, form ->
-              FormData.append(form, name, Web.File.new([bytes], filename: filename, type: type))
+              FormData.append(form, name, Web.File.new([bytes], filename, type: type))
 
             {name, value}, form ->
               FormData.append(form, name, value)

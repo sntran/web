@@ -42,6 +42,7 @@ defmodule AsyncRuntimePowerExample do
                     Console.info("metadata field received: #{value}")
 
                   [_name, %File{} = file] ->
+                    Console.info("file received: #{file.name}")
                     compression = CompressionStream.new("gzip")
                     send(parent, {:compression_pid, compression.readable.controller_pid})
 

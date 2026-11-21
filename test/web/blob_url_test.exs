@@ -35,7 +35,7 @@ defmodule Web.BlobURLTest do
       assert text(response) == "hello"
     end
 
-    file = Web.File.new(["bits"], filename: "a.txt")
+    file = Web.File.new(["bits"], "a.txt")
     assert {:fulfilled, response} = fetch(URL.create_object_url(file))
     assert Web.Headers.get(response.headers, "content-type", nil) == ""
     assert text(response) == "bits"

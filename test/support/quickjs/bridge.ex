@@ -933,17 +933,15 @@ defmodule Web.Test.QuickJS.Bridge do
   defp adapt("WindowOrWorkerGlobalScope", "static", "fetch", _self, [input | init]),
     do: {:ok, Web.fetch(absolute(input), options(init))}
 
+  # The dictionaries `BlobPropertyBag` and `FilePropertyBag` are keyword
+  # lists in the library.
   defp adapt("Blob", "constructor", _member, _self, [parts | rest]),
     do: {:ok, Web.Blob.new(parts || [], options(rest))}
 
   defp adapt("Blob", "constructor", _member, _self, []), do: {:ok, Web.Blob.new([])}
 
-  # The name of a file is `:filename` in the library: `:name` is the name of
-  # a field of a form.
   defp adapt("File", "constructor", _member, _self, [bits, name | rest]),
-    do: {:ok, Web.File.new(bits, [filename: name] ++ options(rest))}
-
-  defp adapt("File", "getter", "name", %Web.File{filename: name}, []), do: {:ok, name}
+    do: {:ok, Web.File.new(bits, name, options(rest))}
 
   defp adapt("Event", "constructor", _member, _self, [type | init]),
     do: {:ok, Web.Event.new(type, options(init))}

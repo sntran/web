@@ -54,7 +54,7 @@ defmodule Web.FetchFormDataTest do
     |> FormData.append("empty", "")
     |> FormData.append(
       "upload",
-      Web.File.new([@bytes], filename: "data.bin", type: "application/x-test")
+      Web.File.new([@bytes], "data.bin", type: "application/x-test")
     )
     |> FormData.append("blob", Web.Blob.new(["blob ", "bytes"]))
   end
@@ -98,8 +98,7 @@ defmodule Web.FetchFormDataTest do
   test "sends a form with a file from a stream, chunk by chunk", %{base: base} do
     chunks = for index <- 1..50, do: String.duplicate(<<rem(index, 256)>>, 1_000)
 
-    file =
-      Web.File.new([], filename: "stream.bin", stream: ReadableStream.from(chunks), size: nil)
+    file = %{Web.File.new([], "stream.bin") | stream: ReadableStream.from(chunks), size: nil}
 
     form = FormData.new() |> FormData.append("field", "value") |> FormData.append("upload", file)
 
@@ -112,7 +111,7 @@ defmodule Web.FetchFormDataTest do
   end
 
   test "rejects a redirect that needs a form with a file stream again", %{base: base} do
-    file = Web.File.new([], filename: "s.bin", stream: ReadableStream.from(["x"]), size: nil)
+    file = %{Web.File.new([], "s.bin") | stream: ReadableStream.from(["x"]), size: nil}
     form = FormData.append(FormData.new(), "upload", file)
 
     assert %TypeError{} =

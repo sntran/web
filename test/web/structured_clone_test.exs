@@ -181,13 +181,7 @@ defmodule Web.StructuredCloneTest do
     test "a blob and a file get a new identity and the same content" do
       blob = Blob.new(["hello"], type: "text/plain")
 
-      file =
-        File.new([blob, " world"],
-          name: "upload",
-          filename: "hello.txt",
-          type: "text/plain",
-          last_modified: 123
-        )
+      file = File.new([blob, " world"], "hello.txt", type: "text/plain", last_modified: 123)
 
       [blob_clone, file_clone, blob_again] = Web.structured_clone([blob, file, blob])
 
@@ -196,13 +190,31 @@ defmodule Web.StructuredCloneTest do
       refute blob_clone.id == blob.id
       assert blob_again.id == blob_clone.id
 
-      assert %File{name: "upload", filename: "hello.txt", type: "text/plain"} = file_clone
+      assert %File{name: "hello.txt", type: "text/plain"} = file_clone
       assert file_clone.size == file.size
       # The File API: "Set serialized.[[LastModified]]".
       assert file_clone.last_modified == 123
       refute file_clone.id == file.id
 
       assert Blob.to_binary(Blob.new(file_clone.parts)) == "hello world"
+    end
+
+    test "a file of a parsed form keeps its name and its size with no bytes" do
+      body =
+        ~s(--b\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n) <>
+          ~s(--b\r\nContent-Disposition: form-data; name="upload"; filename="a.txt"\r\n) <>
+          "Content-Type: text/plain\r\n\r\nhello\r\n" <>
+          ~s(--b\r\nContent-Disposition: form-data; name="after"\r\n\r\ndone\r\n--b--\r\n)
+
+      # A change of a parsed form drops the bytes of its files that no
+      # reader took. Each file keeps its size.
+      form = body |> Web.FormData.parse("b") |> Web.FormData.append("extra", "x")
+      file = Web.FormData.get(form, "upload")
+      assert %File{name: "a.txt", parts: [], stream: nil, size: 5} = file
+
+      clone = Web.structured_clone(file)
+      assert %File{name: "a.txt", type: "text/plain", size: 5} = clone
+      assert clone.last_modified == file.last_modified
     end
 
     test "two equal blobs stay two blobs" do
@@ -302,13 +314,10 @@ defmodule Web.StructuredCloneTest do
     end
 
     test "a file that has a stream" do
-      file =
-        File.new([],
-          name: "upload",
-          filename: "stream.txt",
-          type: "text/plain",
-          stream: Web.ReadableStream.from("payload")
-        )
+      file = %{
+        File.new([], "stream.txt", type: "text/plain")
+        | stream: Web.ReadableStream.from("payload")
+      }
 
       assert data_clone_error(fn -> Web.structured_clone(file) end) ==
                "A file that has a stream cannot be cloned."
@@ -685,11 +694,11 @@ defmodule Web.StructuredCloneTest do
       fn parts ->
         StreamData.fixed_map(%{
           name: StreamData.string(:alphanumeric, max_length: 8),
-          filename: StreamData.string(:alphanumeric, min_length: 1, max_length: 8),
-          type: StreamData.string(:alphanumeric, max_length: 12)
+          type: StreamData.string(:alphanumeric, max_length: 12),
+          last_modified: StreamData.integer()
         })
-        |> StreamData.map(fn %{name: name, filename: filename, type: type} ->
-          File.new(parts, name: name, filename: filename, type: type)
+        |> StreamData.map(fn %{name: name, type: type, last_modified: last_modified} ->
+          File.new(parts, name, type: type, last_modified: last_modified)
         end)
       end
     )
@@ -772,8 +781,8 @@ defmodule Web.StructuredCloneTest do
   end
 
   defp canonicalize(%File{} = value) do
-    {:file, Enum.map(value.parts, &canonicalize/1), value.type, value.name, value.filename,
-     value.size, value.last_modified}
+    {:file, Enum.map(value.parts, &canonicalize/1), value.type, value.name, value.size,
+     value.last_modified}
   end
 
   defp canonicalize(%Headers{} = value) do

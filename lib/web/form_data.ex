@@ -59,6 +59,19 @@ defmodule Web.FormData do
 
   @doc """
   Appends a value for a field name.
+
+  A value that is a `Web.Blob` or a `Web.File` becomes a `Web.File`, as
+  the steps "create an entry" of the XMLHttpRequest Standard specify. The
+  name of the file is `filename`. When `filename` is `nil`, a file keeps
+  its name, and a blob gets the name `"blob"`.
+
+  ## Examples
+
+      iex> blob = Web.Blob.new(["bytes"], type: "text/plain")
+      iex> form = Web.FormData.new() |> Web.FormData.append("upload", blob, "notes.txt")
+      iex> %Web.File{name: name, type: type} = Web.FormData.get(form, "upload")
+      iex> {name, type}
+      {"notes.txt", "text/plain"}
   """
   @spec append(t(), term(), term(), String.t() | nil) :: t()
   def append(form, name, value, filename \\ nil)
@@ -71,12 +84,14 @@ defmodule Web.FormData do
 
   def append(%__MODULE__{entries: entries} = form, name, value, filename) do
     normalized_name = to_string(name)
-    normalized_value = normalize_value(normalized_name, value, filename)
+    normalized_value = normalize_value(value, filename)
     %{form | entries: entries ++ [{normalized_name, normalized_value}]}
   end
 
   @doc """
   Sets a single value for a field name, replacing existing entries.
+
+  A blob or a file becomes a `Web.File` with the rules of `append/4`.
   """
   @spec set(t(), term(), term(), String.t() | nil) :: t()
   def set(form, name, value, filename \\ nil)
@@ -236,26 +251,20 @@ defmodule Web.FormData do
     "multipart/form-data; boundary=" <> boundary
   end
 
-  # The steps "create an entry" of the XMLHttpRequest Standard. A file with a
-  # new name is a new File object with the same bytes and the same time of
-  # the last change.
-  defp normalize_value(_name, %File{} = file, filename) when is_binary(filename) do
-    %{file | id: make_ref(), filename: filename}
-  end
+  # The steps "create an entry" of the XMLHttpRequest Standard. A blob that
+  # is not a file becomes a new File object with the same bytes and the name
+  # "blob". A file name that the caller gives makes a new File object with
+  # the same bytes and that name. The new file keeps the type and the time
+  # of the last change.
+  defp normalize_value(%File{} = file, nil), do: file
 
-  defp normalize_value(_name, %File{} = file, _filename), do: file
+  defp normalize_value(%File{} = file, filename),
+    do: %{file | id: make_ref(), name: to_string(filename)}
 
-  # A blob that is not a file becomes a new File object with the same bytes,
-  # with the name "blob" or the given name.
-  defp normalize_value(name, %Web.Blob{} = blob, filename) do
-    File.new(blob.parts,
-      name: name,
-      filename: filename || "blob",
-      type: blob.type
-    )
-  end
+  defp normalize_value(%Web.Blob{} = blob, filename),
+    do: File.new(blob.parts, to_string(filename || "blob"), type: blob.type)
 
-  defp normalize_value(_name, value, _filename), do: to_string(value)
+  defp normalize_value(value, _filename), do: to_string(value)
 
   # Drains a live coordinator to a static entries list, stopping the coordinator
   # process. Used internally by mutation operations (append/set/delete) on live forms.
@@ -1352,23 +1361,24 @@ defmodule Web.FormData do
        }}
     end
 
-    defp build_file_entry(
-           data,
-           %{name: name, filename: filename, type: type},
-           part_id,
-           entry_index
-         ) do
+    # The steps of the multipart/form-data parser of the Fetch Standard: a
+    # part with a file name is a new File object with that name and the
+    # type of the part. The name of the field is the name of the entry. The
+    # bytes come later, from the body.
+    defp build_file_entry(data, %{filename: filename, type: type}, part_id, entry_index) do
+      file = File.new([], filename, type: type)
+
       case data.materializing? do
         true ->
-          build_materialized_file_entry(name, filename, type, part_id, entry_index)
+          build_materialized_file_entry(file, part_id, entry_index)
 
         false ->
-          build_live_file_entry(name, filename, type, part_id, entry_index, data.async_context)
+          build_live_file_entry(file, part_id, entry_index, data.async_context)
       end
     end
 
-    defp build_materialized_file_entry(name, filename, type, part_id, entry_index) do
-      file = File.new([], name: name, filename: filename, type: type, size: nil, stream: nil)
+    defp build_materialized_file_entry(file, part_id, entry_index) do
+      file = %{file | size: nil}
 
       current_file = %{
         id: part_id,
@@ -1382,7 +1392,7 @@ defmodule Web.FormData do
       {file, current_file}
     end
 
-    defp build_live_file_entry(name, filename, type, part_id, entry_index, %Snapshot{} = snapshot) do
+    defp build_live_file_entry(file, part_id, entry_index, %Snapshot{} = snapshot) do
       coordinator_pid = self()
 
       stream =
@@ -1393,7 +1403,7 @@ defmodule Web.FormData do
           })
         end)
 
-      file = File.new([], name: name, filename: filename, type: type, size: nil, stream: stream)
+      file = %{file | size: nil, stream: stream}
 
       current_file = %{
         id: part_id,

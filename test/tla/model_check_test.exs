@@ -111,6 +111,31 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "TransformLifetime" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("TransformLifetime"))
+    end
+
+    test "a side that does not tell the change of its lock is found" do
+      assert_violates(SpecModel.check("TransformLifetime", bug("no_notify")), "CopyAgrees")
+    end
+
+    test "a side that does not monitor the other side is found" do
+      assert_violates(SpecModel.check("TransformLifetime", bug("no_monitor")), "CopyAgrees")
+    end
+
+    test "a side that ends while the other side has a lock is found" do
+      assert_violates(
+        SpecModel.check("TransformLifetime", bug("own_lock_only")),
+        "KeptByLock"
+      )
+    end
+
+    test "two sides that continue after all their processes are found" do
+      assert_violates(SpecModel.check("TransformLifetime", bug("no_owner_rule")), "NoOrphan")
+    end
+  end
+
   describe "AbortSignal" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("AbortSignal"))

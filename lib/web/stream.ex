@@ -3985,7 +3985,9 @@ defmodule Web.Stream do
   #
   # The two sides of a transform stream are one stream for these rules: a
   # lock of one side keeps the two sides. Each side tells the other side when
-  # its own lock changes: see `notify_peer_lock/2`.
+  # its own lock changes: see `notify_peer_lock/2`. Each side monitors the
+  # other side: a stop of the other side clears its lock. See
+  # `tla/TransformLifetime.tla`.
   defp locked?(data), do: own_lock?(data) or peer_locked?(data)
 
   defp own_lock?(data) do

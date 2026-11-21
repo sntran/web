@@ -7,11 +7,13 @@ defmodule Web.DecompressionStream do
   Elixir: Erlang/OTP has no brotli.
 
   The stream gives its output in chunks of approximately 64 KiB, and makes
-  the next chunk only when its readable side has space. Thus a small
-  compressed chunk that expands much does not fill the memory. The decoder
-  is the decoder of `Web.fetch/2`. It opens its zlib handle in the worker
-  process of the stream, which runs each callback: the handle belongs to
-  that process, and closes when the stream stops.
+  the next chunk only when a read asks for a chunk. Thus a small compressed
+  chunk that expands much does not fill the memory. The Compression
+  Standard puts all the output of a chunk in the queue at once. Here a write
+  that gives more than one chunk is complete only when the reads took its
+  chunks. The decoder is the decoder of `Web.fetch/2`. It opens its zlib
+  handle in the worker process of the stream, which runs each callback: the
+  handle belongs to that process, and closes when the stream stops.
 
   ## Supported formats
 
@@ -25,12 +27,17 @@ defmodule Web.DecompressionStream do
       iex> ds = Web.DecompressionStream.new("gzip")
       iex> writer = Web.WritableStream.get_writer(ds.writable)
       iex> compressed = :zlib.gzip("hello world")
-      iex> Web.await(Web.WritableStreamDefaultWriter.write(writer, compressed))
-      :ok
-      iex> Web.await(Web.WritableStreamDefaultWriter.close(writer))
-      :ok
+      iex> write = Web.WritableStreamDefaultWriter.write(writer, compressed)
+      iex> close = Web.WritableStreamDefaultWriter.close(writer)
       iex> Enum.map_join(ds.readable, &Web.Uint8Array.to_binary/1)
       "hello world"
+      iex> {Web.await(write), Web.await(close)}
+      {:ok, :ok}
+
+  The transform of a chunk starts only when a read asks for a chunk, as the
+  Compression Standard specifies: the readable side has the high water mark
+  0, and the writable side has the high water mark 1. Thus start the read
+  before you wait for a write.
 
   Each chunk of the readable side is a `Web.Uint8Array`, as the Compression
   Standard specifies. A chunk for the writable side is a binary, a
@@ -41,6 +48,7 @@ defmodule Web.DecompressionStream do
 
   require Logger
 
+  alias Web.CountQueuingStrategy
   alias Web.Internal.Bytes
   alias Web.Internal.ContentDecoder
   alias Web.ReadableStreamDefaultController
@@ -56,6 +64,17 @@ defmodule Web.DecompressionStream do
 
   @valid_formats ~w[brotli gzip deflate deflate-raw]
 
+  # The Compression Standard sets up the stream with the steps "set up a
+  # TransformStream" of the Streams Standard. These steps give the writable
+  # side the high water mark 1 and the readable side the high water mark 0.
+  # The size of each chunk is 1 on the two sides. Thus the transform of a
+  # chunk starts only when a reader asks for a chunk.
+  @queuing [
+    high_water_mark: 1,
+    writable_size: :count,
+    strategy: %CountQueuingStrategy{high_water_mark: 0}
+  ]
+
   @doc """
   Creates a new `DecompressionStream` for the given `format`.
 
@@ -64,7 +83,7 @@ defmodule Web.DecompressionStream do
   """
   @spec new(String.t()) :: t()
   def new(format) when format in @valid_formats do
-    {:ok, pid} = start_link(format: format)
+    {:ok, pid} = start_link([format: format] ++ @queuing)
 
     %__MODULE__{
       readable: %Web.ReadableStream{controller_pid: pid},

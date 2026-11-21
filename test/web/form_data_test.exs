@@ -772,6 +772,20 @@ defmodule Web.FormDataTest do
     assert :ok = ReadableStreamDefaultReader.release_lock(reader)
   end
 
+  test "a body that a body function took raises a type error, with no crash report" do
+    stream = ReadableStream.from("payload")
+    assert await(Web.Response.text(%Web.Response{body: stream})) == "payload"
+
+    log =
+      capture_log(fn ->
+        assert_raise Web.TypeError, "ReadableStream is already locked", fn ->
+          Web.FormData.parse(stream, "used-boundary")
+        end
+      end)
+
+    refute log =~ "error"
+  end
+
   test "pid signals abort the coordinator and child stream" do
     boundary = "pid-signal-boundary"
 

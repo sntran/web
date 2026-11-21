@@ -331,6 +331,35 @@ defmodule Web.ReadableStream do
   def __process__(%__MODULE__{lazy: lazy}), do: LazyStream.process(lazy, Promise.owner())
 
   @doc false
+  # The lock step of each path that takes the lock of a stream process: a
+  # reader, a tee, a pipe, an iterator, an enumeration, a cancel, a body
+  # function and the proxy of a body (`Web.Body`), and the FormData parser.
+  # `lock` takes the lock of the process `pid`, and returns
+  # `{:error, :released}` when the process stopped.
+  #
+  # The stream process of a stream with no process can stop before that
+  # lock: a different process can kill it. When it stopped before its first
+  # read, no reader took the bytes, and the state is `:readable`, or
+  # `{:process, pid}` for a new stream process: the step asks for the
+  # stream process again, with `again`, and takes its lock. The state ends
+  # the retry: after a read or a claim, the state is `:gone` or the state of
+  # the claim, and the error stays. See `tla/LazyStream.tla`.
+  def __lock__(%__MODULE__{controller_pid: pid}, lock) when is_pid(pid), do: lock.(pid)
+
+  def __lock__(%__MODULE__{} = stream, lock),
+    do: __lock__(stream, process!(stream), lock, fn -> __lock__(stream, lock) end)
+
+  def __lock__(%__MODULE__{lazy: lazy}, pid, lock, again) do
+    with {:error, :released} = released <- lock.(pid) do
+      if bytes_free?(LazyStream.state(lazy)), do: again.(), else: released
+    end
+  end
+
+  defp bytes_free?(:readable), do: true
+  defp bytes_free?({:process, _pid}), do: true
+  defp bytes_free?(_used_or_gone), do: false
+
+  @doc false
   # The same stream, with its process. Raises `Web.TypeError` when the
   # stream cannot have a process.
   def __with_process__(stream), do: %__MODULE__{controller_pid: process!(stream)}
@@ -680,32 +709,9 @@ defmodule Web.ReadableStream do
       iex> is_struct(reader, Web.ReadableStreamDefaultReader)
       true
   """
-  def get_reader(%__MODULE__{controller_pid: nil} = stream, opts) when is_list(opts) do
-    get_reader(%__MODULE__{controller_pid: process!(stream)}, opts)
-  end
-
-  def get_reader(%__MODULE__{controller_pid: pid}, opts) when is_list(opts) do
-    case reader_mode_from_options(opts) do
-      # The reader keeps the reference of its lock: see
-      # `Web.ReadableStreamBYOBReader`.
-      :byob ->
-        case lock_reader(pid, :byob) do
-          {:ok, lock} ->
-            %ReadableStreamBYOBReader{controller_pid: pid, owner_pid: self(), lock: lock}
-
-          {:error, :already_locked} ->
-            raise TypeError, "ReadableStream is already locked"
-
-          {:error, :not_byte_stream} ->
-            raise TypeError, "ReadableStream is not a byte stream"
-
-          {:error, :released} ->
-            raise TypeError, @released_message
-        end
-
-      :default ->
-        get_reader(%__MODULE__{controller_pid: pid})
-    end
+  def get_reader(%__MODULE__{} = stream, opts) when is_list(opts) do
+    mode = reader_mode_from_options(opts)
+    stream |> __lock__(&reader_lock(&1, mode)) |> new_reader()
   end
 
   def get_reader(pid, opts) when is_pid(pid) and is_list(opts) do
@@ -717,24 +723,34 @@ defmodule Web.ReadableStream do
 
   def get_reader(pid) when is_pid(pid), do: get_reader(pid, [])
 
-  def get_reader(%__MODULE__{controller_pid: nil} = stream) do
-    get_reader(%__MODULE__{controller_pid: process!(stream)})
+  def get_reader(%__MODULE__{} = stream), do: get_reader(stream, [])
+
+  @doc false
+  # A default reader of the process `pid`, for the lock step of
+  # `__lock__/4`: `{:ok, reader}` or `{:error, reason}`.
+  def __reader__(pid) when is_pid(pid) do
+    with {:ok, _lock} = locked <- reader_lock(pid, :default), do: {:ok, new_reader(locked)}
+  end
+
+  defp reader_lock(pid, mode) do
+    with {:ok, lock} <- lock_reader(pid, mode), do: {:ok, {pid, mode, lock}}
   end
 
   # The reader keeps the reference of its lock: see
-  # `Web.ReadableStreamDefaultReader`.
-  def get_reader(%__MODULE__{controller_pid: pid}) do
-    case lock_reader(pid, :default) do
-      {:ok, lock} ->
-        %Web.ReadableStreamDefaultReader{controller_pid: pid, owner_pid: self(), lock: lock}
+  # `Web.ReadableStreamDefaultReader` and `Web.ReadableStreamBYOBReader`.
+  defp new_reader({:ok, {pid, :default, lock}}),
+    do: %Web.ReadableStreamDefaultReader{controller_pid: pid, owner_pid: self(), lock: lock}
 
-      {:error, :already_locked} ->
-        raise TypeError, "ReadableStream is already locked"
+  defp new_reader({:ok, {pid, :byob, lock}}),
+    do: %ReadableStreamBYOBReader{controller_pid: pid, owner_pid: self(), lock: lock}
 
-      {:error, :released} ->
-        raise TypeError, @released_message
-    end
-  end
+  defp new_reader({:error, :already_locked}),
+    do: raise(TypeError, "ReadableStream is already locked")
+
+  defp new_reader({:error, :not_byte_stream}),
+    do: raise(TypeError, "ReadableStream is not a byte stream")
+
+  defp new_reader({:error, :released}), do: raise(TypeError, @released_message)
 
   # Takes the reader lock for this process. Returns `{:ok, lock}` with the
   # reference of the lock, or `{:error, reason}`.
@@ -911,12 +927,19 @@ defmodule Web.ReadableStream do
     Web.Stream.promise_call(pid, {:terminate_unlocked, :cancel, reason}, :ok, &cancel_result/1)
   end
 
-  # A stream with no process has no callback to call.
-  def cancel(%__MODULE__{lazy: lazy}, reason) do
+  # A stream with no process has no callback to call. The cancel of its
+  # stream process waits for the end of the cancel: a process that stopped
+  # before its first read gives the cancel of the bytes. See `__lock__/2`.
+  def cancel(%__MODULE__{lazy: lazy} = stream, reason) do
     case LazyStream.cancel(lazy) do
-      :ok -> Promise.resolve(:ok)
-      :locked -> Promise.reject(%TypeError{message: "Cannot cancel a locked stream."})
-      {:process, pid} -> cancel(%__MODULE__{controller_pid: pid}, reason)
+      :ok ->
+        Promise.resolve(:ok)
+
+      :locked ->
+        Promise.reject(%TypeError{message: "Cannot cancel a locked stream."})
+
+      {:process, pid} ->
+        cancel_lazy_process(stream, pid, reason)
     end
   end
 
@@ -925,6 +948,23 @@ defmodule Web.ReadableStream do
   def cancel(pid, reason) do
     Web.Stream.promise_call(pid, {:terminate, :cancel, reason}, :ok, &cancel_result/1)
   end
+
+  # A process that stopped after a read: the cancel of a stream that ended.
+  defp cancel_lazy_process(stream, pid, reason) do
+    with {:error, :released} <-
+           __lock__(stream, pid, &cancel_process(&1, reason), fn -> cancel(stream, reason) end),
+         do: Promise.resolve(:ok)
+  end
+
+  defp cancel_process(pid, reason) do
+    case Web.Stream.call(pid, {:terminate_unlocked, :cancel, reason}, {:error, :released}) do
+      {:error, :released} -> {:error, :released}
+      reply -> reply |> cancel_result() |> settled()
+    end
+  end
+
+  defp settled({:ok, value}), do: Promise.resolve(value)
+  defp settled({:error, reason}), do: Promise.reject(reason)
 
   # A value that the cancel callback of the source throws is the rejection
   # reason, with no change.
@@ -979,26 +1019,32 @@ defmodule Web.ReadableStream do
   # gets a structured clone of each chunk. The tee of a byte stream always
   # gives each branch its own bytes.
   def __tee__(%__MODULE__{controller_pid: nil, lazy: lazy} = stream, clone?) do
+    tee = &do_tee(%__MODULE__{controller_pid: &1}, clone?)
+
     case LazyStream.tee(lazy) do
-      {:ok, branches} -> Enum.map(branches, &%__MODULE__{lazy: &1})
-      {:process, pid} -> __tee__(%__MODULE__{controller_pid: pid}, clone?)
-      :locked -> raise TypeError, "ReadableStream is already locked"
-      _readable_or_used -> __tee__(%__MODULE__{controller_pid: process!(stream)}, clone?)
-    end
-  end
+      {:ok, branches} ->
+        Enum.map(branches, &%__MODULE__{lazy: &1})
 
-  def __tee__(%__MODULE__{controller_pid: pid}, clone?) do
-    case do_tee(%__MODULE__{controller_pid: pid}, clone?) do
-      branches when is_list(branches) ->
-        branches
+      {:process, pid} ->
+        stream |> __lock__(pid, tee, fn -> __tee__(stream, clone?) end) |> branches()
 
-      {:error, :already_locked} ->
+      :locked ->
         raise TypeError, "ReadableStream is already locked"
 
-      {:error, :released} ->
-        raise TypeError, @released_message
+      _readable_or_used ->
+        stream |> __lock__(tee) |> branches()
     end
   end
+
+  def __tee__(%__MODULE__{controller_pid: pid}, clone?),
+    do: %__MODULE__{controller_pid: pid} |> do_tee(clone?) |> branches()
+
+  defp branches(branches) when is_list(branches), do: branches
+
+  defp branches({:error, :already_locked}),
+    do: raise(TypeError, "ReadableStream is already locked")
+
+  defp branches({:error, :released}), do: raise(TypeError, @released_message)
 
   @doc """
   Pipes a readable stream into a writable stream, as `pipeTo()` of the
@@ -1238,8 +1284,9 @@ defimpl Enumerable, for: Web.ReadableStream do
         case Web.Internal.LazyStream.take_chunks(lazy) do
           {:ok, chunks} -> Enumerable.List.reduce(chunks, acc, fun)
           {:error, reason} -> raise_stream_error(reason)
-          {:process, pid} -> reduce(%Web.ReadableStream{controller_pid: pid}, acc, fun)
-          _readable_used_or_gone -> reduce_process(stream, acc, fun)
+          # The lock step of the reader asks again for a process that
+          # stopped before its first read.
+          _process_readable_used_or_gone -> reduce_process(stream, acc, fun)
         end
     end
   end

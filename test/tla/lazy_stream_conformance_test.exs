@@ -155,17 +155,36 @@ defmodule Web.TLA.LazyStreamConformanceTest do
     spawn(fn ->
       result = operate(operation, lazy)
       send(test, {:result, self(), result})
-      held_loop(test, result)
+      held_loop(test, lazy, result)
     end)
   end
 
-  defp held_loop(test, result) do
+  # The copy reads the process that it got with the lock step of the
+  # library: a process that stopped before its first read gives a new ask.
+  defp held_loop(test, lazy, result) do
     receive do
       :read ->
         {:ok, pid} = result
-        send(test, {:result, self(), read(%ReadableStream{controller_pid: pid})})
-        held_loop(test, result)
+        send(test, {:result, self(), read_held(lazy, pid)})
+        held_loop(test, lazy, result)
     end
+  end
+
+  defp read_held(lazy, pid) do
+    stream = %ReadableStream{lazy: lazy}
+
+    reader =
+      ReadableStream.__lock__(stream, pid, &ReadableStream.__reader__/1, fn ->
+        {:ok, ReadableStream.get_reader(stream)}
+      end)
+
+    case reader do
+      {:ok, reader} -> read_all(reader)
+      {:error, :released} -> {:raised, "The stream is not available"}
+      {:error, :already_locked} -> {:raised, "ReadableStream is already locked"}
+    end
+  rescue
+    error in Web.TypeError -> {:raised, error.message}
   end
 
   defp operate(:take, lazy), do: LazyStream.take(lazy)
@@ -245,7 +264,7 @@ defmodule Web.TLA.LazyStreamConformanceTest do
         pid = system.copies[name]
         send(pid, :read)
         result = receive_result(pid)
-        model = model |> SpecModel.step!("Lock", [name]) |> read_step(name)
+        model = model |> SpecModel.step!("Lock", [name]) |> read_step(name) |> read_again(name)
         check_result(model, name, :read, result)
         {model, record_bytes(%{system | holders: holders}, result)}
     end
@@ -287,10 +306,7 @@ defmodule Web.TLA.LazyStreamConformanceTest do
   # copy that reads, enumerates, or tees a stream process gets the process
   # in the result of these functions, and does not read it.
   defp settle(model, name, operation) do
-    actions = for action <- ~w(Eval Register Decide New Check Wake), do: {action, [name]}
-
-    actions =
-      if operation == :read, do: actions ++ [{"Lock", [name]}, {"Read", [name]}], else: actions
+    actions = internal(name, operation == :read)
 
     model = SpecModel.settle(model, actions)
 
@@ -298,6 +314,13 @@ defmodule Web.TLA.LazyStreamConformanceTest do
          SpecModel.enabled?(model, "Drop", [name]),
        do: SpecModel.step!(model, "Drop", [name]),
        else: model
+  end
+
+  # A copy whose process stopped before its first read asks again.
+  defp read_again(model, name) do
+    if SpecModel.get(model, "cpc")[name] == "ask",
+      do: SpecModel.settle(model, internal(name, true)),
+      else: model
   end
 
   # The chunks come after the lock and the disturb, when the stream process
@@ -442,6 +465,339 @@ defmodule Web.TLA.LazyStreamConformanceTest do
       refute log =~ "already_registered"
       refute log =~ "MatchError"
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # A kill of the stream process between the keep and the lock
+  # ---------------------------------------------------------------------------
+
+  # Each path that takes the lock of a stream process, its operation in the
+  # specification, and its bytes.
+  @form_body "--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nhello\r\n--b--\r\n"
+  @lock_paths [
+    get_reader: "read",
+    byob_reader: "read",
+    values: "read",
+    enum: "read",
+    pipe_to: "read",
+    pipe_through: "read",
+    proxy: "read",
+    form_data: "read",
+    tee: "locked",
+    text: "locked",
+    cancel: "canceled"
+  ]
+
+  describe "a kill of the stream process after the keep of a copy and before its lock" do
+    for {path, operation} <- @lock_paths do
+      test "the path #{path} asks again and gets the bytes" do
+        check_kill_before_lock(unquote(path), unquote(operation))
+      end
+    end
+
+    test "the error stays when the bytes went to a reader" do
+      lazy = LazyStream.new({:bytes, "hello"}, nil)
+      {:ok, pid} = LazyStream.process(lazy, self())
+      assert read(%ReadableStream{controller_pid: pid}) == ["hello"]
+      kill_after_keep(pid)
+
+      copy = start_copy(lazy, :read)
+      assert_receive {:kept, ^pid}, 2_000
+      kill(pid)
+      assert {:raised, "The stream is not available" <> _} = receive_result(copy)
+
+      model =
+        @stop_config
+        |> start_model()
+        |> SpecModel.step!("Begin", ["a", "read"])
+        |> SpecModel.settle(internal("a", true))
+        |> SpecModel.step!("Begin", ["b", "read"])
+        |> SpecModel.settle(internal("b", false))
+        |> SpecModel.step!("StreamKill")
+        |> SpecModel.settle(internal("b", true))
+
+      assert SpecModel.get(model, "result")["b"] == "failed"
+      assert @cell[:atomics.get(lazy.ref, 1)] == SpecModel.get(model, "cell")
+    end
+  end
+
+  describe "a kill of the stream process after the keep, when a different copy started a new one" do
+    test "the lock step asks again, and gets the new process" do
+      lazy = LazyStream.new({:bytes, "hello"}, nil)
+      {:ok, pid} = LazyStream.process(lazy, self())
+      kill_after_keep(pid)
+
+      # The copy waits for the answer of its lock. The test suspends it, kills
+      # the process, and a different copy starts a new stream process. Then
+      # the copy finds that its process stopped.
+      copy = start_copy(lazy, :read)
+      assert_receive {:kept, ^pid}, 2_000
+      wait_until(fn -> calls?(copy) end)
+      true = :erlang.suspend_process(copy)
+      kill(pid)
+      other = start_copy(lazy, :process)
+      assert {:ok, new_pid} = receive_result(other)
+      true = :erlang.resume_process(copy)
+      assert receive_result(copy) == ["hello"]
+      assert LazyStream.state(lazy) == {:process, new_pid}
+
+      model =
+        [{~s(Copies = {"a", "b"}), ~s(Copies = {"a", "b", "c"})} | @stop_config]
+        |> start_model()
+        |> SpecModel.step!("Begin", ["a", "read"])
+        |> SpecModel.settle(internal("a", false))
+        |> SpecModel.step!("Begin", ["b", "read"])
+        |> SpecModel.settle(internal("b", false))
+        |> SpecModel.step!("StreamKill")
+        |> SpecModel.step!("Begin", ["c", "read"])
+        |> SpecModel.settle(internal("c", false))
+        |> SpecModel.settle(internal("b", true))
+
+      assert SpecModel.get(model, "result")["b"] == "bytes"
+      assert @cell[:atomics.get(lazy.ref, 1)] == SpecModel.get(model, "cell")
+      kill(other)
+    end
+
+    test "a cancel after a read resolves, and the bytes stay taken" do
+      lazy = LazyStream.new({:bytes, "hello"}, nil)
+      {:ok, pid} = LazyStream.process(lazy, self())
+      assert read(%ReadableStream{controller_pid: pid}) == ["hello"]
+      kill_after_keep(pid)
+
+      test = self()
+
+      copy =
+        spawn(fn ->
+          result = Web.await(ReadableStream.cancel(%ReadableStream{lazy: lazy}))
+          send(test, {:result, self(), result})
+        end)
+
+      assert_receive {:kept, ^pid}, 2_000
+      kill(pid)
+      assert receive_result(copy) == :ok
+      assert LazyStream.state(lazy) == :gone
+    end
+  end
+
+  # The process waits for the answer of a call.
+  defp calls?(pid) do
+    Process.info(pid, :current_function) == {:current_function, {:gen, :do_call, 4}}
+  end
+
+  # The test gets the stream process, as the copy "a" of the specification.
+  # A copy "b" does the path: the stream process stops after it answered the
+  # keep of that copy, before the lock.
+  defp check_kill_before_lock(path, operation) do
+    bytes = if path == :form_data, do: @form_body, else: "hello"
+    lazy = LazyStream.new({:bytes, bytes}, nil)
+    {:ok, pid} = LazyStream.process(lazy, self())
+
+    # An enumeration and a proxy first claim the bytes, and get the process
+    # with a keep. Then the reader of the enumeration, or the pipe of the
+    # proxy, asks for the process with a second keep, and takes its lock.
+    kill_after_keep(pid, if(path in [:enum, :proxy], do: 2, else: 1))
+
+    test = self()
+
+    copy =
+      spawn(fn ->
+        send(test, {:result, self(), lock_path(path, %ReadableStream{lazy: lazy})})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:kept, ^pid}, 2_000
+    kill(pid)
+    assert receive_result(copy) == path_result(path)
+
+    model =
+      @stop_config
+      |> start_model()
+      |> SpecModel.step!("Begin", ["a", "read"])
+      |> SpecModel.settle(internal("a", false))
+      |> SpecModel.step!("Begin", ["b", operation])
+      |> SpecModel.settle(internal("b", false))
+      |> SpecModel.step!("StreamKill")
+      |> SpecModel.settle(internal("b", true))
+
+    expected = if operation == "read", do: "bytes", else: "ok"
+    assert SpecModel.get(model, "result")["b"] == expected
+    assert @cell[:atomics.get(lazy.ref, 1)] == SpecModel.get(model, "cell")
+    kill(copy)
+  end
+
+  defp start_model(config), do: SpecModel.start("LazyStream", config)
+
+  defp lock_path(:get_reader, stream), do: stream |> ReadableStream.get_reader() |> read_text()
+
+  defp lock_path(:byob_reader, stream),
+    do: stream |> ReadableStream.get_reader(mode: "byob") |> read_byob([])
+
+  defp lock_path(:values, stream), do: stream |> ReadableStream.values() |> iterate([])
+  defp lock_path(:enum, stream), do: Enum.map_join(stream, &Uint8Array.to_binary/1)
+
+  defp lock_path(:pipe_to, stream) do
+    test = self()
+
+    sink =
+      Web.WritableStream.new(%{write: fn chunk, _controller -> send(test, {:sink, chunk}) end})
+
+    :ok = Web.await(ReadableStream.pipe_to(stream, sink))
+    sink_text([])
+  end
+
+  defp lock_path(:pipe_through, stream) do
+    stream
+    |> ReadableStream.pipe_through(Web.TransformStream.new())
+    |> ReadableStream.get_reader()
+    |> read_text()
+  end
+
+  defp lock_path(:proxy, stream),
+    do: Web.await(Web.Response.text(%Web.Response{body: Web.Body.__proxy__(stream)}))
+
+  defp lock_path(:form_data, stream),
+    do: stream |> Web.FormData.parse("b") |> Web.FormData.get("a")
+
+  defp lock_path(:tee, stream) do
+    stream
+    |> ReadableStream.tee()
+    |> Enum.map(&(&1 |> ReadableStream.get_reader() |> read_text()))
+  end
+
+  defp lock_path(:text, stream), do: Web.await(Web.Response.text(%Web.Response{body: stream}))
+
+  # The cancel takes the bytes: a later read gets no chunk.
+  defp lock_path(:cancel, stream) do
+    :ok = Web.await(ReadableStream.cancel(stream))
+    stream |> ReadableStream.get_reader() |> read_text()
+  end
+
+  defp path_result(:tee), do: ["hello", "hello"]
+  defp path_result(:cancel), do: ""
+  defp path_result(_path), do: "hello"
+
+  defp read_text(reader), do: reader |> read_all() |> Enum.join()
+
+  defp read_byob(reader, acc) do
+    view = Uint8Array.new(Web.ArrayBuffer.new(16))
+
+    case Web.await(Web.ReadableStreamBYOBReader.read(reader, view)) do
+      %{done: true} -> acc |> Enum.reverse() |> Enum.join()
+      %{value: chunk} -> read_byob(reader, [Uint8Array.to_binary(chunk) | acc])
+    end
+  end
+
+  defp iterate(iterator, acc) do
+    case Web.await(Web.ReadableStreamAsyncIterator.next(iterator)) do
+      %{done: true} -> acc |> Enum.reverse() |> Enum.join()
+      %{value: chunk} -> iterate(iterator, [Uint8Array.to_binary(chunk) | acc])
+    end
+  end
+
+  defp sink_text(acc) do
+    receive do
+      {:sink, chunk} -> sink_text([Uint8Array.to_binary(chunk) | acc])
+    after
+      0 -> acc |> Enum.reverse() |> Enum.join()
+    end
+  end
+
+  # The stream process stops after its answer to the keep number `count` of
+  # a copy, before the lock of that copy. A debug function of the process
+  # (`:sys.install/2`) holds the process after that answer, and tells it to
+  # the test, which kills the process. The keep of the test itself came
+  # before.
+  defp kill_after_keep(pid, count \\ 1) do
+    test = self()
+
+    # The state of the function is the number of keeps to wait for.
+    hook = fn
+      left, {:in, {{:call, {from, _tag}}, {:keep, _keeper}}, _state}, _process
+      when is_integer(left) and from != test ->
+        if left == 1, do: :keep_in, else: left - 1
+
+      :keep_in, {:out, _reply, _to}, _process ->
+        send(test, {:kept, self()})
+
+        receive do
+          :never -> :done
+        end
+
+      state, _event, _process ->
+        state
+    end
+
+    :ok = :sys.install(pid, {hook, count})
+  end
+
+  # ---------------------------------------------------------------------------
+  # A start that continues after a kill of its starter
+  # ---------------------------------------------------------------------------
+
+  describe "a start that continues after a kill of its starter" do
+    test "stops in its start in the state process, where a claim can take the bytes" do
+      lazy = LazyStream.new({:bytes, "hello"}, nil)
+      {:ok, pid} = LazyStream.process(lazy, self())
+      kill(pid)
+
+      # The cell has "process", and no stream process: the bytes are free.
+      # The start that continued comes now.
+      log =
+        capture_log(fn ->
+          assert Web.ReadableStream.__new__(%{type: "bytes"}, [], registry_key: lazy.ref) ==
+                   :ignore
+        end)
+
+      refute log =~ "error"
+      assert Registry.lookup(LazyStream.registry(), lazy.ref) == []
+      assert LazyStream.take(lazy) == {:ok, "hello"}
+    end
+
+    test "registers itself in the state starting, and a claim after the state readable stops it" do
+      {lazy, continued} = continued_start()
+      assert LazyStream.take(lazy) == {:ok, "hello"}
+      wait_until(fn -> not Process.alive?(continued) end)
+
+      # Some time later, the registry has no key for the process.
+      wait_until(fn -> Registry.lookup(LazyStream.registry(), lazy.ref) == [] end)
+    end
+
+    test "registers itself in the state starting, and a read after the state readable stops it" do
+      {lazy, continued} = continued_start()
+      copy = start_copy(lazy, :read)
+      assert receive_result(copy) == ["hello"]
+      refute Process.alive?(continued)
+
+      # The bytes went to one reader only.
+      body = %Web.Response{body: %ReadableStream{lazy: lazy}}
+
+      assert %Web.TypeError{message: "body already used"} =
+               catch_exit(Web.await(Web.Response.text(body)))
+    end
+  end
+
+  # The start registers itself while the cell has "starting", the state that
+  # it permits. Then the cell has "readable": the state after a starter
+  # that set "readable" for a copy that stopped, before that starter looked
+  # in the registry. The test sets the two states: no step of the real code
+  # can stop there for a test.
+  defp continued_start do
+    lazy = LazyStream.new({:bytes, "hello"}, nil)
+    :atomics.put(lazy.ref, 1, 4)
+
+    source = %{
+      type: "bytes",
+      pull: fn controller ->
+        Web.ReadableStream.enqueue(controller.pid, Uint8Array.from("hello"))
+        Web.ReadableStream.close(controller.pid)
+      end
+    }
+
+    continued =
+      Web.ReadableStream.__new__(source, [high_water_mark: 0], registry_key: lazy.ref)
+
+    :atomics.put(lazy.ref, 1, 0)
+    {lazy, continued.controller_pid}
   end
 
   # The steps of the start: the call of the signal that the abort signal
@@ -690,7 +1046,14 @@ defmodule Web.TLA.LazyStreamConformanceTest do
     |> SpecModel.settle([{"New", ["a"]}, {"Check", ["a"]} | internal("b", true)])
   end
 
-  defp model_read(model, _copy_or_stream) do
+  # The first copy waits after its step: it does no more step.
+  defp model_read(model, :stream) do
+    model
+    |> SpecModel.step!("Begin", ["b", "read"])
+    |> SpecModel.settle(internal("b", true))
+  end
+
+  defp model_read(model, :copy) do
     model
     |> SpecModel.step!("Begin", ["b", "read"])
     |> SpecModel.settle(internal("a", true) ++ internal("b", true))
@@ -699,8 +1062,12 @@ defmodule Web.TLA.LazyStreamConformanceTest do
   defp steps(model, name, actions),
     do: Enum.reduce(actions, model, &SpecModel.step!(&2, &1, [name]))
 
+  # The steps that a real operation does in the copy and in its starter.
   defp internal(name, read?) do
-    actions = for action <- ~w(Eval Register Decide New Check Wake), do: {action, [name]}
+    actions =
+      for action <- ~w(Eval ClaimSet Reap Register Decide New Check Rollback StarterReap Wake),
+          do: {action, [name]}
+
     if read?, do: actions ++ [{"Lock", [name]}, {"Read", [name]}], else: actions
   end
 

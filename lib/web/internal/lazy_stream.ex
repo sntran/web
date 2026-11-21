@@ -153,23 +153,30 @@ defmodule Web.Internal.LazyStream do
       else: remote(lazy, :claim, [to, keeper], :gone)
   end
 
-  # One compare-exchange from a cell whose bytes no process has: "readable",
-  # or "process" with a stream process that stopped before it gave the
-  # bytes out. A cell that changed in between gives a second try.
+  # One compare-exchange from "readable". A cell that changed in between
+  # gives a second try. The claim then stops a stream process with no use:
+  # see `stop_unused/1`.
   defp local_claim(lazy, to, keeper),
     do: claim_from(lazy, to, keeper, :atomics.get(lazy.ref, 1))
 
-  defp claim_from(lazy, to, keeper, current) do
-    if bytes_free?(lazy, current) do
-      changed = :atomics.compare_exchange(lazy.ref, 1, current, encode(to))
-      if changed == :ok, do: :ok, else: claim_from(lazy, to, keeper, changed)
-    else
-      claim_found(lazy, to, keeper, decode(lazy, current))
-    end
+  defp claim_from(lazy, to, keeper, @readable) do
+    changed = :atomics.compare_exchange(lazy.ref, 1, @readable, encode(to))
+    if changed == :ok, do: stop_unused(lazy), else: claim_from(lazy, to, keeper, changed)
   end
 
-  # A stream process that stopped before a disturb: the bytes are free.
-  defp claim_found(lazy, to, keeper, :readable), do: local_claim(lazy, to, keeper)
+  defp claim_from(lazy, to, keeper, current),
+    do: claim_found(lazy, to, keeper, decode(lazy, current))
+
+  # A stream process that stopped before a disturb: the bytes are free. The
+  # cell has "process", and a starter can start a new stream process and
+  # set "process" again between a look of the claim and its compare-exchange:
+  # the claim would take the bytes of that new process. Thus a short process
+  # with the key sets "readable" (no starter works while it has the key), and
+  # the claim takes the bytes from "readable".
+  defp claim_found(lazy, to, keeper, :readable) do
+    :ok = run_keyed(lazy, fn -> release(lazy) end)
+    local_claim(lazy, to, keeper)
+  end
 
   # The caller reads the stream process: the copy keeps it.
   defp claim_found(lazy, to, keeper, {:process, pid}) do
@@ -178,10 +185,6 @@ defmodule Web.Internal.LazyStream do
   end
 
   defp claim_found(_lazy, _to, _keeper, state), do: state
-
-  defp bytes_free?(_lazy, @readable), do: true
-  defp bytes_free?(lazy, @process), do: live_stream(lazy) == nil
-  defp bytes_free?(_lazy, _current), do: false
 
   defp encode(:consumed), do: @consumed
   defp encode(:canceled), do: @canceled
@@ -241,11 +244,28 @@ defmodule Web.Internal.LazyStream do
     end
   end
 
-  # A stream process of the bytes starts only while the bytes are free: the
-  # state of its start, or "process" with no stream process (the registry
-  # has no other key). A closed stream process starts in its state of start.
-  defp start_cells(:bytes), do: [@starting, @process]
+  # A stream process starts only in the state of its start. A start of the
+  # bytes in the state "process" with no stream process had free bytes, but
+  # a claim that looked in the registry before that start could take them,
+  # and the process would have no use.
+  defp start_cells(:bytes), do: [@starting]
   defp start_cells(:closed), do: [@starting_closed]
+
+  # A stream process that the cell does not give: the cell is "readable",
+  # "consumed", "canceled", or "locked". A start that continued after a kill
+  # of its starter registered itself in the state "starting", and then the
+  # state changed: a starter set "readable" for a copy that stopped. No copy
+  # can use that process, and it has the bytes of the struct: it stops. The
+  # starter that set "readable", each claim that takes the bytes, and each
+  # copy that finds such a process stop it. The registry is in ETS: the
+  # look has no cost. See `tla/LazyStream.tla`.
+  defp stop_unused(lazy) do
+    with pid when is_pid(pid) <- live_stream(lazy),
+         false <- :atomics.get(lazy.ref, 1) in [@starting, @starting_closed, @process, @taken],
+         do: Web.Stream.stop(pid)
+
+    :ok
+  end
 
   @doc false
   # The stream process that is alive, or `nil`: see
@@ -325,8 +345,13 @@ defmodule Web.Internal.LazyStream do
         :ok = await_start(lazy, owner)
         local_process(lazy, owner, keeper)
 
-      {_current, pid} when is_pid(pid) ->
+      {current, pid} when is_pid(pid) and current in [@process, @taken] ->
         keep_or(pid, keeper, fn -> local_process(lazy, owner, keeper) end)
+
+      # The cell does not give this process: see `stop_unused/1`.
+      {_readable_used, pid} when is_pid(pid) ->
+        :ok = stop_unused(lazy)
+        local_process(lazy, owner, keeper)
 
       {@taken, nil} ->
         {:error, :released}
@@ -360,14 +385,22 @@ defmodule Web.Internal.LazyStream do
     end
   end
 
-  # The starter runs with the context of the copy, thus the stream process
-  # has the values of the copy.
   defp run_starter(lazy, owner) do
-    snapshot = Snapshot.take()
     copy = self()
+    run_keyed(lazy, fn -> start(lazy, {owner, copy}, :atomics.get(lazy.ref, 1)) end)
+  end
+
+  defp release(lazy) do
+    if live_stream(lazy) == nil, do: :atomics.compare_exchange(lazy.ref, 1, @process, @readable)
+  end
+
+  # The work runs in a short process with the key, the starter, with the
+  # context of the copy: the stream process has the values of the copy.
+  defp run_keyed(lazy, work) do
+    snapshot = Snapshot.take()
 
     {starter, monitor} =
-      spawn_monitor(fn -> Snapshot.run(snapshot, fn -> starter(lazy, owner, copy) end) end)
+      spawn_monitor(fn -> Snapshot.run(snapshot, fn -> starter(lazy, work) end) end)
 
     receive do
       # A different starter has the key: the copy waits for its end.
@@ -384,9 +417,9 @@ defmodule Web.Internal.LazyStream do
     end
   end
 
-  defp starter(lazy, owner, copy) do
+  defp starter(lazy, work) do
     case Registry.register(@registry, {lazy.ref, :start}, nil) do
-      {:ok, _partition} -> start(lazy, {owner, copy}, :atomics.get(lazy.ref, 1))
+      {:ok, _partition} -> work.()
       {:error, {:already_registered, other}} -> exit({:busy, other})
     end
   end
@@ -453,7 +486,7 @@ defmodule Web.Internal.LazyStream do
         else
           Web.Stream.stop(stream.controller_pid)
           _ = :atomics.compare_exchange(lazy.ref, 1, @starting, @readable)
-          :ok
+          stop_unused(lazy)
         end
     end
   end

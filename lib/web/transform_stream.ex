@@ -71,7 +71,7 @@ defmodule Web.TransformStream do
   def start(pid, opts) do
     {side, peer} =
       case Keyword.get(opts, :transform) do
-        {:readable, writable} -> {:readable, writable}
+        {:readable, writable, _cell} -> {:readable, writable}
         _writable -> {:writable, nil}
       end
 
@@ -284,14 +284,17 @@ defmodule Web.TransformStream do
       |> Keyword.drop([:writable_strategy, :readable_strategy, :high_water_mark])
       |> Keyword.merge(transformer: transformer, has_start: is_function(start_fn))
 
-    # InitializeTransformStream. The readable side tells each change of the
-    # backpressure to the writable side, thus the writable side starts
-    # first.
+    # InitializeTransformStream. The two sides share [[backpressure]]: see
+    # "The two sides of a transform stream" in `Web.Stream`. The readable
+    # side sends messages to the writable side, thus the writable side
+    # starts first.
+    backpressure = Web.Stream.__transform_cell__()
+
     {:ok, writable} =
       start_link(
         opts ++
           [
-            transform: :writable,
+            transform: {:writable, backpressure, default_transform?(transformer, readable_size)},
             high_water_mark: writable_hwm,
             strategy: Web.CountQueuingStrategy.new(writable_hwm),
             size: writable_size
@@ -302,7 +305,7 @@ defmodule Web.TransformStream do
       start_link(
         opts ++
           [
-            transform: {:readable, writable},
+            transform: {:readable, writable, backpressure},
             high_water_mark: readable_hwm,
             strategy: Web.CountQueuingStrategy.new(readable_hwm),
             size: readable_size
@@ -321,6 +324,13 @@ defmodule Web.TransformStream do
       writable: %Web.WritableStream{controller_pid: writable}
     }
   end
+
+  # SetUpTransformStreamDefaultControllerFromTransformer: with no function
+  # `transform`, the transform is an enqueue. The engine does it with no
+  # worker, unless the readable side has the size function of the user:
+  # that function must run in a worker.
+  defp default_transform?(transformer, readable_size),
+    do: is_nil(Map.get(transformer, :transform)) and not is_function(readable_size)
 
   @callbacks [start: 1, transform: 2, flush: 1, cancel: 1]
 

@@ -37,15 +37,73 @@ All notable changes to this project are documented in this file.
 - `Web.URLPattern.has_reg_exp_groups/1`, the attribute `hasRegExpGroups`.
   `Web.URLPattern.new/0`, `test/1`, and `exec/1` use the default input
   `{}` of the URL Pattern Standard.
+- `Web.Request.text_stream/1`, `Web.Response.text_stream/1`, and
+  `Web.Blob.text_stream/1`, the method `textStream()` of the Fetch Standard
+  and of the File API: the bytes through a UTF-8 `Web.TextDecoderStream`.
+- The attributes of a `Web.Request` of the Fetch Standard: the fields
+  `destination`, `referrer`, `referrer_policy`, `mode`, `credentials`,
+  `cache`, `integrity`, `keepalive`, `is_reload_navigation`,
+  `is_history_navigation`, and `duplex`, and the options `:referrer`,
+  `:referrer_policy`, `:mode`, `:credentials`, `:cache`, `:integrity`,
+  `:keepalive`, `:priority`, and `:window` of `Web.Request.new/2`. The
+  constructor raises `Web.TypeError` as the steps "new Request(input,
+  init)" specify, for example for the mode "navigate", for "only-if-cached"
+  with a mode that is not "same-origin", and for `keepalive` with a body
+  from a stream.
+- `Web.Headers` has the field `guard` of the Fetch Standard: `"none"` or
+  `"immutable"`. See "Changed".
+- `Web.URL.create_object_url/1` and `Web.URL.revoke_object_url/1`, with
+  the blob URL store of the File API. A URL belongs to the process that
+  made it: the store removes the URLs of a process that stops. A library
+  has no document, thus a blob URL has an opaque origin:
+  `blob:null/<UUID>`. `Web.fetch/2` of a blob URL gives the blob, with
+  `Content-Length` and `Content-Type`, and a request with a `Range` header
+  gets the status 206 and `Content-Range`. A method that is not GET, or a
+  URL that is not in the store, gives a network error.
+- `Web.EventTarget.new/0`. A dispatch runs the listeners in the process
+  that dispatches, before `dispatch_event/2` returns, with the capture and
+  bubble passes of the DOM Standard. The options `once`, `passive`, and
+  `signal` work. `remove_event_listener/4` takes the options.
+- The functions of `Web.Event` of the DOM Standard: `prevent_default/1`,
+  `default_prevented/1`, `stop_propagation/1`,
+  `stop_immediate_propagation/1`, `cancel_bubble/1`, `set_cancel_bubble/2`,
+  `return_value/1`, `set_return_value/2`, `composed_path/1`,
+  `current_target/1`, `src_element/1`, `event_phase/1`, and `init_event/4`,
+  and `Web.CustomEvent.init_custom_event/5`. The new fields `composed`,
+  `is_trusted`, and `time_stamp`. The flags of an event are in an
+  `:atomics` array, thus all the copies of an event share them: a
+  `prevent_default/1` in a listener changes the result of
+  `dispatch_event/2`.
+- A `Web.AbortSignal` is an event target, with `onabort/1` and
+  `onabort/2`. The listeners of the event `abort` run in the process that
+  aborts, before `Web.AbortController.abort/2` returns, as the steps
+  "signal abort" specify. The signals of `Web.AbortSignal.any/1` that
+  depend on it abort before the listeners run.
+- `Web.File.last_modified` and the option `:last_modified` of
+  `Web.File.new/3`. The default is the time of the construction, in
+  milliseconds. `Web.Blob.slice/1..4` accept `nil` for the start and the
+  end.
+- The format `"brotli"` of `Web.CompressionStream` and
+  `Web.DecompressionStream`, and the content coding `br` of `Web.fetch/2`.
+  The decoder (RFC 7932) and the encoder are in Elixir, in
+  `Web.Internal.Brotli`, with the static dictionary of the RFC in
+  `lib/web/internal/brotli/dictionary.txt`. The decoder takes chunks of
+  each size, and gives pieces of 64 KiB at most as the reader takes them.
+  It decodes text at 15–37 MB each second. The encoder uses LZ77 with one
+  hash candidate, and gives a ratio near the quality 1 of the reference
+  encoder.
+- `tla/TransformStream.tla`: the backpressure of the two sides of a
+  transform stream, and one call of the finish of the transformer.
 - `Web.fetch/2` decodes a response body with the header
   `Content-Encoding`, as the Fetch Standard specifies: `gzip`, `x-gzip`,
-  `deflate` (the zlib format, or raw deflate data), and `zstd`. A list of
-  codings is decoded in the opposite sequence. A coding that the library
-  does not know, such as `br`, gives the body with no change. The body is
+  `deflate` (the zlib format, or raw deflate data), `br`, and `zstd`. A
+  list of codings is decoded in the opposite sequence. A coding that the
+  library does not know gives the body with no change. The body is
   decoded chunk by chunk, in pieces of 64 KiB at most, and the headers of
   the response do not change. Data that cannot be decoded, or that is
   cut, gives the reader `Web.TypeError` with the decoder error in `cause`.
-- A request with no header `accept-encoding` sends `gzip, deflate, zstd`.
+- A request with no header `accept-encoding` sends
+  `gzip, deflate, br, zstd`.
   A request with a header `range` sends `identity`. A value of the caller
   is kept.
 
@@ -111,8 +169,8 @@ All notable changes to this project are documented in this file.
   library through a port. The library can call a JavaScript function, such
   as the `pull` of a source, and a promise of the library is a promise of
   JavaScript. The runner answers a call when the processes of the run are
-  at rest, thus the result of each test is the same in each run. 19168 of
-  20387 tests pass. The lists of the tests that do
+  at rest, thus the result of each test is the same in each run. 19570 of
+  20405 tests pass. The lists of the tests that do
   not pass, with the group of their cause, are in
   `test/wpt/quickjs/expectations/`. QuickJS is a tool of the tests only: the
   tests download a pinned release, and examine its SHA-256 hash.
@@ -380,6 +438,49 @@ All notable changes to this project are documented in this file.
   - In `"https://user:pw@host"`, `:pw` is a named group of the username,
     as in the Standard. Write `user\:pw` for a password.
   - A map input gives its base URL in the key `:base_url`.
+- **Breaking:** the body of a `Web.Request` and of a `Web.Response`
+  follows the Fetch Standard. In the WPT runner, 521 of 697 fetch tests
+  pass, where 457 passed.
+  - A body function, such as `text/1`, takes the reader before it returns,
+    and the lock stays: a later `get_reader/1` or `Enum` raises
+    `Web.TypeError`.
+  - `Web.Request.new/2` with a request as the input disturbs and locks the
+    body of that request, also in `Web.fetch/2`. The option `body: nil`
+    keeps the body of the input. A constructor that raises does not change
+    the input.
+  - A constructor refuses a stream that is disturbed or locked.
+  - The headers of a response of `Web.fetch/2`, of `Web.Response.error/0`,
+    and of `Web.Response.redirect/2` have the guard `"immutable"`:
+    `Web.Headers.append/3`, `set/3`, and `delete/2` raise
+    `Web.TypeError` for them. A new `Web.Headers`, `Web.Request`, or
+    `Web.Response` from these headers has the guard `"none"`.
+  - Each body that the library makes is a byte stream, and a `Web.Blob`
+    body is one chunk. The clone of a body gives the second branch a
+    structured clone of each chunk. A pipe disturbs the source at once.
+- **Breaking:** `Web.AbortSignal.throw_if_aborted/1` raises the reason of
+  the signal, also a reason that is not an exception, as `throwIfAborted()`
+  throws. It put the reason in an `AbortError` before.
+- **Breaking:** two `Web.Event` structs of the same type are not equal: each
+  one has its own flags.
+- `Web.Blob` follows the File API: the type becomes ASCII lowercase, and a
+  type with a character outside U+0020 to U+007E becomes `""`. The functions
+  of `Web.Blob` accept a `Web.File`. `Web.Blob.stream/1` is a byte stream,
+  with one chunk for each part, of 64 KiB at most. `Web.FormData` makes a
+  `Web.File` with the name `"blob"` from a blob, as the steps "create an
+  entry" specify.
+- A `Web.TransformStream` has two processes, one for each side, as
+  InitializeTransformStream specifies: the writable side can be "erroring"
+  while the readable side is readable. A cancel, an abort, and a close call
+  the transformer one time, and the others get its result. An abort during
+  a transform waits for that transform. A pipe through a transform stream
+  is approximately 15 % slower with chunks of 64 KiB, and takes 38–39 µs
+  for each small chunk, where it took 31–34 µs. See `BENCHMARKS.md`.
+- A `Web.WritableStreamDefaultWriter` has its own lock, as a reader has. A
+  writer that released its lock gets `Web.TypeError` for each operation.
+  `ready` and `closed` give the same promise until the Standard replaces
+  it. A size function that raises errors the stream, and the write rejects.
+- A decompression stream gives the output of a chunk before the
+  `Web.TypeError` for data after the end, for each format.
 - `README.md` does not say that the library has 100 % WPT compliance for
   `URL`. The JSON data of WPT for the parse of a URL passes, but the
   JavaScript files of WPT show differences: see "Web Platform Tests in

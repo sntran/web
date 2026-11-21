@@ -274,11 +274,12 @@ usual reason phrase of the status (for example `"OK"` for 200), because
 the HTTP client does not give the phrase that the server sent.
 
 `fetch` decodes the body of a response with the header `Content-Encoding`,
-as the Fetch Standard specifies: `gzip`, `x-gzip`, `deflate`, and `zstd`.
-The body is decoded chunk by chunk, and the headers of the response do
-not change. A request with no header `accept-encoding` sends the codings
+as the Fetch Standard specifies: `gzip`, `x-gzip`, `deflate`, `br`, and
+`zstd`. The body is decoded chunk by chunk, and the headers of the response
+do not change. A request with no header `accept-encoding` sends the codings
 that the library can decode. A body with a coding that the library does
-not know, such as `br`, is not changed.
+not know is not changed. The decoder of brotli is in Elixir: it is
+approximately 15 to 25 times slower than the C decoder of brotli.
 
 ```elixir
 # Create a stream from any enumerable
@@ -676,19 +677,24 @@ systems, and examine its SHA-256 hash.
 
 | Suite | WPT tests | Pass | The runner lacks a feature | The library differs | The Standard changed the test | Not in the scope of the library |
 | --- | --- | --- | --- | --- | --- | --- |
-| `Headers` | 287 | 121 | 32 | 99 | 0 | 35 |
-| `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11885 | 16 | 4 | 2 | 194 |
+| `Headers` | 287 | 121 | 32 | 0 | 0 | 134 |
+| `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11885 | 16 | 0 | 2 | 198 |
 | `URL` and `URLSearchParams` | 4869 | 4867 | 2 | 0 | 0 | 0 |
 | `URLPattern` | 373 | 373 | 0 | 0 | 0 | 0 |
-| The streams, the readers, the writers, and the strategies | 1157 | 1012 | 79 | 66 | 0 | 0 |
-| `CompressionStream` and `DecompressionStream` | 318 | 229 | 1 | 88 | 0 | 0 |
-| `Request`, `Response`, and the body | 697 | 457 | 109 | 131 | 0 | 0 |
-| `Blob`, `File`, and `FormData` | 509 | 321 | 51 | 83 | 0 | 54 |
-| `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 29 | 0 | 47 | 0 | 0 |
+| The streams, the readers, the writers, and the strategies | 1157 | 1025 | 108 | 9 | 0 | 15 |
+| `CompressionStream` and `DecompressionStream` | 318 | 305 | 1 | 4 | 0 | 8 |
+| `Request`, `Response`, and the body | 697 | 521 | 119 | 5 | 2 | 50 |
+| `Blob`, `File`, and `FormData` | 527 | 402 | 51 | 3 | 0 | 71 |
+| `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 71 | 5 | 0 | 0 | 0 |
 
-19168 of 20387 tests pass. The tests that are not in the scope of the library
-use `XMLHttpRequest` or `FileReader`. The library will not have them:
-`Web.fetch/2` and the functions of `Web.Blob` replace them.
+19570 of 20405 tests pass. The tests that are not in the scope of the library
+use `XMLHttpRequest` or `FileReader`, the guard of the forbidden headers of a
+browser, the shared memory of JavaScript, or the conversion of JavaScript of
+a value to a string. The library will not have them: `Web.fetch/2` and the
+functions of `Web.Blob` replace `XMLHttpRequest` and `FileReader`, and a
+server runtime, such as Node.js and Deno, sends each header that the caller
+gives. A library has no document, thus a blob URL has an opaque origin:
+`blob:null/<UUID>`.
 
 A structure of the library is a value, and an object of JavaScript is a
 reference. Thus the runner keeps one object for a struct that is a field of
@@ -698,28 +704,33 @@ is relative to the page of the test: the runner gives the URL of the page,
 as a browser gives the base URL of a document.
 
 A test that the runner cannot run needs a feature that the runner does not
-have yet: the server of WPT (186 tests), the conversion to an async sequence
-of `ReadableStream.from()`, `MessageChannel`, or `structuredClone`. A string
-of Elixir is UTF-8, thus a lone surrogate of JavaScript cannot come to the
-library. The runner answers a call when the library is at rest. Thus the
+have yet: the server of WPT, the conversion to an async sequence of
+`ReadableStream.from()`, `MessageChannel`, `crypto`, or `structuredClone`. A
+string of Elixir is UTF-8, thus a lone surrogate of JavaScript cannot come to
+the library. The runner answers a call when the library is at rest. Thus the
 library can do a step before the call returns, where JavaScript does it in a
-later microtask (27 stream tests). The differences of the library are:
+later microtask (28 stream tests). A timer of the library runs in real time,
+also while JavaScript runs: the result of a test of `AbortSignal.timeout()`
+can change from run to run. The differences of the library are:
 
-* `Request` has no `destination`, `referrer`, `mode`, `credentials`, `cache`,
-  and other attributes of the Fetch Standard. The headers of a request have
-  no guard: they accept a forbidden name, such as `Cookie`.
-* There is no `textStream()` of a body or a blob, no `new EventTarget()`, no
-  `onabort` of a signal, no `lastModified` of a file, no
-  `URL.createObjectURL()`, and no `brotli` format of compression.
-* A `TransformStream` has one state for its two sides. The Standard has a
-  writable side that can be "erroring" while the readable side is readable
-  (16 tests).
+* The listeners of the signal of a `WritableStream` controller run in a new
+  process after the abort steps of the stream, because the stream process
+  must answer other processes. In JavaScript, a listener runs in the abort
+  steps, and can call `abort()` or `close()` again (4 tests).
+* A body accepts a binary of Elixir as a chunk of bytes. The Standard
+  accepts only a `Uint8Array` (5 tests).
+* The readable side of a compression stream has the high water mark 1. The
+  Standard gives 0, thus a transform waits for a read (4 tests).
+* A `Request` does not keep the blob of a blob URL: a revoke before the
+  fetch makes the fetch fail (2 tests).
 * A view of a byte stream is a `Web.Uint8Array`: the library has no other
   typed array and no `DataView` (15 tests).
 * `TextEncoderStream` converts a chunk with `String.Chars`, not with the
-  rules of JavaScript: `nil` becomes `""`, not `"undefined"` (4 tests).
-* The lock of a writer belongs to a process, not to the writer, and some
-  promises of a writer are a new promise at each read.
+  rules of JavaScript: `nil` becomes `""`, not `"undefined"`.
+
+The pinned commit of WPT has two tests of the body of an empty `FormData`
+that disagree with a third test of WPT, with RFC 7578, and with each browser:
+the library gives the close delimiter, as browsers do.
 
 The pinned commit of WPT has two tests of `TextDecoder` that the current
 Encoding Standard changed: after a fatal error, `decode()` starts a new
@@ -743,6 +754,7 @@ easy to make and hard to find with an example test:
 | -------------------- | ---------------------------------------------------------- |
 | `Promise.tla`        | One promise: it settles one time, and it stops.            |
 | `StreamLifetime.tla` | When a stream process stops, and when it must stay.        |
+| `TransformStream.tla` | The backpressure of the two sides, and one finish of the transformer. |
 | `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
 | `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |
 | `ConnectionPool.tla` | The connections of an origin, and the slots of a counting governor: the limit, the queue, and the stops. |

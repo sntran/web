@@ -425,7 +425,7 @@ defmodule Web.Socket do
   # The enqueue and the end of the pull go from this process to the stream,
   # thus the stream gets them in their sequence.
   defp complete_pull(%{pull: {ref, stream}} = state) do
-    send(stream, {ref, :pulled})
+    Web.Stream.__send_info__(stream, {ref, :pulled})
     %{state | pull: nil}
   end
 
@@ -536,7 +536,8 @@ defmodule Web.Socket do
     old_writable_pid = state.writable_pid
     # The old stream gets the end of its pull, if it has one: it then
     # closes.
-    for {ref, stream} <- List.wrap(state.pull), do: send(stream, {ref, :pulled})
+    for {ref, stream} <- List.wrap(state.pull),
+        do: Web.Stream.__send_info__(stream, {ref, :pulled})
 
     authority = init_authority()
     {readable, writable} = init_streams(authority, state.options, promises.closed)

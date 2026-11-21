@@ -273,6 +273,63 @@ defmodule Web.PrioritySignalingTest do
       refute_received {:write_started, _chunk}
     end
 
+    test "a call with no wait before a cancel of the same process: the call names its sender" do
+      # The pipe, the tees, and the parser of `Web.FormData` read a stream
+      # with such a call, with their own pid in it.
+      test = self()
+
+      stream =
+        ReadableStream.new(%{start: fn c -> ReadableStreamDefaultController.enqueue(c, "a") end})
+
+      pid = stream.controller_pid
+      :ok = ReadableStream.get_reader(pid)
+      tag = make_ref()
+
+      cancel =
+        while_suspended(pid, fn ->
+          send(pid, {:"$gen_call", {test, tag}, {:read, test}})
+          ReadableStream.cancel(pid, :stop)
+        end)
+
+      # The read came first: it got the chunk in the queue.
+      assert_receive {^tag, {:ok, "a"}}
+      assert await(cancel) == :ok
+    end
+
+    test "the end of a pull before an error of the same source process" do
+      # A source that is a process tells the end of each pull, for example
+      # the process of a socket or of an enumerable.
+      stream = ReadableStream.__new__(%{}, [high_water_mark: 2], direct_pull: {:process, self()})
+      pid = stream.controller_pid
+      assert_receive {:web_stream_pull, ref, ^pid}
+
+      while_suspended(pid, fn ->
+        ReadableStream.enqueue(pid, "a")
+        Web.Stream.__send_info__(pid, {ref, :pulled})
+        ReadableStream.error(pid, :failed)
+      end)
+
+      # The pull ended before the error: the stream wants one more chunk, and
+      # pulls again. Then it gets the error.
+      assert_receive {:web_stream_pull, _next, ^pid}
+      assert ReadableStream.__get_slots__(pid).state == :errored
+    end
+
+    test "a usual cast before a cancel of the same process: the cast names its sender" do
+      # The process of an enumerable gives its error as a usual cast.
+      stream = ReadableStream.new(%{})
+      pid = stream.controller_pid
+
+      cancel =
+        while_suspended(pid, fn ->
+          Web.Stream.__usual_cast__(pid, {:error, :failed})
+          ReadableStream.cancel(pid, :stop)
+        end)
+
+      # The error came first: the cancel of an errored stream rejects.
+      assert catch_exit(await(cancel)) == :failed
+    end
+
     test "a fence that the stream handled before the priority message" do
       stream = ReadableStream.new(%{})
       pid = stream.controller_pid

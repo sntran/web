@@ -1222,8 +1222,13 @@ All notable changes to this project are documented in this file.
   waited 5 s, and then got "not available". A copy that asked for the
   stream process keeps it until it takes its lock. The steps "consume
   body" disturb the stream and take the bytes in one step. A second start
-  of a stream process ends with no crash report. `tla/LazyStream.tla` has
-  each of these cases as a value of `Bug`.
+  of a stream process ends with no crash report. When a different process
+  kills the stream process before its first read, the lock step of a copy
+  asks for a new stream process, and gets the bytes: each path that takes a
+  lock uses this step. A stream process that the shared state does not
+  give, for example after a start that continued, stops. `tla/LazyStream.tla`
+  has each of these cases as a value of `Bug`, also a claim that could take
+  the bytes of a new stream process (ABA), which the model check found.
 - When the owner of a transform stream fails, a side ends only when no
   lock of the two sides exists: the side asks the other side, which
   decides in its own process. Before, a lock that a process took at the

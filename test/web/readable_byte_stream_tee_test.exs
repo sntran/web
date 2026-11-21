@@ -292,6 +292,28 @@ defmodule Web.ReadableByteStreamTeeTest do
     end
   end
 
+  describe "a source that stops" do
+    test "before the tee handles a pull ends the two branches, and the tee does not fail" do
+      {stream, _controller, left, right} = tee()
+      tee = tee_process(stream)
+      monitor = Process.monitor(tee)
+
+      # The pull of the branch comes to the tee before the stop of the
+      # source: the tee cannot take a reader of a source that is gone.
+      true = :erlang.suspend_process(tee)
+      reader = ReadableStream.get_reader(left, mode: "byob")
+      ref = start_read(fn -> BYOBReader.read(reader, view(2)) end)
+      await_message(tee)
+      Process.exit(stream.controller_pid, :kill)
+      true = :erlang.resume_process(tee)
+
+      assert {:rejected, %Web.TypeError{}} = read_result(ref)
+      assert %Web.TypeError{} = catch_exit(await(Reader.read(ReadableStream.get_reader(right))))
+      assert_receive {:DOWN, ^monitor, :process, ^tee, reason}
+      assert reason in [:normal, :noproc]
+    end
+  end
+
   describe "an error" do
     test "of the stream goes to the two branches" do
       {_stream, controller, left, right} = tee()

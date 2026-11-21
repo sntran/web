@@ -146,15 +146,29 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(SpecModel.check("TransformLifetime", bug("no_monitor")), "CopyAgrees")
     end
 
-    test "a side that ends while the other side has a lock is found" do
+    test "a side that asks again after a denial is found" do
       assert_violates(
         SpecModel.check("TransformLifetime", bug("own_lock_only")),
-        "KeptByLock"
+        "DeniedKnowsLock"
       )
     end
 
     test "two sides that continue after all their processes are found" do
       assert_violates(SpecModel.check("TransformLifetime", bug("no_owner_rule")), "NoOrphan")
+    end
+
+    # The design before the handshake: a lock of the other side that is
+    # still in a message does not keep the side.
+    test "a side that ends with no handshake while a lock is in a message is found" do
+      assert_violates(SpecModel.check("TransformLifetime", bug("no_handshake")), "KeptByLock")
+    end
+
+    test "a side that grants a lock while it waits for the answer is found" do
+      assert_violates(SpecModel.check("TransformLifetime", bug("no_freeze")), "KeptByLock")
+    end
+
+    test "two sides that wait for each other in a blocking call are found" do
+      assert_violates(SpecModel.check("TransformLifetime", bug("blocking_ask")), "AskAnswered")
     end
   end
 

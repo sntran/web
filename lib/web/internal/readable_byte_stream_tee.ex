@@ -192,27 +192,42 @@ defmodule Web.Internal.ReadableByteStreamTee do
   end
 
   defp pull_with_default_reader(state) do
-    state = use_reader(state, :default)
-    id = :gen_statem.send_request(state.source, {:read, self()})
-    %{state | read: {id, :default}}
+    case use_reader(state, :default) do
+      {:ok, state} ->
+        id = :gen_statem.send_request(state.source, {:read, self()})
+        %{state | read: {id, :default}}
+
+      :released ->
+        fail_branches(released_error(), state)
+    end
   end
 
   defp pull_with_byob_reader(index, request, state) do
-    state = use_reader(state, :byob)
-    id = :gen_statem.send_request(state.source, {:byob_read, self(), request.view, 1})
-    %{state | read: {id, {:byob, index, request}}}
+    case use_reader(state, :byob) do
+      {:ok, state} ->
+        id = :gen_statem.send_request(state.source, {:byob_read, self(), request.view, 1})
+        %{state | read: {id, {:byob, index, request}}}
+
+      :released ->
+        fail_branches(released_error(), state)
+    end
   end
 
   # The reader of the source has the kind of the read. A new reader gets a
   # new request for its end: the reply to the request of the old reader has
-  # no effect.
-  defp use_reader(%{reader: kind} = state, kind), do: state
+  # no effect. A source that no longer gives this process its lock, for
+  # example a source that stops, ends the tee as a source that stopped.
+  defp use_reader(%{reader: kind} = state, kind), do: {:ok, state}
 
   defp use_reader(state, kind) do
-    :ok = ReadableStream.release_lock(state.source, self())
     mode = if kind == :byob, do: [mode: "byob"], else: []
-    :ok = ReadableStream.get_reader(state.source, mode)
-    %{state | reader: kind, closed_request: wait_closed(state.source)}
+
+    with :ok <- ReadableStream.release_lock(state.source, self()),
+         :ok <- ReadableStream.get_reader(state.source, mode) do
+      {:ok, %{state | reader: kind, closed_request: wait_closed(state.source)}}
+    else
+      _released -> :released
+    end
   end
 
   # The message is the reply to the read that is in progress, the reply to

@@ -129,6 +129,13 @@ defmodule Web.URLPattern.CompilerTest do
     end
   end
 
+  test "the pattern string of adjacent fixed-text parts gives one part" do
+    parts = parts("a{}?b", @default)
+    assert Enum.map(parts, & &1.value) == ["a", "b"]
+    assert Compiler.pattern_string(parts, @default) == "ab"
+    assert joined(parts("ab", @default)) == joined(parts)
+  end
+
   property "the pattern string of a part list gives the same part list" do
     check all(
             input <- pattern_input(),
@@ -142,10 +149,38 @@ defmodule Web.URLPattern.CompilerTest do
         parts ->
           text = Compiler.pattern_string(parts, options)
 
-          assert parts(text, options) == parts, "#{inspect(input)} gives #{inspect(text)}"
+          assert joined(parts(text, options)) == joined(parts),
+                 "#{inspect(input)} gives #{inspect(text)}"
+
           assert Compiler.pattern_string(parts(text, options), options) == text
       end
     end
+  end
+
+  # "Generate a pattern string" writes two fixed-text parts with no modifier
+  # one after the other, and the parse of that text gives one part: `a{}?b`
+  # gives the parts `a` and `b`, and the text `ab`. The two lists match the
+  # same URLs. Thus the property compares the lists with such parts joined.
+  defp joined(parts) do
+    parts
+    |> Enum.chunk_while(
+      nil,
+      fn
+        %{type: :fixed_text, modifier: :none} = part,
+        %{type: :fixed_text, modifier: :none} = acc ->
+          {:cont, %{acc | value: acc.value <> part.value}}
+
+        part, nil ->
+          {:cont, part}
+
+        part, acc ->
+          {:cont, acc, part}
+      end,
+      fn
+        nil -> {:cont, nil}
+        acc -> {:cont, acc, nil}
+      end
+    )
   end
 
   defp try_parts(input, options) do

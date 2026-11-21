@@ -202,6 +202,25 @@ defmodule Web.TransformStreamTest do
       refute log =~ "terminating"
     end
 
+    test "returns after the two sides have the end of a start that gives a value" do
+      for start <- [fn _controller -> :ok end, fn _controller -> Promise.resolve(:ok) end] do
+        transform = TransformStream.new(%{start: start})
+
+        # These calls can come before a message of a worker: the sides have
+        # the end of start before the constructor returns.
+        assert slots(transform).active_operation == nil
+        assert writable_slots(transform).active_operation == nil
+      end
+    end
+
+    test "answers at once a request for the end of start after the start" do
+      transform = TransformStream.new(%{start: fn _controller -> :ok end})
+
+      for pid <- [transform.readable.controller_pid, transform.writable.controller_pid] do
+        assert Web.Stream.call(pid, :await_start, :gone) == :ok
+      end
+    end
+
     test "does not wait for a promise that the function start returns" do
       test = self()
       {started, resolve, _reject} = Promise.with_resolvers()
@@ -888,12 +907,10 @@ defmodule Web.TransformStreamTest do
         writer = WritableStream.get_writer(transform.writable)
         reader = ReadableStream.get_reader(transform.readable)
 
-        # The writable side has the end of the function start: the error of
-        # the function cancel puts it in the state "errored", and not
-        # "erroring". The end of start comes in a message from the worker of
-        # the writable side.
-        eventually(fn -> writable_slots(transform).active_operation != :start end)
-
+        # The constructor returned after the end of start on the two sides.
+        # Thus the error of the function cancel puts the writable side in
+        # the state "errored", and not "erroring", as in JavaScript, where
+        # the reaction to start comes before the reaction to the cancel.
         result =
           if operation == :cancel,
             do: Reader.cancel(reader, :no_interest),

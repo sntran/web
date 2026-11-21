@@ -46,6 +46,9 @@ defmodule Web.Internal.LazyStream do
   #      `:erpc`. When no copy stays on that node, the VM collects the
   #      array, and the stream is not available, as a stream whose process
   #      stopped.
+  #
+  # `tla/LazyStream.tla` has the transitions of the state that copies in
+  # different processes do at the same time.
 
   alias Web.AbortSignal
   alias Web.AsyncContext.Snapshot

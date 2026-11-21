@@ -72,6 +72,13 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(SpecModel.check("TransformStream", bug("no_mark")), "Progress")
     end
 
+    test "a constructor that returns before the end of start on the two sides is found" do
+      assert_violates(
+        SpecModel.check("TransformStream", bug("start_message")),
+        "StartedForUse"
+      )
+    end
+
     test "a check and a mark of the cell in two steps are found" do
       assert_violates(
         SpecModel.check("TransformStream", bug("check_then_mark")),
@@ -107,6 +114,65 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(
         SpecModel.check("StreamLifetime", bug("owner_rule_ignores_lock")),
         "LockStopsOwnerRule"
+      )
+    end
+  end
+
+  describe "TransformLifetime" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("TransformLifetime"))
+    end
+
+    test "a side that does not tell the change of its lock is found" do
+      assert_violates(SpecModel.check("TransformLifetime", bug("no_notify")), "CopyAgrees")
+    end
+
+    test "a side that does not monitor the other side is found" do
+      assert_violates(SpecModel.check("TransformLifetime", bug("no_monitor")), "CopyAgrees")
+    end
+
+    test "a side that ends while the other side has a lock is found" do
+      assert_violates(
+        SpecModel.check("TransformLifetime", bug("own_lock_only")),
+        "KeptByLock"
+      )
+    end
+
+    test "two sides that continue after all their processes are found" do
+      assert_violates(SpecModel.check("TransformLifetime", bug("no_owner_rule")), "NoOrphan")
+    end
+  end
+
+  describe "LazyStream" do
+    # A check with no property BytesOnce: the bug breaks a different
+    # property also.
+    defp lazy_bug(name), do: [bug(name), {"    BytesOnce\n", ""}]
+
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("LazyStream"))
+    end
+
+    test "the design with three copies has all its properties" do
+      assert_holds(SpecModel.check("LazyStream", {~s({"a", "b"}), ~s({"a", "b", "c"})}))
+    end
+
+    test "a claim that reads and then sets the cell is found" do
+      assert_violates(SpecModel.check("LazyStream", bug("read_then_set")), "BytesOnce")
+      assert_violates(SpecModel.check("LazyStream", lazy_bug("read_then_set")), "NoBytesAfterUse")
+    end
+
+    test "a stream read with no state starting is found" do
+      assert_violates(SpecModel.check("LazyStream", lazy_bug("no_starting")), "OneProcess")
+    end
+
+    test "a stream process that gets the bytes after a claim is found" do
+      assert_violates(SpecModel.check("LazyStream", bug("closed_gets_bytes")), "BytesOnce")
+    end
+
+    test "a state process before the registry has the stream process is found" do
+      assert_violates(
+        SpecModel.check("LazyStream", bug("publish_first")),
+        "GoneOnlyAfterStop"
       )
     end
   end

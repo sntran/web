@@ -96,6 +96,9 @@ defmodule Web.Stream do
     :task_timeout_ref,
     :active_operation,
     :async_context,
+    # The callers that wait for the end of the function start: see
+    # `run_start/4`.
+    start_waiters: [],
     # Producer (readable) side
     queue: :queue.new(),
     hwm: 1,
@@ -362,11 +365,24 @@ defmodule Web.Stream do
   @doc false
   # The two sides of a transform stream have the same start: give the list
   # of their processes. The first process owns the promises of `start`.
-  def run_start(pids, start_fn, controller) when is_list(pids) do
+  #
+  # With the option `await: true`, the function returns after each process
+  # has the end of a start that gave a value or a settled promise. In
+  # JavaScript, the reactions to that start come before the reaction to
+  # each later operation. Thus the later operations find the processes
+  # started. See `tla/TransformStream.tla`.
+  def run_start(pids, start_fn, controller, opts \\ [])
+
+  def run_start(pids, start_fn, controller, opts) when is_list(pids) do
     resolvers = Enum.map(pids, &call(&1, :take_start_resolver, nil))
     # A promise from `start` becomes the result of the gate.
     result = Web.Promise.with_owner(hd(pids), fn -> start_fn.(controller) end)
     Enum.each(resolvers, & &1.(result))
+
+    if Keyword.get(opts, :await, false) and settled?(result) do
+      Enum.each(pids, &call(&1, :await_start, :ok))
+    end
+
     :ok
   catch
     kind, value ->
@@ -375,7 +391,11 @@ defmodule Web.Stream do
       :erlang.raise(kind, value, stacktrace)
   end
 
-  def run_start(pid, start_fn, controller), do: run_start([pid], start_fn, controller)
+  def run_start(pid, start_fn, controller, opts),
+    do: run_start([pid], start_fn, controller, opts)
+
+  defp settled?(%Web.Promise{} = promise), do: Web.Promise.peek(promise) != :pending
+  defp settled?(_value), do: true
 
   @doc false
   # Stops a stream process, with no call to a callback.
@@ -1358,6 +1378,14 @@ defmodule Web.Stream do
   # The constructor takes the function that settles the gate of `start`.
   defp handle_common({:call, from}, :take_start_resolver, _state, _data) do
     {:keep_state_and_data, [{:reply, from, Process.delete(@start_resolver)}]}
+  end
+
+  # The caller waits for the end of the start task: see `run_start/4` and
+  # `clear_active_operation/1`.
+  defp handle_common({:call, from}, :await_start, _state, data) do
+    if data.active_operation in [:start, :init],
+      do: {:keep_state, %{data | start_waiters: [from | data.start_waiters]}},
+      else: {:keep_state_and_data, [{:reply, from, :ok}]}
   end
 
   # Query helpers
@@ -3985,7 +4013,9 @@ defmodule Web.Stream do
   #
   # The two sides of a transform stream are one stream for these rules: a
   # lock of one side keeps the two sides. Each side tells the other side when
-  # its own lock changes: see `notify_peer_lock/2`.
+  # its own lock changes: see `notify_peer_lock/2`. Each side monitors the
+  # other side: a stop of the other side clears its lock. See
+  # `tla/TransformLifetime.tla`.
   defp locked?(data), do: own_lock?(data) or peer_locked?(data)
 
   defp own_lock?(data) do
@@ -4264,8 +4294,19 @@ defmodule Web.Stream do
       Process.cancel_timer(data.task_timeout_ref)
     end
 
+    data = reply_start_waiters(data)
     %{data | active_task: nil, task_ref: nil, task_timeout_ref: nil, active_operation: nil}
   end
+
+  # The start task is complete, or it stopped: each caller of
+  # `:await_start` gets its reply.
+  defp reply_start_waiters(%{start_waiters: [_ | _], active_operation: op} = data)
+       when op in [:start, :init] do
+    Enum.each(data.start_waiters, &:gen_statem.reply(&1, :ok))
+    %{data | start_waiters: []}
+  end
+
+  defp reply_start_waiters(data), do: data
 
   defp preserve_abort_task(%{active_operation: :abort} = data), do: data
   defp preserve_abort_task(data), do: clear_active_operation(data)

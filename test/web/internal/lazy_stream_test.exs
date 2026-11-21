@@ -283,6 +283,14 @@ defmodule Web.Internal.LazyStreamTest do
       assert LazyStream.state(stream.lazy) == :locked
     end
 
+    test "a cancel of a stream process that a reader locked rejects" do
+      stream = ReadableStream.from("hello")
+      _reader = ReadableStream.get_reader(stream)
+
+      assert %Web.TypeError{message: "Cannot cancel a locked stream."} =
+               catch_exit(Web.await(ReadableStream.cancel(stream)))
+    end
+
     test "a copy continues the start of a starter that stopped before the stream process" do
       stream = ReadableStream.from("hello")
 

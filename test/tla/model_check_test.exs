@@ -175,7 +175,9 @@ defmodule Web.TLA.ModelCheckTest do
   describe "LazyStream" do
     # A bug that needs no kill of a starter: the check is smaller.
     @no_kill {"Kills = 1", "Kills = 0"}
-    @only_read {~s(Ops = {"consumed", "canceled", "locked", "read"}), ~s(Ops = {"read"})}
+    @stream_kill [@no_kill, {"StreamKills = 0", "StreamKills = 1"}]
+    @all_ops ~s(Ops = {"consumed", "canceled", "locked", "read"})
+    @only_read {@all_ops, ~s(Ops = {"read"})}
 
     defp lazy_check(replace), do: SpecModel.check("LazyStream", replace)
     defp lazy_bug(name, replace \\ [@no_kill]), do: lazy_check([bug(name) | replace])
@@ -185,7 +187,7 @@ defmodule Web.TLA.ModelCheckTest do
     end
 
     test "the design with a kill of a stream process has all its properties" do
-      assert_holds(lazy_check([@no_kill, {"StreamKills = 0", "StreamKills = 1"}]))
+      assert_holds(lazy_check(@stream_kill))
     end
 
     test "the code before the specification gives gone after a stop of the copy that starts" do
@@ -205,7 +207,7 @@ defmodule Web.TLA.ModelCheckTest do
     end
 
     test "starters with no key are found" do
-      assert_violates(lazy_bug("no_key"), "NoGoneWhileBytes")
+      assert_violates(lazy_bug("no_key"), "KeptForLock")
     end
 
     test "a claim that reads and then sets the cell is found" do
@@ -222,7 +224,7 @@ defmodule Web.TLA.ModelCheckTest do
     end
 
     test "a stream process that stops while a copy waits for its lock is found" do
-      assert_violates(lazy_bug("no_keep"), "NoGoneWhileBytes")
+      assert_violates(lazy_bug("no_keep"), "KeptForLock")
     end
 
     test "a disturb that does not take the bytes is found" do
@@ -231,12 +233,28 @@ defmodule Web.TLA.ModelCheckTest do
 
     test "a stream process that takes the bytes at its start is found" do
       assert_violates(lazy_bug("held_at_start"), "NoBytesAfterUse")
-      no_use_property = {"PROPERTIES NoBytesAfterUse ReadEnds", "PROPERTIES ReadEnds"}
+
+      no_use_property =
+        {"PROPERTIES NoBytesAfterUse ReadEnds UselessStops", "PROPERTIES ReadEnds UselessStops"}
+
       assert_violates(lazy_bug("held_at_start", [@no_kill, no_use_property]), "NoGoneWhileBytes")
     end
 
     test "a second start of a stream process that crashes is found" do
       assert_violates(lazy_bug("unchecked_start", [@only_read]), "NoCrash")
+    end
+
+    test "a lock step that does not ask again after a kill of the process is found" do
+      assert_violates(lazy_bug("lock_no_retry", @stream_kill), "NoGoneWhileBytes")
+    end
+
+    test "a stream process with no use that stays is found" do
+      assert_violates(lazy_bug("stale_stays", [@only_read]), "UselessStops")
+    end
+
+    test "a claim from the state process, which a new stream process can have again, is found" do
+      locked_or_read = {@all_ops, ~s(Ops = {"locked", "read"})}
+      assert_violates(lazy_bug("process_claim", [locked_or_read | @stream_kill]), "BytesOnce")
     end
   end
 

@@ -196,9 +196,8 @@ defmodule Web.FormData do
   @spec parse(Web.ReadableStream.t() | binary() | iodata(), String.t(), keyword()) :: t()
   def parse(stream_or_binary, boundary, opts \\ []) do
     normalized_boundary = normalize_boundary(boundary)
-    # The parser reads the stream process.
-    source =
-      stream_or_binary |> Web.ReadableStream.from() |> Web.ReadableStream.__with_process__()
+    # The parser takes the lock of the stream process in its start.
+    source = Web.ReadableStream.from(stream_or_binary)
 
     case Parser.start_link(source, normalized_boundary, opts) do
       {:ok, pid} ->
@@ -419,7 +418,7 @@ defmodule Web.FormData do
     def callback_mode, do: :handle_event_function
 
     @impl true
-    def init({%ReadableStream{controller_pid: source_pid}, boundary, opts, snapshot, parent}) do
+    def init({%ReadableStream{} = source, boundary, opts, snapshot, parent}) do
       Process.flag(:message_queue_data, :off_heap)
       # The exit of the parent, the process of the owner, comes as a
       # message: the parser then stops with its terminate.
@@ -435,7 +434,7 @@ defmodule Web.FormData do
         nil ->
           data = %{
             parent: parent,
-            source_pid: source_pid,
+            source_pid: nil,
             source_lock_released?: false,
             signal_subscription: subscription,
             async_context: snapshot,
@@ -454,9 +453,9 @@ defmodule Web.FormData do
             materializing?: false
           }
 
-          case safe_get_reader(source_pid) do
-            :ok ->
-              {:ok, :running, data}
+          case lock_source(source) do
+            {:ok, source_pid} ->
+              {:ok, :running, %{data | source_pid: source_pid}}
 
             {:error, :already_locked} ->
               {:stop, TypeError.exception("ReadableStream is already locked")}
@@ -1366,11 +1365,16 @@ defmodule Web.FormData do
         {:error, normalize_call_exit(reason)}
     end
 
+    # The lock step of a reader: see `ReadableStream.__lock__/2`. A stream
+    # that cannot have a process raises a `TypeError`.
+    defp lock_source(source) do
+      ReadableStream.__lock__(source, &safe_get_reader/1)
+    rescue
+      error in TypeError -> {:error, error}
+    end
+
     defp safe_get_reader(pid) do
-      case ReadableStream.get_reader(pid) do
-        :ok -> :ok
-        {:error, :already_locked} -> {:error, :already_locked}
-      end
+      with :ok <- ReadableStream.get_reader(pid), do: {:ok, pid}
     catch
       :exit, reason ->
         {:error, normalize_call_exit(reason)}

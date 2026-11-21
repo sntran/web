@@ -234,15 +234,16 @@ defmodule Web.Body do
   def __proxy__(%Web.ReadableStream{controller_pid: nil, lazy: lazy} = stream) do
     case LazyStream.proxy(lazy) do
       {:ok, proxy} -> %Web.ReadableStream{lazy: proxy}
-      {:process, pid} -> __proxy__(%Web.ReadableStream{controller_pid: pid})
       :locked -> raise Web.TypeError, "ReadableStream is already locked"
-      _readable_used_or_held -> stream |> Web.ReadableStream.__with_process__() |> __proxy__()
+      # The pipe takes the lock of the stream process with the lock step of
+      # a reader: see `Web.ReadableStream.__lock__/2`.
+      _process_readable_used_or_held -> pipe_proxy(stream)
     end
   end
 
-  def __proxy__(%Web.ReadableStream{} = stream) do
-    Web.ReadableStream.pipe_through(stream, Web.TransformStream.new())
-  end
+  def __proxy__(%Web.ReadableStream{} = stream), do: pipe_proxy(stream)
+
+  defp pipe_proxy(stream), do: Web.ReadableStream.pipe_through(stream, Web.TransformStream.new())
 
   @doc false
   def text(%{body: body}), do: consume_body(body, &Web.TextDecoder.decode_utf8/1)
@@ -442,34 +443,55 @@ defmodule Web.Body do
   defp acquire(body) when is_binary(body), do: {:bytes, body}
   defp acquire(body) when is_list(body), do: {:bytes, IO.iodata_to_binary(body)}
 
-  defp acquire(%Web.ReadableStream{controller_pid: nil, lazy: lazy}) do
+  defp acquire(%Web.ReadableStream{controller_pid: nil, lazy: lazy} = stream) do
     case LazyStream.take(lazy) do
-      {:ok, binary} -> {:bytes, binary}
-      {:error, reason} -> {:error, reason}
-      :held -> {:held, lazy}
-      {:process, pid} -> acquire(%Web.ReadableStream{controller_pid: pid})
+      {:ok, binary} ->
+        {:bytes, binary}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      :held ->
+        {:held, lazy}
+
+      # A process that stopped before its first read gives the bytes to a
+      # new take: see `Web.ReadableStream.__lock__/2`.
+      {:process, pid} ->
+        stream
+        |> Web.ReadableStream.__lock__(pid, &acquire_process/1, fn -> acquire(stream) end)
+        |> used_if_released()
+
       # A tee, a body function, and a proxy disturb the stream and keep its
       # lock.
-      _locked_or_used -> {:error, Web.TypeError.exception(@used_message)}
+      _locked_or_used ->
+        {:error, Web.TypeError.exception(@used_message)}
     end
   end
+
+  defp acquire(%Web.ReadableStream{controller_pid: pid}),
+    do: pid |> acquire_process() |> used_if_released()
 
   # The reader belongs to the owner of the promise: the promise and its
   # work stop when the owner stops, and the stream then frees the lock. The
   # first read of "read all bytes" disturbs the stream before the function
   # returns, as in the Standard.
-  defp acquire(%Web.ReadableStream{controller_pid: pid}) do
+  defp acquire_process(pid) do
     owner = Web.Promise.owner()
 
-    with false <- Web.ReadableStream.disturbed?(pid),
+    with false <- Web.Stream.call(pid, :disturbed?, {:error, :released}),
          {:ok, _lock} <- Web.Stream.call(pid, {:get_reader, owner}, {:error, :released}) do
       :ok = Web.Stream.call(pid, :disturb, :ok)
       {:reader, pid, owner}
     else
       {:error, :already_locked} -> {:error, Web.TypeError.exception(@locked_message)}
-      _used_or_released -> {:error, Web.TypeError.exception(@used_message)}
+      {:error, :released} -> {:error, :released}
+      true -> {:error, Web.TypeError.exception(@used_message)}
     end
   end
+
+  # A stream process that stopped: the body was used.
+  defp used_if_released({:error, :released}), do: {:error, Web.TypeError.exception(@used_message)}
+  defp used_if_released(acquired), do: acquired
 
   # The steps of "consume body" in the process of the promise: "read all
   # bytes".

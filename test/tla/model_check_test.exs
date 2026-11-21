@@ -446,11 +446,7 @@ defmodule Web.TLA.ModelCheckTest do
     end
 
     test "an abort that comes before the requests of the listeners is found" do
-      assert_violates(SpecModel.check("PublicAbort", bug("no_barrier")), "CloseFirst")
-    end
-
-    test "an abort as a usual message is found: a later priority message comes before it" do
-      assert_violates(SpecModel.check("PublicAbort", bug("usual_rest")), "ErrorAfter")
+      assert_violates(SpecModel.check("PublicAbort", bug("no_fence")), "CloseFirst")
     end
 
     test "a result of the worker that the stream handles before the abort is found" do
@@ -459,6 +455,88 @@ defmodule Web.TLA.ModelCheckTest do
 
     test "a window that stays after the stop of the caller is found" do
       assert_violates(SpecModel.check("PublicAbort", bug("keep_window")), "Progress")
+    end
+  end
+
+  describe "PriorityMessages" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("PriorityMessages"))
+    end
+
+    test "a priority message that passes the messages of its sender is found" do
+      assert_violates(SpecModel.check("PriorityMessages", bug("no_fence")), "SenderOrder")
+    end
+
+    test "an abort as a usual message is found: it waits for the writes of others" do
+      assert_violates(SpecModel.check("PriorityMessages", bug("usual_abort")), "AbortPasses")
+    end
+
+    test "a stream that handles each message up to the fence first is found" do
+      assert_violates(SpecModel.check("PriorityMessages", bug("take_all")), "AbortPasses")
+    end
+
+    test "a fence after the priority message is found: the sender can stop before it" do
+      assert_violates(SpecModel.check("PriorityMessages", bug("fence_after")), "Progress")
+    end
+
+    test "a stream that forgets a fence that it handled is found" do
+      assert_violates(SpecModel.check("PriorityMessages", bug("forget_fence")), "Progress")
+    end
+  end
+
+  describe "PipeTo" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("PipeTo"))
+    end
+
+    test "the design with the three options has all its properties" do
+      options = {"Opts = {}", ~s(Opts = {"close", "abort", "cancel"})}
+      assert_holds(SpecModel.check("PipeTo", options))
+    end
+
+    test "a last chunk that is lost when the source closes during a read is found" do
+      assert_violates(SpecModel.check("PipeTo", bug("lose_last_chunk")), "AllChunks")
+    end
+
+    test "a pipe to a closed destination that does not cancel the source is found" do
+      assert_violates(
+        SpecModel.check("PipeTo", bug("dest_closed_no_cancel")),
+        "ClosedDestCancels"
+      )
+    end
+
+    test "a read when the destination is not ready is found" do
+      assert_violates(SpecModel.check("PipeTo", bug("no_flow_control")), "QueueBound")
+    end
+
+    # With the high water mark 1, the only write of the pipe is in flight,
+    # and the abort of the destination waits for it.
+    test "the design with the high water mark 2 has all its properties" do
+      assert_holds(SpecModel.check("PipeTo", {"HWM = 1", "HWM = 2"}))
+    end
+
+    test "a shutdown that does not wait for the writes is found" do
+      assert_violates(
+        SpecModel.check("PipeTo", [{"HWM = 1", "HWM = 2"}, bug("no_wait_writes")]),
+        "NoLostWrite"
+      )
+    end
+
+    test "a close with preventClose is found" do
+      close = {"Opts = {}", ~s(Opts = {"close"})}
+
+      assert_violates(
+        SpecModel.check("PipeTo", [close, bug("ignore_prevent_close")]),
+        "PreventsActions"
+      )
+    end
+
+    test "a pipe that keeps its locks is found" do
+      assert_violates(SpecModel.check("PipeTo", bug("keep_lock")), "LocksReleased")
+    end
+
+    test "a pipe that ignores its signal is found" do
+      assert_violates(SpecModel.check("PipeTo", bug("ignore_signal")), "Progress")
     end
   end
 end

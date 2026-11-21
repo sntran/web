@@ -176,9 +176,14 @@ defmodule Web.WritableStreamAbortListenerTest do
   end
 
   defp next_request?({:"$gen_call", _from, request}),
-    do: request == :handled or match?({:abort_rest, _window, _abort}, request)
+    do: match?({:abort_rest, _window, _abort}, unfenced(request))
 
   defp next_request?(_message), do: false
+
+  # A priority message has the pid of its sender and a fence: see "Priority
+  # messages" in `Web.Stream`.
+  defp unfenced({:"$web_fenced", _sender, _fence, request}), do: request
+  defp unfenced(request), do: request
 
   describe "the results of the callbacks during the listeners" do
     test "a write that stops when the signal aborts: the sink gets its abort after the write" do
@@ -282,9 +287,15 @@ defmodule Web.WritableStreamAbortListenerTest do
     {:messages, messages} = Process.info(pid, :messages)
 
     Enum.count(messages, fn
-      {:"$gen_call", _from, {:as_writer, _lock, {^name, _pid, ^reason}}} -> true
-      {:"$gen_call", _from, {^name, nil, ^reason}} -> true
-      _other -> false
+      {:"$gen_call", _from, request} ->
+        case unfenced(request) do
+          {:as_writer, _lock, {^name, _pid, ^reason}} -> true
+          {^name, nil, ^reason} -> true
+          _other -> false
+        end
+
+      _other ->
+        false
     end)
   end
 

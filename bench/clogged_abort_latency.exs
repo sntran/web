@@ -4,10 +4,12 @@ defmodule Web.Benchmarks.CloggedAbortLatency do
   @moduledoc false
 
   # The time from the abort of a writable stream to the call of the function
-  # `abort` of its sink, when the mailbox of the stream is full.
+  # `abort` of its sink, when the mailbox of the stream is full of the writes
+  # of a different process.
   #
   # An abort is a priority message of Erlang/OTP: the stream gets it before
-  # the requests that wait in its mailbox.
+  # the requests of the other processes that wait in its mailbox. It does not
+  # pass the earlier requests of the process that aborts.
   #
   # Usage: mix run bench/clogged_abort_latency.exs
 
@@ -30,15 +32,11 @@ defmodule Web.Benchmarks.CloggedAbortLatency do
   defp run_sample(requests) do
     parent = self()
 
+    # No write is in flight: the abort calls the function `abort` of the sink
+    # at once. A write in flight would wait for its sink.
     stream =
       WritableStream.new(%{
-        write: fn _chunk, _controller ->
-          send(parent, {:write_started, self()})
-
-          receive do
-            :release -> :ok
-          end
-        end,
+        write: fn _chunk, _controller -> :ok end,
         abort: fn _reason ->
           send(parent, {:sink_aborted, System.monotonic_time(:microsecond)})
           :ok
@@ -48,22 +46,21 @@ defmodule Web.Benchmarks.CloggedAbortLatency do
     writer = WritableStream.get_writer(stream)
     pid = stream.controller_pid
 
-    # The first write stays in the sink.
-    spawn(fn -> Web.Promise.wait(WritableStreamDefaultWriter.write(writer, "first")) end)
-
-    sink =
-      receive do
-        {:write_started, sink} -> sink
-      end
-
     # The stream process stops while the requests and the abort go into its
     # mailbox. Thus the abort is behind all the requests.
     :erlang.suspend_process(pid)
 
-    for index <- 1..requests do
-      send(pid, {:"$gen_call", {self(), make_ref()}, {:write, writer.owner_pid, index}})
-    end
+    # A different process sends the writes, in the form of
+    # `Web.Stream.promise_call/4`. The answers come to this process.
+    writes =
+      Task.async(fn ->
+        for index <- 1..requests do
+          tag = {:"$web_sent", self(), make_ref()}
+          send(pid, {:"$gen_call", {parent, tag}, {:write, writer.owner_pid, index}})
+        end
+      end)
 
+    Task.await(writes, :infinity)
     abort = WritableStreamDefaultWriter.abort(writer, :emergency_stop)
     Process.sleep(20)
     resumed_at = System.monotonic_time(:microsecond)
@@ -75,17 +72,16 @@ defmodule Web.Benchmarks.CloggedAbortLatency do
       end
 
     Web.Promise.wait(abort)
-    send(sink, :release)
-    flush()
+    flush(requests)
     elapsed
   end
 
   # The answers of the requests that the abort rejected.
-  defp flush do
+  defp flush(0), do: :ok
+
+  defp flush(count) do
     receive do
-      _answer -> flush()
-    after
-      0 -> :ok
+      {{:"$web_sent", _pid, _ref}, _answer} -> flush(count - 1)
     end
   end
 end

@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "ReadableStream with byte source (empty) BYOB reader: releasing the lock should cause closed calls to reject with a TypeError": "library: a different result"
-  }
-}

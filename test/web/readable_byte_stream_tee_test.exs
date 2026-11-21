@@ -241,7 +241,7 @@ defmodule Web.ReadableByteStreamTeeTest do
       # The work of the tee is complete: it ignores the messages that come
       # later, and its promise settles at once.
       send(tee, :not_for_the_tee)
-      ReadableByteStreamTee.pull(tee, 1, nil)
+      ReadableByteStreamTee.pull(tee, 1)
       assert :ok = await(ReadableByteStreamTee.cancel(tee, 1, :late))
       assert Process.alive?(tee)
     end
@@ -365,7 +365,7 @@ defmodule Web.ReadableByteStreamTeeTest do
       {stream, controller, left, _right} = tee(%{pull: fn _controller -> send(test, :pulled) end})
       tee = tee_process(stream)
 
-      ReadableByteStreamTee.pull(tee, 1, nil)
+      ReadableByteStreamTee.pull(tee, 1)
       assert ReadableStream.__get_slots__(stream.controller_pid).read_requests == :queue.new()
       refute_received :pulled
 

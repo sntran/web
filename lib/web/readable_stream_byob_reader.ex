@@ -31,16 +31,19 @@ defmodule Web.ReadableStreamBYOBReader do
   for a minimum number of bytes: see the option `:min`.
   """
 
-  defstruct [:controller_pid, :owner_pid]
+  # The field `lock` is the reference of the lock of this reader: a reader
+  # that released its lock has no effect on the stream, also when the same
+  # process has a new reader.
+  defstruct [:controller_pid, :owner_pid, :lock]
 
   alias Web.ArrayBuffer
   alias Web.Promise
   alias Web.RangeError
-  alias Web.ReadableStream
   alias Web.TypeError
   alias Web.Uint8Array
 
-  @type t :: %__MODULE__{controller_pid: pid()}
+  @typedoc "A BYOB reader. The fields are private."
+  @type t :: %__MODULE__{controller_pid: pid(), owner_pid: pid(), lock: reference()}
 
   @doc """
   Reads bytes into the view, as `read(view, options)`.
@@ -69,7 +72,7 @@ defmodule Web.ReadableStreamBYOBReader do
 
     case view_refusal(view, min) do
       nil ->
-        message = {:byob_read, owner(reader), view, min}
+        message = as_reader(reader, {:byob_read, reader.owner_pid, view, min})
         Web.Stream.promise_call(pid, message, {:error, :not_locked_by_reader}, &read_result/1)
 
       error ->
@@ -115,33 +118,55 @@ defmodule Web.ReadableStreamBYOBReader do
   defp read_result({:error, {:errored, reason}}), do: {:error, reason}
   defp read_result({:error, reason}), do: {:error, reason}
 
-  defp owner(%__MODULE__{owner_pid: owner}) when is_pid(owner), do: owner
-  defp owner(%__MODULE__{}), do: self()
+  # A request of this reader, with the reference of its lock: see
+  # `Web.ReadableStreamDefaultReader`.
+  defp as_reader(%__MODULE__{lock: lock}, message), do: {:as_reader, lock, message}
 
   @doc """
-  Releases the lock of the reader on the stream. The reads that wait reject
+  Releases the lock of the reader on the stream, as
+  ReadableStreamReaderGenericRelease specifies. The reads that wait reject
   with `Web.TypeError`.
+
+  A second call, or a call after a new reader took the lock, has no effect.
   """
   @spec release_lock(t()) :: :ok
   def release_lock(%__MODULE__{controller_pid: pid} = reader) do
-    ReadableStream.release_lock(pid, owner(reader))
+    Web.Stream.call(pid, as_reader(reader, {:release_lock, :reader, reader.owner_pid}), :ok)
   end
 
   @doc """
   Returns a promise that fulfils when the stream is closed, as the attribute
-  `closed`.
+  `closed`. It rejects with the error of the stream when the stream is
+  errored, and with `Web.TypeError` when the lock of the reader is released.
+
+  Each call gives the same promise, as in the Streams Standard. A release of
+  the lock of a stream that is closed or errored replaces the promise with
+  a promise that is rejected with `Web.TypeError`.
   """
   @spec closed(t()) :: Promise.t()
-  def closed(%__MODULE__{controller_pid: pid} = reader) do
-    ReadableStream.reader_closed(pid, owner(reader))
+  def closed(%__MODULE__{controller_pid: pid, lock: lock}) do
+    case Web.Stream.call(pid, {:reader_closed, lock}, :gone) do
+      %Promise{} = promise -> promise
+      # The stream stopped: it was closed or errored.
+      :gone -> Promise.resolve(:ok)
+    end
   end
 
   @doc """
   Cancels the stream, as `cancel(reason)`. The reads that wait fulfil with
   `%{value: nil, done: true}`.
+
+  The reader keeps its lock, as in the Streams Standard. A reader that
+  released its lock gives a promise that rejects with `Web.TypeError`.
   """
   @spec cancel(t(), term()) :: Promise.t()
-  def cancel(%__MODULE__{controller_pid: pid}, reason \\ :cancelled) do
-    ReadableStream.cancel(pid, reason)
+  def cancel(%__MODULE__{controller_pid: pid} = reader, reason \\ :cancelled) do
+    message = as_reader(reader, {:terminate, :cancel, reason})
+
+    Web.Stream.promise_call(pid, message, :ok, fn
+      :ok -> {:ok, :ok}
+      {:error, :not_locked_by_reader} -> read_result({:error, :not_locked_by_reader})
+      {:error, thrown} -> {:error, thrown}
+    end)
   end
 end

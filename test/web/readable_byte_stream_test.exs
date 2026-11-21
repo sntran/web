@@ -158,11 +158,14 @@ defmodule Web.ReadableByteStreamTest do
       assert %TypeError{} = catch_exit(await(promise))
     end
 
-    test "of a reader struct with no owner use the calling process", %{reader: reader} do
-      reader = %BYOBReader{controller_pid: reader.controller_pid}
+    test "of a reader struct with no lock have no effect on the stream", %{reader: reader} do
+      # The lock belongs to the reader, not to its process.
+      other = %BYOBReader{controller_pid: reader.controller_pid, owner_pid: self()}
+      assert %TypeError{} = catch_exit(await(BYOBReader.read(other, view(5))))
+      assert :ok = BYOBReader.release_lock(other)
+
       assert %{value: value} = await(BYOBReader.read(reader, view(5)))
       assert bytes(value) == "hello"
-      assert :ok = BYOBReader.release_lock(reader)
     end
 
     test "lock the stream for BYOB reads only", %{reader: reader} do
@@ -425,6 +428,73 @@ defmodule Web.ReadableByteStreamTest do
       :ok = Request.respond(request, "zz")
       assert {:fulfilled, %{value: value}} = read_result(ref)
       assert bytes(value) == "zz"
+    end
+  end
+
+  describe "the lock of a BYOB reader" do
+    property "a reader that released its lock has no effect on the next reader of its process" do
+      check all(operation <- member_of([:release_lock, :read, :closed, :cancel])) do
+        {stream, controller} = byte_stream()
+        old = ReadableStream.get_reader(stream, mode: "byob")
+        assert :ok = BYOBReader.release_lock(old)
+        new = ReadableStream.get_reader(stream, mode: "byob")
+
+        # The operations of the Standard on a reader with no stream.
+        case operation do
+          :release_lock -> assert BYOBReader.release_lock(old) == :ok
+          :read -> assert %TypeError{} = catch_exit(await(BYOBReader.read(old, view(2))))
+          :closed -> assert %TypeError{} = catch_exit(await(BYOBReader.closed(old)))
+          :cancel -> assert %TypeError{} = catch_exit(await(BYOBReader.cancel(old, :stop)))
+        end
+
+        # The new reader holds the lock, and reads.
+        assert ReadableStream.locked?(stream)
+        Controller.enqueue(controller, "ab")
+        assert %{value: value, done: false} = await(BYOBReader.read(new, view(2)))
+        assert bytes(value) == "ab"
+      end
+    end
+
+    test "gives the same promise closed, and a release rejects it with a TypeError" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      closed = BYOBReader.closed(reader)
+      assert BYOBReader.closed(reader) == closed
+
+      # ReadableStreamReaderGenericRelease rejects the promise, and the
+      # promise keeps its identity.
+      assert :ok = BYOBReader.release_lock(reader)
+      assert BYOBReader.closed(reader) == closed
+      assert %TypeError{} = catch_exit(await(closed))
+
+      # The next reader has its own promise. It fulfils at the close.
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      next = BYOBReader.closed(reader)
+      assert next != closed
+      Controller.close(controller)
+      assert await(next) == :ok
+      assert BYOBReader.closed(reader) == next
+    end
+
+    test "lets only the process of the BYOB lock read with a request of the engine" do
+      {stream, _controller} = byte_stream()
+      pid = stream.controller_pid
+
+      # A request that names a process with no BYOB lock: the default lock
+      # of this process, and no lock.
+      :ok = ReadableStream.get_reader(pid)
+      read = {:byob_read, self(), view(1), 1}
+      assert :gen_statem.call(pid, read) == {:error, :not_locked_by_reader}
+      :ok = ReadableStream.release_lock(pid)
+      assert :gen_statem.call(pid, read) == {:error, :not_locked_by_reader}
+    end
+
+    test "gives a fulfilled promise closed for a stream that stopped" do
+      {stream, controller} = byte_stream()
+      reader = ReadableStream.get_reader(stream, mode: "byob")
+      Controller.close(controller)
+      Web.Stream.stop(stream.controller_pid)
+      assert await(BYOBReader.closed(reader)) == :ok
     end
   end
 

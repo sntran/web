@@ -681,10 +681,12 @@ defmodule Web.ReadableStream do
 
   def get_reader(%__MODULE__{controller_pid: pid}, opts) when is_list(opts) do
     case reader_mode_from_options(opts) do
+      # The reader keeps the reference of its lock: see
+      # `Web.ReadableStreamBYOBReader`.
       :byob ->
-        case get_reader(pid, opts) do
-          :ok ->
-            %ReadableStreamBYOBReader{controller_pid: pid, owner_pid: self()}
+        case lock_reader(pid, :byob) do
+          {:ok, lock} ->
+            %ReadableStreamBYOBReader{controller_pid: pid, owner_pid: self(), lock: lock}
 
           {:error, :already_locked} ->
             raise TypeError, "ReadableStream is already locked"
@@ -1187,15 +1189,12 @@ defmodule Web.ReadableStream do
     }
   end
 
-  # The pull of a branch of a byte stream gives the BYOB request of the
-  # branch.
+  # The tee takes the BYOB request of the branch when it reads: see
+  # `Web.Internal.ReadableByteStreamTee`.
   defp tee_branch_source(ReadableByteStreamTee, tee, index) do
     %{
       type: "bytes",
-      pull: fn controller ->
-        request = ReadableByteStreamController.byob_request(controller)
-        ReadableByteStreamTee.pull(tee, index, request)
-      end,
+      pull: fn _controller -> ReadableByteStreamTee.pull(tee, index) end,
       cancel: fn reason -> ReadableByteStreamTee.cancel(tee, index, reason) end
     }
   end

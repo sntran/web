@@ -316,7 +316,7 @@ defmodule Web.TransformStream do
     controller = %Controller{pid: readable, writable_pid: writable}
 
     if start_fn do
-      Web.Stream.run_start([readable, writable], start_fn, controller)
+      Web.Stream.run_start([readable, writable], start_fn, controller, await: true)
     end
 
     %__MODULE__{

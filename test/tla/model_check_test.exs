@@ -72,6 +72,13 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(SpecModel.check("TransformStream", bug("no_mark")), "Progress")
     end
 
+    test "a constructor that returns before the end of start on the two sides is found" do
+      assert_violates(
+        SpecModel.check("TransformStream", bug("start_message")),
+        "StartedForUse"
+      )
+    end
+
     test "a check and a mark of the cell in two steps are found" do
       assert_violates(
         SpecModel.check("TransformStream", bug("check_then_mark")),

@@ -589,6 +589,31 @@ defmodule Web.PipeRulesTest do
       assert rejection(pipe) == :boom
     end
 
+    test "the destination before the close of the source: a stopped destination is closed" do
+      test = self()
+      {source, controller} = source(test)
+      {dest, _sink} = sink(test)
+
+      pipe = ReadableStream.pipe_to(source, dest)
+      pipe_pid = pipe_process(source)
+      waits_for_read(source)
+      idle(pipe_pid)
+
+      # The pipe gets the close of the source before the stop of the
+      # destination: it closes a destination that is not there.
+      true = :erlang.suspend_process(pipe_pid)
+      assert :ok = Source.close(controller)
+      _ = slots(source)
+      in_mailbox(pipe_pid, &match?({ref, _reply} when is_reference(ref), &1))
+
+      Process.exit(dest.controller_pid, :kill)
+      in_mailbox(pipe_pid, &match?({:DOWN, _ref, :process, _pid, :killed}, &1))
+      true = :erlang.resume_process(pipe_pid)
+
+      assert await(pipe) == :ok
+      refute_received :close
+    end
+
     test "the source: the pipe aborts the destination" do
       test = self()
       {source, _controller} = source(test)

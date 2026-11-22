@@ -530,6 +530,13 @@ All notable changes to this project are documented in this file.
       function, or a tuple as a source goes to `start_link/1`.
     - `Web.TransformStream.new/3` takes `transformer`, `writable_strategy`,
       and `readable_strategy`, as the constructor of the Standard.
+    - `Web.ReadableStream.from/1` takes only an enumerable, as
+      `ReadableStream.from(asyncIterable)`. A binary, a `Web.Blob`, a
+      `Web.ArrayBuffer`, a `Web.Uint8Array`, and `nil` give a
+      `Web.TypeError`: for a stream of bytes, use the body of
+      `Web.Response.new(binary)` or `Web.Blob.stream/1`. A
+      `Web.URLSearchParams` gives its pairs, and a `Web.ReadableStream` gives
+      a new stream that reads it.
     - `Web.CountQueuingStrategy.new/1` and `Web.ByteLengthQueuingStrategy.new/1`
       take the dictionary `QueuingStrategyInit`, for example
       `new(high_water_mark: 4)`. The field `size` holds the function of the
@@ -1002,10 +1009,10 @@ All notable changes to this project are documented in this file.
     `Web.FormData`;
   - the readable side of a `Web.Socket`, of `Web.CompressionStream`, and of
     `Web.DecompressionStream`;
-  - a default read of a byte stream;
-  - `Web.ReadableStream.from/1` for a binary, a `Web.Blob`, a
-    `Web.ArrayBuffer`, a `Web.Uint8Array`, or a `Web.URLSearchParams`. An
-    enumerable gives its elements with no change.
+  - a default read of a byte stream.
+
+  `Web.ReadableStream.from/1` of an enumerable gives its elements with no
+  change.
 
   Thus `Enum.join/1` on a body does not work. Use `Web.Response.text/1` or
   `Web.Response.bytes/1` for all the bytes, or `to_string/1` for one
@@ -1327,6 +1334,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A writer whose process stopped gets the outcome of `ready` and `closed`
+  that the stream keeps, also when the old promise did not stop yet. The
+  stop of the owner comes to its promise some time after the stop. Before,
+  on a busy machine, the writer could get the old promise, which then
+  stopped before its read. The stream now also examines the owner of the
+  promise.
 - A body in memory gives its bytes to the next reader when a copy of the
   body stops during a stream read, or when its stream process stops before
   its first read: no reader took the bytes. Before, the other copies

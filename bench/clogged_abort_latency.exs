@@ -50,8 +50,8 @@ defmodule Web.Benchmarks.CloggedAbortLatency do
     # mailbox. Thus the abort is behind all the requests.
     :erlang.suspend_process(pid)
 
-    # A different process sends the writes, in the form of
-    # `Web.Stream.promise_call/4`. The answers come to this process.
+    # A different process sends the writes, in the form of the internal
+    # calls of the stream. The answers come to this process.
     writes =
       Task.async(fn ->
         for index <- 1..requests do
@@ -71,7 +71,7 @@ defmodule Web.Benchmarks.CloggedAbortLatency do
         {:sink_aborted, aborted_at} -> aborted_at - resumed_at
       end
 
-    Web.Promise.wait(abort)
+    :ok = Web.await(abort)
     flush(requests)
     elapsed
   end

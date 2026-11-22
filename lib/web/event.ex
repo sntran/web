@@ -167,8 +167,8 @@ defmodule Web.Event do
   Returns `true` after `stop_propagation/1`, as the legacy attribute
   `cancelBubble`.
   """
-  @spec cancel_bubble(event()) :: boolean()
-  def cancel_bubble(event), do: set?(event, @stop_propagation)
+  @spec cancel_bubble?(event()) :: boolean()
+  def cancel_bubble?(event), do: set?(event, @stop_propagation)
 
   @doc """
   Sets the stop propagation flag when the value is `true`, as the setter of
@@ -194,15 +194,15 @@ defmodule Web.Event do
   Returns `true` when a listener canceled the event, as the attribute
   `defaultPrevented`.
   """
-  @spec default_prevented(event()) :: boolean()
-  def default_prevented(event), do: set?(event, @canceled)
+  @spec default_prevented?(event()) :: boolean()
+  def default_prevented?(event), do: set?(event, @canceled)
 
   @doc """
   Returns `false` when a listener canceled the event, as the legacy
   attribute `returnValue`.
   """
-  @spec return_value(event()) :: boolean()
-  def return_value(event), do: not default_prevented(event)
+  @spec return_value?(event()) :: boolean()
+  def return_value?(event), do: not default_prevented?(event)
 
   @doc """
   Cancels the event when the value is `false`, as the setter of the legacy

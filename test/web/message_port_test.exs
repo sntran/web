@@ -67,16 +67,16 @@ defmodule Web.MessagePortTest do
       assert Web.Event.src_element(event) == nil
 
       :ok = Web.Event.prevent_default(event)
-      assert Web.Event.default_prevented(event)
-      refute Web.Event.return_value(event)
+      assert Web.Event.default_prevented?(event)
+      refute Web.Event.return_value?(event)
 
       :ok = Web.Event.stop_propagation(event)
-      assert Web.Event.cancel_bubble(event)
+      assert Web.Event.cancel_bubble?(event)
 
       again = Web.Event.init_event(event, "again", true, false)
       assert %MessageEvent{type: "again", bubbles: true, cancelable: false} = again
-      refute Web.Event.default_prevented(again)
-      refute Web.Event.cancel_bubble(again)
+      refute Web.Event.default_prevented?(again)
+      refute Web.Event.cancel_bubble?(again)
     end
 
     test "init_message_event/9 initializes the event again, as initMessageEvent()" do

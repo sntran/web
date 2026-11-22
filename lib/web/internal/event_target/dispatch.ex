@@ -59,7 +59,7 @@ defmodule Web.Internal.EventTarget.Dispatch do
           do: Event.__put_flag__(flags, flag, 0)
     end
 
-    not Event.default_prevented(flags)
+    not Event.default_prevented?(flags)
   end
 
   # The flags of the event. A map with no flags, such as `%{type: "x"}`,

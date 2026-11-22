@@ -20,9 +20,9 @@ defmodule Web.EventTest do
     assert Event.current_target(event) == nil
     assert Event.src_element(event) == nil
     assert Event.composed_path(event) == []
-    refute Event.default_prevented(event)
-    assert Event.return_value(event)
-    refute Event.cancel_bubble(event)
+    refute Event.default_prevented?(event)
+    assert Event.return_value?(event)
+    refute Event.cancel_bubble?(event)
 
     event = Event.new("x", bubbles: true, cancelable: true, composed: true)
     assert %Event{bubbles: true, cancelable: true, composed: true} = event
@@ -42,7 +42,7 @@ defmodule Web.EventTest do
           :return_value -> :ok = Event.return_value(event, false)
         end
 
-        send(me, {:canceled, Event.default_prevented(event), Event.return_value(event)})
+        send(me, {:canceled, Event.default_prevented?(event), Event.return_value?(event)})
       end
 
       target = EventTarget.add_event_listener(EventTarget.new(), "x", listener, passive: passive)
@@ -67,11 +67,11 @@ defmodule Web.EventTest do
 
     assert :ok = Event.return_value(event, true)
     assert :ok = Event.cancel_bubble(event, false)
-    refute Event.default_prevented(event)
-    refute Event.cancel_bubble(event)
+    refute Event.default_prevented?(event)
+    refute Event.cancel_bubble?(event)
 
     assert :ok = Event.cancel_bubble(event, true)
-    assert Event.cancel_bubble(event)
+    assert Event.cancel_bubble?(event)
   end
 
   test "a listener gets the event with its target and its phase" do
@@ -116,7 +116,7 @@ defmodule Web.EventTest do
     refute_received :second
 
     # The flags of the propagation are unset after the dispatch.
-    refute Event.cancel_bubble(event)
+    refute Event.cancel_bubble?(event)
   end
 
   test "stop_propagation/1 in a capture listener stops the other listeners of the target" do
@@ -128,9 +128,9 @@ defmodule Web.EventTest do
       |> EventTarget.add_event_listener(
         "x",
         fn event ->
-          send(me, {:capturing, Event.cancel_bubble(event)})
+          send(me, {:capturing, Event.cancel_bubble?(event)})
           :ok = Event.stop_propagation(event)
-          send(me, {:capturing, Event.cancel_bubble(event)})
+          send(me, {:capturing, Event.cancel_bubble?(event)})
         end,
         true
       )
@@ -167,8 +167,8 @@ defmodule Web.EventTest do
 
     event = Event.init_event(event, :y, true, true)
     assert %Event{type: "y", bubbles: true, cancelable: true, is_trusted: false} = event
-    refute Event.default_prevented(event)
-    refute Event.cancel_bubble(event)
+    refute Event.default_prevented?(event)
+    refute Event.cancel_bubble?(event)
     assert %Event{bubbles: false, cancelable: false} = Event.init_event(event, "z")
 
     target =
@@ -186,7 +186,7 @@ defmodule Web.EventTest do
     assert %CustomEvent{type: "tick", detail: %{n: 1}, cancelable: true} = event
     assert event.time_stamp > 0
     :ok = Event.prevent_default(event)
-    assert Event.default_prevented(event)
+    assert Event.default_prevented?(event)
 
     assert %CustomEvent{bubbles: true, cancelable: false, detail: nil} =
              CustomEvent.init_custom_event(event, "a", true)
@@ -196,7 +196,7 @@ defmodule Web.EventTest do
 
     event = CustomEvent.init_custom_event(event, "other", true, false, :data)
     assert %CustomEvent{type: "other", bubbles: true, cancelable: false, detail: :data} = event
-    refute Event.default_prevented(event)
+    refute Event.default_prevented?(event)
 
     me = self()
 

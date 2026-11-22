@@ -415,6 +415,32 @@ defmodule Web.TLA.ModelCheckTest do
     test "a dispatch in the dispatch of the same event is found" do
       assert_violates(SpecModel.check("EventTarget", bug("no_dispatch_flag")), "CalledOnce")
     end
+
+    # The old steps of a message port and a broadcast channel.
+    test "a listener with once that is removed after its call is found" do
+      assert_violates(SpecModel.check("EventTarget", bug("once_after_call")), "OnceOnce")
+    end
+
+    test "a listener with passive that cancels the event is found" do
+      assert_violates(
+        SpecModel.check("EventTarget", bug("passive_ignored")),
+        "PassiveNoCancel"
+      )
+    end
+
+    test "a dispatch that gives true for an event that a listener canceled is found" do
+      assert_violates(
+        SpecModel.check("EventTarget", bug("result_always_true")),
+        "ResultTells"
+      )
+    end
+
+    test "a dispatch of an event that is not initialized is found" do
+      assert_violates(
+        SpecModel.check("EventTarget", bug("no_initialized_check")),
+        "InitializedOnly"
+      )
+    end
   end
 
   describe "MessagePort" do

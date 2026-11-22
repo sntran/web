@@ -556,9 +556,13 @@ The rules are those of a browser:
 * The other port gets the event `close` when a port closes, or when the
   process that holds the port stops.
 * A function on a closed port has no effect and gives no error.
-* The listeners of a port run in a process of that port. A listener can
-  call each function of its port, and a listener that raises does not stop
-  the port.
+* A port fires its events in a process of that port, one at a time. A
+  listener can call each function of its port, and a listener that raises
+  does not stop the port.
+* The listener steps are those of the DOM Standard, as for each event
+  target of the library: `dispatch_event/2` runs the listeners in the
+  calling process, before it returns, and the options `:capture`,
+  `:passive`, `:once`, and `:signal` have their effect.
 
 A port and a channel stay until `close/1`, or until the process that made
 them stops. Close them, or use `using`.
@@ -811,7 +815,7 @@ easy to make and hard to find with an example test:
 | `ByteTee.tla`        | The tee of a byte stream: each read of a branch ends, and no buffer is lost. |
 | `AbortSteps.tla`     | The steps "signal abort": the dependent signals, the algorithms, then the events. |
 | `AbortTimeouts.tla`  | The timeouts of one process abort in their sequence. |
-| `EventTarget.tla`    | The listeners of a target, a dispatch, and the lifetime of the target. |
+| `EventTarget.tla`    | The listener steps of each event target, a dispatch, and the lifetime of a target of `EventTarget.new()`. |
 | `FormDataParser.tla` | The live parser of a multipart form: each call gets an answer, and a file part ends. |
 | `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
 | `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |

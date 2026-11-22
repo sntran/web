@@ -61,6 +61,18 @@ defmodule Web.Uint8Array do
   end
 
   @doc """
+  The constant `Uint8Array.BYTES_PER_ELEMENT` of ECMAScript (1): the size
+  of one element in bytes.
+
+  ## Examples
+
+      iex> Web.Uint8Array.bytes_per_element()
+      1
+  """
+  @spec bytes_per_element() :: 1
+  def bytes_per_element, do: 1
+
+  @doc """
   Makes a `Uint8Array` with a new buffer that has the given bytes.
 
   The bytes are a binary, iodata, a `Web.ArrayBuffer`, or a

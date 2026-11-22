@@ -305,22 +305,10 @@ defmodule Web.Internal.MessagePort do
 
   defp request(request, state) do
     case MessageTarget.request(state.target, request) do
-      {:reply, reply, target} ->
-        state = %{state | target: target}
-        {:reply, reply, maybe_start(request, state)}
-
-      :unknown ->
-        {:reply, {:error, :unknown_request}, state}
+      {:reply, reply, target} -> {:reply, reply, %{state | target: target}}
+      :unknown -> {:reply, {:error, :unknown_request}, state}
     end
   end
-
-  # The first callback of `onmessage` starts the port, as the HTML Standard
-  # specifies.
-  defp maybe_start({:set_handler, "message", callback}, state) when callback != nil do
-    pump(%{state | started?: true})
-  end
-
-  defp maybe_start(_request, state), do: state
 
   # ---------------------------------------------------------------------------
   # State changes

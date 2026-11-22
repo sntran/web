@@ -80,13 +80,21 @@ defmodule Web.EventTargetNewTest do
     assert received() == []
   end
 
-  test "the protocol takes the options as a keyword list" do
-    target = EventTarget.new()
-    target = Web.EventTarget.Protocol.add_event_listener(target, "x", recorder(:a), once: true)
+  test "the options can be a keyword list, a map, or a boolean for the capture" do
+    for options <- [[once: true], %{once: true}] do
+      target = EventTarget.add_event_listener(EventTarget.new(), "x", recorder(:a), options)
+      assert dispatch(target, Event.new("x"))
+      assert dispatch(target, Event.new("x"))
+      assert received() == [:a]
+    end
+
+    target =
+      EventTarget.new()
+      |> EventTarget.add_event_listener("x", recorder(:bubbling), false)
+      |> EventTarget.add_event_listener("x", recorder(:capturing), true)
 
     assert dispatch(target, Event.new("x"))
-    assert dispatch(target, Event.new("x"))
-    assert received() == [:a]
+    assert received() == [:capturing, :bubbling]
   end
 
   test "the capture listeners run first" do
@@ -209,9 +217,11 @@ defmodule Web.EventTargetNewTest do
       assert received() == []
     end
 
-    test "a value that is not a signal raises a TypeError" do
-      assert_raise Web.TypeError, fn ->
-        EventTarget.add_event_listener(EventTarget.new(), "x", recorder(:a), signal: self())
+    test "a value that is not a signal raises a TypeError, also with no callback" do
+      for callback <- [recorder(:a), nil] do
+        assert_raise Web.TypeError, fn ->
+          EventTarget.add_event_listener(EventTarget.new(), "x", callback, signal: self())
+        end
       end
     end
   end

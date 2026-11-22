@@ -116,31 +116,13 @@ defmodule Web.URL.RegexEquivalenceTest do
     assert Regex.match?(~r/^\d+$/, "12\n")
   end
 
-  property "Web.Resolver accepts the remote names of the first regular expression" do
-    check all(value <- text(), max_runs: 1_000) do
-      expected =
-        if String.match?(value, ~r/^[A-Za-z0-9][A-Za-z0-9+.-]*:(?!\/\/).*$/) do
-          Web.Dispatcher.TCP
-        else
-          # The first version parsed each other input as a URL.
-          try do
-            value |> Web.URL.new() |> Web.Resolver.resolve()
-          rescue
-            Web.TypeError -> Web.Dispatcher.HTTP
-          end
-        end
-
-      assert Web.Resolver.resolve(value) == expected
-    end
-  end
-
   property "a status text is valid when the first regular expression accepted it" do
     check all(value <- text(), max_runs: 1_000) do
       expected = Regex.match?(~r/\A[\t \x21-\x7E\x80-\xFF]*\z/, value)
 
       result =
         try do
-          Web.Response.new(status_text: value)
+          Web.Response.new(nil, status_text: value)
           true
         rescue
           Web.TypeError -> false

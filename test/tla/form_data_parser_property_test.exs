@@ -26,6 +26,7 @@ defmodule Web.TLA.FormDataParserPropertyTest do
 
   import Web, only: [await: 1]
 
+  alias Web.FormData.Parser
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultReader, as: Reader
 
@@ -300,7 +301,7 @@ defmodule Web.TLA.FormDataParserPropertyTest do
 
   defp operate(:cancel, run) do
     stop(run, :cancel, fn ->
-      call(run, :cancel, fn -> Web.FormData.cancel(run.form, :form_cancel) end)
+      call(run, :cancel, fn -> Parser.cancel(run.form.coordinator, :form_cancel) end)
     end)
   end
 

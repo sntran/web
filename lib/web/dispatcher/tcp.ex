@@ -1,18 +1,18 @@
 defmodule Web.Dispatcher.TCP do
-  @moduledoc """
-  The dispatcher of `Web.fetch/2` for a `tcp:` URL, and for an rclone
-  remote such as `remote:host:port/path`.
+  @moduledoc false
 
-  The request opens a TCP connection to the host and the port of the URL.
-  The port 80 is the default. The request body goes to the peer first. The
-  response has the status 200, the status text `"Connected"`, and a body
-  with the bytes that the peer sends until it closes the connection.
-
-  The response body follows the rules of the body of an HTTP response: it
-  reads the socket only when a reader wants data, a cancel or an abort
-  closes the connection, and a body that no process reads releases its
-  connection after the time of `unread_body_timeout`.
-  """
+  # The dispatcher of `Web.fetch/2` for a `tcp:` URL, and for an rclone
+  # remote such as `remote:host:port/path`.
+  #
+  # The request opens a TCP connection to the host and the port of the URL.
+  # The port 80 is the default. The request body goes to the peer first. The
+  # response has the status 200, the status text `"Connected"`, and a body
+  # with the bytes that the peer sends until it closes the connection.
+  #
+  # The response body follows the rules of the body of an HTTP response: it
+  # reads the socket only when a reader wants data, a cancel or an abort
+  # closes the connection, and a body that no process reads releases its
+  # connection after the time of `unread_body_timeout`.
 
   @behaviour Web.Dispatcher
 

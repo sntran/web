@@ -74,30 +74,30 @@ defmodule Web.ByteChunksTest do
             ["hel", "lo"],
             Stream.map(["hel", "lo"], & &1)
           ] do
-        assert_bytes(chunks(Response.new(body: body).body), "hello")
+        assert_bytes(chunks(Response.new(body).body), "hello")
 
         request = Request.new("https://example.com/", method: "POST", body: body, duplex: "half")
         assert_bytes(chunks(request.body), "hello")
       end
 
       params = URLSearchParams.new(%{"a" => "1"})
-      assert_bytes(chunks(Response.new(body: params).body), "a=1")
+      assert_bytes(chunks(Response.new(params).body), "a=1")
     end
 
     test "raises a TypeError for a body that is not bytes and not a stream" do
-      assert_raise TypeError, ~r/Cannot make a ReadableStream/, fn -> Response.new(body: 123) end
+      assert_raise TypeError, ~r/Cannot make a ReadableStream/, fn -> Response.new(123) end
     end
 
     test "keeps the chunks of a stream from the caller, and reads each form of bytes" do
       mixed = ["ab", Uint8Array.from("cd"), ArrayBuffer.new("ef"), [?g, "h"]]
       stream = ReadableStream.from(mixed)
-      response = Response.new(body: stream)
+      response = Response.new(stream)
 
       assert response.body == stream
       assert await(Response.text(response)) == "abcdefgh"
 
       for read <- [&Response.bytes/1, &Response.array_buffer/1, &Response.blob/1] do
-        result = await(read.(Response.new(body: ReadableStream.from(mixed))))
+        result = await(read.(Response.new(ReadableStream.from(mixed))))
 
         bytes =
           case result do
@@ -112,13 +112,13 @@ defmodule Web.ByteChunksTest do
 
     test "rejects with a TypeError for a chunk that is not bytes" do
       for read <- [&Response.text/1, &Response.bytes/1] do
-        response = Response.new(body: ReadableStream.from(["ok", :not_bytes]))
+        response = Response.new(ReadableStream.from(["ok", :not_bytes]))
         assert %TypeError{} = catch_exit(await(read.(response)))
       end
     end
 
     test "gives the two branches of a clone the same views" do
-      {response, clone} = Response.clone(Response.new(body: "hello"))
+      {response, clone} = Response.clone(Response.new("hello"))
       assert_bytes(chunks(response.body), "hello")
       assert_bytes(chunks(clone.body), "hello")
     end

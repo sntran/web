@@ -39,7 +39,7 @@ defmodule Web.GovernorTest do
         %{state | current: max(current - 1, 0)}
       end)
 
-      {:ok, Web.Response.new(status: 200, body: ["ok"], url: Web.URL.href(request.url))}
+      {:ok, Web.Response.__network__(status: 200, body: ["ok"], url: Web.URL.href(request.url))}
     end
   end
 
@@ -844,11 +844,8 @@ defmodule Web.GovernorTest do
     requests =
       for label <- 1..5 do
         Governor.with(governor, fn ->
-          Web.fetch("mock://#{label}",
-            dispatcher: TrackingDispatcher,
-            tracker: tracker,
-            test_pid: parent
-          )
+          request = Web.Request.new("mock://#{label}", tracker: tracker, test_pid: parent)
+          Web.fetch(%{request | dispatcher: TrackingDispatcher})
         end)
       end
 

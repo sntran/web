@@ -4,6 +4,40 @@ defmodule Web.Response do
 
   Represents an HTTP response, including status, headers, and a streamable body.
   Matches the zero-buffer streaming rule.
+
+  ## The attributes
+
+  The fields of the struct are the attributes of the `Response` class of the
+  Fetch Standard, in snake case: `type`, `url`, `redirected`, `status`, `ok`,
+  `status_text`, `headers`, and `body`. The function `body_used?/1` is the
+  attribute `bodyUsed`. The other fields are internal.
+
+  ## The body
+
+  The methods of the body mixin of the Fetch Standard read the body:
+  `text/1`, `json/1`, `array_buffer/1`, `bytes/1`, `blob/1`, `form_data/1`,
+  and `text_stream/1`. Each method except `text_stream/1` returns a
+  `Web.Promise`. A body can be read one time: a second method rejects with
+  `Web.TypeError`. A chunk of a body stream must be bytes: a
+  `Web.Uint8Array`, a binary, iodata, or a `Web.ArrayBuffer`.
+
+      iex> response = Web.Response.new("hello")
+      iex> Web.await(Web.Response.text(response))
+      "hello"
+
+      iex> response = Web.Response.new(~s({"ok":true}))
+      iex> Web.await(Web.Response.json(response))
+      %{"ok" => true}
+
+      iex> response = Web.Response.new("hello")
+      iex> %Web.ArrayBuffer{byte_length: 5} = Web.await(Web.Response.array_buffer(response))
+
+      iex> response = Web.Response.new("hello")
+      iex> {response, clone} = Web.Response.clone(response)
+      iex> Web.await(Web.Response.text(response))
+      "hello"
+      iex> Web.await(Web.Response.text(clone))
+      "hello"
   """
   use Web.Body
 
@@ -38,17 +72,22 @@ defmodule Web.Response do
   @null_body_statuses [101, 103, 204, 205, 304]
 
   @doc """
-  Makes a response, as the `Response` constructor of the Fetch Standard.
+  Makes a response, as the constructor `new Response(body, init)` of the
+  Fetch Standard. `new/0` gives a response with no body and the default
+  init, and `new/1` gives a response with the body and the default init.
+
+  The body is `nil` (no body), a binary or iodata, a `Web.ReadableStream`,
+  a `Web.Blob`, a `Web.ArrayBuffer`, a `Web.Uint8Array`, a
+  `Web.URLSearchParams`, a `Web.FormData`, or an enumerable of chunks of
+  bytes.
 
   ## Options
 
-    * `:body` - the body. A response with no body has the body `nil`.
+  The options are the members of `ResponseInit`, in snake case:
+
     * `:status` - an integer from 200 to 599. The default is 200.
     * `:status_text` - the reason phrase. The default is `""`.
     * `:headers` - a `Web.Headers` struct, a map, or a list of pairs.
-
-  These options are for a dispatcher, which makes the response of a
-  `Web.fetch/2`: `:url`, `:redirected`, and `:type`.
 
   The function raises for input that the Fetch Standard refuses:
 
@@ -62,44 +101,34 @@ defmodule Web.Response do
 
   ## Examples
 
-      iex> resp = Web.Response.new(status: 200)
-      iex> {resp.ok, resp.body, resp.status_text, resp.url}
-      {true, nil, "", ""}
+      iex> resp = Web.Response.new()
+      iex> {resp.status, resp.ok, resp.body, resp.status_text, resp.url}
+      {200, true, nil, "", ""}
 
-      iex> resp = Web.Response.new(status: 404)
+      iex> resp = Web.Response.new(nil, status: 404)
       iex> resp.ok
       false
 
-      iex> resp = Web.Response.new(status: 206)
-      iex> resp.ok
-      true
+      iex> resp = Web.Response.new("partial", status: 206, status_text: "Partial Content")
+      iex> {resp.ok, resp.status_text, Web.await(Web.Response.text(resp))}
+      {true, "Partial Content", "partial"}
   """
-  def new(opts) when is_list(opts) do
-    status = Keyword.get(opts, :status, 200)
-    status_text = Keyword.get(opts, :status_text, "")
-    body = Keyword.get(opts, :body)
+  @spec new(term(), keyword()) :: t()
+  def new(body \\ nil, init \\ [])
+
+  def new(body, init) when is_list(init) do
+    status = Keyword.get(init, :status, 200)
+    status_text = Keyword.get(init, :status_text, "")
 
     :ok = validate_status!(status)
     :ok = validate_status_text!(status_text)
     :ok = validate_null_body!(status, body)
     :ok = validate_body_stream!(body)
 
-    build(opts)
-  end
-
-  def new(other) do
-    raise Web.TypeError, "Response init must be a keyword list, got: #{inspect(other)}"
-  end
-
-  def new, do: new([])
-
-  @doc """
-  Makes a response from a body and init options. See `new/1`.
-  """
-  def new(body, init) when is_list(init) do
     init
+    |> Keyword.take([:status, :status_text, :headers])
     |> Keyword.put(:body, body)
-    |> new()
+    |> build()
   end
 
   def new(_body, init) do

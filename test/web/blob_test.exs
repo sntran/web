@@ -179,11 +179,10 @@ defmodule Web.BlobTest do
     assert "hello" == blob |> Blob.stream() |> Web.TestBytes.join()
   end
 
-  test "text/json/array_buffer/bytes can be called multiple times" do
+  test "text/array_buffer/bytes can be called multiple times" do
     blob = Blob.new([~s({"id":1})], type: "application/json")
 
     assert {:ok, ~s({"id":1})} = Blob.text(blob)
-    assert {:ok, %{"id" => 1}} = Blob.json(blob)
     assert {:ok, %Web.ArrayBuffer{byte_length: 8}} = Blob.array_buffer(blob)
 
     assert {:ok, %Web.Uint8Array{} = bytes} = Blob.bytes(blob)

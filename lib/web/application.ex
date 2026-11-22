@@ -9,11 +9,6 @@ defmodule Web.Application do
   def start(_type, _args) do
     Web.Performance.put_time_origin()
 
-    # Eagerly initialize the url_params singleton in :persistent_term so that
-    # the Variable handle is stable across all processes from the moment the
-    # application boots.
-    Web.URLPattern.params()
-
     children = [
       # The groups of the broadcast channels. The scope has its own name,
       # thus it does not conflict with a `:pg` scope of the application.

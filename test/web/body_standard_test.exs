@@ -85,7 +85,7 @@ defmodule Web.BodyStandardTest do
             body -> body
           end
 
-        response = Response.new(body: body)
+        response = Response.new(body)
         promise = function.(response)
 
         assert Response.body_used?(response)
@@ -102,7 +102,7 @@ defmodule Web.BodyStandardTest do
 
     test "takes the reader of a body that a process holds before it returns" do
       {holder, body} = held_body("held")
-      response = Response.new(body: body)
+      response = Response.new(body)
       promise = Response.text(response)
 
       assert ReadableStream.locked?(response.body)
@@ -111,7 +111,7 @@ defmodule Web.BodyStandardTest do
     end
 
     test "rejects for a stream with a reader, and gives the error of an errored stream" do
-      response = Response.new(body: stream_of(["a"]))
+      response = Response.new(stream_of(["a"]))
       _reader = ReadableStream.get_reader(response.body)
 
       for function <- @functions do
@@ -123,8 +123,7 @@ defmodule Web.BodyStandardTest do
 
       errored =
         Response.new(
-          body:
-            ReadableStream.new(%{start: &Web.ReadableStreamDefaultController.error(&1, error)})
+          ReadableStream.new(%{start: &Web.ReadableStreamDefaultController.error(&1, error)})
         )
 
       assert ^error = catch_exit(await(Response.form_data(errored)))
@@ -141,10 +140,10 @@ defmodule Web.BodyStandardTest do
           ReadableStream.new(%{pull: &Web.ReadableStreamDefaultController.error(&1, pull_error)})
 
         assert ^expected =
-                 catch_exit(await(Response.form_data(Response.new(body: body, headers: headers))))
+                 catch_exit(await(Response.form_data(Response.new(body, headers: headers))))
       end
 
-      response = Response.new(body: stream_of(["a=1"]))
+      response = Response.new(stream_of(["a=1"]))
 
       assert %TypeError{message: "Cannot parse form data" <> _} =
                catch_exit(await(Response.form_data(response)))
@@ -154,8 +153,7 @@ defmodule Web.BodyStandardTest do
       form =
         await(
           Response.form_data(
-            Response.new(
-              body: stream_of(["a=1&b", "=2"]),
+            Response.new(stream_of(["a=1&b", "=2"]),
               headers: [{"content-type", "application/x-www-form-urlencoded"}]
             )
           )
@@ -193,10 +191,10 @@ defmodule Web.BodyStandardTest do
     end
 
     test "rejects for a body that an enumeration read, or that a cancel closed" do
-      read = Response.new(body: "a")
+      read = Response.new("a")
       assert [_chunk] = Enum.to_list(read.body)
 
-      canceled = Response.new(body: "a")
+      canceled = Response.new("a")
       assert :ok = await(ReadableStream.cancel(canceled.body))
 
       for response <- [read, canceled], function <- @functions do
@@ -213,7 +211,7 @@ defmodule Web.BodyStandardTest do
               size <- integer(1..64)
             ) do
         for struct <- [
-              Response.new(body: body),
+              Response.new(body),
               Request.new("https://example.com/", method: "POST", body: body)
             ] do
           reader = ReadableStream.get_reader(struct.body, mode: "byob")
@@ -227,7 +225,7 @@ defmodule Web.BodyStandardTest do
       params = Web.URLSearchParams.new("a=1")
 
       for body <- [form, params] do
-        response = Response.new(body: body)
+        response = Response.new(body)
         reader = ReadableStream.get_reader(response.body, mode: "byob")
         text = read_byob(reader, 16, [])
         assert text =~ "name" or text == "a=1"
@@ -236,18 +234,18 @@ defmodule Web.BodyStandardTest do
 
     test "gives no chunk for no bytes, and the close delimiter for an empty form" do
       for body <- body_forms("") do
-        assert Enum.to_list(Response.new(body: body).body) == []
+        assert Enum.to_list(Response.new(body).body) == []
       end
 
       form = Web.FormData.new()
-      text = await(Response.text(Response.new(body: form)))
+      text = await(Response.text(Response.new(form)))
       assert text == "--#{form.boundary}--\r\n"
-      assert %Web.FormData{} = await(Response.form_data(Response.new(body: form)))
+      assert %Web.FormData{} = await(Response.form_data(Response.new(form)))
     end
 
     test "of a stream from the caller is the same stream" do
       stream = stream_of(["a"])
-      assert Response.new(body: stream).body == stream
+      assert Response.new(stream).body == stream
 
       assert_raise TypeError, ~r/not a byte stream/, fn ->
         ReadableStream.get_reader(stream, mode: "byob")
@@ -264,13 +262,13 @@ defmodule Web.BodyStandardTest do
 
   describe "a pipe of a body" do
     test "disturbs the body when the function returns, before a read" do
-      response = Response.new(body: stream_of(["a"]))
+      response = Response.new(stream_of(["a"]))
       destination = Web.WritableStream.new(%{}, high_water_mark: 0)
       _promise = ReadableStream.pipe_to(response.body, destination)
 
       assert Response.body_used?(response)
 
-      other = Response.new(body: "a")
+      other = Response.new("a")
 
       _readable =
         ReadableStream.pipe_through(other.body, %{
@@ -285,7 +283,7 @@ defmodule Web.BodyStandardTest do
   test "a cancel of an errored stream disturbs it" do
     response =
       Response.new(
-        body: ReadableStream.new(%{start: &Web.ReadableStreamDefaultController.error(&1, :boom)})
+        ReadableStream.new(%{start: &Web.ReadableStreamDefaultController.error(&1, :boom)})
       )
 
     reader = ReadableStream.get_reader(response.body)
@@ -298,7 +296,7 @@ defmodule Web.BodyStandardTest do
   describe "clone/1" do
     test "gives the second branch a structured clone of each chunk" do
       chunk = Uint8Array.from("abc")
-      {original, clone} = Response.clone(Response.new(body: stream_of([chunk])))
+      {original, clone} = Response.clone(Response.new(stream_of([chunk])))
 
       [first] = Enum.to_list(original.body)
       [second] = Enum.to_list(clone.body)
@@ -321,7 +319,7 @@ defmodule Web.BodyStandardTest do
           cancel: fn reason -> send(test, {:cancel, reason}) end
         })
 
-      {original, clone} = Response.clone(Response.new(body: body))
+      {original, clone} = Response.clone(Response.new(body))
 
       for branch <- [original, clone] do
         assert %Web.DOMException{name: "DataCloneError"} =
@@ -341,11 +339,11 @@ defmodule Web.BodyStandardTest do
     end
 
     test "refuses a body that is disturbed or locked" do
-      used = Response.new(body: "a")
+      used = Response.new("a")
       await(Response.text(used))
       assert_raise TypeError, "body already used", fn -> Response.clone(used) end
 
-      locked = Response.new(body: "a")
+      locked = Response.new("a")
       _reader = ReadableStream.get_reader(locked.body)
       assert_raise TypeError, "ReadableStream is already locked", fn -> Response.clone(locked) end
     end
@@ -360,7 +358,7 @@ defmodule Web.BodyStandardTest do
         chunks = split(text, cuts) |> Enum.map(&Uint8Array.from/1)
 
         for struct <- [
-              Response.new(body: stream_of(chunks)),
+              Response.new(stream_of(chunks)),
               Request.new("https://example.com/", method: "POST", body: text)
             ] do
           stream = struct.__struct__.text_stream(struct)
@@ -377,14 +375,14 @@ defmodule Web.BodyStandardTest do
       bytes = <<0x68, 0x00, 0x69, 0x00, 0xFF>>
 
       for type <- ["text/plain; charset=utf-16le", "text/plain; charset=invalid"] do
-        response = Response.new(body: bytes, headers: [{"content-type", type}])
+        response = Response.new(bytes, headers: [{"content-type", type}])
         assert response |> Response.text_stream() |> Enum.join() == "h\0i\0�"
       end
     end
 
     test "locks the body for the pipe" do
       # The pipe waits for a chunk of this stream: the lock stays.
-      response = Response.new(body: ReadableStream.new())
+      response = Response.new(ReadableStream.new())
       _stream = Response.text_stream(response)
 
       assert Response.body_used?(response)
@@ -407,11 +405,11 @@ defmodule Web.BodyStandardTest do
       _promise = Request.text(used)
       assert_raise TypeError, fn -> Request.text_stream(used) end
 
-      locked = Response.new(body: "a")
+      locked = Response.new("a")
       _reader = ReadableStream.get_reader(locked.body)
       assert_raise TypeError, fn -> Response.text_stream(locked) end
 
-      canceled = Response.new(body: "a")
+      canceled = Response.new("a")
       assert :ok = await(ReadableStream.cancel(canceled.body))
       refute ReadableStream.locked?(canceled.body)
       assert_raise TypeError, "body already used", fn -> Response.text_stream(canceled) end
@@ -436,7 +434,7 @@ defmodule Web.BodyStandardTest do
       proxy = Web.Body.__proxy__(body)
 
       assert ReadableStream.locked?(body)
-      assert await(Response.text(Response.new(body: proxy))) == "held"
+      assert await(Response.text(Response.new(proxy))) == "held"
       send(holder, :stop)
     end
 

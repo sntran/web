@@ -28,7 +28,7 @@ defmodule Web.URLSearchParamsTest do
     assert Enum.to_list(params) == [{"a", "9"}, {"b", "2"}, {"c", "4"}]
 
     params = URLSearchParams.delete(params, "b")
-    refute URLSearchParams.has?(params, "b")
+    refute URLSearchParams.has(params, "b")
     assert URLSearchParams.to_string(params) == "a=9&c=4"
   end
 
@@ -77,7 +77,7 @@ defmodule Web.URLSearchParamsTest do
 
     assert URLSearchParams.get(params, "q") == "hello world"
     assert URLSearchParams.get_all(params, "tag") == ["one", "two"]
-    assert URLSearchParams.has?(params, "tag")
+    assert URLSearchParams.has(params, "tag")
 
     assert URLSearchParams.to_list(params) == [
              {"q", "hello world"},

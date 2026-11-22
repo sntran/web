@@ -1,63 +1,32 @@
 defmodule Web.Body do
-  @moduledoc """
-  Shared body-consumption helpers for Web API structs.
+  @moduledoc false
 
-  `use Web.Body` injects convenience functions:
-
-  - `text/1` reads the body as a binary.
-  - `json/1` reads the body as text and parses it as JSON, as the Fetch
-    Standard specifies, with the JSON decoder of Erlang/OTP.
-  - `array_buffer/1` reads the body as `%Web.ArrayBuffer{}`.
-  - `bytes/1` reads the body as `%Web.Uint8Array{}`.
-  - `blob/1` reads the body as `%Web.Blob{}`.
-  - `clone/1` tees the body stream and returns updated original plus clone.
-
-  It also provides shared `Content-Type` inference used by `Web.Request.new/2` and
-  `Web.Response.new/1` when the caller does not supply that header:
-
-  - `%Web.URLSearchParams{}` defaults to `application/x-www-form-urlencoded;charset=UTF-8`
-  - plain string/binary bodies default to `text/plain;charset=UTF-8`
-  - `%Web.Blob{}` uses the blob's non-empty `type`
-
-  - `text_stream/1` gives the body as a stream of text.
-
-  The injected functions follow the step "consume body" of the Fetch
-  Standard. A body function takes the reader of the body before it returns,
-  and the reader keeps its lock: after `text/1`, the body stream is
-  disturbed and locked, and `Web.ReadableStream.get_reader/1` raises
-  `Web.TypeError`. A second body function rejects with
-  `Web.TypeError.exception("body already used")`.
-
-  A chunk of a body stream must be bytes: a `Web.Uint8Array`, as the Fetch
-  Standard specifies, or a binary, iodata, or a `Web.ArrayBuffer`. A binary
-  is the usual form of bytes in Elixir. Each other chunk rejects with
-  `Web.TypeError`.
-
-  ## Examples
-
-      iex> response = Web.Response.new(body: "hello")
-      iex> Web.await(Web.Response.text(response))
-      "hello"
-
-      iex> response = Web.Response.new(body: ~s({"ok":true}))
-      iex> Web.await(Web.Response.json(response))
-      %{"ok" => true}
-
-      iex> response = Web.Response.new(body: "hello")
-      iex> %Web.ArrayBuffer{byte_length: 5} = Web.await(Web.Response.array_buffer(response))
-
-      iex> request = Web.Request.new("https://example.com", method: "POST", body: "payload")
-      iex> array_buffer = Web.await(Web.Request.array_buffer(request))
-      iex> {array_buffer.byte_length, array_buffer.data}
-      {7, "payload"}
-
-      iex> response = Web.Response.new(body: "hello")
-      iex> {response, clone} = Web.Response.clone(response)
-      iex> Web.await(Web.Response.text(response))
-      "hello"
-      iex> Web.await(Web.Response.text(clone))
-      "hello"
-  """
+  # The body mixin of the Fetch Standard. A mixin has no interface object,
+  # thus this module is internal. `use Web.Body` puts the methods of the
+  # mixin in `Web.Request` and `Web.Response`: `array_buffer/1`, `blob/1`,
+  # `bytes/1`, `form_data/1`, `json/1`, `text/1`, `text_stream/1`, and the
+  # attribute `body_used?/1`. It also puts `clone/1` there, which the two
+  # classes have.
+  #
+  # The methods follow the step "consume body" of the Fetch Standard. A body
+  # method takes the reader of the body before it returns, and the reader
+  # keeps its lock: after `text/1`, the body stream is disturbed and locked,
+  # and `Web.ReadableStream.get_reader/1` raises `Web.TypeError`. A second
+  # body method rejects with `Web.TypeError.exception("body already used")`.
+  #
+  # A chunk of a body stream must be bytes: a `Web.Uint8Array`, as the Fetch
+  # Standard specifies, or a binary, iodata, or a `Web.ArrayBuffer`. A binary
+  # is the usual form of bytes in Elixir. Each other chunk rejects with
+  # `Web.TypeError`.
+  #
+  # The module also infers the header `Content-Type` for the constructors,
+  # when the caller does not give that header: the step "extract a body".
+  #
+  #   * `%Web.URLSearchParams{}` gives
+  #     `application/x-www-form-urlencoded;charset=UTF-8`.
+  #   * A binary gives `text/plain;charset=UTF-8`.
+  #   * `%Web.Blob{}` gives the type of the blob, when it is not empty.
+  #   * `%Web.FormData{}` gives `multipart/form-data` with its boundary.
 
   alias Web.ArrayBuffer
   alias Web.FormData.Encoder
@@ -622,8 +591,7 @@ defmodule Web.Body do
   # The MIME type comes only from the header `content-type`, as the Fetch
   # Standard specifies. The content of the body has no effect.
   defp content_type(%{headers: %Web.Headers{} = headers}) do
-    headers
-    |> Web.Headers.get("content-type", "")
+    (Web.Headers.get(headers, "content-type") || "")
     |> Web.MIME.parse()
     |> Kernel.||("")
   end

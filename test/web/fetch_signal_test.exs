@@ -8,7 +8,7 @@ defmodule Web.FetchSignalTest do
     # The pause is a part of the scenario: a slow dispatcher.
     def fetch(%Web.Request{} = req) do
       Process.sleep(50)
-      {:ok, Web.Response.new(status: 200, body: ["data"], url: req.url, ok: true)}
+      {:ok, Web.Response.__network__(status: 200, body: ["data"], url: Web.URL.href(req.url))}
     end
   end
 
@@ -17,9 +17,14 @@ defmodule Web.FetchSignalTest do
 
     def fetch(_req) do
       send(self(), :dispatcher_called)
-      {:ok, Web.Response.new(status: 200, body: [], url: "mock://never", ok: true)}
+      {:ok, Web.Response.__network__(status: 200, body: [], url: "mock://never")}
     end
   end
+
+  # The dispatcher of a request is an internal field: the public API has no
+  # option for it.
+  defp slow(input, init \\ []),
+    do: %{Web.Request.new(input, init) | dispatcher: SlowDispatcher}
 
   # A server that reads the request, tells the test, and gives no response.
   # Thus the test can do a step while the client waits for the response
@@ -69,15 +74,13 @@ defmodule Web.FetchSignalTest do
   end
 
   test "fetch stops immediately if message received before fetch" do
-    req = Web.Request.new("mock://slow", signal: :my_ref, dispatcher: SlowDispatcher)
+    req = slow("mock://slow", signal: :my_ref)
     send(self(), {:abort, :my_ref})
     assert %Web.DOMException{name: "AbortError"} = catch_exit(await(Web.fetch(req)))
     send(self(), {:abort, :my_ref})
 
     assert %Web.DOMException{name: "AbortError"} =
-             catch_exit(
-               await(Web.fetch("mock://slow", signal: :my_ref, dispatcher: SlowDispatcher))
-             )
+             catch_exit(await(Web.fetch(slow("mock://slow"), signal: :my_ref)))
   end
 
   test "fetch stops immediately if signal PID is dead before fetch" do
@@ -85,7 +88,7 @@ defmodule Web.FetchSignalTest do
     monitor = Process.monitor(dead_pid)
     assert_receive {:DOWN, ^monitor, :process, ^dead_pid, _reason}, 1_000
 
-    req = Web.Request.new("mock://slow", signal: dead_pid, dispatcher: SlowDispatcher)
+    req = slow("mock://slow", signal: dead_pid)
     assert %Web.DOMException{name: "AbortError"} = catch_exit(await(Web.fetch(req)))
   end
 
@@ -116,7 +119,7 @@ defmodule Web.FetchSignalTest do
 
   test "fetch links and succeeds if signal PID stays alive" do
     alive_pid = spawn(fn -> Process.sleep(:infinity) end)
-    req = Web.Request.new("mock://slow", signal: alive_pid, dispatcher: SlowDispatcher)
+    req = slow("mock://slow", signal: alive_pid)
 
     resp = await(Web.fetch(req))
     assert resp.status == 200
@@ -128,7 +131,7 @@ defmodule Web.FetchSignalTest do
     controller = Web.AbortController.new()
 
     response =
-      await(Web.fetch("mock://slow", signal: controller.signal, dispatcher: SlowDispatcher))
+      await(Web.fetch(slow("mock://slow"), signal: controller.signal))
 
     assert response.status == 200
     assert response.snapshot.ambient_signal == controller.signal
@@ -138,9 +141,8 @@ defmodule Web.FetchSignalTest do
     assert :manual_cancel =
              catch_exit(
                await(
-                 Web.fetch("mock://never",
-                   signal: Web.AbortSignal.abort(:manual_cancel),
-                   dispatcher: NeverDispatcher
+                 Web.fetch(%{Web.Request.new("mock://never") | dispatcher: NeverDispatcher},
+                   signal: Web.AbortSignal.abort(:manual_cancel)
                  )
                )
              )

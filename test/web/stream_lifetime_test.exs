@@ -95,7 +95,7 @@ defmodule Web.StreamLifetimeTest do
     end
 
     test "rejects a second read of a body after it stopped" do
-      response = Response.new(body: "hello")
+      response = Response.new("hello")
       assert await(Response.text(response)) == "hello"
       # A body in memory has no process: the read takes its bytes.
       assert response.body.controller_pid == nil
@@ -154,7 +154,7 @@ defmodule Web.StreamLifetimeTest do
     end
 
     test "continues when a different process reads it in the linger time" do
-      response = in_short_process(fn -> Response.new(body: "handed over") end)
+      response = in_short_process(fn -> Response.new("handed over") end)
       assert await(Response.text(response)) == "handed over"
     end
 
@@ -634,7 +634,7 @@ defmodule Web.StreamLifetimeTest do
       baseline = process_count()
 
       for _ <- 1..@count do
-        assert await(Response.text(Response.new(body: "hello"))) == "hello"
+        assert await(Response.text(Response.new("hello"))) == "hello"
       end
 
       assert settle(baseline) <= @tolerance
@@ -661,7 +661,7 @@ defmodule Web.StreamLifetimeTest do
       baseline = process_count()
 
       for _ <- 1..@count do
-        {first, second} = Response.clone(Response.new(body: "hello"))
+        {first, second} = Response.clone(Response.new("hello"))
         assert await(Response.text(first)) == "hello"
         assert await(Response.text(second)) == "hello"
       end
@@ -699,7 +699,7 @@ defmodule Web.StreamLifetimeTest do
       baseline = process_count()
 
       for _ <- 1..@count do
-        in_short_process(fn -> Response.new(body: "not read") end)
+        in_short_process(fn -> Response.new("not read") end)
       end
 
       assert settle(baseline) <= @tolerance

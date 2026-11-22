@@ -82,14 +82,14 @@ defmodule Web.MIMETest do
   test "blob/1 gets its type from the header only, and does not examine the body" do
     html = "<!doctype html><html><head></head><body>x</body></html>"
 
-    response = Response.new(body: html, headers: [{"content-type", "application/octet-stream"}])
+    response = Response.new(html, headers: [{"content-type", "application/octet-stream"}])
     {response, clone} = Response.clone(response)
 
     assert await(Response.blob(response)).type == "application/octet-stream"
     assert await(Response.text(clone)) =~ "<html>"
 
     # A body from a stream has no header `content-type`, thus the type is "".
-    no_header = Response.new(body: Web.ReadableStream.from([html]))
+    no_header = Response.new(Web.ReadableStream.from([html]))
     assert await(Response.blob(no_header)).type == ""
 
     # `Web.MIME.sniff/1` examines the bytes when that is necessary.
@@ -116,7 +116,7 @@ defmodule Web.MIMETest do
     if is_nil(input) or is_nil(header) or is_nil(expected_mime) do
       :ok
     else
-      response = Response.new(body: input, headers: [{"content-type", header}])
+      response = Response.new(input, headers: [{"content-type", header}])
       actual_mime = await(Response.blob(response)).type
 
       if normalize_mime_type(actual_mime) == normalize_mime_type(expected_mime) do

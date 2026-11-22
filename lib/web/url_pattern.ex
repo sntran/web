@@ -2,9 +2,9 @@ defmodule Web.URLPattern do
   @moduledoc """
   An implementation of `URLPattern` of the WHATWG URL Pattern Standard.
 
-  `new/2` compiles a pattern string, or a map of the patterns of the
-  components (a `URLPatternInit`). `test/2` and `exec/2` match a URL with
-  the pattern, and `exec/2` gives the groups of each component.
+  `new/2` and `new/3` compile a pattern string, or a map of the patterns
+  of the components (a `URLPatternInit`). `test/3` and `exec/3` match a URL
+  with the pattern, and `exec/3` gives the groups of each component.
 
   ## Pattern syntax
 
@@ -39,47 +39,8 @@ defmodule Web.URLPattern do
 
       iex> Web.URLPattern.new(%{pathname: "/foo/(.*)"}).pathname
       "/foo/*"
-
-  ## AsyncContext integration
-
-  Use `match_context/3` to put the groups of a match in the ambient
-  execution context. Each asynchronous task that runs from it can read them:
-
-      pattern = Web.URLPattern.new(%{pathname: "/api/:version/:resource"})
-
-      Web.URLPattern.match_context(pattern, request.url, fn ->
-        params = Web.AsyncContext.Variable.get(Web.URLPattern.params())
-        params["version"]   # e.g. "v2"
-        params["resource"]  # e.g. "users"
-      end)
-
-  In a `Web.Stream` or a `Web.Promise`, `Web.AsyncContext.Snapshot` gives
-  the same `params()` variable:
-
-      stream = Web.ReadableStream.new(%{
-        pull: fn controller ->
-          params = Web.AsyncContext.Variable.get(Web.URLPattern.params())
-          # params["id"] is available here
-          ...
-        end
-      })
-
-  The same `Snapshot` keeps the variables of `Web.AsyncContext` and the
-  groups of `URLPattern`:
-
-      user_var = Web.AsyncContext.Variable.new(name: "user")
-
-      Web.AsyncContext.Variable.run(user_var, "alice", fn ->
-        pattern = Web.URLPattern.new(%{pathname: "/items/:id"})
-
-        Web.URLPattern.match_context(pattern, %{pathname: "/items/99"}, fn ->
-          Web.AsyncContext.Variable.get(user_var)          # => "alice"
-          Web.AsyncContext.Variable.get(Web.URLPattern.params()) # => %{"id" => "99"}
-        end)
-      end)
   """
 
-  alias Web.AsyncContext.Variable
   alias Web.URL
   alias Web.URLPattern.{Cache, Canonical, Compiler, ConstructorString, Init}
 
@@ -133,53 +94,14 @@ defmodule Web.URLPattern do
         }
 
   # ---------------------------------------------------------------------------
-  # The AsyncContext variable of the groups (one for each node)
-  # ---------------------------------------------------------------------------
-
-  @params_term_key {__MODULE__, :url_params_variable}
-  @pinned_prefix {__MODULE__, :pinned}
-
-  @doc """
-  Returns the `Web.AsyncContext.Variable` that keeps the groups of a match.
-
-  The variable is a singleton: the first call makes it and keeps it in
-  `:persistent_term`. An asynchronous task can call
-  `Variable.get(Web.URLPattern.params())` to read the groups that
-  `match_context/3` puts in the context.
-  """
-  @spec params() :: Variable.t()
-  def params do
-    var =
-      case :persistent_term.get(@params_term_key, nil) do
-        nil ->
-          v = Variable.new(name: "url_params")
-          :persistent_term.put(@params_term_key, v)
-          v
-
-        v ->
-          v
-      end
-
-    # `Variable.new/1` registers the key only in the process that makes the
-    # variable. Another process gets the variable from `:persistent_term`
-    # without the key in its registry, and `Snapshot.new/0` then does not
-    # find the key. Thus each process registers the key here.
-    registry_key = Variable.registry_key()
-    registry = Process.get(registry_key, MapSet.new())
-
-    unless MapSet.member?(registry, var.key) do
-      Process.put(registry_key, MapSet.put(registry, var.key))
-    end
-
-    var
-  end
-
-  # ---------------------------------------------------------------------------
-  # new/2
+  # new/3
   # ---------------------------------------------------------------------------
 
   @doc """
   Compiles a URL pattern: the constructor of `URLPattern`.
+
+  The Standard has two forms of the constructor: `new(input, options)` and
+  `new(input, base_url, options)`.
 
   `input` can be:
 
@@ -191,15 +113,15 @@ defmodule Web.URLPattern do
       `:base_url` gives the base URL. A component that is not in the map
       matches all values, or comes from the base URL.
 
-  The second argument can be the base URL (a string), or a map of options:
+  `base_url` is the base URL of a pattern string. `options` is a map, the
+  dictionary `URLPatternOptions`:
 
-    * `:base_url` - the base URL of a pattern string.
     * `:ignore_case` - `true` for a match that ignores the case. The
       default is `false`.
 
   Raises `Web.TypeError` when the pattern is not valid, when a relative
   pattern string has no base URL, and when a map has a base URL in the
-  second argument.
+  argument `base_url`.
 
   ## Examples
 
@@ -210,6 +132,10 @@ defmodule Web.URLPattern do
       iex> p = Web.URLPattern.new("/books/:id", "https://example.com")
       iex> {p.hostname, p.pathname}
       {"example.com", "/books/:id"}
+
+      iex> p = Web.URLPattern.new("/Books/:id", "https://example.com", %{ignore_case: true})
+      iex> Web.URLPattern.test(p, "https://example.com/books/7")
+      true
 
       iex> p = Web.URLPattern.new(%{pathname: "/foo/:bar"})
       iex> result = Web.URLPattern.exec(p, %{pathname: "/foo/baz"})
@@ -222,39 +148,29 @@ defmodule Web.URLPattern do
   @spec new(String.t() | map(), String.t() | map()) :: t()
   def new(input \\ %{}, options \\ %{})
 
-  def new(input, base_url) when is_binary(base_url), do: new(input, %{base_url: base_url})
+  def new(input, base_url) when is_binary(base_url), do: new(input, base_url, %{})
+  def new(input, options) when is_map(options), do: construct(input, nil, options)
 
-  def new(input, options) when (is_binary(input) or is_map(input)) and is_map(options) do
-    base_url = Map.get(options, :base_url)
+  @doc """
+  Compiles a URL pattern from a pattern string and its base URL. See
+  `new/2`.
+  """
+  @spec new(String.t() | map(), String.t(), map()) :: t()
+  def new(input, base_url, options) when is_binary(base_url) and is_map(options),
+    do: construct(input, base_url, options)
+
+  # The compiled patterns are in a cache: a pattern of a route is compiled
+  # one time.
+  defp construct(input, base_url, options) when is_binary(input) or is_map(input) do
     ignore_case = Map.get(options, :ignore_case, false) == true
     key = {input, base_url, ignore_case}
 
-    fetch_cached_pattern(Map.get(options, :pinned, false), key, fn ->
-      create(input, base_url, ignore_case)
-    end)
-  end
-
-  defp fetch_cached_pattern(true, key, builder) do
-    term_key = {@pinned_prefix, key}
-
-    case :persistent_term.get(term_key, nil) do
-      nil ->
-        pattern = builder.()
-        :persistent_term.put(term_key, pattern)
-        pattern
-
-      pattern ->
-        pattern
-    end
-  end
-
-  defp fetch_cached_pattern(false, key, builder) do
     case Cache.get(key) do
       {:ok, pattern} ->
         pattern
 
       :miss ->
-        pattern = builder.()
+        pattern = create(input, base_url, ignore_case)
         Cache.put(key, pattern)
         pattern
     end
@@ -341,14 +257,14 @@ defmodule Web.URLPattern do
 
   ## Examples
 
-      iex> Web.URLPattern.has_reg_exp_groups(Web.URLPattern.new(%{pathname: "/:id(\\\\d+)"}))
+      iex> Web.URLPattern.has_reg_exp_groups?(Web.URLPattern.new(%{pathname: "/:id(\\\\d+)"}))
       true
 
-      iex> Web.URLPattern.has_reg_exp_groups(Web.URLPattern.new(%{pathname: "/:id"}))
+      iex> Web.URLPattern.has_reg_exp_groups?(Web.URLPattern.new(%{pathname: "/:id"}))
       false
   """
-  @spec has_reg_exp_groups(t()) :: boolean()
-  def has_reg_exp_groups(%__MODULE__{compiled: compiled}),
+  @spec has_reg_exp_groups?(t()) :: boolean()
+  def has_reg_exp_groups?(%__MODULE__{compiled: compiled}),
     do: Enum.any?(compiled, fn {_name, component} -> component.has_regexp_groups end)
 
   # ---------------------------------------------------------------------------
@@ -462,42 +378,6 @@ defmodule Web.URLPattern do
         groups -> {:cont, Map.put(result, key, %{input: input, groups: groups})}
       end
     end)
-  end
-
-  # ---------------------------------------------------------------------------
-  # match_context/3 (AsyncContext integration)
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Matches the pattern with `input`. When the input matches, runs `fun` with
-  the named groups of all components in the variable `params/0`.
-
-  Returns the result of `fun`, or `nil` when the input does not match.
-
-  ## Examples
-
-      iex> pattern = Web.URLPattern.new(%{pathname: "/users/:id"})
-      iex> Web.URLPattern.match_context(pattern, %{pathname: "/users/99"}, fn ->
-      ...>   Web.AsyncContext.Variable.get(Web.URLPattern.params())
-      ...> end)
-      %{"id" => "99"}
-  """
-  @spec match_context(t(), String.t() | map() | URL.t(), (-> result)) :: result | nil
-        when result: var
-  def match_context(%__MODULE__{} = pattern, input, fun) when is_function(fun, 0) do
-    case exec(pattern, input) do
-      nil -> nil
-      result -> Variable.run(params(), named_groups(result), fun)
-    end
-  end
-
-  # The groups with a name that is not a number.
-  defp named_groups(result) do
-    for key <- @components,
-        {name, value} <- result[key].groups,
-        not String.match?(name, ~r/\A\d/),
-        into: %{},
-        do: {name, value}
   end
 
   # ---------------------------------------------------------------------------

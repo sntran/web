@@ -10,28 +10,28 @@ defmodule Web.BodyJSONTextTest do
   alias Web.Response
 
   defp chunked(binaries) do
-    Response.new(body: Web.ReadableStream.from(Enum.map(binaries, &Web.Uint8Array.from/1)))
+    Response.new(Web.ReadableStream.from(Enum.map(binaries, &Web.Uint8Array.from/1)))
   end
 
-  defp json!(body), do: await(Response.json(Response.new(body: body)))
-  defp json_error(body), do: catch_exit(await(Response.json(Response.new(body: body))))
+  defp json!(body), do: await(Response.json(Response.new(body)))
+  defp json_error(body), do: catch_exit(await(Response.json(Response.new(body))))
 
   describe "text/1" do
     test "gives valid UTF-8 with no change" do
       text = "plain ASCII, then café and 😀"
-      assert await(Response.text(Response.new(body: text))) == text
+      assert await(Response.text(Response.new(text))) == text
     end
 
     test "removes a byte order mark at the start, and only there" do
       bom = <<0xEF, 0xBB, 0xBF>>
-      assert await(Response.text(Response.new(body: bom <> "x" <> bom))) == "x﻿"
+      assert await(Response.text(Response.new(bom <> "x" <> bom))) == "x﻿"
       assert await(Response.text(chunked([<<0xEF, 0xBB>>, <<0xBF, ?y>>]))) == "y"
     end
 
     test "replaces each invalid sequence with U+FFFD" do
       body = <<?a, 0xFF, ?b, 0xE2, 0x82, ?c, 0xED, 0xA0, 0x80>>
 
-      assert await(Response.text(Response.new(body: body))) ==
+      assert await(Response.text(Response.new(body))) ==
                "a�b�c���"
     end
 
@@ -112,8 +112,6 @@ defmodule Web.BodyJSONTextTest do
       # The heap setting is for the process of the promise, not for the
       # caller.
       assert Process.info(self(), :min_heap_size) == {:min_heap_size, before}
-      assert {:ok, ^items} = Web.Blob.json(Web.Blob.new([text]))
-      assert Process.info(self(), :min_heap_size) == {:min_heap_size, before}
     end
 
     test "rejects the values that a UTF-8 binary or a float cannot have" do
@@ -152,11 +150,6 @@ defmodule Web.BodyJSONTextTest do
   end
 
   describe "Web.Blob" do
-    test "json/1 gives the value or the decode error" do
-      assert Web.Blob.json(Web.Blob.new([~s({"a":1,"a":2})])) == {:ok, %{"a" => 2}}
-      assert {:error, %JSON.DecodeError{}} = Web.Blob.json(Web.Blob.new(["{"]))
-    end
-
     test "array_buffer/1 gives the bytes with no decode" do
       bytes = <<0xEF, 0xBB, 0xBF, 0xFF>>
       {:ok, buffer} = Web.Blob.array_buffer(Web.Blob.new([bytes]))

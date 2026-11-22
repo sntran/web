@@ -594,7 +594,7 @@ defmodule Web.ReadableStreamTeeTest do
     test "can be read to its end while the other response is not read" do
       body = String.duplicate("x", 500_000)
       chunks = for <<part::binary-size(1_000) <- body>>, do: part
-      response = Response.new(body: ReadableStream.from(chunks))
+      response = Response.new(ReadableStream.from(chunks))
 
       {response, clone} = Response.clone(response)
       assert await(Response.text(clone)) == body

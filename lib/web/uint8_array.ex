@@ -14,7 +14,7 @@ defmodule Web.Uint8Array do
   stream, and of `Web.TextEncoderStream`, and a default read of a byte
   stream. Use `to_string/1` to get the binary of a chunk:
 
-      iex> response = Web.Response.new(body: "hello")
+      iex> response = Web.Response.new("hello")
       iex> Enum.map(response.body, &to_string/1)
       ["hello"]
 

@@ -10,8 +10,6 @@ defmodule Web.URLPatternTest do
     ],
     prefix: "URLPattern WPT compliance"
 
-  alias Web.AsyncContext.Snapshot
-  alias Web.AsyncContext.Variable
   alias Web.URLPattern
   alias Web.URLPattern.{Canonical, Compiler}
 
@@ -64,7 +62,7 @@ defmodule Web.URLPatternTest do
   defp build([input, options]), do: URLPattern.new(input, options(options))
 
   defp build([input, base, options]) when is_binary(base),
-    do: URLPattern.new(input, Map.put(options(options), :base_url, base))
+    do: URLPattern.new(input, base, options(options))
 
   # WebIDL converts an object in the place of the base URL to a string.
   defp build([input, _object, options]), do: build([input, "[object Object]", options])
@@ -240,7 +238,7 @@ defmodule Web.URLPatternTest do
                {"https", "discussion.example", "/admin/*"}
 
       assert {pattern.search, pattern.hash} == {"*", "*"}
-      assert URLPattern.new("?q", %{base_url: "https://example.com/a"}).pathname == "/a"
+      assert URLPattern.new("?q", "https://example.com/a").pathname == "/a"
     end
 
     test "escapes the characters of the pattern syntax" do
@@ -256,11 +254,11 @@ defmodule Web.URLPatternTest do
     end
   end
 
-  test "has_reg_exp_groups/1 tells if a component has a regular expression" do
-    refute URLPattern.has_reg_exp_groups(URLPattern.new())
-    refute URLPattern.has_reg_exp_groups(URLPattern.new(%{pathname: "/a/:foo/:baz?/b/*"}))
-    assert URLPattern.has_reg_exp_groups(URLPattern.new(%{pathname: "/:foo([a-z]+)?"}))
-    assert URLPattern.has_reg_exp_groups(URLPattern.new(%{hash: "(hi)"}))
+  test "has_reg_exp_groups?/1 tells if a component has a regular expression" do
+    refute URLPattern.has_reg_exp_groups?(URLPattern.new())
+    refute URLPattern.has_reg_exp_groups?(URLPattern.new(%{pathname: "/a/:foo/:baz?/b/*"}))
+    assert URLPattern.has_reg_exp_groups?(URLPattern.new(%{pathname: "/:foo([a-z]+)?"}))
+    assert URLPattern.has_reg_exp_groups?(URLPattern.new(%{hash: "(hi)"}))
   end
 
   describe "the result of exec/3" do
@@ -370,83 +368,9 @@ defmodule Web.URLPatternTest do
   # The functions of the library
   # ---------------------------------------------------------------------------
 
-  describe "match_context/3" do
-    test "puts the named groups in the variable while the function runs" do
-      pattern = URLPattern.new(%{pathname: "/api/:id/*"})
-
-      result =
-        URLPattern.match_context(pattern, %{pathname: "/api/42/x"}, fn ->
-          Variable.get(URLPattern.params())
-        end)
-
-      assert result == %{"id" => "42"}
-    end
-
-    test "returns nil when the pattern does not match" do
-      pattern = URLPattern.new(%{pathname: "/api/:id"})
-
-      assert URLPattern.match_context(pattern, %{pathname: "/other"}, fn -> :called end) == nil
-    end
-
-    test "gives the earlier groups back after the function" do
-      outer = URLPattern.new(%{pathname: "/api/:x"})
-      inner = URLPattern.new(%{pathname: "/data/:y"})
-
-      result =
-        URLPattern.match_context(outer, %{pathname: "/api/outer"}, fn ->
-          URLPattern.match_context(inner, %{pathname: "/data/inner"}, fn ->
-            Variable.get(URLPattern.params())
-          end)
-
-          Variable.get(URLPattern.params())
-        end)
-
-      assert result == %{"x" => "outer"}
-    end
-
-    test "gives an empty map when the pattern has no named group" do
-      pattern = URLPattern.new(%{pathname: "/literal"})
-
-      assert URLPattern.match_context(pattern, %{pathname: "/literal"}, fn ->
-               Variable.get(URLPattern.params())
-             end) == %{}
-    end
-
-    test "puts the groups in a snapshot for a task" do
-      pattern = URLPattern.new(%{pathname: "/api/:version"})
-      assert Variable.get(URLPattern.params()) == nil
-
-      captured =
-        URLPattern.match_context(pattern, %{pathname: "/api/v3"}, fn ->
-          snapshot = Snapshot.new()
-
-          Task.async(fn ->
-            Snapshot.run(snapshot, fn -> Variable.get(URLPattern.params()) end)
-          end)
-          |> Task.await()
-        end)
-
-      assert captured == %{"version" => "v3"}
-      assert Variable.get(URLPattern.params()) == nil
-    end
-  end
-
   describe "the cache" do
     test "gives the same struct for the same pattern" do
       assert URLPattern.new(%{pathname: "/foo/:id"}) == URLPattern.new(%{pathname: "/foo/:id"})
-    end
-
-    test "keeps a pinned pattern in persistent_term" do
-      for {input, base} <- [{"https://example.com/pinned", nil}, {%{pathname: "/p"}, nil}] do
-        key = {{URLPattern, :pinned}, {input, base, false}}
-        :persistent_term.erase(key)
-
-        pattern = URLPattern.new(input, %{pinned: true})
-
-        assert URLPattern.new(input, %{pinned: true}) == pattern
-        assert :persistent_term.get(key) == pattern
-        :persistent_term.erase(key)
-      end
     end
   end
 

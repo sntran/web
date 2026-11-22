@@ -58,7 +58,7 @@ defmodule Web.Benchmarks.OperationCost do
     report("text of a response with a body in memory", fn ->
       each(fn ->
         for _index <- 1..@count do
-          response = Web.Response.new(body: ReadableStream.from("hello"))
+          response = Web.Response.new(ReadableStream.from("hello"))
           "hello" = Web.await(Web.Response.text(response))
         end
       end)

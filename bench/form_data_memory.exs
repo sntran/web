@@ -6,7 +6,8 @@ defmodule Web.Benchmarks.FormDataMemory do
   # A multipart form with one large file goes through the library in the
   # two directions, and the memory of the VM stays flat:
   #
-  #   * parse: `Web.FormData.parse/2` reads a `multipart/form-data` body
+  #   * parse: the parser of `Web.Response.form_data/1` (the internal
+  #     function `Web.FormData.parse/2`) reads a `multipart/form-data` body
   #     from a stream. The file of the form is a stream too;
   #   * encode: a `Web.FormData` with a file that has a stream is the body
   #     of a response. The body is a stream of `multipart/form-data` bytes.
@@ -61,9 +62,9 @@ defmodule Web.Benchmarks.FormDataMemory do
     file = Web.File.new([], "large.bin", type: "application/octet-stream")
     file = %{file | stream: Web.ReadableStream.from(file_chunks())}
 
-    form = FormData.new(boundary: @boundary) |> FormData.append("upload", file)
+    form = %{FormData.new() | boundary: @boundary} |> FormData.append("upload", file)
 
-    Web.Response.new(body: form).body
+    Web.Response.new(form).body
     |> count_bytes()
   end
 

@@ -81,7 +81,6 @@ defmodule Web.HeadersTest do
 
       assert Headers.get(headers, "set-cookie") == "a=1, b=2"
       assert Headers.get_set_cookie(headers) == ["a=1", "b=2"]
-      assert Headers.getSetCookie(headers) == ["a=1", "b=2"]
     end
 
     # The steps "sort and combine" of the Fetch Standard.
@@ -116,9 +115,8 @@ defmodule Web.HeadersTest do
       assert Enum.to_list(Headers.values(headers)) == ["*/*", "b=2", "a=1", "1, 2"]
     end
 
-    test "missing headers return nil by default" do
+    test "a missing header gives nil (null)" do
       assert Headers.get(Headers.new(), "missing") == nil
-      assert Headers.get(Headers.new(), "missing", :default) == :default
     end
   end
 
@@ -344,10 +342,10 @@ defmodule Web.HeadersTest do
 
     test "is not in the headers of a response, a request, or a JSON response" do
       for headers <- [
-            Web.Response.new(body: "x").headers,
+            Web.Response.new("x").headers,
             Web.Response.json(%{}).headers,
             Web.Request.new("https://example.com").headers,
-            Web.Response.new(headers: Web.Response.error().headers).headers
+            Web.Response.new(nil, headers: Web.Response.error().headers).headers
           ] do
         assert headers.guard == "none"
         assert %Headers{} = Headers.append(headers, "x", "1")

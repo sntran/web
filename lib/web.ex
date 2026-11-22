@@ -3,7 +3,7 @@ defmodule Web do
   A Universal Fetch Library for Elixir.
 
   This module provides a Web-compliant Fetch API for Elixir, matching the WHATWG Fetch standard.
-  It supports zero-buffer streaming, abort signals, and an extensible dispatcher architecture.
+  It supports zero-buffer streaming and abort signals.
 
   ## The "Web-First" DSL
 
@@ -283,19 +283,29 @@ defmodule Web do
   defp socket_options(options), do: options
 
   @doc """
-  Initiates a network fetch.
-
-  Matches the Javascript Fetch API standard.
+  Initiates a network fetch, as `fetch(input, init)` of the Fetch Standard.
 
   ## Parameters
-    - `input`: A string representing the URL, OR a pre-constructed `Web.Request` struct.
-    - `init`: A keyword list of options. Each option replaces the value of an input request.
+    - `input`: A string representing the URL, a `Web.URL`, OR a pre-constructed `Web.Request` struct.
+    - `init`: A keyword list of options, the members of `RequestInit`: see
+      `Web.Request.new/2`. Each option replaces the value of an input request.
       - `:method` (String.t | atom) - HTTP method (default: "GET").
       - `:headers` (Map.t | List.t | Web.Headers.t) - Request headers.
       - `:body` (any) - Request payload.
       - `:redirect` (`"follow" | "error" | "manual"`) - Redirect handling mode.
       - `:signal` (`Web.AbortSignal.t()` | pid | reference) - Optional abort signal.
-      - `:dispatcher` (module) - Optional override for the request handler.
+
+  ## The schemes
+
+    - `http:` and `https:` - an HTTP request on a pool of connections.
+    - `blob:` - the blob of a URL from `Web.URL.create_object_url/1`, as the
+      Fetch Standard specifies. A `Range` header of one range gives the
+      status 206 and the bytes of the range.
+    - `tcp:`, and an rclone URL such as `my_remote:host:port/path` (a
+      remote name with `_`) - a TCP connection to the host and the port. The
+      port 80 is the default. The request body goes to the peer, and the
+      response body has the bytes that the peer sends until it closes the
+      connection.
 
   ## Returns
     - `%Web.Promise{}` resolving to `Web.Response.t()` on success.
@@ -398,7 +408,8 @@ defmodule Web do
     do_fetch(request)
   end
 
-  # A dispatcher that the caller gives in the option `:dispatcher`.
+  # A different dispatcher in the internal field `dispatcher` of the
+  # request. The field is not a part of the public API: the tests set it.
   defp do_fetch(%Web.Request{dispatcher: dispatcher} = request) do
     Web.AbortSignal.check!(request.signal)
     dispatcher.fetch(request)

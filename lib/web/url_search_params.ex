@@ -3,6 +3,9 @@ defmodule Web.URLSearchParams do
   An implementation of the WHATWG URLSearchParams standard.
 
   Provides a storage for ordered query parameters.
+
+  The struct is an `Enumerable` of `{name, value}` tuples, as the iterable
+  of the Standard. Thus `Enum.to_list/1` gives the pairs.
   """
 
   import Kernel, except: [to_string: 1]
@@ -39,7 +42,7 @@ defmodule Web.URLSearchParams do
       iex> Web.URLSearchParams.get_all(params, "foo")
       ["bar", "baz"]
 
-      iex> Web.URLSearchParams.new("?&a=1&&b") |> Web.URLSearchParams.to_list()
+      iex> Web.URLSearchParams.new("?&a=1&&b") |> Enum.to_list()
       [{"a", "1"}, {"b", ""}]
 
       iex> Web.URLSearchParams.new([["a", "1"], {"b", "2"}]) |> Web.URLSearchParams.to_string()
@@ -141,19 +144,6 @@ defmodule Web.URLSearchParams do
   end
 
   @doc """
-  Returns true if the given name exists in the query parameters. The same
-  as `has/2`.
-
-  ## Examples
-
-      iex> params = Web.URLSearchParams.new("foo=bar")
-      iex> Web.URLSearchParams.has?(params, "foo")
-      true
-  """
-  @spec has?(t(), String.t()) :: boolean()
-  def has?(%__MODULE__{} = params, name), do: has(params, name)
-
-  @doc """
   Returns true if a pair has the given name. With a value, returns true only
   if a pair has the name and the value. A `nil` value is the same as no
   value.
@@ -226,7 +216,7 @@ defmodule Web.URLSearchParams do
       "a=1&a=0&b=2&c=3"
 
       iex> params = Web.URLSearchParams.new("\uFB03&\u{1F308}")
-      iex> Web.URLSearchParams.sort(params) |> Web.URLSearchParams.to_list()
+      iex> Web.URLSearchParams.sort(params) |> Enum.to_list()
       [{"\u{1F308}", ""}, {"\uFB03", ""}]
   """
   @spec sort(t()) :: t()
@@ -258,6 +248,9 @@ defmodule Web.URLSearchParams do
     end)
   end
 
+  @doc false
+  # The list of the pairs. Use `Enum.to_list/1`: the struct is an
+  # `Enumerable` of its pairs, as the iterable of the Standard.
   @spec to_list(t()) :: [pair()]
   def to_list(%__MODULE__{} = params), do: params.pairs
 

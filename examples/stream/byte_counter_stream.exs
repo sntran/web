@@ -132,8 +132,8 @@ defmodule StreamByteCounterDemo do
       combined =
         Promise.all([
           custom_pipe_task,
-          Response.text(Response.new(body: custom_counter.readable)),
-          Response.text(Response.new(body: transformed_readable))
+          Response.text(Response.new(custom_counter.readable)),
+          Response.text(Response.new(transformed_readable))
         ])
 
       [_pipe_ok, _custom_body, _transform_body] = await(combined)

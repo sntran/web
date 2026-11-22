@@ -31,14 +31,14 @@ defmodule Web.BlobURLTest do
     for target <- [url, url <> "#fragment", Web.Request.new(url)] do
       assert {:fulfilled, response} = fetch(target)
       assert {response.status, response.status_text, response.url} == {200, "OK", url}
-      assert Web.Headers.get(response.headers, "content-length", nil) == "5"
-      assert Web.Headers.get(response.headers, "content-type", nil) == "text/plain"
+      assert Web.Headers.get(response.headers, "content-length") == "5"
+      assert Web.Headers.get(response.headers, "content-type") == "text/plain"
       assert text(response) == "hello"
     end
 
     file = Web.File.new(["bits"], "a.txt")
     assert {:fulfilled, response} = fetch(URL.create_object_url(file))
-    assert Web.Headers.get(response.headers, "content-type", nil) == ""
+    assert Web.Headers.get(response.headers, "content-type") == ""
     assert text(response) == "bits"
   end
 
@@ -84,7 +84,8 @@ defmodule Web.BlobURLTest do
     assert {:error, :blob_url_method_not_get} =
              Web.Dispatcher.Blob.fetch(Web.Request.new(url, method: "PUT"))
 
-    assert {:fulfilled, %Web.Response{}} = fetch(url, dispatcher: Web.Dispatcher.Blob)
+    request = %{Web.Request.new(url) | dispatcher: Web.Dispatcher.Blob}
+    assert {:fulfilled, %Web.Response{}} = fetch(request)
 
     assert {:error, :blob_url_not_found} =
              Web.Dispatcher.Blob.fetch(Web.Request.new("https://example.com/"))
@@ -192,9 +193,9 @@ defmodule Web.BlobURLTest do
       case fetch(url, headers: [{"range", value}]) do
         {:fulfilled, response} ->
           {response.status, response.status_text,
-           Web.Headers.get(response.headers, "content-range", nil),
-           Web.Headers.get(response.headers, "content-length", nil),
-           Web.Headers.get(response.headers, "content-type", nil), text(response)}
+           Web.Headers.get(response.headers, "content-range"),
+           Web.Headers.get(response.headers, "content-length"),
+           Web.Headers.get(response.headers, "content-type"), text(response)}
 
         {:rejected, %Web.TypeError{}} ->
           :network_error

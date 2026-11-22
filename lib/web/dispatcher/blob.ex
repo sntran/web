@@ -1,21 +1,21 @@
 defmodule Web.Dispatcher.Blob do
-  @moduledoc """
-  The dispatcher of `Web.fetch/2` for a `blob:` URL, as the steps "scheme
-  fetch" of the Fetch Standard specify for the scheme `"blob"`.
+  @moduledoc false
 
-  The URL comes from `Web.URL.create_object_url/1`. The response has the
-  status 200, the bytes of the blob, and the headers `Content-Length` and
-  `Content-Type` with the size and the type of the blob. A request with a
-  `Range` header of one range, such as `bytes=0-99`, gets the status 206
-  with the bytes of the range and the header `Content-Range`.
-
-  A method other than `GET`, a URL that is not in the blob URL store, and a
-  range that is not valid give a network error: `Web.fetch/2` rejects with
-  a `Web.TypeError`. The fragment of the URL has no effect.
-
-  The dispatcher reads the store when the fetch starts. Thus a revoke of
-  the URL after the call of `Web.fetch/2` does not change the response.
-  """
+  # The dispatcher of `Web.fetch/2` for a `blob:` URL, as the steps "scheme
+  # fetch" of the Fetch Standard specify for the scheme `"blob"`.
+  #
+  # The URL comes from `Web.URL.create_object_url/1`. The response has the
+  # status 200, the bytes of the blob, and the headers `Content-Length` and
+  # `Content-Type` with the size and the type of the blob. A request with a
+  # `Range` header of one range, such as `bytes=0-99`, gets the status 206
+  # with the bytes of the range and the header `Content-Range`.
+  #
+  # A method other than `GET`, a URL that is not in the blob URL store, and a
+  # range that is not valid give a network error: `Web.fetch/2` rejects with
+  # a `Web.TypeError`. The fragment of the URL has no effect.
+  #
+  # The dispatcher reads the store when the fetch starts. Thus a revoke of
+  # the URL after the call of `Web.fetch/2` does not change the response.
 
   @behaviour Web.Dispatcher
 
@@ -47,7 +47,7 @@ defmodule Web.Dispatcher.Blob do
     size = Map.get(blob, :size) || 0
     url = url_without_fragment(request.url)
 
-    case Web.Headers.get(request.headers, "range", nil) do
+    case Web.Headers.get(request.headers, "range") do
       nil ->
         {:ok,
          Web.Response.__network__(

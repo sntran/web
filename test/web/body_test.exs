@@ -29,7 +29,7 @@ defmodule Web.BodyTest do
   end
 
   test "Response.text/1 marks the body as disturbed and rejects a second read" do
-    response = Response.new(body: "hello")
+    response = Response.new("hello")
 
     assert ReadableStream.disturbed?(response.body) == false
     assert "hello" = await(Response.text(response))
@@ -40,7 +40,7 @@ defmodule Web.BodyTest do
   end
 
   test "Response.clone/1 tees the body and both branches can be consumed" do
-    response = Response.new(body: "hello")
+    response = Response.new("hello")
 
     assert {response, clone} = Response.clone(response)
     assert "hello" = await(Response.text(response))
@@ -65,7 +65,7 @@ defmodule Web.BodyTest do
   end
 
   test "clone of disturbed body raises TypeError" do
-    response = Response.new(body: "hello")
+    response = Response.new("hello")
     await(Response.text(response))
 
     assert_raise Web.TypeError, "body already used", fn ->
@@ -74,7 +74,7 @@ defmodule Web.BodyTest do
   end
 
   test "clone of locked stream raises TypeError" do
-    response = Response.new(body: ReadableStream.from("hello"))
+    response = Response.new(ReadableStream.from("hello"))
     _reader = ReadableStream.get_reader(response.body)
 
     assert_raise Web.TypeError, "ReadableStream is already locked", fn ->
@@ -90,21 +90,21 @@ defmodule Web.BodyTest do
 
   test "Response.text/1 reads iolist body" do
     # read_body_to_binary/1 list branch (source line 172)
-    response = Response.new(body: ["hel", "lo"])
+    response = Response.new(["hel", "lo"])
     assert "hello" == await(Response.text(response))
   end
 
   test "Response.text/1 rejects when body read fails via mapper {:error, reason}" do
     # consume_body reject path: mapper returns {:error, reason} (source line 160)
     # json/1 returns {:error, reason} when JSON parsing fails
-    response = Response.new(body: "invalid json {{")
+    response = Response.new("invalid json {{")
 
     assert %Web.SyntaxError{cause: %JSON.DecodeError{}} =
              catch_exit(await(Response.json(response)))
   end
 
   test "Response.text/1 rejects when stream is already locked" do
-    response = Response.new(body: ReadableStream.from("hello"))
+    response = Response.new(ReadableStream.from("hello"))
     _reader = ReadableStream.get_reader(response.body)
 
     assert %Web.TypeError{} = catch_exit(await(Response.text(response)))
@@ -116,7 +116,7 @@ defmodule Web.BodyTest do
     stream = %ReadableStream{controller_pid: pid}
     # Error the stream so read() returns {:error, :stream_fail}
     ReadableStream.error(pid, :stream_fail)
-    response = Response.new(body: stream)
+    response = Response.new(stream)
     result = catch_exit(await(Response.text(response)))
     assert result == :stream_fail
   end
@@ -151,7 +151,7 @@ defmodule Web.BodyTest do
   end
 
   test "Response.array_buffer/1 rejects when body stream is already locked" do
-    response = Response.new(body: ReadableStream.from("hello"))
+    response = Response.new(ReadableStream.from("hello"))
     _reader = ReadableStream.get_reader(response.body)
 
     assert %Web.TypeError{message: "ReadableStream is already locked"} =
@@ -162,7 +162,7 @@ defmodule Web.BodyTest do
     {:ok, pid} = ReadableStream.start_link()
     stream = %ReadableStream{controller_pid: pid}
     ReadableStream.error(pid, :stream_fail)
-    response = Response.new(body: stream)
+    response = Response.new(stream)
 
     assert :stream_fail = catch_exit(await(Response.array_buffer(response)))
   end
@@ -180,18 +180,18 @@ defmodule Web.BodyTest do
       |> Uint8Array.new()
 
     response =
-      Response.new(body: [Uint8Array.new(bytes.buffer, 0, 1), Uint8Array.new(bytes.buffer, 1, 4)])
+      Response.new([Uint8Array.new(bytes.buffer, 0, 1), Uint8Array.new(bytes.buffer, 1, 4)])
 
     assert "A🌍" == await(Response.text(response))
   end
 
   test "Response.text/1 decodes iodata chunks from a stream" do
-    response = Response.new(body: [["hel"], ["lo"]])
+    response = Response.new([["hel"], ["lo"]])
     assert "hello" == await(Response.text(response))
   end
 
   test "Response.text/1 rejects invalid stream chunk types" do
-    response = Response.new(body: [123])
+    response = Response.new([123])
 
     assert %Web.TypeError{message: "Body stream chunk must be binary, Uint8Array, or iodata"} =
              catch_exit(await(Response.text(response)))
@@ -215,7 +215,7 @@ defmodule Web.BodyTest do
   end
 
   test "Web.Body.put_inferred_content_type infers multipart FormData bodies" do
-    form_data = Web.FormData.new(boundary: "body-form-boundary")
+    form_data = %{Web.FormData.new() | boundary: "body-form-boundary"}
 
     headers = Web.Body.put_inferred_content_type(Web.Headers.new(), form_data)
 
@@ -306,11 +306,10 @@ defmodule Web.BodyTest do
 
     response =
       Response.new(
-        body:
-          Web.ReadableStream.from([
-            binary_part(payload, 0, 9),
-            binary_part(payload, 9, byte_size(payload) - 9)
-          ]),
+        Web.ReadableStream.from([
+          binary_part(payload, 0, 9),
+          binary_part(payload, 9, byte_size(payload) - 9)
+        ]),
         headers: %{"content-type" => "multipart/form-data; boundary=#{boundary}"}
       )
 
@@ -326,8 +325,7 @@ defmodule Web.BodyTest do
 
   test "Response.form_data/1 parses application/x-www-form-urlencoded payload" do
     response =
-      Response.new(
-        body: "a=1&b=two",
+      Response.new("a=1&b=two",
         headers: %{"content-type" => "application/x-www-form-urlencoded;charset=UTF-8"}
       )
 
@@ -341,10 +339,7 @@ defmodule Web.BodyTest do
   # constructor of URLSearchParams removes it.
   test "Response.form_data/1 keeps a ? at the start of a urlencoded payload" do
     response =
-      Response.new(
-        body: "?a=1",
-        headers: %{"content-type" => "application/x-www-form-urlencoded"}
-      )
+      Response.new("?a=1", headers: %{"content-type" => "application/x-www-form-urlencoded"})
 
     form_data = await(Response.form_data(response))
 
@@ -354,8 +349,7 @@ defmodule Web.BodyTest do
 
   test "Response.form_data/1 rejects multipart payload when boundary is missing" do
     response =
-      Response.new(
-        body: "--x\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--x--\r\n",
+      Response.new("--x\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--x--\r\n",
         headers: %{"content-type" => "multipart/form-data"}
       )
 
@@ -365,10 +359,7 @@ defmodule Web.BodyTest do
 
   test "Response.form_data/1 rejects empty quoted multipart boundaries" do
     response =
-      Response.new(
-        body: "",
-        headers: %{"content-type" => "multipart/form-data; boundary=\"\""}
-      )
+      Response.new("", headers: %{"content-type" => "multipart/form-data; boundary=\"\""})
 
     assert %Web.TypeError{message: "multipart/form-data boundary is missing"} =
              catch_exit(await(Response.form_data(response)))
@@ -376,10 +367,7 @@ defmodule Web.BodyTest do
 
   test "Response.form_data/1 rejects whitespace-only multipart boundaries" do
     response =
-      Response.new(
-        body: "",
-        headers: %{"content-type" => "multipart/form-data; boundary=   "}
-      )
+      Response.new("", headers: %{"content-type" => "multipart/form-data; boundary=   "})
 
     assert %Web.TypeError{message: "multipart/form-data boundary is missing"} =
              catch_exit(await(Response.form_data(response)))
@@ -390,11 +378,10 @@ defmodule Web.BodyTest do
 
     response =
       Response.new(
-        body:
-          "--#{boundary}\r\n" <>
-            "Content-Disposition: form-data; name=\"field\"\r\n\r\n" <>
-            "value\r\n" <>
-            "--#{boundary}--\r\n",
+        "--#{boundary}\r\n" <>
+          "Content-Disposition: form-data; name=\"field\"\r\n\r\n" <>
+          "value\r\n" <>
+          "--#{boundary}--\r\n",
         headers: %{"content-type" => "multipart/form-data; boundary=\"#{boundary}\""}
       )
 
@@ -404,10 +391,7 @@ defmodule Web.BodyTest do
 
   test "Response.form_data/1 rejects multipart bodies with an empty boundary" do
     response =
-      Response.new(
-        body: "",
-        headers: [{"content-type", "multipart/form-data; boundary="}]
-      )
+      Response.new("", headers: [{"content-type", "multipart/form-data; boundary="}])
 
     assert %Web.TypeError{message: "multipart/form-data boundary is missing"} =
              catch_exit(await(Response.form_data(response)))
@@ -415,10 +399,7 @@ defmodule Web.BodyTest do
 
   test "Response.form_data/1 rejects multipart bodies with a whitespace-only boundary" do
     response =
-      Response.new(
-        body: "",
-        headers: [{"content-type", ~s(multipart/form-data; boundary="   ")}]
-      )
+      Response.new("", headers: [{"content-type", ~s(multipart/form-data; boundary="   ")}])
 
     assert %Web.TypeError{message: "multipart/form-data boundary is missing"} =
              catch_exit(await(Response.form_data(response)))
@@ -426,8 +407,7 @@ defmodule Web.BodyTest do
 
   test "Response.form_data/1 rescues malformed multipart parser errors" do
     response =
-      Response.new(
-        body: "not-a-multipart-body",
+      Response.new("not-a-multipart-body",
         headers: %{"content-type" => "multipart/form-data; boundary=broken"}
       )
 
@@ -437,10 +417,7 @@ defmodule Web.BodyTest do
 
   test "Response.form_data/1 rejects unsupported content types" do
     response =
-      Response.new(
-        body: "plain text",
-        headers: %{"content-type" => "text/plain"}
-      )
+      Response.new("plain text", headers: %{"content-type" => "text/plain"})
 
     assert %Web.TypeError{message: "Cannot parse form data from content-type \"text/plain\""} =
              catch_exit(await(Response.form_data(response)))

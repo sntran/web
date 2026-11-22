@@ -13,7 +13,6 @@ defmodule Web.Blob do
   """
 
   alias Web.Internal.Bytes
-  alias Web.Internal.JSON, as: JSONText
 
   @enforce_keys [:id, :parts, :size, :type]
   defstruct [:id, :parts, :size, :type]
@@ -31,7 +30,12 @@ defmodule Web.Blob do
   @chunk_size 65_536
 
   @doc """
-  Creates a new Blob from parts and optional content type.
+  Creates a new Blob from parts and optional content type, as the
+  constructor `new Blob(blobParts, options)` of the File API. With no
+  parts, the blob is empty.
+
+  The options are the members of `BlobPropertyBag`: `:type`, the type of
+  the blob. The default is the empty string.
 
   A part is a binary, a `Web.Blob`, a `Web.File`, a `Web.Uint8Array`, or a
   `Web.ArrayBuffer`. The blob keeps a copy of the bytes of a view or a
@@ -47,6 +51,9 @@ defmodule Web.Blob do
       iex> {blob.size, Web.Blob.text(blob)}
       {4, {:ok, "abcd"}}
 
+      iex> Web.Blob.new().size
+      0
+
       iex> Web.Blob.new([], type: "Text/Plain").type
       "text/plain"
 
@@ -54,7 +61,7 @@ defmodule Web.Blob do
       ""
   """
   @spec new([blob_part()], keyword()) :: t()
-  def new(parts_list, opts \\ []) when is_list(parts_list) do
+  def new(parts_list \\ [], opts \\ []) when is_list(parts_list) do
     type = opts |> Keyword.get(:type, "") |> normalize_type()
     parts_list = Enum.map(parts_list, &normalize_part/1)
 
@@ -210,18 +217,6 @@ defmodule Web.Blob do
   @spec text(t() | Web.File.t()) :: {:ok, String.t()}
   def text(blob) do
     {:ok, blob |> to_binary() |> Web.TextDecoder.decode_utf8()}
-  end
-
-  @doc """
-  Reads the contents of the blob as text, and parses it as JSON, as
-  `JSON.parse` of ECMAScript. Returns `{:ok, value}`, or
-  `{:error, %JSON.DecodeError{}}`.
-  """
-  @spec json(t() | Web.File.t()) :: {:ok, any()} | {:error, any()}
-  def json(blob) do
-    with {:ok, text} <- text(blob) do
-      JSONText.parse(text)
-    end
   end
 
   @doc """

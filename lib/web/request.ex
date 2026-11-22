@@ -18,6 +18,19 @@ defmodule Web.Request do
   `integrity`, `keepalive`, and the option `:priority` do not change what
   `Web.fetch/2` sends. The constructor examines them as the Standard
   specifies.
+
+  The function `body_used?/1` is the attribute `bodyUsed`.
+
+  ## The body
+
+  The methods of the body mixin of the Fetch Standard read the body, as
+  for a `Web.Response`: `text/1`, `json/1`, `array_buffer/1`, `bytes/1`,
+  `blob/1`, `form_data/1`, and `text_stream/1`.
+
+      iex> request = Web.Request.new("https://example.com", method: "POST", body: "payload")
+      iex> array_buffer = Web.await(Web.Request.array_buffer(request))
+      iex> {array_buffer.byte_length, array_buffer.data}
+      {7, "payload"}
   """
   use Web.Body
 
@@ -83,8 +96,8 @@ defmodule Web.Request do
   `:headers`, `:body`, `:referrer`, `:referrer_policy`, `:mode`,
   `:credentials`, `:cache`, `:redirect`, `:integrity`, `:keepalive`,
   `:signal`, `:duplex`, `:priority`, and `:window`. A value that is a
-  string can also be an atom. The option `:dispatcher` sets the module that
-  `Web.fetch/2` uses.
+  string can also be an atom. The constructor ignores each other key, as
+  WebIDL specifies for a dictionary.
 
   The function raises `Web.TypeError` for input that the Fetch Standard
   refuses:
@@ -536,14 +549,13 @@ defmodule Web.Request do
 
     options =
       request.options
-      |> Keyword.merge(Keyword.drop(init, [:method, :headers, :body, :dispatcher]))
+      |> Keyword.merge(Keyword.drop(init, [:method, :headers, :body]))
       |> Keyword.put(:redirect, request.redirect)
       |> Keyword.put(:signal, signal)
 
     %{
       request
       | headers: headers,
-        dispatcher: Keyword.get(init, :dispatcher, request.dispatcher),
         signal: signal,
         snapshot: snapshot,
         options: options

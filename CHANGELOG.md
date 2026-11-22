@@ -144,6 +144,8 @@ All notable changes to this project are documented in this file.
 - `bench/http_clients.exs`, which compares `Web.fetch/2` with Finch and
   Req on one server of the machine. The clients run in turns, in 8 rounds.
   Req and Finch are dependencies only in the environment `:dev`.
+- `bench/operation_cost.exs`, which measures the cost of one element or one
+  operation of a stream, of `text/1` of a body in memory, and of a promise.
 - The HTTP client of `Web.fetch/2` is in the library, on the connection
   functions of Mint. Finch is not a dependency now. Each origin has a pool
   of 25 connections. The process of the request owns the socket while the
@@ -500,7 +502,10 @@ All notable changes to this project are documented in this file.
   the stream stays in its state. Before, the stream failed with a
   `Web.TypeError` after 30 s. Use an `AbortSignal` (for example
   `AbortSignal.timeout/1`) in the callback, or a time limit of your own,
-  to stop a callback that waits too long.
+  to stop a callback that waits too long. A callback, and a pull that goes
+  to the process of an enumerable, start no timer now: a read of
+  `ReadableStream.from/1` costs approximately 1 µs less for each element.
+  See `BENCHMARKS.md`.
 - `Web.Blob` follows the File API: the type becomes ASCII lowercase, and a
   type with a character outside U+0020 to U+007E becomes `""`. The functions
   of `Web.Blob` accept a `Web.File`. `Web.Blob.stream/1` is a byte stream,

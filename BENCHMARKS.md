@@ -5,9 +5,8 @@ a stream that keeps no data, a mailbox that does not delay an abort, and a
 form upload with flat memory. One script compares `Web.fetch/2` with other
 HTTP clients.
 
-The numbers below are from one or two runs of each script. A range shows
-two runs. Run the scripts on your machine to get your
-numbers.
+The numbers below are from one or more runs of each script. A range shows
+two or more runs. Run the scripts on your machine to get your numbers.
 
 | Field | Value |
 | --- | --- |
@@ -26,9 +25,15 @@ The script reads 512 MiB in chunks of 64 KiB with `Enum`.
 
 | Source | MiB each second | Chunks each second | Increase of memory |
 | --- | --- | --- | --- |
-| A readable stream from `ReadableStream.from/1` | 4999–5089 | 79987–81422 | 0.9–1.1 MiB |
-| The stream through one transform stream | 2005–2340 | 32086–37442 | 0.5–0.6 MiB |
-| A response body of `fetch`, from a server on the machine | 992–1310 | 468–2046 | 1.5–31 MiB |
+| A readable stream from `ReadableStream.from/1` | 5943–7383 | 95091–118136 | 0.7 MiB |
+| The stream through one transform stream | 3084–3329 | 49348–53265 | 0.7 MiB |
+| A response body of `fetch`, from a server on the machine | 1307–1641 | 1961–11709 | 20.4–21.4 MiB |
+
+The build before the removal of the time limit of a callback ran in turns
+with this build, on the same day: it gave 6228–7635 MiB each second for the
+readable stream, and 2871–2934 for the transform stream. The numbers are
+higher than in the earlier version of this table (4999–5089 and 2005–2340)
+because the machine gave more on that day, not because of the code.
 
 The memory does not increase with the number of bytes. The body of
 `fetch` is limited by the server of the script, which sends from one
@@ -95,6 +100,37 @@ thus 16 streams do not read more than 4 streams.
 | 4 | 52836 chunks/s | 489195–490112 chunks/s |
 | 16 | 68457 chunks/s | 221742–226365 chunks/s |
 
+### The cost of one operation
+
+```shell
+mix run bench/operation_cost.exs
+```
+
+The script measures the cost of one element or one operation, for one
+process. The table gives the range of the medians of 5 runs, in turns: the
+build before the last changes of the streams, and this build.
+
+| Operation | Before | Now |
+| --- | --- | --- |
+| `ReadableStream.from` read with `Enum` | 6.3–7.3 µs (median 6.7) | 4.6–6.5 µs (median 5.6) |
+| `ReadableStream.new` with a `pull` that enqueues one chunk | 9.8–10.7 µs (median 10.0) | 9.2–10.4 µs (median 10.0) |
+| `from` through one `TransformStream` | 18.5–22.3 µs (median 19.0) | 17.2–20.9 µs (median 19.0) |
+| A write to a `WritableStream` | 17.4–25.3 µs (median 22.6) | 16.8–25.6 µs (median 19.4) |
+| `text/1` of a response with a body in memory | 1.35–1.54 µs (median 1.39) | 1.35–1.88 µs (median 1.43) |
+| `Web.Promise.new` and `Web.await` | 7.7–8.4 µs (median 8.0) | 7.4–9.0 µs (median 7.6) |
+| A message to a process and its answer | 0.59–0.63 µs (median 0.60) | 0.56–0.78 µs (median 0.59) |
+
+A callback has no time limit now, as in the Streams Standard. Thus a
+callback, and a pull that goes to the process of an enumerable, start no
+timer: a read of `from/1` costs approximately 1 µs less for each element,
+and the read was faster in each of the 5 rounds. The other operations have
+the same range in the two builds. The claim of a body with no process
+looks in the registry only when its state needs it: with a look at each
+claim, `text/1` took 1.75–2.03 µs, where the build before took 1.23–1.66.
+
+These numbers come from a different script than the table above, on a
+different day: compare the numbers of one table only.
+
 ## A form upload of 1 GiB
 
 ```shell
@@ -130,9 +166,9 @@ to the call of the function `abort` of the sink.
 
 | Requests in the mailbox | Time (median, three runs) |
 | --- | --- |
-| 1000 | 83–111 µs |
-| 50000 | 1273–1354 µs |
-| 200000 | 4898–4972 µs |
+| 1000 | 56–90 µs |
+| 50000 | 918–1116 µs |
+| 200000 | 4159–5320 µs |
 
 An abort is a priority message of Erlang/OTP: the stream gets it before the
 requests of the other processes. It must not pass the earlier messages of
@@ -140,7 +176,7 @@ its own sender, for example a `write` before the abort: the sender thus
 sends a usual fence message before the priority message, and the stream
 takes the messages of that sender up to the fence first. To find the fence,
 the stream examines its mailbox, thus the time increases with the number
-of requests, by approximately 25 ns for each request. With no fence, the
+of requests, by approximately 20–30 ns for each request. With no fence, the
 time stayed at 75–115 µs, but a `write` and then an `abort` of one process
 lost the write. Before version 0.5.0, the stream handled each request
 first: with 5000 requests the abort took 24.6 ms, and the time increased

@@ -218,6 +218,15 @@ defmodule Web.Body do
   def text(%{body: body}), do: consume_body(body, &Web.TextDecoder.decode_utf8/1)
 
   @doc false
+  # The steps "read all bytes" of a stream with a reader that this function
+  # takes, then `convert` of the bytes: the methods of `Web.Blob` for a
+  # file from a form stream. The promise rejects with the error of the
+  # stream, and with `Web.TypeError` for a chunk that is not bytes.
+  @spec __read_all_bytes__(Web.ReadableStream.t(), (binary() -> term())) :: Web.Promise.t()
+  def __read_all_bytes__(%Web.ReadableStream{} = stream, convert) when is_function(convert, 1),
+    do: consume_body(stream, convert)
+
+  @doc false
   # The algorithm "parse JSON from bytes" of the Fetch Standard: the UTF-8
   # decode of the bytes, then `JSON.parse`.
   def json(%{body: body}) do

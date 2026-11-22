@@ -14,6 +14,25 @@ defmodule Web.ReadableStreamDefaultReader do
   alias Web.TypeError
 
   @doc """
+  Makes a reader of the stream, as the constructor
+  `new ReadableStreamDefaultReader(stream)` of the Streams Standard. The
+  steps are the steps of `Web.ReadableStream.get_reader/2` with no mode.
+
+  Raises `Web.TypeError` if the stream is locked, and for a value that is
+  not a `Web.ReadableStream`.
+
+  ## Examples
+
+      iex> stream = Web.ReadableStream.from(["a"])
+      iex> reader = Web.ReadableStreamDefaultReader.new(stream)
+      iex> {Web.ReadableStream.locked?(stream), Web.await(Web.ReadableStreamDefaultReader.read(reader))}
+      {true, %{value: "a", done: false}}
+  """
+  @spec new(ReadableStream.t()) :: t()
+  def new(%ReadableStream{} = stream), do: ReadableStream.get_reader(stream)
+  def new(value), do: raise(TypeError, "The value is not a ReadableStream: #{inspect(value)}")
+
+  @doc """
   Reads a chunk from the stream.
 
   Returns a `%Web.Promise{}` that resolves to a `ReadableStreamReadResult` map:

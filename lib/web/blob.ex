@@ -34,8 +34,15 @@ defmodule Web.Blob do
   constructor `new Blob(blobParts, options)` of the File API. With no
   parts, the blob is empty.
 
-  The options are the members of `BlobPropertyBag`: `:type`, the type of
-  the blob. The default is the empty string.
+  The options are the members of `BlobPropertyBag`:
+
+    * `:type` - the type of the blob. The default is the empty string.
+    * `:endings` - `"transparent"` (the default) or `"native"`. With
+      `"native"`, each line ending in a binary part becomes the native line
+      ending of the host, as the steps "convert line endings to native"
+      specify: `"\\r\\n"` on Windows, and `"\\n"` on each other host.
+      The line endings of the other parts do not change. Each other value
+      raises `Web.TypeError`.
 
   A part is a binary, a `Web.Blob`, a `Web.File`, a `Web.Uint8Array`, or a
   `Web.ArrayBuffer`. The blob keeps a copy of the bytes of a view or a
@@ -48,8 +55,12 @@ defmodule Web.Blob do
   ## Examples
 
       iex> blob = Web.Blob.new(["a", Web.Uint8Array.from("bc"), Web.ArrayBuffer.new("d")])
-      iex> {blob.size, Web.Blob.text(blob)}
-      {4, {:ok, "abcd"}}
+      iex> {blob.size, Web.await(Web.Blob.text(blob))}
+      {4, "abcd"}
+
+      iex> blob = Web.Blob.new(["a\\r\\nb\\rc"], endings: "native")
+      iex> Web.await(Web.Blob.text(blob))
+      "a\\nb\\nc"
 
       iex> Web.Blob.new().size
       0
@@ -63,7 +74,8 @@ defmodule Web.Blob do
   @spec new([blob_part()], keyword()) :: t()
   def new(parts_list \\ [], opts \\ []) when is_list(parts_list) do
     type = opts |> Keyword.get(:type, "") |> normalize_type()
-    parts_list = Enum.map(parts_list, &normalize_part/1)
+    endings = opts |> Keyword.get(:endings) |> endings!()
+    parts_list = Enum.map(parts_list, &normalize_part(&1, endings))
 
     size =
       Enum.reduce(parts_list, 0, fn part, acc ->
@@ -88,8 +100,8 @@ defmodule Web.Blob do
   ## Examples
 
       iex> blob = Web.Blob.new(["hello world"])
-      iex> blob |> Web.Blob.slice(-5) |> Web.Blob.text()
-      {:ok, "world"}
+      iex> blob |> Web.Blob.slice(-5) |> Web.Blob.text() |> Web.await()
+      "world"
       iex> blob |> Web.Blob.slice(nil, 5, "Text/Plain") |> Map.take([:size, :type])
       %{size: 5, type: "text/plain"}
   """
@@ -205,37 +217,61 @@ defmodule Web.Blob do
   end
 
   @doc """
-  Reads the contents of the blob as text, as `text()` of the File API: the
-  UTF-8 decode of the bytes. A byte order mark goes away, and each byte
-  sequence that is not valid UTF-8 becomes U+FFFD.
+  Reads the contents of the blob as text, as `text()` of the File API.
+  Returns a `Web.Promise` that fulfils with the UTF-8 decode of the bytes. A
+  byte order mark goes away, and each byte sequence that is not valid UTF-8
+  becomes U+FFFD.
 
   ## Examples
 
-      iex> Web.Blob.text(Web.Blob.new([<<0xEF, 0xBB, 0xBF>>, "caf", <<0xC3, 0xA9>>, <<0xFF>>]))
-      {:ok, "café�"}
+      iex> blob = Web.Blob.new([<<0xEF, 0xBB, 0xBF>>, "caf", <<0xC3, 0xA9>>, <<0xFF>>])
+      iex> Web.await(Web.Blob.text(blob))
+      "café�"
   """
-  @spec text(t() | Web.File.t()) :: {:ok, String.t()}
-  def text(blob) do
-    {:ok, blob |> to_binary() |> Web.TextDecoder.decode_utf8()}
-  end
+  @spec text(t() | Web.File.t()) :: Web.Promise.t()
+  def text(blob), do: read_all_bytes(blob, &Web.TextDecoder.decode_utf8/1)
 
   @doc """
-  Reads Blob contents as ArrayBuffer.
+  Reads the contents of the blob, as `arrayBuffer()` of the File API.
+  Returns a `Web.Promise` that fulfils with a new `Web.ArrayBuffer` of the
+  bytes.
+
+  ## Examples
+
+      iex> buffer = Web.await(Web.Blob.array_buffer(Web.Blob.new(["abc"])))
+      iex> {buffer.byte_length, to_string(buffer)}
+      {3, "abc"}
   """
-  @spec array_buffer(t() | Web.File.t()) :: {:ok, Web.ArrayBuffer.t()}
-  def array_buffer(blob) do
-    {:ok, blob |> to_binary() |> Web.ArrayBuffer.new()}
-  end
+  @spec array_buffer(t() | Web.File.t()) :: Web.Promise.t()
+  def array_buffer(blob), do: read_all_bytes(blob, &Web.ArrayBuffer.new/1)
 
   @doc """
-  Reads Blob contents as Uint8Array.
+  Reads the contents of the blob, as `bytes()` of the File API. Returns a
+  `Web.Promise` that fulfils with a new `Web.Uint8Array` of the bytes.
+
+  ## Examples
+
+      iex> bytes = Web.await(Web.Blob.bytes(Web.Blob.new(["abc"])))
+      iex> to_string(bytes)
+      "abc"
   """
-  @spec bytes(t() | Web.File.t()) :: {:ok, Web.Uint8Array.t()}
+  @spec bytes(t() | Web.File.t()) :: Web.Promise.t()
   def bytes(blob) do
-    with {:ok, array_buffer} <- array_buffer(blob) do
-      {:ok, Web.Uint8Array.new(array_buffer)}
-    end
+    read_all_bytes(blob, fn binary -> binary |> Web.ArrayBuffer.new() |> Web.Uint8Array.new() end)
   end
+
+  # The steps of `text()`, `arrayBuffer()`, and `bytes()`: "get stream",
+  # "get a reader", and "read all bytes", then `convert` of the bytes. A
+  # blob has its bytes in memory: the promise is settled when the function
+  # returns. A file from a form stream reads that stream, as the body of a
+  # request: the reader takes the lock of the stream before the function
+  # returns, and an error of the stream rejects the promise.
+  defp read_all_bytes(%Web.File{stream: %Web.ReadableStream{} = stream}, convert) do
+    Web.Body.__read_all_bytes__(stream, convert)
+  end
+
+  defp read_all_bytes(blob, convert),
+    do: blob |> to_binary() |> convert.() |> Web.Promise.resolve()
 
   # A file is a blob with a name. A file from a form stream has its bytes
   # in that stream: the stream gives them.
@@ -253,10 +289,34 @@ defmodule Web.Blob do
     %__MODULE__{id: file.id, parts: [bytes], size: byte_size(bytes), type: file.type}
   end
 
-  defp normalize_part(%Web.Uint8Array{} = part), do: Web.Uint8Array.to_binary(part)
-  defp normalize_part(%Web.ArrayBuffer{} = part), do: Web.ArrayBuffer.data(part)
-  defp normalize_part(%Web.File{} = part), do: from_file(part)
-  defp normalize_part(part), do: part
+  # The steps "process blob parts" of the File API. Only a string part has
+  # its line endings converted.
+  defp normalize_part(%Web.Uint8Array{} = part, _endings), do: Web.Uint8Array.to_binary(part)
+  defp normalize_part(%Web.ArrayBuffer{} = part, _endings), do: Web.ArrayBuffer.data(part)
+  defp normalize_part(%Web.File{} = part, _endings), do: from_file(part)
+  defp normalize_part(part, "native") when is_binary(part), do: convert_to_native(part)
+  defp normalize_part(part, _endings), do: part
+
+  # The enumeration `EndingType` of the File API. A dictionary member that
+  # is not given has its default value.
+  defp endings!(nil), do: "transparent"
+  defp endings!(endings) when endings in ["transparent", "native"], do: endings
+
+  defp endings!(endings) do
+    raise Web.TypeError,
+          "#{inspect(endings)} is not a valid value of endings. " <>
+            "Use one of: \"transparent\", \"native\""
+  end
+
+  # The steps "convert line endings to native": each CR LF, each CR, and
+  # each LF becomes the native line ending. The match of `String.replace/3`
+  # takes the longest pattern, thus CR LF is one line ending.
+  @native_line_endings %{win32: "\r\n", unix: "\n"}
+
+  defp convert_to_native(string) do
+    native = Map.fetch!(@native_line_endings, elem(:os.type(), 0))
+    String.replace(string, ["\r\n", "\r", "\n"], native)
+  end
 
   defp part_size(part) when is_binary(part), do: byte_size(part)
   defp part_size(%__MODULE__{size: size}), do: size

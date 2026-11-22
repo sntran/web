@@ -293,14 +293,30 @@ defmodule Web do
       - `:headers` (Map.t | List.t | Web.Headers.t) - Request headers.
       - `:body` (any) - Request payload.
       - `:redirect` (`"follow" | "error" | "manual"`) - Redirect handling mode.
-      - `:signal` (`Web.AbortSignal.t()` | pid | reference) - Optional abort signal.
+      - `:signal` (`Web.AbortSignal.t()`) - Optional abort signal. Each other
+        value except `nil` gives a rejection with `Web.TypeError`.
 
   ## The schemes
 
+  The steps "scheme fetch" of the Fetch Standard:
+
     - `http:` and `https:` - an HTTP request on a pool of connections.
-    - `blob:` - the blob of a URL from `Web.URL.create_object_url/1`, as the
-      Fetch Standard specifies. A `Range` header of one range gives the
-      status 206 and the bytes of the range.
+    - `blob:` - the blob of a URL from `Web.URL.create_object_url/1`. A
+      `Range` header of one range gives the status 206 and the bytes of the
+      range.
+    - `about:` - `about:blank` gives the status 200, the header
+      `Content-Type: text/html;charset=utf-8`, and an empty body. Each
+      other `about:` URL gives a network error.
+    - `data:` - the steps "data: URL processor" give the body and the header
+      `Content-Type`: the MIME type of the URL, or
+      `text/plain;charset=US-ASCII`. The body is percent-decoded, and a
+      MIME type that ends with `;base64` gives the forgiving-base64 decode
+      of the body. A URL with no `,` or with a body that is not valid
+      base64 gives a network error.
+    - `file:` and each other scheme - a network error.
+
+  The library adds these schemes:
+
     - `tcp:`, and an rclone URL such as `my_remote:host:port/path` (a
       remote name with `_`) - a TCP connection to the host and the port. The
       port 80 is the default. The request body goes to the peer, and the
@@ -370,11 +386,12 @@ defmodule Web do
   # The Fetch Standard has two forms of rejection: the abort reason of the
   # signal, and `TypeError` for each other failure. The field `cause` of the
   # `TypeError` has the failure of the dispatcher.
-  defp fetch_error(:aborted, %Web.Request{signal: %Web.AbortSignal{} = signal}) do
+  # The signal of a request is a `Web.AbortSignal` or `nil`: see
+  # `Web.Request.new/2`.
+  defp fetch_error(:aborted, %Web.Request{signal: signal}) do
     Web.AbortSignal.reason(signal) || Web.AbortSignal.default_reason()
   end
 
-  defp fetch_error(:aborted, _request), do: Web.AbortSignal.default_reason()
   defp fetch_error(%Web.DOMException{} = error, _request), do: error
   defp fetch_error(%TypeError{} = error, _request), do: error
 
@@ -392,6 +409,12 @@ defmodule Web do
     do: ": the redirect URL must be HTTP or HTTPS"
 
   defp fetch_error_detail(:redirect_invalid_location), do: ": the redirect URL is not valid"
+
+  defp fetch_error_detail({:scheme_not_supported, scheme}),
+    do: ": the library cannot fetch a URL with the scheme #{inspect(scheme)}"
+
+  defp fetch_error_detail(:about_url_not_blank), do: ": the only about: URL is about:blank"
+  defp fetch_error_detail(:data_url_not_valid), do: ": the data: URL is not valid"
 
   defp fetch_error_detail(%{__exception__: true, reason: :timeout}),
     do: ": the server did not answer in time"

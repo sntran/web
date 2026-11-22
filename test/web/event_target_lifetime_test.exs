@@ -81,11 +81,6 @@ defmodule Web.EventTargetLifetimeTest do
     Process.exit(target.pid, :kill)
   end
 
-  test "a signal of any/1 with a token source stops with its waiter after its owner stopped" do
-    signal = in_short_process(fn -> AbortSignal.any([:token]) end)
-    assert_down(signal.pid)
-  end
-
   test "the listeners of a process that stopped go away" do
     target = EventTarget.new()
     signal = AbortController.new().signal

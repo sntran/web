@@ -321,7 +321,7 @@ defmodule Web.PipingTest do
     refute_received :sink_write_called
   end
 
-  test "pipe_to/3 preserves custom token abort reasons while blocked" do
+  test "pipe_to/3 rejects with the reason of the signal while a pull waits" do
     parent = self()
 
     source =
@@ -347,17 +347,18 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise = ReadableStream.pipe_to(source, sink, signal: :pipe_token)
+    controller = AbortController.new()
+    promise = ReadableStream.pipe_to(source, sink, signal: controller.signal)
 
     assert_receive :token_pull_started
-    send(pipe_process(source), {:abort, :pipe_token, :token_reason})
+    :ok = AbortController.abort(controller, :token_reason)
 
     assert catch_exit(await(promise)) == :token_reason
     assert_receive {:token_source_cancelled, :token_reason}
     assert_receive {:token_sink_aborted, :token_reason}
   end
 
-  test "pipe_to/3 normalizes token aborts without explicit reasons" do
+  test "pipe_to/3 rejects with an AbortError for an abort with no reason" do
     parent = self()
 
     source =
@@ -383,25 +384,39 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise = ReadableStream.pipe_to(source, sink, signal: :pipe_token_default)
+    controller = AbortController.new()
+    promise = ReadableStream.pipe_to(source, sink, signal: controller.signal)
 
     assert_receive :token_default_pull_started
-    send(pipe_process(source), {:abort, :pipe_token_default})
+    :ok = AbortController.abort(controller)
 
     assert %Web.DOMException{name: "AbortError"} = catch_exit(await(promise))
     assert_receive {:token_default_source_cancelled, %Web.DOMException{name: "AbortError"}}
     assert_receive {:token_default_sink_aborted, %Web.DOMException{name: "AbortError"}}
   end
 
-  # The process that does the pipe holds the reader lock of the source.
-  defp pipe_process(%ReadableStream{controller_pid: pid}, attempts \\ 100) do
-    case ReadableStream.__get_slots__(pid).reader_pid do
-      nil when attempts > 0 ->
-        Process.sleep(5)
-        pipe_process(%ReadableStream{controller_pid: pid}, attempts - 1)
+  test "pipe_to/3 and pipe_through/3 refuse a signal that is not an AbortSignal" do
+    # The member `signal` of `StreamPipeOptions` has the type `AbortSignal`:
+    # the conversion of the options comes before the steps of the method.
+    for signal <- [:pipe_token, make_ref(), self(), "signal", %{aborted: true}] do
+      source = ReadableStream.from(["a"])
+      message = "The value is not an AbortSignal: #{inspect(signal)}"
 
-      reader_pid ->
-        reader_pid
+      assert %Web.TypeError{message: ^message} =
+               catch_exit(
+                 await(ReadableStream.pipe_to(source, WritableStream.new(), signal: signal))
+               )
+
+      assert_raise Web.TypeError, message, fn ->
+        ReadableStream.pipe_through(source, TransformStream.new(), signal: signal)
+      end
+
+      # The stream has no lock and is not disturbed.
+      refute ReadableStream.locked?(source)
+      assert Enum.to_list(source) == ["a"]
     end
+
+    source = ReadableStream.from(["a"])
+    assert await(ReadableStream.pipe_to(source, WritableStream.new(), signal: nil)) == :ok
   end
 end

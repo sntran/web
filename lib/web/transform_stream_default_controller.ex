@@ -21,14 +21,16 @@ defmodule Web.TransformStreamDefaultController do
   @type t :: %__MODULE__{pid: pid(), writable_pid: pid()}
 
   @doc """
-  Puts a chunk in the queue of the readable side.
+  Puts a chunk in the queue of the readable side, as `enqueue(chunk)` of
+  the Streams Standard. The chunk is optional: the default is `nil`, as
+  `undefined` in the Standard.
 
   Raises `Web.TypeError` when the readable side is closed or errored, as the
   Streams Standard specifies. For example, after a reader cancelled the
   stream, or after `terminate/1`.
   """
   @spec enqueue(t(), term()) :: :ok
-  def enqueue(%__MODULE__{pid: pid}, chunk) do
+  def enqueue(%__MODULE__{pid: pid}, chunk \\ nil) do
     Web.ReadableStream.controller_enqueue(pid, chunk, :transform)
   end
 

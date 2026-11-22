@@ -751,18 +751,10 @@ defmodule Web.Test.QuickJS.Bridge do
   end
 
   defp outcome({:ok, value}, kind, message, module) do
-    case {Map.get(@out_buffers, {message["i"], message["m"]}), value, message["p"]} do
-      {index, {value, %Web.Uint8Array{} = buffer}, _promise} when is_integer(index) ->
+    case {Map.get(@out_buffers, {message["i"], message["m"]}), value} do
+      {index, {value, %Web.Uint8Array{} = buffer}} when is_integer(index) ->
         bytes = :binary.bin_to_list(Web.Uint8Array.to_binary(buffer))
         {:ok, encode(value), [%{"i" => index, "b" => bytes}]}
-
-      # A function of the library can give the outcome of a promise as
-      # `{:ok, value}` or `{:error, reason}`, with no process.
-      {nil, {:ok, value}, true} ->
-        {:ok, %{"$pv" => %{"ok" => encode(value)}}}
-
-      {nil, {:error, reason}, true} ->
-        {:ok, %{"$pv" => %{"error" => encode(reason)}}}
 
       _other ->
         {:ok, result(kind, message, module, value)}
@@ -896,15 +888,6 @@ defmodule Web.Test.QuickJS.Bridge do
      )}
   end
 
-  defp adapt("ReadableStreamDefaultReader", "constructor", _member, _self, [stream]),
-    do: {:ok, Web.ReadableStream.get_reader(stream)}
-
-  defp adapt("ReadableStreamBYOBReader", "constructor", _member, _self, [stream]),
-    do: {:ok, Web.ReadableStream.get_reader(stream, mode: "byob")}
-
-  defp adapt("WritableStreamDefaultWriter", "constructor", _member, _self, [stream]),
-    do: {:ok, Web.WritableStream.get_writer(stream)}
-
   # The attribute `size` of a strategy is a field of the struct: each
   # strategy has the same function. The layer calls it with the arguments
   # of the JavaScript call, and an argument that the call does not give is
@@ -946,10 +929,6 @@ defmodule Web.Test.QuickJS.Bridge do
 
   defp adapt("Response", "static", "json", _self, [data | init]),
     do: {:ok, Web.Response.json(data, options(init))}
-
-  # The URL of a request is a `Web.URL` in the library, and a string in
-  # WebIDL.
-  defp adapt("Request", "getter", "url", %Web.Request{url: url}, []), do: {:ok, Web.URL.href(url)}
 
   # `clone/1` gives the two structs: the original struct changes, as its
   # body is now a branch of a tee.

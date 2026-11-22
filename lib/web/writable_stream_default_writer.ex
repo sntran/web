@@ -17,13 +17,35 @@ defmodule Web.WritableStreamDefaultWriter do
   alias Web.TypeError
 
   @doc """
-  Writes a chunk to the stream and waits until the underlying sink finishes it.
+  Makes a writer of the stream, as the constructor
+  `new WritableStreamDefaultWriter(stream)` of the Streams Standard. The
+  steps are the steps of `Web.WritableStream.get_writer/1`.
+
+  Raises `Web.TypeError` if the stream is locked, and for a value that is
+  not a `Web.WritableStream`.
+
+  ## Examples
+
+      iex> stream = Web.WritableStream.new()
+      iex> writer = Web.WritableStreamDefaultWriter.new(stream)
+      iex> {Web.WritableStream.locked?(stream), Web.await(Web.WritableStreamDefaultWriter.write(writer, "a"))}
+      {true, :ok}
+  """
+  @spec new(Web.WritableStream.t()) :: t()
+  def new(%Web.WritableStream{} = stream), do: Web.WritableStream.get_writer(stream)
+  def new(value), do: raise(TypeError, "The value is not a WritableStream: #{inspect(value)}")
+
+  @doc """
+  Writes a chunk to the stream, as `write(chunk)` of the Streams Standard.
+  Returns a promise that fulfils when the underlying sink finished the
+  chunk. The chunk is optional: the default is `nil`, as `undefined` in the
+  Standard.
 
   The size function of the queuing strategy runs in the process that calls
   this function, before the write goes to the stream, as the Streams
   Standard specifies.
   """
-  def write(%__MODULE__{controller_pid: pid, owner_pid: owner_pid} = writer, chunk) do
+  def write(%__MODULE__{controller_pid: pid, owner_pid: owner_pid} = writer, chunk \\ nil) do
     case Web.Stream.__writable_size__(pid) do
       nil ->
         promise_call(writer, {:write, owner_pid, chunk})

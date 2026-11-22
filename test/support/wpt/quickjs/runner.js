@@ -237,12 +237,13 @@ function localPath(input) {
 // For a test of the Fetch Standard, the response is a `Response` of the
 // library. The other tests get a plain object: their data can have text
 // that a JSON parser of Elixir refuses, such as a lone surrogate.
-// A blob URL is a URL of the library: the `fetch` of the library reads it.
+// A blob URL, a data URL, and an about URL need no server: the `fetch` of
+// the library reads them, as the steps "scheme fetch" specify.
 let libraryFetch = null;
 
 globalThis.fetch = (input, init) => {
   const url = typeof input === "object" && input !== null && "url" in input ? input.url : input;
-  if (/^blob:/i.test(String(url))) {
+  if (/^\s*(blob|data|about):/i.test(String(url))) {
     libraryFetch = libraryFetch || globalThis.__webidl.globalOperation("WindowOrWorkerGlobalScope", "fetch");
     return libraryFetch(input, init);
   }

@@ -16,21 +16,6 @@
 #
 # Not ported (not applicable):
 #
-#   * "ReadableStreamDefaultReader constructor should get a ReadableStream
-#     object as argument": the library has no public constructor for
-#     ReadableStreamDefaultReader, and the arguments have JS types.
-#   * "Constructing a ReadableStreamDefaultReader directly should fail if the
-#     stream is already locked (via direct construction)": no public
-#     constructor.
-#   * "Getting a ReadableStreamDefaultReader via getReader should fail if the
-#     stream is already locked (via direct construction)": the first lock
-#     needs the constructor, and the library has no public constructor.
-#   * "Constructing a ReadableStreamDefaultReader directly should fail if the
-#     stream is already locked (via getReader)": no public constructor.
-#   * "Constructing a ReadableStreamDefaultReader directly should be OK if
-#     the stream is closed": no public constructor.
-#   * "Constructing a ReadableStreamDefaultReader directly should be OK if
-#     the stream is errored": no public constructor.
 #   * "getReader() should call ToString() on mode": the mode is a JS object
 #     with a method toString. Elixir has no ToString conversion of a value.
 defmodule Web.WPT.Streams.DefaultReaderTest do
@@ -54,22 +39,52 @@ defmodule Web.WPT.Streams.DefaultReaderTest do
     {rs, controller}
   end
 
-  # The library has no public constructor for ReadableStreamDefaultReader.
-  # This test is about the getter `closed`, thus it uses `get_reader/1`. In
-  # the Streams Standard, getReader() and the constructor do the same steps
-  # (AcquireReadableStreamDefaultReader).
-  #
-  # The library: `closed/1` sends a request to the stream and makes a new
-  # promise for each call. The Standard: the getter `closed` returns
-  # this.[[closedPromise]], which is the same promise for each access
-  # (ReadableStreamGenericReader, the getter `closed`).
-  @tag :wpt_failure
+  test "ReadableStreamDefaultReader constructor should get a ReadableStream object as argument" do
+    for value <- [nil, %{}, :stream] do
+      assert_raise TypeError, fn -> ReadableStreamDefaultReader.new(value) end
+    end
+  end
+
   test "ReadableStreamDefaultReader closed should always return the same promise object" do
-    rs_reader = ReadableStream.get_reader(ReadableStream.new())
+    rs_reader = ReadableStreamDefaultReader.new(ReadableStream.new())
 
     assert ReadableStreamDefaultReader.closed(rs_reader) ==
              ReadableStreamDefaultReader.closed(rs_reader),
            "closed should return the same promise"
+  end
+
+  test "Constructing a ReadableStreamDefaultReader directly should fail if the stream is already locked (via direct construction)" do
+    rs = ReadableStream.new()
+    ReadableStreamDefaultReader.new(rs)
+
+    assert_raise TypeError, fn -> ReadableStreamDefaultReader.new(rs) end
+  end
+
+  test "Getting a ReadableStreamDefaultReader via getReader should fail if the stream is already locked (via direct construction)" do
+    rs = ReadableStream.new()
+    ReadableStreamDefaultReader.new(rs)
+
+    assert_raise TypeError, fn -> ReadableStream.get_reader(rs) end
+  end
+
+  test "Constructing a ReadableStreamDefaultReader directly should fail if the stream is already locked (via getReader)" do
+    rs = ReadableStream.new()
+    ReadableStream.get_reader(rs)
+
+    assert_raise TypeError, fn -> ReadableStreamDefaultReader.new(rs) end
+  end
+
+  test "Constructing a ReadableStreamDefaultReader directly should be OK if the stream is closed" do
+    rs = ReadableStream.new(%{start: &ReadableStreamDefaultController.close/1})
+
+    assert %ReadableStreamDefaultReader{} = ReadableStreamDefaultReader.new(rs)
+  end
+
+  test "Constructing a ReadableStreamDefaultReader directly should be OK if the stream is errored" do
+    the_error = %RuntimeError{message: "boo!"}
+    rs = ReadableStream.new(%{start: &ReadableStreamDefaultController.error(&1, the_error)})
+
+    assert %ReadableStreamDefaultReader{} = ReadableStreamDefaultReader.new(rs)
   end
 
   test "Getting a ReadableStreamDefaultReader via getReader should fail if the stream is already locked (via getReader)" do
@@ -92,12 +107,6 @@ defmodule Web.WPT.Streams.DefaultReaderTest do
            "read() should fulfill with the enqueued chunk"
   end
 
-  # The library: a cancel removes the reader from the stream before it calls
-  # the function `cancel` of the source (see `clear_owner/1` in
-  # lib/web/stream.ex). Thus the stream is not locked in that function, and
-  # a different reader can lock it. The Standard: ReadableStreamCancel does
-  # not release the reader. The stream stays locked until releaseLock().
-  @tag :wpt_failure
   test "cancel() on a reader does not release the reader" do
     parent = self()
     passed_reason = %RuntimeError{message: "it wasn't the right time, sorry"}
@@ -141,13 +150,6 @@ defmodule Web.WPT.Streams.DefaultReaderTest do
     await(promise)
   end
 
-  # The library: a lock belongs to a process, not to a reader. reader1 and
-  # reader2 are in the same process, thus the stream sees reader1 as the
-  # reader that has the lock. Also, `closed/1` gives a fulfilled promise for
-  # a closed stream before it examines the lock. The Standard: releaseLock()
-  # rejects reader1.[[closedPromise]] with a TypeError, and this promise
-  # does not change after (ReadableStreamReaderGenericRelease, step 4).
-  @tag :wpt_failure
   test "closed should be rejected after reader releases its lock (multiple stream locks)" do
     {rs, controller} = stream_with_controller()
 
@@ -165,11 +167,6 @@ defmodule Web.WPT.Streams.DefaultReaderTest do
     await(closed2)
   end
 
-  # The library: `closed/1` after the release of the lock gives a fulfilled
-  # promise, because the stream is closed. The Standard: the release sets
-  # reader.[[closedPromise]] to a promise rejected with a TypeError when the
-  # stream is not readable (ReadableStreamReaderGenericRelease, step 5).
-  @tag :wpt_failure
   test "closed is replaced when stream closes and reader releases its lock" do
     {rs, controller} = stream_with_controller()
 
@@ -188,11 +185,6 @@ defmodule Web.WPT.Streams.DefaultReaderTest do
            ".closed after releasing lock"
   end
 
-  # The library: `closed/1` after the release of the lock gives a promise
-  # rejected with the error of the stream. The Standard: the release sets
-  # reader.[[closedPromise]] to a promise rejected with a TypeError when the
-  # stream is not readable (ReadableStreamReaderGenericRelease, step 5).
-  @tag :wpt_failure
   test "closed is replaced when stream errors and reader releases its lock" do
     the_error = %{name: "unique error"}
     {rs, controller} = stream_with_controller()
@@ -239,12 +231,6 @@ defmodule Web.WPT.Streams.DefaultReaderTest do
            "reading the second chunk from reader2 works"
   end
 
-  # The library: a lock belongs to a process, not to a reader. reader1 and
-  # reader2 are in the same process, thus the second release_lock/1 of
-  # reader1 releases the lock of reader2, and the read of reader2 rejects
-  # with a TypeError. The Standard: releaseLock() on a reader with no stream
-  # does nothing (ReadableStreamDefaultReader releaseLock(), step 1).
-  @tag :wpt_failure
   test "Cannot use an already-released reader to unlock a stream again" do
     rs =
       ReadableStream.new(%{
@@ -263,12 +249,6 @@ defmodule Web.WPT.Streams.DefaultReaderTest do
            "read() should still work on reader2 even after reader1 is released"
   end
 
-  # The library: ReadableStreamDefaultReader.cancel/2 does not examine the
-  # lock. It cancels the stream, and calls the function `cancel` of the
-  # source. The Standard: cancel() on a reader with no stream returns a
-  # promise rejected with a TypeError (ReadableStreamGenericReader
-  # cancel(reason), step 1).
-  @tag :wpt_failure
   test "cancel() on a released reader is a no-op and does not pass through" do
     parent = self()
 

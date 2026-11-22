@@ -4,6 +4,9 @@ defmodule Web.Headers do
 
   Each function validates its input as the Fetch Standard specifies:
 
+    * A name or a value becomes a string, as Web IDL converts a value to a
+      `ByteString`: `nil` is the JavaScript `null`, thus the text `"null"`,
+      and a number is its text.
     * A header name must be an HTTP token. A name that is not a token raises
       `Web.TypeError`.
     * A header value has its leading and trailing HTTP whitespace removed.
@@ -37,6 +40,7 @@ defmodule Web.Headers do
   @behaviour Access
 
   alias Web.Internal.Ascii
+  alias Web.Internal.Iterable
 
   @set_cookie "set-cookie"
 
@@ -240,6 +244,29 @@ defmodule Web.Headers do
     |> Stream.map(&elem(&1, 1))
   end
 
+  @doc """
+  Calls `callback` for each pair of `entries/1`, as `forEach()` of the
+  iterable of the Fetch Standard. Returns `:ok`.
+
+  The callback gets the value, the name, and the headers, in this
+  sequence, as Web IDL specifies. A callback of arity 0, 1, or 2 gets the
+  first arguments, as a JavaScript function that ignores the other
+  arguments. Each other callback raises `Web.TypeError`.
+
+  ## Examples
+
+      iex> headers = Web.Headers.new([{"b", "2"}, {"A", "1"}])
+      iex> Web.Headers.for_each(headers, fn value, name -> send(self(), {name, value}) end)
+      :ok
+      iex> {:messages, messages} = Process.info(self(), :messages)
+      iex> messages
+      [{"a", "1"}, {"b", "2"}]
+  """
+  @spec for_each(t(), function()) :: :ok
+  def for_each(%__MODULE__{} = headers, callback) do
+    headers |> normalized_entries() |> Iterable.for_each(headers, callback)
+  end
+
   @impl Access
   def fetch(%__MODULE__{} = headers, key) do
     if has(headers, key) do
@@ -290,7 +317,9 @@ defmodule Web.Headers do
   @spec token?(term()) :: boolean()
   def token?(value), do: Ascii.token?(value)
 
-  # A header name is an HTTP token. The map keeps it in lower case.
+  # A header name is an HTTP token. The map keeps it in lower case. Web IDL
+  # converts a name to a `ByteString`: `nil` is the JavaScript `null`, thus
+  # the text "null", and a number is its text.
   defp normalize_name(name) when is_binary(name) do
     case Ascii.downcase_token(name) do
       :error -> raise Web.TypeError, "Invalid header name: #{inspect(name)}"
@@ -298,8 +327,10 @@ defmodule Web.Headers do
     end
   end
 
-  defp normalize_name(name) when is_atom(name) and not is_nil(name) do
-    name |> Atom.to_string() |> normalize_name()
+  defp normalize_name(nil), do: "null"
+
+  defp normalize_name(name) when is_atom(name) or is_number(name) do
+    name |> to_string() |> normalize_name()
   end
 
   defp normalize_name(name) do
@@ -317,6 +348,8 @@ defmodule Web.Headers do
       value
     end
   end
+
+  defp normalize_value(nil), do: "null"
 
   defp normalize_value(value) when is_number(value) or is_atom(value) do
     value |> to_string() |> normalize_value()

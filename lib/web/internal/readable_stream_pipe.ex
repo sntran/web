@@ -278,7 +278,8 @@ defmodule Web.Internal.ReadableStreamPipe do
   end
 
   # The reason of an abort of the signal, as `AbortSignal.receive_abort/3`
-  # gives it for each kind of signal.
+  # gives it. The signal of a pipe is a `Web.AbortSignal`: see
+  # `Web.ReadableStream.pipe_to/3`.
   defp abort_reason(%{type: :abort_signal, ref: ref}, {:abort, ref, reason}), do: {:ok, reason}
 
   defp abort_reason(%{type: :abort_signal, monitor_ref: ref}, {:DOWN, ref, _, _, exit_reason}) do
@@ -287,16 +288,6 @@ defmodule Web.Internal.ReadableStreamPipe do
       _no_abort -> {:ok, AbortSignal.default_reason()}
     end
   end
-
-  defp abort_reason(%{type: :pid, pid: pid}, {:abort, pid, reason}), do: {:ok, reason}
-
-  defp abort_reason(%{type: :pid, monitor_ref: ref}, {:DOWN, ref, _, _, reason}),
-    do: {:ok, reason}
-
-  defp abort_reason(%{type: :token, token: token}, {:abort, token, reason}), do: {:ok, reason}
-
-  defp abort_reason(%{type: :token, token: token}, {:abort, token}),
-    do: {:ok, AbortSignal.default_reason()}
 
   defp abort_reason(_subscription, _message), do: :error
 

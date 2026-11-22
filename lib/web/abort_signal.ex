@@ -186,7 +186,13 @@ defmodule Web.AbortSignal do
   end
 
   @doc """
-  Returns a signal that aborts when any provided signal aborts.
+  Returns a signal that aborts when a signal of the list aborts, as the
+  static method `AbortSignal.any(signals)` of the DOM Standard.
+
+  The argument is a list of `Web.AbortSignal` values, as the type
+  `sequence<AbortSignal>`. Each other value, also `nil`, raises
+  `Web.TypeError`. A signal of the list that already aborted gives a new
+  signal that is aborted with the same reason.
 
   The new signal depends on each signal of the list, as the steps "create
   a dependent abort signal" specify: the abort of a signal of the list
@@ -200,35 +206,58 @@ defmodule Web.AbortSignal do
       {true, :boom}
       iex> Web.AbortController.abort(controller)
       :ok
+
+      iex> Web.AbortSignal.any([:token])
+      ** (Web.TypeError) The value is not an AbortSignal: :token
   """
+  @spec any([t()]) :: t()
   def any(signals) do
+    signals = signals |> sequence!() |> Enum.map(&__convert__/1)
+
     case Enum.find_value(signals, &any_abort_result/1) do
       {:aborted, reason} -> abort(reason)
       nil -> new_dependent(signals)
     end
   end
 
+  # The conversion of Web IDL to a sequence: the value must be a list or
+  # another enumerable.
+  defp sequence!(signals) when is_list(signals), do: signals
+
+  defp sequence!(signals) do
+    if Enumerable.impl_for(signals) do
+      Enum.to_list(signals)
+    else
+      raise Web.TypeError, "The signals must be a list, not #{inspect(signals)}."
+    end
+  end
+
+  @doc false
+  # The conversion of Web IDL to the type `AbortSignal`: the value must be
+  # a `Web.AbortSignal`. Each other value raises `Web.TypeError`. The
+  # functions with an option `:signal` call it, for example
+  # `Web.Request.new/2`.
+  @spec __convert__(term()) :: t()
+  def __convert__(%__MODULE__{} = signal), do: signal
+
+  def __convert__(value) do
+    raise Web.TypeError, "The value is not an AbortSignal: #{inspect(value)}"
+  end
+
   defp new_dependent(signals) do
     controller = Web.AbortController.new()
     result = controller.signal
-    {signal_sources, other_sources} = Enum.split_with(signals, &process_signal?/1)
 
-    sources = signal_sources |> Enum.flat_map(&sources_of/1) |> Enum.uniq_by(& &1.pid)
+    sources =
+      signals
+      |> Enum.filter(&is_pid(&1.pid))
+      |> Enum.flat_map(&sources_of/1)
+      |> Enum.uniq_by(& &1.pid)
+
     :ok = GenServer.call(result.pid, {:set_sources, sources}, :infinity)
     Enum.each(sources, &add_dependent(&1, result))
-
-    # A pid or a token is not a signal of the DOM Standard: a process waits
-    # for its abort.
-    case Enum.reject(other_sources, &is_nil/1) do
-      [] -> :ok
-      others -> spawn_link(fn -> wait_for_any_abort(others, controller) end)
-    end
-
     result
   end
-
-  defp process_signal?(%__MODULE__{pid: pid}) when is_pid(pid), do: true
-  defp process_signal?(_signal), do: false
 
   # A signal that depends on other signals gives its sources: the new
   # signal depends on them, not on it.
@@ -870,95 +899,6 @@ defmodule Web.AbortSignal do
       {:error, :aborted} ->
         reason = reason(signal)
         if(is_nil(reason), do: nil, else: {:aborted, reason})
-    end
-  end
-
-  defp any_abort_result(_signal), do: nil
-
-  defp wait_for_any_abort(signals, controller) do
-    address = Process.alias([:reply])
-    coordinator = self()
-
-    Enum.each(signals, &start_any_abort_waiter(&1, coordinator, address))
-
-    # The waiters stop when this process stops. Thus this process must stop
-    # when the new signal stops with no abort.
-    signal_monitor = Process.monitor(controller.signal.pid)
-
-    try do
-      receive do
-        {:abort_signal_any, ^address, reason} ->
-          Process.unalias(address)
-          Web.AbortController.abort(controller, reason)
-
-        {:DOWN, ^signal_monitor, :process, _pid, _reason} ->
-          :ok
-      end
-    after
-      Process.unalias(address)
-    end
-  end
-
-  defp start_any_abort_waiter(signal, coordinator, address) do
-    spawn(fn ->
-      coordinator_monitor = Process.monitor(coordinator)
-
-      try do
-        case subscribe(signal) do
-          {:ok, subscription} ->
-            try do
-              case wait_for_subscription_or_coordinator(
-                     subscription,
-                     coordinator,
-                     coordinator_monitor
-                   ) do
-                {:aborted, reason} -> send(address, {:abort_signal_any, address, reason})
-                :ok -> :ok
-              end
-            after
-              unsubscribe(subscription)
-            end
-
-          {:error, :aborted} ->
-            :ok
-        end
-      after
-        Process.demonitor(coordinator_monitor, [:flush])
-      end
-    end)
-  end
-
-  defp wait_for_subscription_or_coordinator(
-         %{type: :pid, pid: pid, monitor_ref: monitor_ref},
-         coordinator,
-         coordinator_monitor
-       ) do
-    receive do
-      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
-        {:aborted, reason}
-
-      {:abort, ^pid, reason} ->
-        {:aborted, reason}
-
-      {:DOWN, ^coordinator_monitor, :process, ^coordinator, _reason} ->
-        :ok
-    end
-  end
-
-  defp wait_for_subscription_or_coordinator(
-         %{type: :token, token: token},
-         coordinator,
-         coordinator_monitor
-       ) do
-    receive do
-      {:abort, ^token} ->
-        {:aborted, default_reason()}
-
-      {:abort, ^token, reason} ->
-        {:aborted, reason}
-
-      {:DOWN, ^coordinator_monitor, :process, ^coordinator, _reason} ->
-        :ok
     end
   end
 end

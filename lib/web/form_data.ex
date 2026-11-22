@@ -36,6 +36,7 @@ defmodule Web.FormData do
 
   alias __MODULE__.Parser
   alias Web.File
+  alias Web.Internal.Iterable
 
   @type name :: String.t()
   @type value :: String.t() | File.t()
@@ -60,12 +61,19 @@ defmodule Web.FormData do
   def new, do: %__MODULE__{entries: [], boundary: default_boundary()}
 
   @doc """
-  Appends a value for a field name.
+  Appends a value for a field name, as `append(name, value)` and
+  `append(name, blobValue, filename)` of the XMLHttpRequest Standard.
 
   A value that is a `Web.Blob` or a `Web.File` becomes a `Web.File`, as
   the steps "create an entry" of the XMLHttpRequest Standard specify. The
   name of the file is `filename`. When `filename` is `nil`, a file keeps
-  its name, and a blob gets the name `"blob"`.
+  its name, and a blob gets the name `"blob"`. A `filename` with a value
+  that is not a blob raises `Web.TypeError`, as no overload of the method
+  has these arguments.
+
+  A name and a value that is not a blob become strings, as Web IDL
+  converts a value to a `USVString`: `nil` is the JavaScript `null`, thus
+  the text `"null"`.
 
   ## Examples
 
@@ -85,7 +93,7 @@ defmodule Web.FormData do
   end
 
   def append(%__MODULE__{entries: entries} = form, name, value, filename) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
     normalized_value = normalize_value(value, filename)
     %{form | entries: entries ++ [{normalized_name, normalized_value}]}
   end
@@ -105,7 +113,7 @@ defmodule Web.FormData do
   end
 
   def set(%__MODULE__{} = form, name, value, filename) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
 
     form
     |> delete(normalized_name)
@@ -125,7 +133,7 @@ defmodule Web.FormData do
   end
 
   def delete(%__MODULE__{entries: entries} = form, name) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
 
     %{
       form
@@ -139,12 +147,12 @@ defmodule Web.FormData do
   """
   @spec get(t(), term()) :: value() | nil
   def get(%__MODULE__{coordinator: pid}, name) when is_pid(pid) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
     Parser.get(pid, normalized_name)
   end
 
   def get(%__MODULE__{entries: entries}, name) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
 
     entries
     |> Enum.find(fn {entry_name, _value} -> entry_name == normalized_name end)
@@ -159,12 +167,12 @@ defmodule Web.FormData do
   """
   @spec get_all(t(), term()) :: [value()]
   def get_all(%__MODULE__{coordinator: pid}, name) when is_pid(pid) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
     Parser.get_all(pid, normalized_name)
   end
 
   def get_all(%__MODULE__{entries: entries}, name) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
 
     entries
     |> Enum.filter(fn {entry_name, _value} -> entry_name == normalized_name end)
@@ -177,7 +185,7 @@ defmodule Web.FormData do
   """
   @spec has(t(), term()) :: boolean()
   def has(%__MODULE__{coordinator: pid}, name) when is_pid(pid) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
     Parser.has?(pid, normalized_name)
   end
 
@@ -186,12 +194,63 @@ defmodule Web.FormData do
   end
 
   @doc """
-  Returns ordered entries.
+  Returns the entries in their sequence, as `entries()` of the iterable of
+  the XMLHttpRequest Standard: an enumerable of `[name, value]` lists. The
+  form itself is the same enumerable.
   """
   @spec entries(t()) :: Enumerable.t()
   def entries(%__MODULE__{} = form) do
     form
   end
+
+  @doc """
+  Returns the names of the entries, as `keys()` of the iterable of the
+  XMLHttpRequest Standard. A name of more than one entry comes one time for
+  each entry.
+
+  ## Examples
+
+      iex> form = Web.FormData.new() |> Web.FormData.append("a", "1") |> Web.FormData.append("a", "2")
+      iex> form |> Web.FormData.keys() |> Enum.to_list()
+      ["a", "a"]
+  """
+  @spec keys(t()) :: Enumerable.t()
+  def keys(%__MODULE__{} = form), do: Stream.map(form, fn [name, _value] -> name end)
+
+  @doc """
+  Returns the values of the entries, as `values()` of the iterable of the
+  XMLHttpRequest Standard: each value is a string or a `Web.File`.
+
+  ## Examples
+
+      iex> form = Web.FormData.new() |> Web.FormData.append("a", "1") |> Web.FormData.append("b", "2")
+      iex> form |> Web.FormData.values() |> Enum.to_list()
+      ["1", "2"]
+  """
+  @spec values(t()) :: Enumerable.t()
+  def values(%__MODULE__{} = form), do: Stream.map(form, fn [_name, value] -> value end)
+
+  @doc """
+  Calls `callback` for each entry, as `forEach()` of the iterable of the
+  XMLHttpRequest Standard. Returns `:ok`.
+
+  The callback gets the value, the name, and the form, in this sequence,
+  as Web IDL specifies. A callback of arity 0, 1, or 2 gets the first
+  arguments, as a JavaScript function that ignores the other arguments.
+  Each other callback raises `Web.TypeError`.
+
+  ## Examples
+
+      iex> form = Web.FormData.new() |> Web.FormData.append("a", "1")
+      iex> Web.FormData.for_each(form, fn value, name, ^form -> send(self(), {name, value}) end)
+      :ok
+      iex> {:messages, messages} = Process.info(self(), :messages)
+      iex> messages
+      [{"a", "1"}]
+  """
+  @spec for_each(t(), function()) :: :ok
+  def for_each(%__MODULE__{} = form, callback),
+    do: Iterable.for_each(form, form, callback)
 
   @doc false
   # Parses a `multipart/form-data` body into a form that a coordinator
@@ -254,7 +313,17 @@ defmodule Web.FormData do
   defp normalize_value(%Web.Blob{} = blob, filename),
     do: File.new(blob.parts, to_string(filename || "blob"), type: blob.type)
 
-  defp normalize_value(value, _filename), do: to_string(value)
+  defp normalize_value(value, nil), do: usv_string(value)
+
+  defp normalize_value(value, _filename) do
+    raise Web.TypeError,
+          "The value of an entry with a file name must be a Blob, not #{inspect(value)}."
+  end
+
+  # The conversion of Web IDL to a `USVString`: `nil` is the JavaScript
+  # `null`, which becomes the text "null".
+  defp usv_string(nil), do: "null"
+  defp usv_string(value), do: to_string(value)
 
   # Drains a live coordinator to a static entries list, stopping the coordinator
   # process. Used internally by mutation operations (append/set/delete) on live forms.

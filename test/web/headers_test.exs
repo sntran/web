@@ -193,7 +193,7 @@ defmodule Web.HeadersTest do
     test "refuse a name that is not an HTTP token, in each function" do
       headers = Headers.new(%{"a" => "1"})
 
-      for name <- ["", "bad name", "a:b", "a\r\n", "é", "a(b", 1, nil, {"a"}] do
+      for name <- ["", "bad name", "a:b", "a\r\n", "é", "a(b", %{}, {"a"}] do
         for fun <- [
               fn -> Headers.new([{name, "x"}]) end,
               fn -> Headers.append(headers, name, "x") end,
@@ -205,6 +205,17 @@ defmodule Web.HeadersTest do
           assert_raise Web.TypeError, ~r/Invalid header name/, fun
         end
       end
+    end
+
+    test "convert nil to the text \"null\" and a number to its text, as a ByteString" do
+      headers = Headers.new([{nil, nil}, {1, 2}])
+
+      assert Enum.to_list(Headers.entries(headers)) == [{"1", "2"}, {"null", "null"}]
+      assert Headers.get(headers, nil) == "null"
+      assert Headers.has(headers, 1)
+      assert headers |> Headers.set(nil, "x") |> Headers.get("null") == "x"
+      assert headers |> Headers.append("a", nil) |> Headers.get("a") == "null"
+      refute headers |> Headers.delete(nil) |> Headers.has("null")
     end
 
     test "accept each character of an HTTP token in a name" do

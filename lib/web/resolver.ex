@@ -1,10 +1,12 @@
 defmodule Web.Resolver do
   @moduledoc false
 
-  # Finds the dispatcher of `Web.fetch/2` for the scheme of a URL: HTTP for
-  # `http:` and `https:`, `Web.Dispatcher.Blob` for `blob:`, and TCP for
-  # `tcp:` and for an rclone remote such as `remote:path`. Each other scheme
-  # goes to HTTP.
+  # Finds the dispatcher of `Web.fetch/2` for the scheme of a URL, as the
+  # steps "scheme fetch" of the Fetch Standard: HTTP for `http:` and
+  # `https:`, and `Web.Dispatcher.Blob` for `blob:`. The library adds TCP
+  # for `tcp:` and for an rclone remote such as `remote:path`. Each other
+  # scheme goes to `Web.Dispatcher.Scheme`: `about:blank` and a `data:` URL
+  # give a response, and each other URL gives a network error.
 
   @spec resolve(Web.URL.t()) :: module()
   def resolve(%Web.URL{} = url) do
@@ -24,7 +26,7 @@ defmodule Web.Resolver do
         Web.Dispatcher.TCP
 
       true ->
-        Web.Dispatcher.HTTP
+        Web.Dispatcher.Scheme
     end
   end
 end

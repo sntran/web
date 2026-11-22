@@ -46,6 +46,19 @@ defmodule Web.ReadableStreamBYOBReader do
   @type t :: %__MODULE__{controller_pid: pid(), owner_pid: pid(), lock: reference()}
 
   @doc """
+  Makes a BYOB reader of the stream, as the constructor
+  `new ReadableStreamBYOBReader(stream)` of the Streams Standard. The steps
+  are the steps of `Web.ReadableStream.get_reader/2` with the mode
+  `"byob"`.
+
+  Raises `Web.TypeError` if the stream is locked, if it is not a byte
+  stream, and for a value that is not a `Web.ReadableStream`.
+  """
+  @spec new(Web.ReadableStream.t()) :: t()
+  def new(%Web.ReadableStream{} = stream), do: Web.ReadableStream.get_reader(stream, mode: "byob")
+  def new(value), do: raise(TypeError, "The value is not a ReadableStream: #{inspect(value)}")
+
+  @doc """
   Reads bytes into the view, as `read(view, options)`.
 
   The promise fulfils with `%{value: view, done: false}` when the stream

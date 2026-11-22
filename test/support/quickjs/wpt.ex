@@ -342,6 +342,12 @@ defmodule Web.Test.QuickJS.WPT do
        "Consume empty FormData response body as text", @empty_form},
       {:test, "fetch/api/request/request-consume-empty.any.js",
        "Consume empty FormData request body as text", @empty_form},
+      # A JSON object is a map of Elixir, and a map has no sequence of its
+      # keys: the bridge gives the keys of the object in the sequence of the
+      # map. The `fetch` of a `data:` URL is in the library: the test now
+      # comes to this step.
+      {:test, "fetch/api/response/json.any.js", "Ensure the correct JSON parser is used",
+       "library: a JSON object is a map, which has no sequence of its keys"},
       # The JSON `null` is `nil` in the library, and the bridge gives `nil`
       # to JavaScript as `undefined`.
       {:test, "fetch/api/request/request-consume.any.js", "Consume JSON from text: '\"null\"'",

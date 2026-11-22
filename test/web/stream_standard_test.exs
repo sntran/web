@@ -1081,4 +1081,74 @@ defmodule Web.StreamStandardTest do
       assert rejection(Reader.read(ReadableStream.get_reader(transform.readable))) == nil
     end
   end
+
+  describe "the constructors of the readers and of the writer" do
+    test "lock the stream, as getReader() and getWriter() do" do
+      readable = ReadableStream.from(["a"])
+      reader = Reader.new(readable)
+      assert ReadableStream.locked?(readable)
+      assert await(Reader.read(reader)) == %{value: "a", done: false}
+      assert_raise Web.TypeError, fn -> Reader.new(readable) end
+
+      bytes = ReadableStream.new(%{type: "bytes"})
+      assert %ReadableStreamBYOBReader{} = ReadableStreamBYOBReader.new(bytes)
+      assert ReadableStream.locked?(bytes)
+      assert_raise Web.TypeError, fn -> ReadableStreamBYOBReader.new(ReadableStream.new()) end
+
+      writable = WritableStream.new(recording_sink(self()))
+      writer = Writer.new(writable)
+      assert WritableStream.locked?(writable)
+      assert await(Writer.write(writer, "w")) == :ok
+      assert_received {:write, "w"}
+      assert_raise Web.TypeError, fn -> Writer.new(writable) end
+    end
+
+    test "raise Web.TypeError for a value that is not a stream of the kind" do
+      for value <- [nil, :stream, WritableStream.new()] do
+        assert_raise Web.TypeError, ~r/is not a ReadableStream/, fn -> Reader.new(value) end
+
+        assert_raise Web.TypeError, ~r/is not a ReadableStream/, fn ->
+          ReadableStreamBYOBReader.new(value)
+        end
+      end
+
+      for value <- [nil, :stream, ReadableStream.new()] do
+        assert_raise Web.TypeError, ~r/is not a WritableStream/, fn -> Writer.new(value) end
+      end
+    end
+  end
+
+  describe "an optional chunk" do
+    # The argument `chunk` of `enqueue(chunk)` and `write(chunk)` is
+    # `optional any`: a call with no argument gives `undefined`, which is
+    # `nil`.
+    test "is nil for an enqueue of a readable stream controller" do
+      readable = ReadableStream.new(%{start: &ReadableStreamDefaultController.enqueue/1})
+      reader = ReadableStream.get_reader(readable)
+
+      assert await(Reader.read(reader)) == %{value: nil, done: false}
+    end
+
+    test "is nil for an enqueue of a transform stream controller" do
+      transform =
+        TransformStream.new(%{
+          transform: fn _chunk, controller ->
+            TransformStreamDefaultController.enqueue(controller)
+          end
+        })
+
+      writer = WritableStream.get_writer(transform.writable)
+      _write = Writer.write(writer, "a")
+      reader = ReadableStream.get_reader(transform.readable)
+
+      assert await(Reader.read(reader)) == %{value: nil, done: false}
+    end
+
+    test "is nil for a write of a writer" do
+      writer = WritableStream.get_writer(WritableStream.new(recording_sink(self())))
+
+      assert await(Writer.write(writer)) == :ok
+      assert_received {:write, nil}
+    end
+  end
 end

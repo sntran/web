@@ -445,25 +445,17 @@ defmodule Web.Dispatcher.HTTPProcessTest do
   end
 
   describe "the signal of a request" do
-    test "can be a process that sends the abort" do
-      # The process of the signal stays alive during the test.
-      signal = spawn(fn -> Process.sleep(2_000) end)
+    test "aborts the request at the abort of the signal" do
+      controller = Web.AbortController.new()
       port = late_server(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
-      {task, request} = start_fetch(Request.new("http://localhost:#{port}/", signal: signal))
 
-      send(request, {:abort, signal, :stop})
+      {task, request} =
+        start_fetch(Request.new("http://localhost:#{port}/", signal: controller.signal))
+
+      # The request starts after the subscription to the signal.
+      eventually(fn -> exchange(request) != nil end)
+      :ok = Web.AbortController.abort(controller, :stop)
       assert await_fetch(task) == {:error, :aborted}
-    end
-
-    test "can be a token" do
-      for message <- [&{:abort, &1}, &{:abort, &1, :stop}] do
-        token = make_ref()
-        port = late_server(["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"])
-        {task, request} = start_fetch(Request.new("http://localhost:#{port}/", signal: token))
-
-        send(request, message.(token))
-        assert await_fetch(task) == {:error, :aborted}
-      end
     end
 
     test "aborts when its process stops with no abort" do

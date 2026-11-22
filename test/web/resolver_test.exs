@@ -25,8 +25,11 @@ defmodule Web.ResolverTest do
     end
   end
 
-  test "resolves an rclone URL to TCP, and each other scheme to HTTP" do
+  test "resolves an rclone URL to TCP, and each other scheme to the steps scheme fetch" do
     assert Resolver.resolve(URL.new("my_s3:path/to/file")) == Web.Dispatcher.TCP
-    assert Resolver.resolve(URL.new("foo://example.com")) == Web.Dispatcher.HTTP
+
+    for url <- ["foo://example.com", "about:blank", "data:,x", "file:///etc/hosts", "ws://a/"] do
+      assert Resolver.resolve(URL.new(url)) == Web.Dispatcher.Scheme
+    end
   end
 end

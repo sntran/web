@@ -129,7 +129,7 @@ defmodule Web.ByteChunksTest do
       blob = Blob.new(["ab", Blob.new(["cd"]), Uint8Array.from("ef"), ArrayBuffer.new("gh")])
       assert blob.size == 8
       assert_bytes(chunks(Blob.stream(blob)), "abcdefgh")
-      assert Blob.text(Blob.slice(blob, 3, 7)) == {:ok, "defg"}
+      assert Web.await(Blob.text(Blob.slice(blob, 3, 7))) == "defg"
     end
   end
 

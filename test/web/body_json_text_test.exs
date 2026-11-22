@@ -152,7 +152,7 @@ defmodule Web.BodyJSONTextTest do
   describe "Web.Blob" do
     test "array_buffer/1 gives the bytes with no decode" do
       bytes = <<0xEF, 0xBB, 0xBF, 0xFF>>
-      {:ok, buffer} = Web.Blob.array_buffer(Web.Blob.new([bytes]))
+      buffer = Web.await(Web.Blob.array_buffer(Web.Blob.new([bytes])))
       assert Web.ArrayBuffer.data(buffer) == bytes
     end
   end

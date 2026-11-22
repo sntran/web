@@ -182,13 +182,13 @@ defmodule Web.BlobTest do
   test "text/array_buffer/bytes can be called multiple times" do
     blob = Blob.new([~s({"id":1})], type: "application/json")
 
-    assert {:ok, ~s({"id":1})} = Blob.text(blob)
-    assert {:ok, %Web.ArrayBuffer{byte_length: 8}} = Blob.array_buffer(blob)
+    assert ~s({"id":1}) = Web.await(Blob.text(blob))
+    assert %Web.ArrayBuffer{byte_length: 8} = Web.await(Blob.array_buffer(blob))
 
-    assert {:ok, %Web.Uint8Array{} = bytes} = Blob.bytes(blob)
+    assert %Web.Uint8Array{} = bytes = Web.await(Blob.bytes(blob))
     assert Web.Uint8Array.to_binary(bytes) == ~s({"id":1})
 
-    assert {:ok, ~s({"id":1})} = Blob.text(blob)
+    assert ~s({"id":1}) = Web.await(Blob.text(blob))
   end
 
   describe "the rules of the File API" do
@@ -237,7 +237,7 @@ defmodule Web.BlobTest do
       blob = Blob.new([file, "!"])
 
       assert Blob.to_binary(blob) == "héllo!"
-      assert {:ok, "héllo"} = Blob.text(file)
+      assert "héllo" = Web.await(Blob.text(file))
       assert Blob.to_binary(Blob.slice(file, 1)) == "éllo"
       assert file |> Blob.stream() |> Web.TestBytes.join() == "héllo"
       assert file |> Blob.text_stream() |> Enum.join() == "héllo"
@@ -247,7 +247,50 @@ defmodule Web.BlobTest do
       stream = Web.ReadableStream.from(["ab", "c"])
       file = %{Web.File.new([], "s.bin") | stream: stream, size: nil}
 
-      assert {:ok, "abc"} = Blob.text(file)
+      assert "abc" = Web.await(Blob.text(file))
+
+      # A file from a stream that is a part of a blob gives the bytes of
+      # its stream to the blob.
+      file = %{file | stream: Web.ReadableStream.from(["ab", Web.Uint8Array.from("c")])}
+      blob = Blob.new([file, "d"])
+      assert {blob.size, Blob.to_binary(blob)} == {4, "abcd"}
+    end
+
+    test "text/1, array_buffer/1, and bytes/1 return a promise, as the File API specifies" do
+      blob = Blob.new(["a", <<0xFF>>])
+
+      # A buffer and a view have an identity: the test compares the bytes.
+      for {read, module, bytes} <- [
+            {&Blob.text/1, BitString, "a\uFFFD"},
+            {&Blob.array_buffer/1, Web.ArrayBuffer, "a" <> <<0xFF>>},
+            {&Blob.bytes/1, Web.Uint8Array, "a" <> <<0xFF>>}
+          ] do
+        assert %Web.Promise{} = promise = read.(blob)
+        assert {:fulfilled, value} = Web.Promise.peek(promise)
+        assert {kind(value), to_string(value)} == {module, bytes}
+
+        file = %{Web.File.new([], "s.bin") | stream: Web.ReadableStream.from(["a", <<0xFF>>])}
+        assert %Web.Promise{} = promise = read.(file)
+        assert to_string(Web.await(promise)) == bytes
+      end
+    end
+
+    defp kind(%module{}), do: module
+    defp kind(value) when is_binary(value), do: BitString
+
+    test "a read of a file from a stream rejects with the error of the stream" do
+      stream =
+        Web.ReadableStream.new(%{
+          pull: fn controller -> Web.ReadableStreamDefaultController.error(controller, :boom) end
+        })
+
+      file = %{Web.File.new([], "s.bin") | stream: stream, size: nil}
+
+      assert %Web.Promise{} = promise = Blob.text(file)
+      assert catch_exit(Web.await(promise)) == :boom
+
+      # The reader of the first read keeps the lock of the stream.
+      assert %Web.TypeError{} = catch_exit(Web.await(Blob.bytes(file)))
     end
 
     test "stream/1 is a byte stream: a reader of the mode byob reads it" do
@@ -282,6 +325,59 @@ defmodule Web.BlobTest do
 
       assert blob |> Blob.text_stream() |> Enum.join() == "aé\uFFFD"
       assert Blob.new([]) |> Blob.text_stream() |> Enum.to_list() == []
+    end
+  end
+
+  describe "the option endings" do
+    defp line_text do
+      list_of(member_of(["\r\n", "\r", "\n", "a", "é", " "]), max_length: 12)
+      |> map(&Enum.join/1)
+    end
+
+    # The steps "convert line endings to native", with the native line
+    # ending of the host.
+    defp native(text, ending) do
+      Regex.replace(~r/\r\n|\r|\n/, text, ending)
+    end
+
+    property ~s("native" converts each line ending of a string part, and "transparent" keeps it) do
+      ending = if match?({:win32, _}, :os.type()), do: "\r\n", else: "\n"
+
+      check all(texts <- list_of(line_text(), max_length: 4)) do
+        joined = Enum.join(texts)
+        native = Blob.new(texts, endings: "native")
+
+        assert Blob.to_binary(native) == Enum.map_join(texts, &native(&1, ending))
+        assert native.size == byte_size(Blob.to_binary(native))
+        assert Blob.to_binary(Blob.new(texts, endings: "transparent")) == joined
+        assert Blob.to_binary(Blob.new(texts)) == joined
+        assert Blob.to_binary(Blob.new(texts, endings: nil)) == joined
+
+        file = Web.File.new(texts, "a.txt", endings: "native")
+        assert Blob.to_binary(file) == Blob.to_binary(native)
+      end
+    end
+
+    test "\"native\" changes only the parts that are strings" do
+      parts = [
+        Web.Uint8Array.from("a\r\n"),
+        Web.ArrayBuffer.new("b\r"),
+        Blob.new(["c\r\n"]),
+        Web.File.new(["d\r"], "d.txt"),
+        "e\r\n"
+      ]
+
+      assert Blob.to_binary(Blob.new(parts, endings: "native")) == "a\r\nb\rc\r\nd\re\n"
+    end
+
+    test "a value that is not in the enumeration EndingType raises Web.TypeError" do
+      for endings <- ["", "Native", "NATIVE", "invalid", :native, 0] do
+        assert_raise Web.TypeError, ~r/is not a valid value of endings/, fn ->
+          Blob.new([], endings: endings)
+        end
+
+        assert_raise Web.TypeError, fn -> Web.File.new([], "a", endings: endings) end
+      end
     end
   end
 

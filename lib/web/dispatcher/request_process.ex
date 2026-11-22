@@ -206,18 +206,15 @@ defmodule Web.Dispatcher.RequestProcess do
   end
 
   # The messages of the subscription to the abort signal: see
-  # `Web.AbortSignal.receive_abort/3`. A signal whose process stopped is an
-  # aborted signal.
+  # `Web.AbortSignal.receive_abort/3`. The signal of a request is a
+  # `Web.AbortSignal`: see `Web.Request.new/2`. A signal whose process
+  # stopped is an aborted signal.
   defp abort_event({:abort, ref, reason}, %{type: :abort_signal, ref: ref}), do: reason
-  defp abort_event({:abort, pid, reason}, %{type: :pid, pid: pid}), do: reason
-  defp abort_event({:abort, token}, %{type: :token, token: token}), do: :aborted
-  defp abort_event({:abort, token, reason}, %{type: :token, token: token}), do: reason
 
-  defp abort_event({:DOWN, monitor, :process, _pid, reason}, %{monitor_ref: monitor} = sub) do
-    case {sub.type, reason} do
-      {:abort_signal, {:shutdown, {:aborted, reason}}} -> reason
-      {:abort_signal, _reason} -> Web.AbortSignal.default_reason()
-      {:pid, reason} -> reason
+  defp abort_event({:DOWN, monitor, :process, _pid, reason}, %{monitor_ref: monitor}) do
+    case reason do
+      {:shutdown, {:aborted, reason}} -> reason
+      _reason -> Web.AbortSignal.default_reason()
     end
   end
 

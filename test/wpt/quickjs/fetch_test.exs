@@ -82,7 +82,9 @@ defmodule Web.WPT.QuickJS.FetchTest do
     "fetch/api/response/response-stream-with-broken-then.any.js",
     "fetch/api/body/formdata.any.js",
     "fetch/api/body/mime-type.any.js",
-    "fetch/api/body/textstream.any.js"
+    "fetch/api/body/textstream.any.js",
+    "fetch/data-urls/base64.any.js",
+    "fetch/data-urls/processing.any.js"
   ]
 
   for path <- @files do

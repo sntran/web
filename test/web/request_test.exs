@@ -36,6 +36,8 @@ defmodule Web.RequestTest do
   end
 
   test "new/2 applies supplied options reliably" do
+    signal = Web.AbortSignal.abort(:stop)
+
     req =
       Request.new(
         "http://example.com",
@@ -44,7 +46,7 @@ defmodule Web.RequestTest do
         headers: %{"x" => "y"},
         dispatcher: MyDispatcher,
         redirect: :manual,
-        signal: self(),
+        signal: signal,
         extra_option: true
       )
 
@@ -61,10 +63,44 @@ defmodule Web.RequestTest do
     # A key that `RequestInit` does not have changes no field.
     assert req.dispatcher == nil
     assert req.redirect == "manual"
-    assert req.signal == self()
+    assert req.signal == signal
     assert req.options[:extra_option] == true
     assert req.options[:redirect] == "manual"
-    assert req.options[:signal] == self()
+    assert req.options[:signal] == signal
+  end
+
+  test "url/1 gives the attribute url: the serialized URL, with its fragment" do
+    for input <- ["http://example.com", "HTTPS://[::1]:443/a b?q#frag", "data:,x#y"] do
+      request = Request.new(input)
+
+      assert Request.url(request) == Web.URL.href(Web.URL.new(input))
+      assert Request.url(Request.new(request, method: "POST")) == Request.url(request)
+    end
+
+    assert Request.url(Request.new("http://example.com/a#b")) == "http://example.com/a#b"
+  end
+
+  test "new/2 raises TypeError for a signal that is not an AbortSignal or nil" do
+    body = Web.ReadableStream.from(["data"])
+    input = Request.new("http://example.com", method: "POST", body: body, duplex: "half")
+
+    for signal <- [self(), make_ref(), :token, "signal", 1, %{aborted: false}] do
+      assert_raise Web.TypeError, "The value is not an AbortSignal: #{inspect(signal)}", fn ->
+        Request.new("http://example.com", signal: signal)
+      end
+
+      # The conversion of the init dictionary comes first: the body of the
+      # input request does not change.
+      assert_raise Web.TypeError, fn -> Request.new(input, signal: signal) end
+      refute Web.ReadableStream.disturbed?(input.body)
+    end
+
+    # A `nil` signal is a member that is not given: the signal of the input
+    # request stays.
+    signal = Web.AbortSignal.abort(:stop)
+    request = Request.new("http://example.com", signal: signal)
+    assert Request.new(request, signal: nil).signal == signal
+    assert Request.new("http://example.com", signal: nil).signal == nil
   end
 
   test "new/2 normalizes tuple-list headers into Web.Headers" do

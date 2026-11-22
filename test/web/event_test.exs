@@ -209,16 +209,58 @@ defmodule Web.EventTest do
     assert_received "other"
   end
 
-  test "a map with no flags is dispatched, and no listener can cancel it" do
+  test "a dispatch of an event that is not initialized raises an InvalidStateError" do
+    me = self()
+    target = EventTarget.add_event_listener(EventTarget.new(), "x", fn -> send(me, :called) end)
+
+    # A struct with no flags is not initialized, as an event of
+    # `document.createEvent()`. A map with no flags is not an event.
+    for event <- [%Event{type: "x"}, %CustomEvent{type: "x"}, %{type: "x", cancelable: true}] do
+      error = catch_error(EventTarget.dispatch_event(target, event))
+      assert %Web.DOMException{name: "InvalidStateError", code: 11} = error
+      assert error.code == Web.DOMException.invalid_state_err()
+    end
+
+    refute_received :called
+
+    # The functions of Event accept a struct with no flags, and change
+    # nothing: it has no state of a dispatch.
+    raw = %Event{type: "x", cancelable: true}
+    assert :ok = Event.stop_immediate_propagation(raw)
+    assert :ok = Event.prevent_default(raw)
+    assert Event.event_phase(raw) == Event.none()
+    refute Event.cancel_bubble?(raw)
+    refute Event.default_prevented?(raw)
+
+    # init_event/4 initializes the event.
+    event = Event.init_event(%Event{type: "y"}, "x", false, true)
+    assert dispatch(target, event)
+    assert_received :called
+    assert :ok = Event.prevent_default(event)
+    assert Event.default_prevented?(event)
+
+    event = CustomEvent.init_custom_event(%CustomEvent{}, "x", false, false, :data)
+    assert %CustomEvent{type: "x", detail: :data} = event
+    assert dispatch(target, event)
+    assert_received :called
+  end
+
+  test "the constants of Event are the numbers of event_phase/1" do
+    assert {Event.none(), Event.capturing_phase(), Event.at_target(), Event.bubbling_phase()} ==
+             {0, 1, 2, 3}
+
     me = self()
 
     target =
       EventTarget.add_event_listener(EventTarget.new(), "x", fn event ->
-        :ok = Event.prevent_default(event)
-        send(me, {Map.has_key?(event, :flags), Event.event_phase(event)})
+        send(me, Event.event_phase(event))
       end)
 
-    assert dispatch(target, %{type: "x", cancelable: true})
-    assert_received {false, 0}
+    event = Event.new("x")
+    assert Event.event_phase(event) == Event.none()
+    assert dispatch(target, event)
+    assert_received phase
+    assert phase == Event.at_target()
+    assert Event.event_phase(event) == Event.none()
   end
 end

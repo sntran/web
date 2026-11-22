@@ -126,7 +126,10 @@ defmodule Web.AbortSignalEventTest do
 
     for object <- [AbortController.new().signal, EventTarget.new()] do
       object = EventTarget.add_event_listener(object, "x", listener)
-      assert Web.EventTarget.Protocol.remove_event_listener(object, "x", listener) == object
+
+      assert Web.EventTarget.Protocol.remove_event_listener(object, "x", listener, false) ==
+               object
+
       assert {^object, true} = EventTarget.dispatch_event(object, Event.new("x"))
       refute_received :listener
     end

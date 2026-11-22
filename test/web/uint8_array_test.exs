@@ -21,6 +21,12 @@ defmodule Web.Uint8ArrayTest do
     end
   end
 
+  test "the constant BYTES_PER_ELEMENT is the size of one element" do
+    assert Uint8Array.bytes_per_element() == 1
+    view = Uint8Array.from("hello")
+    assert byte_size(to_string(view)) == view.byte_length * Uint8Array.bytes_per_element()
+  end
+
   test "new/3 raises on invalid length" do
     buffer = ArrayBuffer.new("hello")
 

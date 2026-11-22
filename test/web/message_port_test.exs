@@ -9,6 +9,7 @@ defmodule Web.MessagePortTest do
   alias Web.AsyncContext.Variable
   alias Web.DOMException
   alias Web.Internal.MessagePort, as: Engine
+  alias Web.Internal.MessageTarget
   alias Web.Internal.StructuredData
   alias Web.MessageChannel
   alias Web.MessageEvent
@@ -244,6 +245,10 @@ defmodule Web.MessagePortTest do
 
   defp listener_pid(%MessagePort{address: pid}), do: :sys.get_state(pid).target.listener
 
+  # The listeners in the store of the port.
+  defp listeners(%MessagePort{address: pid}),
+    do: :sys.get_state(:sys.get_state(pid).target.store).listeners.entries
+
   defp data_clone_error(fun) do
     exception = assert_raise DOMException, fun
     assert exception.name == "DataCloneError"
@@ -271,6 +276,7 @@ defmodule Web.MessagePortTest do
              {:post_message, 2},
              {:post_message, 3},
              {:remove_event_listener, 3},
+             {:remove_event_listener, 4},
              {:start, 1}
            ]
   end
@@ -606,24 +612,24 @@ defmodule Web.MessagePortTest do
       MessagePort.post_message(port1, 1)
       assert_receive {:got, 1}
 
+      # The abort removes the listener before abort/2 returns.
       Web.AbortController.abort(controller)
-      eventually(fn -> :sys.get_state(listener_pid(port2)).listeners == %{} end)
+      assert listeners(port2) == []
 
       MessagePort.post_message(port1, 2)
       refute_receive {:got, 2}, 50
     end
 
-    test "dispatch_event gives an event to the listeners" do
+    test "dispatch_event gives an event to the listeners, before it returns" do
       {_port1, port2} = channel()
       MessagePort.add_event_listener(port2, "custom", forward(:custom))
 
       event = Web.CustomEvent.new("custom", detail: 7)
       assert {^port2, true} = MessagePort.dispatch_event(port2, event)
-
-      assert_receive {:custom, ^event}
+      assert_received {:custom, %Web.CustomEvent{detail: 7, target: ^port2}}
 
       assert {^port2, true} = Web.EventTarget.dispatch_event(port2, event)
-      assert_receive {:custom, ^event}
+      assert_received {:custom, %Web.CustomEvent{detail: 7, target: ^port2}}
     end
 
     test "a listener that raises goes to the log, and the port continues" do
@@ -747,7 +753,8 @@ defmodule Web.MessagePortTest do
       assert MessagePort.onmessage(port1) == nil
       assert MessagePort.add_event_listener(port1, "message", callback) == port1
       assert MessagePort.remove_event_listener(port1, "message", callback) == port1
-      assert {^port1, true} = MessagePort.dispatch_event(port1, %{type: "message"})
+      assert MessagePort.remove_event_listener(port1, "message", callback, true) == port1
+      assert {^port1, true} = MessagePort.dispatch_event(port1, Web.Event.new("message"))
 
       refute_receive {:got, _data}, 30
     end
@@ -793,10 +800,14 @@ defmodule Web.MessagePortTest do
       {port1, port2} = channel()
       server = port1.address
       listener = listener_pid(port1)
+      store = :sys.get_state(server).target.store
 
       MessagePort.close(port1)
 
-      eventually(fn -> not Process.alive?(server) and not Process.alive?(listener) end)
+      eventually(fn ->
+        not Process.alive?(server) and not Process.alive?(listener) and not Process.alive?(store)
+      end)
+
       assert Process.alive?(port2.address)
     end
 
@@ -1037,20 +1048,22 @@ defmodule Web.MessagePortTest do
     # Makes the listener process of the port wait in a listener, until the
     # returned function is called. An item that the server gives to the
     # listener process in that time stays in its mailbox.
+    # The listener process does a task that waits until the test lets it
+    # continue. The task gives no event.
     defp block_listener(port) do
-      test = self()
-
-      MessagePort.add_event_listener(port, "block", fn ->
-        send(test, {:blocked, self()})
-
-        receive do
-          :continue -> :ok
-        end
-      end)
-
-      MessagePort.dispatch_event(port, %{type: "block"})
+      target = :sys.get_state(port.address).target
+      :ok = MessageTarget.run(target, {__MODULE__, :block, [self()]}, Snapshot.new())
       assert_receive {:blocked, listener}
       fn -> send(listener, :continue) end
+    end
+
+    @doc false
+    def block(test) do
+      send(test, {:blocked, self()})
+
+      receive do
+        :continue -> nil
+      end
     end
 
     test "an item that the first listener process did not start goes to the new holder" do

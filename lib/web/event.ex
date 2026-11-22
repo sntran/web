@@ -2,8 +2,8 @@ defmodule Web.Event do
   @moduledoc """
   An event, as `Event` of the DOM Standard.
 
-  A `Web.EventTarget`, a `Web.AbortSignal`, and a `Web.MessagePort`
-  dispatch events to their listeners.
+  A `Web.EventTarget`, a `Web.AbortSignal`, a `Web.MessagePort`, and a
+  `Web.BroadcastChannel` dispatch events to their listeners.
 
   ## Examples
 
@@ -21,15 +21,29 @@ defmodule Web.Event do
   The flags of the DOM Standard change during a dispatch, and all the
   copies of one event share them: a call of `prevent_default/1` in a
   listener changes the result of the dispatch. Read them with
-  `default_prevented/1`, `event_phase/1`, `cancel_bubble/1`, and
-  `return_value/1`. Set the legacy attributes with `cancel_bubble/2` and
+  `default_prevented?/1`, `event_phase/1`, `cancel_bubble?/1`, and
+  `return_value?/1`. Set the legacy attributes with `cancel_bubble/2` and
   `return_value/2`.
 
   The value of `current_target/1` and of `composed_path/1` is only there
   during a dispatch, as the DOM Standard specifies.
+
+  `new/2` sets the initialized flag of the event. A struct that a caller
+  makes with no `new/2`, for example `%Web.Event{type: "x"}`, has no
+  initialized flag: a dispatch of it raises an `InvalidStateError`, as for
+  an event of `document.createEvent()`. `init_event/4` initializes it.
+
+  ## Constants
+
+  The constants of the interface `Event` are functions with no argument:
+  `none/0`, `capturing_phase/0`, `at_target/0`, and `bubbling_phase/0`.
+  `event_phase/1` gives one of them.
   """
 
   @none 0
+  @capturing_phase 1
+  @at_target 2
+  @bubbling_phase 3
 
   # The slots of the flags of an event, in an `:atomics` array.
   @stop_propagation 1
@@ -38,7 +52,8 @@ defmodule Web.Event do
   @in_passive_listener 4
   @dispatch 5
   @phase 6
-  @slots 6
+  @initialized 7
+  @slots 7
 
   defstruct type: nil,
             target: nil,
@@ -70,6 +85,33 @@ defmodule Web.Event do
         }
 
   @doc """
+  The constant `Event.NONE` (0): the phase of an event that is not in a
+  dispatch.
+  """
+  @spec none() :: 0
+  def none, do: @none
+
+  @doc """
+  The constant `Event.CAPTURING_PHASE` (1): the phase of an event at an
+  ancestor of its target, before the target.
+  """
+  @spec capturing_phase() :: 1
+  def capturing_phase, do: @capturing_phase
+
+  @doc """
+  The constant `Event.AT_TARGET` (2): the phase of an event at its target.
+  """
+  @spec at_target() :: 2
+  def at_target, do: @at_target
+
+  @doc """
+  The constant `Event.BUBBLING_PHASE` (3): the phase of an event at an
+  ancestor of its target, after the target.
+  """
+  @spec bubbling_phase() :: 3
+  def bubbling_phase, do: @bubbling_phase
+
+  @doc """
   Makes an event, as the constructor `new Event(type, eventInitDict)`.
 
   ## Options
@@ -83,10 +125,13 @@ defmodule Web.Event do
 
   @doc false
   # An event with the fields of a dispatch: the options of `new/2`, and
-  # `:target` and `:current_target` (the default is the target).
+  # `:target` and `:current_target` (the default is the target). The
+  # steps "inner event creation steps" set the initialized flag.
   @spec __new__(String.t() | atom(), keyword()) :: t()
   def __new__(type, opts) do
     target = Keyword.get(opts, :target)
+    flags = :atomics.new(@slots, signed: false)
+    :atomics.put(flags, @initialized, 1)
 
     %__MODULE__{
       type: to_string(type),
@@ -96,14 +141,9 @@ defmodule Web.Event do
       cancelable: Keyword.get(opts, :cancelable, false) == true,
       composed: Keyword.get(opts, :composed, false) == true,
       time_stamp: Web.Performance.now(),
-      flags: __flags__()
+      flags: flags
     }
   end
-
-  @doc false
-  # The flags of a new event: see "The state of a dispatch".
-  @spec __flags__() :: :atomics.atomics_ref()
-  def __flags__, do: :atomics.new(@slots, signed: false)
 
   @doc false
   # An event that the library makes, as "create an event" of the DOM
@@ -140,8 +180,15 @@ defmodule Web.Event do
   end
 
   @doc """
-  Returns the phase of the event, as the attribute `eventPhase`: 0
-  (`NONE`) when no dispatch runs, and 2 (`AT_TARGET`) during a dispatch.
+  Returns the phase of the event, as the attribute `eventPhase`: `none/0`
+  when no dispatch runs, and `at_target/0` during a dispatch. An event
+  target of this library has no parent, thus the phase is never
+  `capturing_phase/0` or `bubbling_phase/0`.
+
+  ## Examples
+
+      iex> Web.Event.event_phase(Web.Event.new("x")) == Web.Event.none()
+      true
   """
   @spec event_phase(event()) :: 0 | 1 | 2 | 3
   def event_phase(%{flags: flags}) when flags != nil, do: :atomics.get(flags, @phase)
@@ -216,14 +263,20 @@ defmodule Web.Event do
   Initializes the event again, as the legacy `initEvent(type, bubbles,
   cancelable)`. Returns the new event. During a dispatch, the event does
   not change.
+
+  The steps "initialize" set the initialized flag. An event with no flags,
+  such as `%Web.Event{type: "x"}`, gets its flags.
   """
   @spec init_event(event(), String.t() | atom(), boolean(), boolean()) :: event()
   def init_event(event, type, bubbles \\ false, cancelable \\ false) do
     if set?(event, @dispatch) do
       event
     else
+      flags = Map.get(event, :flags) || :atomics.new(@slots, signed: false)
+      :atomics.put(flags, @initialized, 1)
+
       for slot <- [@stop_propagation, @stop_immediate_propagation, @canceled],
-          do: :atomics.put(event.flags, slot, 0)
+          do: :atomics.put(flags, slot, 0)
 
       %{
         event
@@ -231,15 +284,18 @@ defmodule Web.Event do
           bubbles: bubbles == true,
           cancelable: cancelable == true,
           is_trusted: false,
-          target: nil
+          target: nil,
+          flags: flags
       }
     end
   end
 
   @doc false
   # The steps of a dispatch: see `Web.Internal.EventTarget.Dispatch`.
-  @spec __flag__(event(), :stop_propagation | :stop_immediate | :dispatch | :passive) ::
-          boolean()
+  @spec __flag__(
+          event(),
+          :stop_propagation | :stop_immediate | :dispatch | :passive | :initialized
+        ) :: boolean()
   def __flag__(event, name), do: set?(event, slot(name))
 
   @doc false
@@ -255,6 +311,7 @@ defmodule Web.Event do
   defp slot(:stop_immediate), do: @stop_immediate_propagation
   defp slot(:dispatch), do: @dispatch
   defp slot(:passive), do: @in_passive_listener
+  defp slot(:initialized), do: @initialized
 
   defp set(%{flags: flags}, slot) when flags != nil, do: :atomics.put(flags, slot, 1)
   defp set(_event, _slot), do: :ok

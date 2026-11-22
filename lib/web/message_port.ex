@@ -39,9 +39,13 @@ defmodule Web.MessagePort do
 
   ## Listeners
 
-  The listeners of one port run in one process of that port, one event at a
+  The port fires its events in one process of that port, one event at a
   time. A listener can call each function of this module, also on its port.
   A value that a listener throws goes to the log, and the port continues.
+
+  The listener steps are those of the DOM Standard: see
+  `Web.EventTarget`. `dispatch_event/2` runs the listeners in the calling
+  process, before it returns.
 
   ## A handle
 
@@ -126,9 +130,12 @@ defmodule Web.MessagePort do
   @spec onclose(t(), callback() | nil) :: t()
   def onclose(%__MODULE__{} = port, callback), do: set_handler(port, "close", callback)
 
+  # The first callback of `onmessage` starts the port, as the HTML Standard
+  # specifies. The callback is in its place before the first message.
   defp set_handler(port, type, callback)
        when is_nil(callback) or is_function(callback, 0) or is_function(callback, 1) do
     :ok = MessageTarget.set_handler(port, type, callback)
+    if type == "message" and callback != nil, do: Engine.start(port)
     port
   end
 
@@ -139,32 +146,43 @@ defmodule Web.MessagePort do
   end
 
   @doc """
-  Adds a listener for an event of the port. Returns the port.
+  Adds a listener for an event of the port, as `addEventListener()`.
+  Returns the port.
 
-  The options are those of `Web.EventTarget.add_event_listener/4`: `:once`
-  and `:signal`. This function does not start the port: see `start/1`.
+  The options are those of `Web.EventTarget.add_event_listener/4`:
+  `:capture`, `:passive`, `:once`, and `:signal`. This function does not
+  start the port: see `start/1`.
   """
-  @spec add_event_listener(t(), String.t() | atom(), callback(), keyword() | map()) :: t()
+  @spec add_event_listener(t(), String.t() | atom(), callback(), keyword() | map() | boolean()) ::
+          t()
   def add_event_listener(%__MODULE__{} = port, type, callback, options \\ %{})
       when is_function(callback, 0) or is_function(callback, 1) do
     EventTarget.add_event_listener(port, type, callback, options)
   end
 
   @doc """
-  Removes a listener. Returns the port.
+  Removes the listener with the type, the callback, and the capture of the
+  options, as `removeEventListener()`. Returns the port.
   """
-  @spec remove_event_listener(t(), String.t() | atom(), callback()) :: t()
-  def remove_event_listener(%__MODULE__{} = port, type, callback)
+  @spec remove_event_listener(
+          t(),
+          String.t() | atom(),
+          callback(),
+          keyword() | map() | boolean()
+        ) :: t()
+  def remove_event_listener(%__MODULE__{} = port, type, callback, options \\ %{})
       when is_function(callback, 0) or is_function(callback, 1) do
-    EventTarget.remove_event_listener(port, type, callback)
+    EventTarget.remove_event_listener(port, type, callback, options)
   end
 
   @doc """
-  Gives an event to the listeners of the port. Returns the port and `true`.
+  Dispatches an event to the port, as `dispatchEvent()`. Returns the port,
+  and `false` when a listener canceled the event.
 
-  The function does not wait for the listeners.
+  The listeners run in the calling process, before the function returns.
+  See `Web.EventTarget.dispatch_event/2`.
   """
-  @spec dispatch_event(t(), map()) :: {t(), boolean()}
+  @spec dispatch_event(t(), Web.Event.event()) :: {t(), boolean()}
   def dispatch_event(%__MODULE__{} = port, event) when is_map(event) do
     EventTarget.dispatch_event(port, event)
   end
@@ -263,8 +281,8 @@ defimpl Web.EventTarget.Protocol, for: Web.MessagePort do
     target
   end
 
-  def remove_event_listener(target, type, callback) do
-    :ok = MessageTarget.remove_event_listener(target, type, callback)
+  def remove_event_listener(target, type, callback, capture) do
+    :ok = MessageTarget.remove_event_listener(target, type, callback, capture)
     target
   end
 

@@ -30,10 +30,14 @@ defmodule Web.BroadcastChannel do
 
   ## Listeners
 
-  The listeners of one channel run in one process of that channel, one
-  event at a time. A slow listener delays only its channel. A listener can
-  call each function of this module, also on its channel. A value that a
+  The channel fires its events in one process of that channel, one event
+  at a time. A slow listener delays only its channel. A listener can call
+  each function of this module, also on its channel. A value that a
   listener throws goes to the log, and the channel continues.
+
+  The listener steps are those of the DOM Standard: see
+  `Web.EventTarget`. `dispatch_event/2` runs the listeners in the calling
+  process, before it returns.
 
   ## Lifetime
 
@@ -129,24 +133,32 @@ defmodule Web.BroadcastChannel do
   end
 
   @doc """
-  Adds a listener for an event of the channel. Returns the channel.
+  Adds a listener for an event of the channel, as `addEventListener()`.
+  Returns the channel.
 
-  The options are those of `Web.EventTarget.add_event_listener/4`: `:once`
-  and `:signal`.
+  The options are those of `Web.EventTarget.add_event_listener/4`:
+  `:capture`, `:passive`, `:once`, and `:signal`.
   """
-  @spec add_event_listener(t(), String.t() | atom(), callback(), keyword() | map()) :: t()
+  @spec add_event_listener(t(), String.t() | atom(), callback(), keyword() | map() | boolean()) ::
+          t()
   def add_event_listener(%__MODULE__{} = channel, type, callback, options \\ %{})
       when is_function(callback, 0) or is_function(callback, 1) do
     EventTarget.add_event_listener(channel, type, callback, options)
   end
 
   @doc """
-  Removes a listener. Returns the channel.
+  Removes the listener with the type, the callback, and the capture of the
+  options, as `removeEventListener()`. Returns the channel.
   """
-  @spec remove_event_listener(t(), String.t() | atom(), callback()) :: t()
-  def remove_event_listener(%__MODULE__{} = channel, type, callback)
+  @spec remove_event_listener(
+          t(),
+          String.t() | atom(),
+          callback(),
+          keyword() | map() | boolean()
+        ) :: t()
+  def remove_event_listener(%__MODULE__{} = channel, type, callback, options \\ %{})
       when is_function(callback, 0) or is_function(callback, 1) do
-    EventTarget.remove_event_listener(channel, type, callback)
+    EventTarget.remove_event_listener(channel, type, callback, options)
   end
 
   @doc """
@@ -182,12 +194,13 @@ defmodule Web.BroadcastChannel do
   end
 
   @doc """
-  Gives an event to the listeners of the channel. Returns the channel and
-  `true`.
+  Dispatches an event to the channel, as `dispatchEvent()`. Returns the
+  channel, and `false` when a listener canceled the event.
 
-  The function does not wait for the listeners.
+  The listeners run in the calling process, before the function returns.
+  See `Web.EventTarget.dispatch_event/2`.
   """
-  @spec dispatch_event(t(), map()) :: {t(), boolean()}
+  @spec dispatch_event(t(), Web.Event.event()) :: {t(), boolean()}
   def dispatch_event(%__MODULE__{} = channel, event) when is_map(event) do
     EventTarget.dispatch_event(channel, event)
   end
@@ -209,8 +222,8 @@ defmodule Web.BroadcastChannel do
       target
     end
 
-    def remove_event_listener(target, type, callback) do
-      :ok = MessageTarget.remove_event_listener(target, type, callback)
+    def remove_event_listener(target, type, callback, capture) do
+      :ok = MessageTarget.remove_event_listener(target, type, callback, capture)
       target
     end
 

@@ -129,7 +129,8 @@ defmodule Web.BroadcastChannelTest do
              {:onmessageerror, 1},
              {:onmessageerror, 2},
              {:post_message, 2},
-             {:remove_event_listener, 3}
+             {:remove_event_listener, 3},
+             {:remove_event_listener, 4}
            ]
   end
 
@@ -362,15 +363,15 @@ defmodule Web.BroadcastChannelTest do
       end
     end
 
-    test "dispatch_event gives an event to the listeners", %{name: name} do
+    test "dispatch_event gives an event to the listeners, before it returns", %{name: name} do
       channel = BroadcastChannel.add_event_listener(open(name), "custom", forward(:custom))
       event = Web.CustomEvent.new("custom", detail: 7)
 
       assert {^channel, true} = BroadcastChannel.dispatch_event(channel, event)
-      assert_receive {:custom, ^event}
+      assert_received {:custom, %Web.CustomEvent{detail: 7, target: ^channel}}
 
       assert {^channel, true} = Web.EventTarget.dispatch_event(channel, event)
-      assert_receive {:custom, ^event}
+      assert_received {:custom, %Web.CustomEvent{detail: 7, target: ^channel}}
     end
 
     test "a listener that raises goes to the log, and the channel continues", %{name: name} do
@@ -502,18 +503,23 @@ defmodule Web.BroadcastChannelTest do
       assert BroadcastChannel.onmessage(channel) == nil
       assert BroadcastChannel.add_event_listener(channel, "message", callback) == channel
       assert BroadcastChannel.remove_event_listener(channel, "message", callback) == channel
-      assert {^channel, true} = BroadcastChannel.dispatch_event(channel, %{type: "message"})
+      assert BroadcastChannel.remove_event_listener(channel, "message", callback, true) == channel
+      assert {^channel, true} = BroadcastChannel.dispatch_event(channel, Web.Event.new("message"))
     end
 
     test "the processes stop, and the channel leaves its group", %{name: name} do
       channel = open(name)
       server = channel.address
       listener = listener_pid(channel)
+      store = :sys.get_state(server).target.store
       assert members(name) == [server]
 
       BroadcastChannel.close(channel)
 
-      eventually(fn -> not Process.alive?(server) and not Process.alive?(listener) end)
+      eventually(fn ->
+        not Process.alive?(server) and not Process.alive?(listener) and not Process.alive?(store)
+      end)
+
       assert members(name) == []
     end
 

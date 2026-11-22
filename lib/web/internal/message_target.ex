@@ -4,30 +4,43 @@ defmodule Web.Internal.MessageTarget do
   # The part that a message port and a broadcast channel have in common. A
   # socket uses the handle and the supervisor of this module too.
   #
-  # Each port and each channel is two processes:
+  # Each port and each channel is three processes:
   #
   #   * the server keeps the state and answers the calls. It never runs the
   #     code of a user, thus it always answers;
-  #   * the listener process keeps the listeners and runs them, one event at
-  #     a time. It is a `Web.Internal.EventTarget.Server`.
+  #   * the listener process fires the events of the port or the channel,
+  #     one at a time. It is a `Web.Internal.EventTarget.Runner`;
+  #   * the store keeps the listeners and the event handlers. It is a
+  #     `Web.Internal.EventTarget.Store` that stops with the listener
+  #     process.
   #
   # The server sends to the listener process and does not wait. A listener
   # can thus call each function of its port or channel.
   #
+  # The listener steps are those of a target of `Web.EventTarget.new/0`:
+  # the process that calls `dispatch_event/2` runs the listeners, before
+  # the function returns, and the listener process runs them for the events
+  # that the port or the channel fires. See
+  # `Web.Internal.EventTarget.Dispatch`.
+  #
   # A handle has the pid of the server and a token. The server refuses a
   # request that does not have its token, thus only a process that got the
   # handle can use the port or the channel. A request to a server that
-  # stopped has no effect: the port or the channel is closed.
+  # stopped has no effect: the port or the channel is closed, and it has no
+  # listener.
 
   alias Web.AsyncContext.Snapshot
-  alias Web.Internal.EventTarget.Server, as: Listener
+  alias Web.EventTarget
+  alias Web.Internal.EventTarget.Runner
+  alias Web.Internal.EventTarget.Store
 
-  defstruct [:listener, :gate, handlers: %{}]
+  defstruct [:listener, :gate, :store, :handle]
 
   @type t :: %__MODULE__{
           listener: pid(),
           gate: :atomics.atomics_ref(),
-          handlers: %{optional(String.t()) => Web.EventTarget.callback()}
+          store: pid(),
+          handle: struct()
         }
 
   @type handle :: %{
@@ -49,61 +62,35 @@ defmodule Web.Internal.MessageTarget do
     pid
   end
 
-  @doc "Starts the listener process of a handle. The server calls this."
+  @doc """
+  Starts the listener process and the store of a handle. The server calls
+  this. The events go to `handle`.
+  """
   @spec start(struct()) :: t()
   def start(handle) do
     gate = :atomics.new(1, signed: false)
-    {:ok, listener} = Listener.start_link(target: handle, callback_module: nil, gate: gate)
-    %__MODULE__{listener: listener, gate: gate}
+    {:ok, listener} = Runner.start_link(gate)
+    store = Store.start(listener, :with_owner)
+    %__MODULE__{listener: listener, gate: gate, store: store, handle: handle}
   end
 
   @doc """
   Stops the events immediately: the listener process drops each event that
-  it did not start, and stops after the event that it does now.
+  it did not start, and stops after the event that it does now. The store
+  stops after it.
   """
   @spec close(t()) :: :ok
   def close(%__MODULE__{listener: listener, gate: gate}) do
     :atomics.put(gate, 1, 1)
-    Listener.stop(listener)
+    Runner.stop(listener)
   end
 
   @doc """
-  Does a request that a port and a channel have in common. Returns
-  `:unknown` for each other request.
+  Does a request that a port and a channel have in common: the store of the
+  listeners. Returns `:unknown` for each other request.
   """
   @spec request(t(), term()) :: {:reply, term(), t()} | :unknown
-  def request(%__MODULE__{} = target, {:set_handler, type, callback}) do
-    Listener.set_handler(target.listener, type, callback)
-
-    handlers =
-      if callback do
-        Map.put(target.handlers, type, callback)
-      else
-        Map.delete(target.handlers, type)
-      end
-
-    {:reply, :ok, %{target | handlers: handlers}}
-  end
-
-  def request(%__MODULE__{} = target, {:get_handler, type}) do
-    {:reply, Map.get(target.handlers, type), target}
-  end
-
-  def request(%__MODULE__{} = target, {:add_listener, type, callback, options}) do
-    GenServer.cast(target.listener, {:add_event_listener, type, callback, options})
-    {:reply, :ok, target}
-  end
-
-  def request(%__MODULE__{} = target, {:remove_listener, type, callback}) do
-    GenServer.cast(target.listener, {:remove_event_listener, type, callback})
-    {:reply, :ok, target}
-  end
-
-  def request(%__MODULE__{} = target, {:dispatch, event, snapshot}) do
-    GenServer.cast(target.listener, {:dispatch_event, event, snapshot})
-    {:reply, :ok, target}
-  end
-
+  def request(%__MODULE__{} = target, :store), do: {:reply, {:ok, target.store}, target}
   def request(%__MODULE__{}, _request), do: :unknown
 
   @doc """
@@ -111,10 +98,10 @@ defmodule Web.Internal.MessageTarget do
   event in that process.
   """
   @spec run(t(), {module(), atom(), list()}, Snapshot.t(), {pid(), term()} | nil) :: :ok
-  def run(%__MODULE__{listener: listener}, build, snapshot, reply_to \\ nil) do
-    task = %{build: build, snapshot: snapshot}
+  def run(%__MODULE__{} = target, build, snapshot, reply_to \\ nil) do
+    task = %{build: build, snapshot: snapshot, target: target.handle, store: target.store}
     task = if reply_to, do: Map.put(task, :reply_to, reply_to), else: task
-    Listener.run_task(listener, task)
+    Runner.run_task(target.listener, task)
   end
 
   # ---------------------------------------------------------------------------
@@ -137,40 +124,41 @@ defmodule Web.Internal.MessageTarget do
 
   def call(_handle, _request), do: {:error, :detached}
 
-  @spec get_handler(handle(), String.t()) :: Web.EventTarget.callback() | nil
-  def get_handler(handle, type) do
-    case call(handle, {:get_handler, type}) do
+  # The store of the listeners, or `nil` when the port or the channel is
+  # closed or detached.
+  defp store(handle) do
+    case call(handle, :store) do
+      {:ok, store} -> store
       {:error, _reason} -> nil
-      callback -> callback
     end
   end
 
-  @spec set_handler(handle(), String.t(), Web.EventTarget.callback() | nil) :: :ok
+  @spec get_handler(handle(), String.t()) :: EventTarget.callback() | nil
+  def get_handler(handle, type) do
+    case store(handle) do
+      nil -> nil
+      store -> Store.request(store, {:get_handler, type}, nil)
+    end
+  end
+
+  @spec set_handler(handle(), String.t(), EventTarget.callback() | nil) :: :ok
   def set_handler(handle, type, callback) do
-    _reply = call(handle, {:set_handler, type, callback})
+    with store when store != nil <- store(handle) do
+      _ok = Store.request(store, {:set_handler, type, callback}, :ok)
+    end
+
     :ok
   end
 
-  @spec add_event_listener(handle(), String.t() | atom(), function(), keyword() | map()) :: :ok
-  def add_event_listener(handle, type, callback, options) do
-    _reply = call(handle, {:add_listener, type, callback, options})
-    :ok
-  end
+  @spec add_event_listener(handle(), String.t() | atom(), function(), map()) :: :ok
+  def add_event_listener(handle, type, callback, options),
+    do: EventTarget.__add__(store(handle), type, callback, options)
 
-  @spec remove_event_listener(handle(), String.t() | atom(), function()) :: :ok
-  def remove_event_listener(handle, type, callback) do
-    _reply = call(handle, {:remove_listener, type, callback})
-    :ok
-  end
+  @spec remove_event_listener(handle(), String.t() | atom(), function(), boolean()) :: :ok
+  def remove_event_listener(handle, type, callback, capture),
+    do: EventTarget.__remove__(store(handle), type, callback, capture)
 
-  # The steps of `dispatchEvent(event)`: the event is not trusted. The
-  # listener process does the dispatch at a later time, thus the caller
-  # cannot see the end of a dispatch: the function does not refuse an event
-  # that is in a dispatch.
-  @spec dispatch_event(handle(), Web.EventTarget.event()) :: boolean()
-  def dispatch_event(handle, event) do
-    event = if Map.has_key?(event, :is_trusted), do: %{event | is_trusted: false}, else: event
-    _reply = call(handle, {:dispatch, event, Snapshot.new()})
-    true
-  end
+  # The steps of `dispatchEvent(event)`, in the calling process.
+  @spec dispatch_event(handle(), Web.Event.event()) :: boolean()
+  def dispatch_event(handle, event), do: EventTarget.__dispatch__(handle, store(handle), event)
 end

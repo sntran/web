@@ -909,8 +909,8 @@ defimpl Web.EventTarget.Protocol, for: Web.AbortSignal do
     signal
   end
 
-  def remove_event_listener(signal, type, callback) do
-    :ok = Web.EventTarget.__remove__(signal.pid, type, callback, false)
+  def remove_event_listener(signal, type, callback, capture) do
+    :ok = Web.EventTarget.__remove__(signal.pid, type, callback, capture)
     signal
   end
 

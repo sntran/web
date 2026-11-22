@@ -589,9 +589,14 @@ defmodule Web.Dispatcher.HTTPConnectionsTest do
 
     test "sends a request again on a new connection when its write fails on a closed socket",
          context do
+      # A complete response first: the settings of the server come before it
+      # on the socket, thus the process of the connection has them, and it
+      # gives a new stream to the next request.
+      assert await(Response.text(await(fetch(context.base <> "/")))) == "ok"
       held = fetch(context.base <> "/hold")
       [handler] = held(1)
       mux = multiplex(context)
+      assert :sys.get_state(mux).ready?
       ref = Process.monitor(mux)
 
       # The socket closes with no message to the process of the connection:

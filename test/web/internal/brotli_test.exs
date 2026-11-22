@@ -641,10 +641,12 @@ defmodule Web.Internal.BrotliTest do
     end
 
     property "makes complete prefix codes with lengths up to the limit" do
+      # A code of `limit` bits has 2 ** limit symbols at most. The length of
+      # the list comes from the limit, thus no list is filtered out.
       check all(
-              counts <- list_of(integer(1..1_000_000), min_length: 2, max_length: 300),
               limit <- member_of([5, 15]),
-              length(counts) <= 1 <<< limit
+              counts <-
+                list_of(integer(1..1_000_000), min_length: 2, max_length: min(300, 1 <<< limit))
             ) do
         lengths =
           Encoder.__lengths__(Enum.with_index(counts, fn count, i -> {i, count} end), limit)

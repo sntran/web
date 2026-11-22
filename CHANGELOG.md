@@ -1399,12 +1399,13 @@ All notable changes to this project are documented in this file.
 ### Security
 
 - **Breaking:** a TLS socket from `Web.connect/2` or
-  `Web.Socket.start_tls/2` verifies the certificate of the server and its
+  `Web.Socket.start_tls/1` verifies the certificate of the server and its
   host name. Before, the default was `verify: :verify_none`: the socket
   accepted each certificate, and a process in the network path could read
   and change the data. The trust store is the store of the operating
-  system, or the option `cacertfile` or `cacerts` of the caller. A caller
-  that needs no verification must give `verify: :verify_none`.
+  system, or `cacertfile` or `cacerts` in the setting
+  `config :web, tls_options: [...]`. To stop the verification, put
+  `verify: :verify_none` in that setting.
 
 ### Fixed
 

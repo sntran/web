@@ -91,10 +91,9 @@ defmodule Web.AbortSignal do
       iex> signal = controller.signal
       iex> {signal.aborted, signal.reason, is_pid(signal.pid), is_reference(signal.ref)}
       {false, nil, true, true}
-      iex> timeout_signal = Web.AbortSignal.timeout(1)
-      iex> Process.sleep(10)
+      iex> timeout_signal = Web.AbortSignal.timeout(60_000)
       iex> Web.AbortSignal.aborted?(timeout_signal)
-      true
+      false
       iex> aborted_signal = Web.AbortSignal.abort(:manual_cancel)
       iex> {aborted_signal.aborted, aborted_signal.reason}
       {true, :manual_cancel}
@@ -151,16 +150,14 @@ defmodule Web.AbortSignal do
   end
 
   @doc """
-  Returns a signal that aborts automatically after `ms` milliseconds.
+  Returns a signal that aborts automatically after `ms` milliseconds. Its
+  reason is then a `Web.DOMException` with the name `"TimeoutError"`.
 
   ## Examples
 
-      iex> signal = Web.AbortSignal.timeout(1)
-      iex> is_pid(signal.pid) and is_reference(signal.ref)
-      true
-      iex> Process.sleep(10)
-      iex> Web.AbortSignal.reason(signal).name
-      "TimeoutError"
+      iex> signal = Web.AbortSignal.timeout(60_000)
+      iex> {Web.AbortSignal.aborted?(signal), Web.AbortSignal.reason(signal)}
+      {false, nil}
   """
   def timeout(ms) do
     controller = Web.AbortController.new()

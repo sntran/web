@@ -1334,6 +1334,11 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- After `error/2` of the controller of a writable stream, a write does not
+  call the size function of the strategy, also while the stream is
+  erroring, for example before the end of `start`. The stream removes the
+  function at once, as WritableStreamDefaultControllerClearAlgorithms
+  does. Before, it removed the function only when the stream was errored.
 - A writer whose process stopped gets the outcome of `ready` and `closed`
   that the stream keeps, also when the old promise did not stop yet. The
   stop of the owner comes to its promise some time after the stop. Before,

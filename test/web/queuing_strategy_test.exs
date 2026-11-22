@@ -430,6 +430,28 @@ defmodule Web.QueuingStrategyTest do
       refute_received :size
     end
 
+    # The start does not end, thus the error leaves the stream erroring.
+    test "is not called after an error of the controller while the start runs" do
+      test = self()
+      size = fn _chunk -> recorded(test, :size, 1) end
+      {start, _resolve, _reject} = Web.Promise.with_resolvers()
+
+      begin = fn controller ->
+        send(test, {:controller, controller})
+        start
+      end
+
+      stream = WritableStream.new(%{start: begin}, size: size)
+      assert_receive {:controller, controller}
+      writer = WritableStream.get_writer(stream)
+
+      WritableController.error(controller, :stop)
+      assert Writer.desired_size(writer) == nil
+      assert WritableStream.__get_slots__(stream.controller_pid).state == :erroring
+      assert rejection(Writer.write(writer, "a")) == :stop
+      refute_received :size
+    end
+
     test "can close the stream: the write then rejects" do
       size = fn _chunk ->
         _ = Writer.close(Process.get(:writer))

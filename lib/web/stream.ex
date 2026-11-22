@@ -1803,8 +1803,12 @@ defmodule Web.Stream do
   # `error` of the controller of a writable stream, as
   # WritableStreamDefaultControllerError specifies: it has an effect only in
   # the state "writable". A write or a close that is in flight completes.
+  # WritableStreamDefaultControllerClearAlgorithms comes first: a write after
+  # the error does not call the size function, also while the stream is
+  # erroring, for example before the end of `start`.
   defp handle_common(:cast, {:error, reason}, state, %{type: :consumer} = data) do
     if state in [:writable, :closing] do
+      Process.delete(@writable_size_key)
       start_erroring(reason, data, [])
     else
       :keep_state_and_data
@@ -4070,16 +4074,15 @@ defmodule Web.Stream do
   # also examines the owner.
   defp entry_promise({:pending, promise, _resolve, _reject, _owner}), do: promise
 
-  defp entry_promise({:settled, promise, outcome, owner}) do
-    if local_alive?(owner) and Process.alive?(promise.pid),
-      do: promise,
-      else: %Web.Promise{state: outcome}
-  end
-
   # The stream cannot examine a process of a different node: the promise
   # then tells.
-  defp local_alive?(pid) when node(pid) == node(), do: Process.alive?(pid)
-  defp local_alive?(_pid), do: true
+  defp entry_promise({:settled, promise, outcome, owner}) do
+    owner_stopped? = node(owner) == node() and not Process.alive?(owner)
+
+    if owner_stopped? or not Process.alive?(promise.pid),
+      do: %Web.Promise{state: outcome},
+      else: promise
+  end
 
   defp sync_writer_promises(_state, %{writer_ready: nil, writer_closed: nil} = data),
     do: {data, false}

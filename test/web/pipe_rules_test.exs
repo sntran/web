@@ -556,6 +556,9 @@ defmodule Web.PipeRulesTest do
       abort_controller = AbortController.new()
       pipe = ReadableStream.pipe_to(source, dest, signal: abort_controller.signal)
       pipe_pid = pipe_process(source)
+      # The pipe waits for a read in its loop: the two messages come before
+      # the result of that read.
+      waits_for_read(source)
       send(pipe_pid, {:abort, make_ref(), :other_reason})
       send(pipe_pid, {:abort, :other_token})
 

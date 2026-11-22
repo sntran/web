@@ -764,6 +764,16 @@ can change from run to run. The differences of the library are:
   typed array and no `DataView` (15 tests).
 * `TextEncoderStream` converts a chunk with `String.Chars`, not with the
   rules of JavaScript: `nil` becomes `""`, not `"undefined"`.
+* With TLS, the `ssl` application of Erlang/OTP ends the connection when the
+  peer closes it. Thus `allow_half_open: true` of `Web.connect/2` keeps the
+  writable side open only for a TCP socket, not for a TLS socket.
+
+The library has two extensions that no Standard has. `Web.fetch/2` also
+takes the scheme `tcp:` and the rclone form `remote:path` (a remote name
+with `_`): a TCP connection to the host and the port, where the request
+body goes to the peer, and the response body has the bytes that the peer
+sends until it closes the connection. The Fetch Standard gives a network
+error for these schemes.
 
 The pinned commit of WPT has two tests of the body of an empty `FormData`
 that disagree with a third test of WPT, with RFC 7578, and with each browser:

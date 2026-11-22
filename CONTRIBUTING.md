@@ -34,7 +34,13 @@ does not specify.
   - the suffix `?` is only for an attribute that is a boolean, for example
     `locked?/1` and `aborted?/1`;
   - a constructor is `new/n`, and a static method is a function of the
-    module, for example `Web.Response.json/2`.
+    module, for example `Web.Response.json/2`;
+  - a constant is a function with no argument and the snake_case name of
+    the constant, for example `Web.Event.at_target/0` for
+    `Event.AT_TARGET`.
+- The library has two extensions that no Standard has: the scheme `tcp:`
+  and the rclone form `remote:path` of `Web.fetch/2`. Add no other
+  extension unless the owner decides it.
 - Two kinds of Elixir glue stay public: `start_link/1` and `child_spec/1`,
   so that a supervisor can own a process, and the implementations of the
   Elixir protocols, for example `Enumerable`, `Inspect`, and

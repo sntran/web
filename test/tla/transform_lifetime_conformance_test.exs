@@ -90,7 +90,7 @@ defmodule Web.TLA.TransformLifetimeConformanceTest do
     # chunk that no process read. The linger time 0 fires each timer at
     # once.
     make = fn ->
-      TransformStream.new(%{start: &Controller.enqueue(&1, :chunk)}, linger: 0)
+      TransformStream.__new__(%{start: &Controller.enqueue(&1, :chunk)}, [], [], linger: 0)
     end
 
     transform = call(procs, :owner, make)

@@ -1320,8 +1320,8 @@
     for (const m of members) {
       if (m.type === "attribute" && resolve(m.idlType).idlType === "Function") {
         // One function for the interface, as the Standard of the queuing
-        // strategies specifies: it calls the function of the library with
-        // the same name.
+        // strategies specifies: it calls the function of the attribute in
+        // the library (see `adapt/5` in the bridge).
         const fn = function (...values) {
           return decodeAny(call({ i: name, k: "static", m: m.name, a: values.map(encodeAny) }));
         };

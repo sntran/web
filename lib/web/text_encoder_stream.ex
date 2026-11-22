@@ -37,6 +37,9 @@ defmodule Web.TextEncoderStream do
           encoding: String.t()
         }
 
+  @doc """
+  Makes an encoder stream, as `new TextEncoderStream()`.
+  """
   @spec new() :: t()
   def new do
     # A UTF-8 decoder does the work: it joins a code point that is divided

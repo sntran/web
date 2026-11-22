@@ -33,14 +33,15 @@ defmodule Web.TransformStreamDefaultController do
   end
 
   @doc """
-  Puts the two sides of the stream in the errored state, as
-  TransformStreamDefaultControllerError specifies.
+  Puts the two sides of the stream in the errored state, as `error(reason)`
+  and TransformStreamDefaultControllerError specify. The default reason is
+  `nil`, as `undefined` in the Streams Standard.
 
   The readable side gets the error only when it is readable. The writable
   side gets it only when it is writable. A second call has no effect.
   """
   @spec error(t(), term()) :: :ok
-  def error(%__MODULE__{pid: pid, writable_pid: writable}, reason) do
+  def error(%__MODULE__{pid: pid, writable_pid: writable}, reason \\ nil) do
     # The writable side gets the error first: a transform that calls this
     # function sends its result to the writable side after this message.
     error_writable(writable, reason)
@@ -64,26 +65,13 @@ defmodule Web.TransformStreamDefaultController do
     do: Web.Stream.control_cast(writable, {:transform_error_unblock, reason})
 
   @doc """
-  Returns the number of chunks that the readable side can accept before it
-  gives backpressure. The value is `nil` for an errored stream, and 0 for a
-  closed stream.
+  Returns the desired size of the readable side, as the attribute
+  `desiredSize`: the number of chunks that the readable side can accept
+  before it gives backpressure. The value is `nil` for an errored stream,
+  and 0 for a closed stream.
   """
   @spec desired_size(t()) :: number() | nil
   def desired_size(%__MODULE__{pid: pid}) do
     Web.ReadableStream.get_desired_size(pid)
-  end
-
-  @doc """
-  Waits until the readable side wants a chunk.
-
-  A transform that gives many chunks for one input chunk can call this
-  function between the chunks. Thus it does not fill the queue of the
-  readable side.
-  """
-  @spec wait_for_capacity(t()) :: :ok
-  def wait_for_capacity(%__MODULE__{pid: pid}) do
-    Web.ReadableStreamDefaultController.wait_for_capacity(%Web.ReadableStreamDefaultController{
-      pid: pid
-    })
   end
 end

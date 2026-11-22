@@ -8,7 +8,7 @@ defmodule Web.AsyncContext.Snapshot do
     * Erlang `:logger` metadata (OpenTelemetry trace IDs, custom fields, etc.)
     * Elixir `$callers` — the supervision ancestry chain
 
-  Snapshots are the mechanism by which `Web.Promise` and `Web.Stream` propagate
+  Snapshots are the mechanism by which `Web.Promise` and the streams propagate
   context invisibly across BEAM process boundaries.
 
   ## Taking a Snapshot

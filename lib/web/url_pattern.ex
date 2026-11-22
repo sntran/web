@@ -53,7 +53,7 @@ defmodule Web.URLPattern do
         params["resource"]  # e.g. "users"
       end)
 
-  In a `Web.Stream` or a `Web.Promise`, `Web.AsyncContext.Snapshot` gives
+  In a stream or a `Web.Promise`, `Web.AsyncContext.Snapshot` gives
   the same `params()` variable:
 
       stream = Web.ReadableStream.new(%{

@@ -12,6 +12,7 @@ defmodule Web.WritableStreamErroringTest do
   alias Web.Promise
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultReader, as: Reader
+  alias Web.Test.StreamEngine
   alias Web.TransformStream
   alias Web.TypeError
   alias Web.WritableStream
@@ -61,7 +62,7 @@ defmodule Web.WritableStreamErroringTest do
     property "waits for the write, rejects the writes that wait, and then calls the abort of the sink" do
       check all(queued <- integer(0..5), result <- member_of([:ok, {:throw, :failed}])) do
         test = self()
-        stream = WritableStream.new(Map.put(gated_sink(test), :high_water_mark, 10))
+        stream = WritableStream.new(gated_sink(test), high_water_mark: 10)
         writer = WritableStream.get_writer(stream)
 
         first = Writer.write(writer, :first)
@@ -98,7 +99,7 @@ defmodule Web.WritableStreamErroringTest do
 
       first = Writer.abort(writer, :first_reason)
       second = Writer.abort(writer, :second_reason)
-      third = WritableStream.abort(stream.controller_pid, :third_reason)
+      third = StreamEngine.terminate(stream.controller_pid, :abort, :third_reason)
 
       send(sink, {:result, :ok})
 
@@ -333,7 +334,7 @@ defmodule Web.WritableStreamErroringTest do
   describe "the promise ready" do
     test "fulfils when a write completes and the queue is below its limit, with writes in the queue" do
       test = self()
-      stream = WritableStream.new(Map.put(gated_sink(test), :high_water_mark, 3))
+      stream = WritableStream.new(gated_sink(test), high_water_mark: 3)
       writer = WritableStream.get_writer(stream)
 
       _first = Writer.write(writer, 1)
@@ -382,7 +383,8 @@ defmodule Web.WritableStreamErroringTest do
             end,
             cancel: fn reason -> send(test, {:cancel, reason}) end
           },
-          readable_strategy: CountQueuingStrategy.new(1)
+          [],
+          CountQueuingStrategy.new(high_water_mark: 1)
         )
 
       writer = WritableStream.get_writer(transform.writable)

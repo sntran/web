@@ -81,7 +81,7 @@ defmodule Web.Internal.ReadableByteStreamTee do
 
   @impl true
   def init({source, caller}) do
-    case ReadableStream.get_reader(source) do
+    case ReadableStream.__get_reader__(source) do
       :ok ->
         state = %{
           source: source,
@@ -223,7 +223,7 @@ defmodule Web.Internal.ReadableByteStreamTee do
     mode = if kind == :byob, do: [mode: "byob"], else: []
 
     with :ok <- ReadableStream.release_lock(state.source, self()),
-         :ok <- ReadableStream.get_reader(state.source, mode) do
+         :ok <- ReadableStream.__get_reader__(state.source, mode) do
       {:ok, %{state | reader: kind, closed_request: wait_closed(state.source)}}
     else
       _released -> :released

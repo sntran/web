@@ -152,12 +152,23 @@ defmodule Web.ReadableStream do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Creates a new ReadableStream with the given underlying source.
+  Creates a new ReadableStream with the given underlying source, as
+  `new ReadableStream(underlyingSource, strategy)`.
+
+  ## The underlying source
+
+  A map with the members of the dictionary `UnderlyingSource` of the
+  Streams Standard: `:start`, `:pull`, and `:cancel` (functions), `:type`
+  (`"bytes"` for a byte stream), and `:auto_allocate_chunk_size`. The
+  function `start` and `pull` get the controller: a
+  `Web.ReadableStreamDefaultController`, or a
+  `Web.ReadableByteStreamController` for a byte stream.
 
   ## The queuing strategy
 
-  The options `:high_water_mark` and `:size` are the members of the
-  dictionary `QueuingStrategy` of the Streams Standard:
+  The strategy is the dictionary `QueuingStrategy` of the Streams Standard:
+  a keyword list or a map with these keys, or a `Web.CountQueuingStrategy`
+  or a `Web.ByteLengthQueuingStrategy`.
 
     * `:high_water_mark` - the limit of the queue: a number that is not
       below zero, or `:infinity`. The default is 1, and 0 for a byte stream.
@@ -167,12 +178,10 @@ defmodule Web.ReadableStream do
       zero, or `:infinity`, puts the stream in the errored state, and the
       enqueue raises `Web.RangeError`.
 
-  The option `:strategy` takes a `Web.CountQueuingStrategy` or a
-  `Web.ByteLengthQueuingStrategy` instead.
-
   Raises `Web.RangeError` for a high water mark that is NaN or below zero,
-  and for a byte stream with a size function. Raises `Web.TypeError` for a
-  size that is not a function.
+  and for a byte stream with a size function, also the size function of a
+  strategy struct. Raises `Web.TypeError` for a size that is not a function,
+  and for an underlying source that is not a map.
 
   ## Examples
 
@@ -186,13 +195,36 @@ defmodule Web.ReadableStream do
       iex> Enum.to_list(stream)
       ["hello"]
   """
-  def new(underlying_source \\ %{}, opts \\ []) when is_list(opts) do
-    __new__(underlying_source, opts, [])
+  def new(underlying_source \\ %{}, strategy \\ []) do
+    __new__(underlying_source, strategy_options(strategy), [])
   end
+
+  # The members of the dictionary `QueuingStrategy`. A struct is a map: a
+  # strategy struct gives its two fields. Each other key has no effect, as
+  # in WebIDL.
+  defp strategy_options(strategy) when is_list(strategy) or is_map(strategy) do
+    [:high_water_mark, :size]
+    |> Enum.map(&{&1, member(strategy, &1)})
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp strategy_options(strategy) do
+    raise TypeError, "Invalid queuing strategy: #{inspect(strategy)}"
+  end
+
+  defp member(strategy, key) when is_list(strategy) do
+    case List.keyfind(strategy, key, 0) do
+      {^key, value} -> value
+      nil -> nil
+    end
+  end
+
+  defp member(strategy, key), do: Map.get(strategy, key)
 
   @doc false
   # `new/2` with the options of the engine that no public function has: see
-  # `Web.Stream.__start__/3`.
+  # `Web.Stream.__start__/3`. The option `:strategy` is a strategy struct
+  # for the engine, and `:high_water_mark` and `:size` change its values.
   def __new__(underlying_source, opts, internal) when is_list(opts) and is_list(internal) do
     :ok = validate_source!(underlying_source)
     stream_type = source_stream_type(underlying_source)
@@ -215,7 +247,7 @@ defmodule Web.ReadableStream do
     start_fn = source_start(underlying_source)
     stream_opts = Keyword.put(stream_opts, :has_start, is_function(start_fn))
 
-    case Web.Stream.__start__(__MODULE__, stream_opts, pid_source(underlying_source) ++ internal) do
+    case Web.Stream.__start__(__MODULE__, stream_opts, internal) do
       {:ok, pid} ->
         if start_fn do
           Web.Stream.run_start(pid, start_fn, controller_for(stream_type, pid))
@@ -229,11 +261,6 @@ defmodule Web.ReadableStream do
         :ignore
     end
   end
-
-  # A source that is a process gets the message `{:pull, stream}` from the
-  # stream process directly.
-  defp pid_source(source) when is_pid(source), do: [direct_pull: {:pid_source, source}]
-  defp pid_source(_source), do: []
 
   defp source_start(%{start: start}) when is_function(start, 1), do: start
   defp source_start(_source), do: nil
@@ -409,10 +436,10 @@ defmodule Web.ReadableStream do
       raise Web.RangeError, "A byte stream cannot have a size function."
     end
 
-    strategy = Keyword.get(opts, :strategy) || source_value(underlying_source, :strategy, nil)
+    strategy = Keyword.get(opts, :strategy)
 
     {strategy_hwm, strategy_size} =
-      QueuingStrategy.extract!(strategy, source_default_hwm(underlying_source, stream_type))
+      QueuingStrategy.extract!(strategy, default_hwm(stream_type))
 
     {high_water_mark, size} =
       QueuingStrategy.extract!(Keyword.take(opts, [:high_water_mark, :size]), strategy_hwm)
@@ -423,19 +450,13 @@ defmodule Web.ReadableStream do
   end
 
   # The Streams Standard gives a byte stream the high water mark 0, and each
-  # other stream the high water mark 1. A source map can give a different
-  # one.
-  defp source_default_hwm(source, :bytes), do: source_value(source, :high_water_mark, 0)
-  defp source_default_hwm(source, :default), do: source_value(source, :high_water_mark, 1)
-
-  defp source_value(%{} = source, key, default), do: Map.get(source, key, default)
-  defp source_value(_source, _key, default), do: default
+  # other stream the high water mark 1.
+  defp default_hwm(:bytes), do: 0
+  defp default_hwm(:default), do: 1
 
   @source_callbacks [start: 1, pull: 1, cancel: 1]
 
-  # The checks of the Streams Standard for an underlying source that is a
-  # map. A process, a function, and a module-function-arguments tuple are
-  # sources of this library only, and have no such checks.
+  # The checks of the Streams Standard for an underlying source.
   defp validate_source!(%{} = source) when not is_struct(source) do
     if Map.get(source, :type) not in [nil, "bytes"] do
       raise TypeError, "Invalid type of the underlying source: #{inspect(source.type)}"
@@ -454,20 +475,13 @@ defmodule Web.ReadableStream do
     :ok
   end
 
-  defp validate_source!(source)
-       when is_pid(source) or is_function(source, 1) or
-              (is_tuple(source) and tuple_size(source) == 3),
-       do: :ok
-
   defp validate_source!(source) do
     raise TypeError, "Invalid underlying source: #{inspect(source)}"
   end
 
-  defp source_stream_type(%{} = source) do
+  defp source_stream_type(source) do
     if Map.get(source, :type) == "bytes", do: :bytes, else: :default
   end
-
-  defp source_stream_type(_underlying_source), do: :default
 
   # SetUpReadableByteStreamControllerFromUnderlyingSource: the size of the
   # buffer of a default read of a byte stream is a positive integer.
@@ -484,19 +498,13 @@ defmodule Web.ReadableStream do
 
   defp validate_auto_allocate_chunk_size!(:default, _source), do: :ok
 
-  defp source_auto_allocate_chunk_size(%{} = source) do
-    Map.get(source, :auto_allocate_chunk_size)
-  end
+  defp source_auto_allocate_chunk_size(source), do: Map.get(source, :auto_allocate_chunk_size)
 
-  defp source_auto_allocate_chunk_size(_underlying_source), do: nil
+  defp default_strategy_for(:bytes, high_water_mark),
+    do: %Web.ByteLengthQueuingStrategy{high_water_mark: high_water_mark}
 
-  defp default_strategy_for(:bytes, high_water_mark) do
-    Web.ByteLengthQueuingStrategy.new(high_water_mark)
-  end
-
-  defp default_strategy_for(:default, high_water_mark) do
-    Web.CountQueuingStrategy.new(high_water_mark)
-  end
+  defp default_strategy_for(:default, high_water_mark),
+    do: %Web.CountQueuingStrategy{high_water_mark: high_water_mark}
 
   defp reader_mode_from_options(opts) do
     case Keyword.get(opts, :mode) do
@@ -676,32 +684,39 @@ defmodule Web.ReadableStream do
   def disturbed?(_body), do: false
 
   @doc """
-  Returns `true` when the stream currently has an active reader lock.
+  Returns `true` when the stream is locked to a reader, as the attribute
+  `locked`.
   """
-  def locked?(nil), do: false
-  def locked?(body) when is_binary(body) or is_list(body), do: false
+  @spec locked?(t()) :: boolean()
+  def locked?(%__MODULE__{} = stream), do: __locked__(stream)
 
-  def locked?(%__MODULE__{controller_pid: pid}) when is_pid(pid) do
-    locked?(pid)
-  end
+  @doc false
+  # `locked?/1` for each value of a body: `nil`, a binary, or a list have no
+  # lock. The stream process `pid` gives the lock of its stream.
+  def __locked__(%__MODULE__{controller_pid: pid}) when is_pid(pid), do: __locked__(pid)
 
-  def locked?(%__MODULE__{lazy: lazy}) do
+  def __locked__(%__MODULE__{lazy: lazy}) do
     case LazyStream.state(lazy) do
       :locked -> true
-      {:process, pid} -> locked?(pid)
+      {:process, pid} -> __locked__(pid)
       _other -> false
     end
   end
 
-  def locked?(pid) when is_pid(pid) do
-    Web.Stream.call(pid, {:locked?, :reader}, false)
-  end
+  def __locked__(pid) when is_pid(pid), do: Web.Stream.call(pid, {:locked?, :reader}, false)
+  def __locked__(_body), do: false
 
-  def locked?(_body), do: false
-
-  # Private helper — reads all chunks from a stream to a binary.
   @doc """
-  Locks the stream and returns a reader.
+  Locks the stream and returns a reader, as `getReader(options)`.
+
+  ## Options
+
+    * `:mode` - `"byob"` gives a `Web.ReadableStreamBYOBReader` for a byte
+      stream. With no mode, the reader is a
+      `Web.ReadableStreamDefaultReader`.
+
+  Raises `Web.TypeError` if the stream is locked, and for the mode
+  `"byob"` of a stream that is not a byte stream.
 
   ## Examples
 
@@ -710,21 +725,20 @@ defmodule Web.ReadableStream do
       iex> is_struct(reader, Web.ReadableStreamDefaultReader)
       true
   """
-  def get_reader(%__MODULE__{} = stream, opts) when is_list(opts) do
+  def get_reader(%__MODULE__{} = stream, opts \\ []) when is_list(opts) do
     mode = reader_mode_from_options(opts)
     stream |> __lock__(&reader_lock(&1, mode)) |> new_reader()
   end
 
-  def get_reader(pid, opts) when is_pid(pid) and is_list(opts) do
+  @doc false
+  # The lock of a reader for this process on the stream process `pid`, with
+  # no reader struct: `:ok` or `{:error, reason}`.
+  def __get_reader__(pid, opts \\ []) when is_pid(pid) and is_list(opts) do
     case lock_reader(pid, reader_mode_from_options(opts)) do
       {:ok, _lock} -> :ok
       {:error, reason} -> {:error, reason}
     end
   end
-
-  def get_reader(pid) when is_pid(pid), do: get_reader(pid, [])
-
-  def get_reader(%__MODULE__{} = stream), do: get_reader(stream, [])
 
   @doc false
   # A default reader of the process `pid`, for the lock step of
@@ -763,10 +777,6 @@ defmodule Web.ReadableStream do
       end
 
     Web.Stream.call(pid, request, {:error, :released})
-  end
-
-  def read(pid) do
-    Web.Stream.call(pid, {:read, self()}, {:error, :not_locked_by_reader})
   end
 
   @doc """
@@ -811,6 +821,8 @@ defmodule Web.ReadableStream do
     Web.Stream.request(pid, {:read_batch, owner, max}, {:error, :not_locked_by_reader})
   end
 
+  @doc false
+  # The release of the reader lock of `owner` on the stream process `pid`.
   def release_lock(pid, owner \\ self()) do
     Web.Stream.call(pid, {:release_lock, :reader, owner}, :ok)
   end
@@ -830,6 +842,9 @@ defmodule Web.ReadableStream do
     end)
   end
 
+  @doc false
+  # The desired size of the stream process `pid`: see the attribute
+  # `desiredSize` of the controllers.
   def get_desired_size(pid) do
     Web.Stream.call(pid, :get_desired_size, nil)
   end
@@ -920,10 +935,18 @@ defmodule Web.ReadableStream do
     Web.Stream.control_cast(pid, {:error, reason})
   end
 
-  def cancel(target, reason \\ :cancelled)
+  @doc """
+  Cancels the stream, as `cancel(reason)`. The function `cancel` of the
+  underlying source gets the reason. The default reason is `nil`, as
+  `undefined` in the Streams Standard.
 
-  # A cancel of the stream object. The Streams Standard refuses it when the
-  # stream has a reader: use the cancel function of the reader.
+  Returns a `Web.Promise` that fulfils when the cancel is complete. It
+  rejects with `Web.TypeError` when the stream is locked: use the cancel
+  function of the reader.
+  """
+  @spec cancel(t(), term()) :: Promise.t()
+  def cancel(stream, reason \\ nil)
+
   def cancel(%__MODULE__{controller_pid: pid}, reason) when is_pid(pid) do
     Web.Stream.promise_call(pid, {:terminate_unlocked, :cancel, reason}, :ok, &cancel_result/1)
   end
@@ -944,9 +967,10 @@ defmodule Web.ReadableStream do
     end
   end
 
-  # A cancel by a reader, or by the code of this library: it has no check of
-  # the lock.
-  def cancel(pid, reason) do
+  @doc false
+  # A cancel of the stream process `pid` by a reader, or by the code of this
+  # library: it has no check of the lock.
+  def __cancel__(pid, reason) when is_pid(pid) do
     Web.Stream.promise_call(pid, {:terminate, :cancel, reason}, :ok, &cancel_result/1)
   end
 
@@ -981,8 +1005,6 @@ defmodule Web.ReadableStream do
   def __get_slots__(pid) do
     :gen_statem.call(pid, :get_slots)
   end
-
-  def tee(pid) when is_pid(pid), do: do_tee(%__MODULE__{controller_pid: pid}, false)
 
   @doc """
   Gives two branches of the stream, as `ReadableStream.prototype.tee()` of
@@ -1061,17 +1083,20 @@ defmodule Web.ReadableStream do
 
   ## Options
 
-  - `:prevent_close` - do not close the writable side when the source is done
-  - `:prevent_abort` - do not abort the writable side when the source errors
-  - `:prevent_cancel` - do not cancel the readable side when the sink errors
-    or closes
+  The options are the members of the dictionary `StreamPipeOptions` of the
+  Streams Standard:
 
-  The names `:preventClose`, `:preventAbort`, and `:preventCancel` of the
-  Streams Standard are accepted also.
-  - `:signal` - optional `%Web.AbortSignal{}` that stops the pipe: the pipe
-    aborts the destination and cancels the source, and rejects with the
-    reason of the signal
+    * `:prevent_close` - do not close the destination when the source
+      closes.
+    * `:prevent_abort` - do not abort the destination when the source has
+      an error.
+    * `:prevent_cancel` - do not cancel the source when the destination has
+      an error or closes.
+    * `:signal` - a `Web.AbortSignal` that stops the pipe: the pipe aborts
+      the destination and cancels the source, and rejects with the reason
+      of the signal.
   """
+  @spec pipe_to(t(), WritableStream.t(), keyword()) :: Promise.t()
   def pipe_to(readable, writable, options \\ []) do
     {ready, wait_for_locks} = pipe_lock_signal()
 
@@ -1164,8 +1189,17 @@ defmodule Web.ReadableStream do
   end
 
   @doc """
-  Pipes this stream through a transform and returns the transform's readable side.
+  Pipes this stream through a transform, and returns the readable side of
+  the transform, as `pipeThrough(transform, options)`.
+
+  The transform is the dictionary `ReadableWritablePair`: a map or a struct
+  with the fields `readable` and `writable`, for example a
+  `Web.TransformStream`. The options are the options of `pipe_to/3`. The
+  pipe from this stream to the writable side runs in a different process.
+
+  Raises `Web.TypeError` if this stream or the writable side is locked.
   """
+  @spec pipe_through(t(), %{readable: t(), writable: WritableStream.t()}, keyword()) :: t()
   def pipe_through(
         readable,
         %{readable: transformed_readable, writable: transformed_writable},
@@ -1182,25 +1216,21 @@ defmodule Web.ReadableStream do
   # Private pipe helpers
   # ---------------------------------------------------------------------------
 
+  # The steps "If ! IsReadableStream(this) is false" and "If !
+  # IsWritableStream(destination) is false": `pipe_to/3` rejects, and
+  # `pipe_through/3` raises.
   defp acquire_reader_for_pipe(%__MODULE__{} = readable), do: get_reader(readable)
 
-  defp acquire_reader_for_pipe(pid) when is_pid(pid) do
-    case get_reader(pid) do
-      :ok -> %Web.ReadableStreamDefaultReader{controller_pid: pid, owner_pid: self()}
-      {:error, :already_locked} -> raise TypeError, "ReadableStream is already locked"
-      {:error, :released} -> raise TypeError, @released_message
-    end
+  defp acquire_reader_for_pipe(readable) do
+    raise TypeError, "The source of a pipe must be a ReadableStream, got: #{inspect(readable)}"
   end
 
   defp acquire_writer_for_pipe(%WritableStream{} = writable),
     do: WritableStream.get_writer(writable, :pipe)
 
-  defp acquire_writer_for_pipe(pid) when is_pid(pid) do
-    case WritableStream.get_writer(pid, :pipe) do
-      :ok -> %Web.WritableStreamDefaultWriter{controller_pid: pid, owner_pid: self()}
-      {:error, :already_locked} -> raise TypeError, "WritableStream is already locked"
-      {:error, :released} -> raise TypeError, @released_message
-    end
+  defp acquire_writer_for_pipe(writable) do
+    raise TypeError,
+          "The destination of a pipe must be a WritableStream, got: #{inspect(writable)}"
   end
 
   # The two branches are usual streams of the type of the source. The tee

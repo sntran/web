@@ -10,6 +10,9 @@ defmodule Web.WritableStreamDefaultWriter do
   # `Web.WritableStream.get_writer/1`.
   defstruct [:controller_pid, :owner_pid, :lock]
 
+  @typedoc "A writer. The fields are private."
+  @type t :: %__MODULE__{controller_pid: pid(), owner_pid: pid(), lock: reference()}
+
   alias Web.Internal.QueuingStrategy
   alias Web.TypeError
 
@@ -48,13 +51,15 @@ defmodule Web.WritableStreamDefaultWriter do
   end
 
   @doc """
-  Aborts the stream and notifies the underlying sink.
+  Aborts the stream, as `abort(reason)`. The function `abort` of the sink
+  gets the reason. The default reason is `nil`, as `undefined` in the
+  Streams Standard.
 
   The listeners of the event `abort` of the signal of the controller run in
   the calling process before this function returns, as the Streams Standard
   specifies.
   """
-  def abort(%__MODULE__{controller_pid: pid, owner_pid: owner_pid} = writer, reason) do
+  def abort(%__MODULE__{controller_pid: pid, owner_pid: owner_pid} = writer, reason \\ nil) do
     # A value that the abort callback of the sink throws is the rejection
     # reason, with no change.
     Web.Stream.__abort__(

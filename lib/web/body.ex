@@ -215,7 +215,7 @@ defmodule Web.Body do
   # a `TypeError`.
   @spec extract!(term()) :: Web.ReadableStream.t()
   def extract!(%Web.ReadableStream{} = body) do
-    if Web.ReadableStream.disturbed?(body) or Web.ReadableStream.locked?(body) do
+    if Web.ReadableStream.disturbed?(body) or Web.ReadableStream.__locked__(body) do
       raise Web.TypeError, "The body stream is already used or locked"
     end
 
@@ -562,7 +562,7 @@ defmodule Web.Body do
   defp ensure_usable!(body) do
     cond do
       Web.ReadableStream.disturbed?(body) -> raise Web.TypeError, @used_message
-      Web.ReadableStream.locked?(body) -> raise Web.TypeError, @locked_message
+      Web.ReadableStream.__locked__(body) -> raise Web.TypeError, @locked_message
       true -> :ok
     end
   end

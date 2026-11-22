@@ -27,6 +27,13 @@ defmodule Web.TextDecoderStream do
           ignore_bom: boolean()
         }
 
+  @doc """
+  Makes a decoder stream, as `new TextDecoderStream(label, options)`.
+
+  The options are the members of the dictionary `TextDecoderOptions`:
+  `:fatal` and `:ignore_bom`. Raises `Web.RangeError` for a label that
+  names no encoding.
+  """
   @spec new(String.t(), map() | keyword()) :: t()
   def new(label \\ "utf-8", options \\ %{}) do
     decoder = TextDecoder.new(label, options)

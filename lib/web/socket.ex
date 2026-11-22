@@ -310,19 +310,21 @@ defmodule Web.Socket do
         %{cancel: fn reason -> GenServer.cast(address, {token, {:readable_cancel, reason}}) end},
         [
           high_water_mark: readable_hwm,
-          strategy: ByteLengthQueuingStrategy.new(readable_hwm),
+          strategy: ByteLengthQueuingStrategy.new(high_water_mark: readable_hwm),
           cancel_on_reader_exit: true
         ],
         direct_pull: {:process, address}
       )
 
     writable =
-      WritableStream.new(%{
-        high_water_mark: Map.get(options, :writable_high_water_mark, 1),
-        write: fn chunk, _controller -> sink_write(handle, chunk) end,
-        close: fn _controller -> sink_close(handle, closed) end,
-        abort: fn _reason -> sink_abort(handle) end
-      })
+      WritableStream.new(
+        %{
+          write: fn chunk, _controller -> sink_write(handle, chunk) end,
+          close: fn _controller -> sink_close(handle, closed) end,
+          abort: fn _reason -> sink_abort(handle) end
+        },
+        high_water_mark: Map.get(options, :writable_high_water_mark, 1)
+      )
 
     {readable, writable}
   end

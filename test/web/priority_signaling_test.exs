@@ -7,6 +7,7 @@ defmodule Web.PrioritySignalingTest do
 
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController
+  alias Web.Test.StreamEngine
   alias Web.WritableStream
   alias Web.WritableStreamDefaultWriter
 
@@ -71,7 +72,9 @@ defmodule Web.PrioritySignalingTest do
     request =
       while_suspended(stream.controller_pid, fn ->
         request =
-          usual_request(stream.controller_pid, fn -> WritableStream.desired_size(stream) end)
+          usual_request(stream.controller_pid, fn ->
+            StreamEngine.desired_size(stream)
+          end)
 
         _abort = WritableStreamDefaultWriter.abort(writer, :stop)
         request
@@ -88,7 +91,9 @@ defmodule Web.PrioritySignalingTest do
     request =
       while_suspended(stream.controller_pid, fn ->
         request =
-          usual_request(stream.controller_pid, fn -> WritableStream.desired_size(stream) end)
+          usual_request(stream.controller_pid, fn ->
+            StreamEngine.desired_size(stream)
+          end)
 
         _close = WritableStreamDefaultWriter.close(writer)
         request
@@ -282,13 +287,13 @@ defmodule Web.PrioritySignalingTest do
         ReadableStream.new(%{start: fn c -> ReadableStreamDefaultController.enqueue(c, "a") end})
 
       pid = stream.controller_pid
-      :ok = ReadableStream.get_reader(pid)
+      :ok = ReadableStream.__get_reader__(pid)
       tag = make_ref()
 
       cancel =
         while_suspended(pid, fn ->
           send(pid, {:"$gen_call", {test, tag}, {:read, test}})
-          ReadableStream.cancel(pid, :stop)
+          ReadableStream.__cancel__(pid, :stop)
         end)
 
       # The read came first: it got the chunk in the queue.
@@ -323,7 +328,7 @@ defmodule Web.PrioritySignalingTest do
       cancel =
         while_suspended(pid, fn ->
           Web.Stream.__usual_cast__(pid, {:error, :failed})
-          ReadableStream.cancel(pid, :stop)
+          ReadableStream.__cancel__(pid, :stop)
         end)
 
       # The error came first: the cancel of an errored stream rejects.

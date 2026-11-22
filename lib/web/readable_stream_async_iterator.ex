@@ -92,7 +92,7 @@ defmodule Web.ReadableStreamAsyncIterator do
       if prevent_cancel do
         Promise.resolve(:ok)
       else
-        ReadableStream.cancel(reader.controller_pid, value)
+        ReadableStream.__cancel__(reader.controller_pid, value)
       end
 
     :ok = ReadableStreamDefaultReader.release_lock(reader)

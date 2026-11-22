@@ -13,7 +13,7 @@ so.
 | --- | --- | --- |
 | `demo.exs` | A short tour: `fetch`, a body as a stream, `tee` and `pipe_through`, an abort signal, and a governor. | Nothing |
 | `fetch_pool.exs` | Four requests with two at a time, with `Web.CountingGovernor`. | The network |
-| `stream/byte_counter_stream.exs` | A response body through a custom stream and through a transform stream. | The network |
+| `stream/byte_counter_stream.exs` | A response body through a writable stream that counts its bytes and through a transform stream. | The network |
 | `stream/live_round_trip.exs` | A pipeline of transform streams: compress, decompress, and decode. | Nothing |
 | `stream/hardened_pipeline.exs` | An abort signal stops a pipeline whose source has no end. | Nothing |
 | `secure_byob_stream.exs` | A byte stream with a BYOB reader: the consumer gives the buffer, and each read fills it. | Nothing |

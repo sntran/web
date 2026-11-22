@@ -47,13 +47,15 @@ defmodule Web.PipeBatchTest do
     source = queued_source(Enum.to_list(1..8))
 
     destination =
-      WritableStream.new(%{
-        high_water_mark: 16,
-        write: fn chunk, _controller ->
-          send(test, {:written, chunk})
-          :ok
-        end
-      })
+      WritableStream.new(
+        %{
+          write: fn chunk, _controller ->
+            send(test, {:written, chunk})
+            :ok
+          end
+        },
+        high_water_mark: 16
+      )
 
     assert await(ReadableStream.pipe_to(source, destination)) == :ok
 
@@ -64,13 +66,15 @@ defmodule Web.PipeBatchTest do
     source = queued_source(Enum.to_list(1..8))
 
     destination =
-      WritableStream.new(%{
-        high_water_mark: 16,
-        write: fn
-          3, _controller -> raise "the third write fails"
-          _chunk, _controller -> :ok
-        end
-      })
+      WritableStream.new(
+        %{
+          write: fn
+            3, _controller -> raise "the third write fails"
+            _chunk, _controller -> :ok
+          end
+        },
+        high_water_mark: 16
+      )
 
     assert %RuntimeError{message: "the third write fails"} =
              catch_exit(await(ReadableStream.pipe_to(source, destination)))

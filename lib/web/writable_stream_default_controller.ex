@@ -1,6 +1,8 @@
 defmodule Web.WritableStreamDefaultController do
   @moduledoc """
-  The interface passed to WritableStream user-defined callbacks.
+  The controller that the functions `start`, `write`, and `close` of the
+  underlying sink of a `Web.WritableStream` get, as
+  `WritableStreamDefaultController` of the Streams Standard.
   """
   defstruct [:pid]
 
@@ -9,17 +11,11 @@ defmodule Web.WritableStreamDefaultController do
   alias Web.WritableStream
 
   @doc """
-  Errors the stream with the given reason.
+  Puts the stream in the errored state, as `error(e)`. The default reason
+  is `nil`, as `undefined` in the Streams Standard.
   """
-  def error(%__MODULE__{pid: pid}, reason) do
+  def error(%__MODULE__{pid: pid}, reason \\ nil) do
     WritableStream.error(pid, reason)
-  end
-
-  @doc """
-  Returns the writable stream desired size.
-  """
-  def desired_size(%__MODULE__{pid: pid}) do
-    WritableStream.desired_size(pid)
   end
 
   @doc """

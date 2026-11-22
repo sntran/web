@@ -9,6 +9,7 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
 
   alias Web.ReadableStream
   alias Web.Test.SpecModel
+  alias Web.Test.StreamEngine
 
   @procs [:owner, :other]
   @linger 15
@@ -63,7 +64,7 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
     # test gives each chunk.
     send(
       procs.owner,
-      {:run, fn -> ReadableStream.new(%{}, linger: @linger, high_water_mark: 10) end}
+      {:run, fn -> ReadableStream.__new__(%{}, [linger: @linger, high_water_mark: 10], []) end}
     )
 
     assert_receive {:result, stream}
@@ -132,7 +133,7 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
 
   defp run({:lock, proc}, model, queue, system) do
     if SpecModel.enabled?(model, "Lock", [to_string(proc)]) do
-      result = call(system, proc, fn -> ReadableStream.get_reader(system.pid) end)
+      result = call(system, proc, fn -> ReadableStream.__get_reader__(system.pid) end)
 
       checked(result, :ok, model, queue, system, fn ->
         {SpecModel.step!(model, "Lock", [to_string(proc)]), queue}
@@ -158,7 +159,7 @@ defmodule Web.TLA.StreamLifetimeConformanceTest do
   defp run({:read, proc}, model, queue, system) do
     if SpecModel.enabled?(model, "Read", [to_string(proc)]) do
       [chunk | rest] = queue
-      result = call(system, proc, fn -> ReadableStream.read(system.pid) end)
+      result = call(system, proc, fn -> StreamEngine.read(system.pid) end)
 
       checked(result, {:ok, chunk}, model, queue, system, fn ->
         {SpecModel.step!(model, "Read", [to_string(proc)]), rest}

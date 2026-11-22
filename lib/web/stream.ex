@@ -1,33 +1,36 @@
 defmodule Web.Stream do
-  @moduledoc """
-  Universal `:gen_statem` stream engine.
+  @moduledoc false
 
-  Manages all process logic, locking, and data queuing for `Web.ReadableStream`,
-  `Web.WritableStream`, and `Web.TransformStream`.
-
-  ## Behavior Callbacks
-
-  Implementing modules must define `start/2` and may optionally define any of the
-  data-processing callbacks. All data-processing callbacks (`pull/2`, `write/3`,
-  `flush/2`) run in supervised `Task`s.
-
-  - `start(pid, opts)` — **Required.** Returns the stream type and initial state.
-  - `pull(ctrl, state)` — **Optional.** Called when the producer needs more data.
-  - `write(chunk, ctrl, state)` — **Optional.** Called to process an incoming write.
-  - `flush(ctrl, state)` — **Optional.** Called just before the stream closes.
-  - `terminate(event, state)` — **Optional.** Called when the stream terminates.
-
-  ## Stream Types
-
-  The `start/2` callback declares one of three types:
-
-  - `:producer` — readable source (e.g. `ReadableStream`)
-  - `:consumer` — writable sink (e.g. `WritableStream`)
-  - `:producer_consumer` — transform in one process (e.g. `CompressionStream`)
-
-  A `Web.TransformStream` has two processes: a `:producer` and a
-  `:consumer`. See "The two sides of a transform stream".
-  """
+  # The `:gen_statem` engine of the streams. It has the process logic, the
+  # locks, and the queues of `Web.ReadableStream`, `Web.WritableStream`,
+  # `Web.TransformStream`, and the streams of the Compression Standard. The
+  # behaviour and its callbacks are an extension point of this library: no
+  # Standard has them.
+  #
+  # ## The callbacks
+  #
+  # A stream module defines `start/2`, and can define the other callbacks.
+  # The callbacks `pull/2`, `write/3`, and `flush/2` run in the worker of
+  # the stream.
+  #
+  #   * `start(pid, opts)` - required. Gives the type of the stream and its
+  #     first state.
+  #   * `pull(ctrl, state)` - the producer must give more data.
+  #   * `write(chunk, ctrl, state)` - a write comes.
+  #   * `flush(ctrl, state)` - the stream closes after this callback.
+  #   * `terminate(event, state)` - the stream ends.
+  #
+  # ## The types of a stream
+  #
+  # The callback `start/2` gives one of three types:
+  #
+  #   * `:producer` - a readable source, for example `ReadableStream`;
+  #   * `:consumer` - a writable sink, for example `WritableStream`;
+  #   * `:producer_consumer` - a transform in one process, for example
+  #     `CompressionStream`.
+  #
+  # A `Web.TransformStream` has two processes: a `:producer` and a
+  # `:consumer`. See "The two sides of a transform stream".
 
   @behaviour :gen_statem
 
@@ -64,14 +67,16 @@ defmodule Web.Stream do
 
   @optional_callbacks [pull: 2, write: 3, flush: 2, terminate: 2]
 
-  @doc """
-  Sets up an implementing stream module with the `Web.Stream` behaviour and
-  a default `start_link/1` delegating to the shared engine.
-  """
+  # Gives a stream module the behaviour, and the function `start_link/1`
+  # that starts its stream process. A supervisor can own that process.
   defmacro __using__(_opts) do
     quote do
       @behaviour Web.Stream
 
+      @doc """
+      Starts the stream process with the options of the stream engine, for
+      a supervisor. Returns `{:ok, pid}`.
+      """
       def start_link(opts \\ []) do
         Web.Stream.start_link(__MODULE__, opts)
       end
@@ -235,8 +240,6 @@ defmodule Web.Stream do
   #     with no callback in the worker:
   #       - `{:message, pid, message}`: the engine sends `message` to `pid`,
   #         and the pull is complete at once. The source enqueues later;
-  #       - `{:pid_source, pid}`: the same, with the message
-  #         `{:pull, stream}` of a source that is a process;
   #       - `{:process, pid}`: the engine sends
   #         `{:web_stream_pull, ref, stream}` to `pid` and monitors it. The
   #         pull is complete when `pid` sends `{ref, :pulled}` with
@@ -1641,10 +1644,6 @@ defmodule Web.Stream do
     after_stopped_holder(data.writer_pid, data.writer_ref, from, request, is_pid(data.writer_pid))
   end
 
-  defp handle_common({:call, from}, :backpressure?, _state, data) do
-    {:keep_state_and_data, [{:reply, from, data.backpressure}]}
-  end
-
   # Tells if the readable side wants a chunk now: the rule of a pull. A tee
   # asks this before a read for the pull of a branch.
   defp handle_common({:call, from}, :wants_chunk?, state, data) do
@@ -1828,43 +1827,6 @@ defmodule Web.Stream do
   # Cancel
   defp handle_common(:cast, {:cancel, reason}, _state, data) do
     handle_termination(:cancel, reason, data)
-  end
-
-  defp handle_common(
-         :cast,
-         {:register_ready_waiter, waiter_pid, owner_pid, ref},
-         state,
-         data
-       )
-       when data.type in [:consumer, :producer_consumer] do
-    cond do
-      # A pipe to a destination that is errored gets the error of the
-      # destination, as the Streams Standard specifies.
-      state in [:errored, :erroring] ->
-        send(waiter_pid, {:stream_error, ref, {:errored, data.error_reason}})
-        :keep_state_and_data
-
-      state == :closed and match?({:errored, _reason}, data.writable_error) ->
-        {:errored, reason} = data.writable_error
-        send(waiter_pid, {:stream_error, ref, {:errored, reason}})
-        :keep_state_and_data
-
-      owner_pid != data.writer_pid ->
-        send(waiter_pid, {:stream_error, ref, :not_locked_by_writer})
-        :keep_state_and_data
-
-      state in [:closed, :closing] ->
-        send(waiter_pid, {:ready, ref})
-        :keep_state_and_data
-
-      writable_ready?(data) ->
-        send(waiter_pid, {:ready, ref})
-        :keep_state_and_data
-
-      true ->
-        waiter = {:signal, waiter_pid, ref}
-        {:keep_state, %{data | ready_waiters: :queue.in(waiter, data.ready_waiters)}}
-    end
   end
 
   defp handle_common(
@@ -2580,10 +2542,6 @@ defmodule Web.Stream do
     case data.direct_pull do
       {:message, pid, message} ->
         send(pid, message)
-        :keep_state_and_data
-
-      {:pid_source, pid} ->
-        send(pid, {:pull, self()})
         :keep_state_and_data
 
       # The source process answers this process directly: the pull costs

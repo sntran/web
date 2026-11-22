@@ -1,9 +1,13 @@
 defmodule Web.ReadableStreamDefaultController do
   @moduledoc """
-  The interface passed to ReadableStream user-defined callbacks.
-  Reflects the WHATWG ReadableStreamDefaultController API.
+  The controller that the functions `start` and `pull` of the underlying
+  source of a `Web.ReadableStream` get, as `ReadableStreamDefaultController`
+  of the Streams Standard.
   """
   defstruct [:pid]
+
+  @typedoc "A controller. The field is private."
+  @type t :: %__MODULE__{pid: pid()}
 
   alias Web.ReadableStream
 
@@ -40,23 +44,20 @@ defmodule Web.ReadableStreamDefaultController do
   end
 
   @doc """
-  Errors the stream with a reason.
+  Puts the stream in the errored state, as `error(e)`. The chunks in the
+  queue are discarded. The default reason is `nil`, as `undefined` in the
+  Streams Standard.
   """
-  def error(%_{pid: pid}, reason) do
+  def error(%_{pid: pid}, reason \\ nil) do
     ReadableStream.error(pid, reason)
   end
 
-  @doc """
-  Blocks the calling process until the stream's readable queue has capacity.
-
-  Used by `TransformStream` implementations that produce multiple output chunks
-  per input to implement signal-driven (non-polling) backpressure. Returns `:ok`
-  immediately if capacity is already available, or parks the caller until a
-  reader drains the queue below the High-Water Mark.
-
-  If the stream is closed or errored the call also returns `:ok` so the
-  transform task can complete cleanly.
-  """
+  @doc false
+  # Blocks the calling process until the queue of the stream has space: the
+  # backpressure of `Web.DecompressionStream`, which gives many chunks for
+  # one input chunk. Returns `:ok` at once when the queue has space, and
+  # also when the stream is closed or errored, thus the transform can
+  # complete.
   def wait_for_capacity(%_{pid: pid}) do
     ref = make_ref()
     Web.Stream.control_cast(pid, {:register_enqueue_waiter, self(), ref})
@@ -71,7 +72,9 @@ defmodule Web.ReadableStreamDefaultController do
   end
 
   @doc """
-  Returns the desired size to fill the stream's internal queue.
+  Returns the desired size to fill the queue of the stream, as the
+  attribute `desiredSize`. It is `nil` for an errored stream, and 0 for a
+  closed stream.
 
   ## Examples
 

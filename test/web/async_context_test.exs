@@ -854,13 +854,13 @@ defmodule Web.AsyncContextTest do
   end
 
   # ===========================================================================
-  # Backpressure: :readable_strategy integration
+  # Backpressure: the strategy of the readable side
   # ===========================================================================
 
-  describe "TransformStream :readable_strategy" do
-    test "readable_strategy controls readable-side high water mark" do
-      strategy = Web.CountQueuingStrategy.new(4)
-      ts = TransformStream.new(%{}, readable_strategy: strategy, high_water_mark: 1)
+  describe "TransformStream readable strategy" do
+    test "the readable strategy controls the high water mark of the readable side" do
+      strategy = Web.CountQueuingStrategy.new(high_water_mark: 4)
+      ts = TransformStream.new(%{}, [high_water_mark: 1], strategy)
 
       pid = ts.readable.controller_pid
       writer = WritableStream.get_writer(ts.writable)
@@ -888,7 +888,7 @@ defmodule Web.AsyncContextTest do
     test "the writer gets backpressure when the readable side is full" do
       pull_count = :counters.new(1, [])
 
-      strategy = Web.CountQueuingStrategy.new(2)
+      strategy = Web.CountQueuingStrategy.new(high_water_mark: 2)
 
       ts =
         TransformStream.new(
@@ -898,8 +898,8 @@ defmodule Web.AsyncContextTest do
               Web.ReadableStreamDefaultController.enqueue(ctrl, chunk)
             end
           },
-          readable_strategy: strategy,
-          high_water_mark: 1
+          [high_water_mark: 1],
+          strategy
         )
 
       writer = WritableStream.get_writer(ts.writable)

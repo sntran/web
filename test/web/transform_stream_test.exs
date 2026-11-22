@@ -7,6 +7,7 @@ defmodule Web.TransformStreamTest do
   import ExUnit.CaptureLog
 
   alias Web.ReadableStreamDefaultReader, as: Reader
+  alias Web.Test.StreamEngine
   alias Web.TransformStreamDefaultController, as: Controller
   alias Web.WritableStreamDefaultWriter, as: Writer
 
@@ -94,11 +95,11 @@ defmodule Web.TransformStreamTest do
 
     strategy =
       if scenario == :size,
-        do: ByteLengthQueuingStrategy.new(16),
-        else: CountQueuingStrategy.new(2)
+        do: ByteLengthQueuingStrategy.new(high_water_mark: 16),
+        else: CountQueuingStrategy.new(high_water_mark: 2)
 
     transform =
-      TransformStream.new(Map.put(transformer, :start, start), readable_strategy: strategy)
+      TransformStream.new(Map.put(transformer, :start, start), [], strategy)
 
     assert_receive {:controller, controller}
     readable = transform.readable.controller_pid
@@ -167,9 +168,10 @@ defmodule Web.TransformStreamTest do
 
     test "accepts a strategy for each side" do
       transform =
-        TransformStream.new(%{},
-          writable_strategy: CountQueuingStrategy.new(3),
-          readable_strategy: CountQueuingStrategy.new(7)
+        TransformStream.new(
+          %{},
+          CountQueuingStrategy.new(high_water_mark: 3),
+          CountQueuingStrategy.new(high_water_mark: 7)
         )
 
       assert writable_slots(transform).writable_desired_size == 3
@@ -353,7 +355,7 @@ defmodule Web.TransformStreamTest do
     end
 
     test "lets the transform run for the limit of the readable side with no reader" do
-      transform = TransformStream.new(%{}, readable_strategy: CountQueuingStrategy.new(3))
+      transform = TransformStream.new(%{}, [], CountQueuingStrategy.new(high_water_mark: 3))
       writer = WritableStream.get_writer(transform.writable)
       writes = for index <- 1..5, do: Writer.write(writer, index)
 
@@ -384,7 +386,7 @@ defmodule Web.TransformStreamTest do
               limit <- integer(0..4),
               max_runs: 40
             ) do
-        transform = TransformStream.new(%{}, readable_strategy: CountQueuingStrategy.new(limit))
+        transform = TransformStream.new(%{}, [], CountQueuingStrategy.new(high_water_mark: limit))
         {_writer, writes, close} = write_all(transform, chunks)
         reader = ReadableStream.get_reader(transform.readable)
 
@@ -445,9 +447,10 @@ defmodule Web.TransformStreamTest do
               max_runs: 40
             ) do
         transform =
-          TransformStream.new(transformer,
-            readable_strategy: CountQueuingStrategy.new(readable_limit),
-            writable_strategy: CountQueuingStrategy.new(writable_limit)
+          TransformStream.new(
+            transformer,
+            CountQueuingStrategy.new(high_water_mark: writable_limit),
+            CountQueuingStrategy.new(high_water_mark: readable_limit)
           )
 
         reader = Task.async(fn -> Enum.to_list(transform.readable) end)
@@ -576,7 +579,7 @@ defmodule Web.TransformStreamTest do
         1
       end
 
-      transform = TransformStream.new(%{}, readable_strategy: %{high_water_mark: 2, size: size})
+      transform = TransformStream.new(%{}, [], %{high_water_mark: 2, size: size})
       writer = WritableStream.get_writer(transform.writable)
 
       assert await(Writer.write(writer, :chunk)) == :ok
@@ -629,7 +632,8 @@ defmodule Web.TransformStreamTest do
               Controller.enqueue(controller, chunk)
             end
           },
-          readable_strategy: CountQueuingStrategy.new(2)
+          [],
+          CountQueuingStrategy.new(high_water_mark: 2)
         )
 
       {_writer, _writes, _close} = write_all(transform, ["a"])
@@ -822,7 +826,7 @@ defmodule Web.TransformStreamTest do
       writer = WritableStream.get_writer(transform.writable)
 
       assert {:error, {:errored, %TypeError{message: "The transform stream was terminated."}}} =
-               WritableStream.ready(writer.controller_pid, writer.owner_pid)
+               StreamEngine.ready(writer.controller_pid, writer.owner_pid)
     end
 
     test "terminate in the function start gives a stream with no chunks" do
@@ -900,7 +904,7 @@ defmodule Web.TransformStreamTest do
       assert rejection(Writer.ready(writer)) == :no_interest
       assert rejection(Writer.closed(writer)) == :no_interest
 
-      assert WritableStream.ready(writer.controller_pid, writer.owner_pid) ==
+      assert StreamEngine.ready(writer.controller_pid, writer.owner_pid) ==
                {:error, {:errored, :no_interest}}
     end
 
@@ -952,7 +956,8 @@ defmodule Web.TransformStreamTest do
               Controller.error(controller, :failed)
             end
           },
-          readable_strategy: CountQueuingStrategy.new(1)
+          [],
+          CountQueuingStrategy.new(high_water_mark: 1)
         )
 
       writer = WritableStream.get_writer(transform.writable)
@@ -1158,7 +1163,8 @@ defmodule Web.TransformStreamTest do
             end,
             flush: fn _controller -> send(test, :flush) end
           },
-          readable_strategy: CountQueuingStrategy.new(10)
+          [],
+          CountQueuingStrategy.new(high_water_mark: 10)
         )
 
       {_writer, _writes, close} = write_all(transform, [1, 2, 3])

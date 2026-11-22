@@ -119,7 +119,11 @@ defmodule Web.TLA.PipeAbortPropertyTest do
       abort = abort_callback(test, source, kind, dest_case == :ready)
       {dest, release} = destination(dest_case, abort)
 
-      pipe = ReadableStream.pipe_to(source, dest, signal: AbortSignal.abort(:stop))
+      pipe =
+        ReadableStream.pipe_to(source, %WritableStream{controller_pid: dest},
+          signal: AbortSignal.abort(:stop)
+        )
+
       pipe_pid = slots(dest).writer_pid
 
       # AbortFirst.

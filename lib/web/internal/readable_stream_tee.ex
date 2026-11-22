@@ -80,7 +80,7 @@ defmodule Web.Internal.ReadableStreamTee do
 
   @impl true
   def init({source, caller, clone?}) do
-    case ReadableStream.get_reader(source) do
+    case ReadableStream.__get_reader__(source) do
       :ok ->
         state = %{
           source: source,

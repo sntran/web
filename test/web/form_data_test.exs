@@ -9,6 +9,7 @@ defmodule Web.FormDataTest do
   alias Web.AsyncContext
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultReader
+  alias Web.Test.StreamEngine
 
   defmodule ShutdownCallMachine do
     @behaviour :gen_statem
@@ -1274,7 +1275,7 @@ defmodule Web.FormDataTest do
                %Web.ReadableStreamDefaultController{pid: stale_stream.controller_pid}
              )
 
-    assert :done = ReadableStream.read(stale_stream.controller_pid)
+    assert :done = StreamEngine.read(stale_stream.controller_pid)
     assert :ok = ReadableStreamDefaultReader.release_lock(stale_reader)
 
     discarded_stream = ReadableStream.new()
@@ -1289,7 +1290,7 @@ defmodule Web.FormDataTest do
                %Web.ReadableStreamDefaultController{pid: discarded_stream.controller_pid}
              )
 
-    assert :done = ReadableStream.read(discarded_stream.controller_pid)
+    assert :done = StreamEngine.read(discarded_stream.controller_pid)
     assert :ok = ReadableStreamDefaultReader.release_lock(discarded_reader)
   end
 
@@ -1312,7 +1313,7 @@ defmodule Web.FormDataTest do
                %Web.ReadableStreamDefaultController{pid: closed_stream.controller_pid}
              )
 
-    assert :done = ReadableStream.read(closed_stream.controller_pid)
+    assert :done = StreamEngine.read(closed_stream.controller_pid)
     assert :ok = ReadableStreamDefaultReader.release_lock(closed_reader)
 
     # A coordinator that is gone cannot give the rest of a file part: the
@@ -1333,7 +1334,7 @@ defmodule Web.FormDataTest do
              )
 
     assert {:error, {:errored, %Web.TypeError{message: "The form data is not available." <> _}}} =
-             ReadableStream.read(dead_stream.controller_pid)
+             StreamEngine.read(dead_stream.controller_pid)
 
     assert :ok = ReadableStreamDefaultReader.release_lock(dead_reader)
   end
@@ -1367,7 +1368,7 @@ defmodule Web.FormDataTest do
                %Web.ReadableStreamDefaultController{pid: closed_stream.controller_pid}
              )
 
-    assert :done = ReadableStream.read(closed_stream.controller_pid)
+    assert :done = StreamEngine.read(closed_stream.controller_pid)
     assert :ok = ReadableStreamDefaultReader.release_lock(closed_reader)
   end
 

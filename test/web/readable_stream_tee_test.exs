@@ -388,7 +388,7 @@ defmodule Web.ReadableStreamTeeTest do
       pending = Task.async(fn -> Enum.to_list(left) end)
       await_pending_read(left)
 
-      first = ReadableStream.cancel(left.controller_pid, :one)
+      first = ReadableStream.__cancel__(left.controller_pid, :one)
       assert await(ReadableStream.cancel(right, :two)) == :ok
       assert await(first) == :ok
 
@@ -504,7 +504,7 @@ defmodule Web.ReadableStreamTeeTest do
 
       owner =
         spawn(fn ->
-          stream = ReadableStream.new(counting_source(parent), linger: 60_000)
+          stream = ReadableStream.__new__(counting_source(parent), [linger: 60_000], [])
           branches = ReadableStream.tee(stream)
           send(parent, {:tee, stream, branches, tee_process(stream)})
           Process.sleep(:infinity)

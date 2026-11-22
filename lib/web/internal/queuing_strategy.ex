@@ -5,13 +5,15 @@ defmodule Web.Internal.QueuingStrategy do
   # ExtractHighWaterMark, ExtractSizeAlgorithm, EnqueueValueWithSize,
   # DequeueValue, and the desired size.
   #
-  # A strategy is a struct of this library (`Web.CountQueuingStrategy` or
-  # `Web.ByteLengthQueuingStrategy`), or the dictionary `QueuingStrategy`
-  # of the Standard: a map or a keyword list with the keys
-  # `:high_water_mark` and `:size`.
+  # A strategy is the dictionary `QueuingStrategy` of the Standard: a map or
+  # a keyword list with the keys `:high_water_mark` and `:size`. A struct is
+  # a map: the structs of this library (`Web.CountQueuingStrategy` and
+  # `Web.ByteLengthQueuingStrategy`) have these two fields, as the objects of
+  # the Standard have the two attributes.
   #
   # The size algorithm is `:count`, `:byte_length`, or the function of the
-  # user. The stream process calls the two algorithms of the library. The
+  # user. The size functions of the two strategies of this library are
+  # `:count` and `:byte_length`: the stream process calls them. The
   # process that enqueues or writes the chunk calls the function of the
   # user, as the Standard does: thus the function can call the stream.
   #
@@ -28,25 +30,36 @@ defmodule Web.Internal.QueuingStrategy do
   @type size :: :count | :byte_length | (term() -> term())
 
   @doc false
+  # The constructors of `Web.CountQueuingStrategy` and
+  # `Web.ByteLengthQueuingStrategy`: the member `highWaterMark` of the
+  # dictionary `QueuingStrategyInit`, an unrestricted double of WebIDL. The
+  # member is required.
+  @spec init!(term()) :: Web.CountQueuingStrategy.high_water_mark()
+  def init!(init) when is_list(init) or is_map(init) do
+    case get(init, :high_water_mark) do
+      value when is_number(value) or value in [:infinity, :neg_infinity, :nan] ->
+        value
+
+      nil ->
+        raise TypeError, "The dictionary QueuingStrategyInit needs the key :high_water_mark."
+
+      value ->
+        raise TypeError, "The high water mark must be a number, got: #{inspect(value)}"
+    end
+  end
+
+  def init!(init) do
+    raise TypeError,
+          "The argument must be the dictionary QueuingStrategyInit, got: #{inspect(init)}"
+  end
+
+  @doc false
   # ExtractHighWaterMark and ExtractSizeAlgorithm. Returns
   # `{high_water_mark, size}`. Raises `Web.TypeError` for a size that is not
   # a function, and `Web.RangeError` for a high water mark that is NaN or
   # below zero.
   @spec extract!(term(), high_water_mark()) :: {high_water_mark(), size()}
   def extract!(nil, default_hwm), do: {default_hwm, :count}
-
-  def extract!(%Web.CountQueuingStrategy{high_water_mark: hwm}, default_hwm),
-    do: {high_water_mark!(hwm, default_hwm), :count}
-
-  def extract!(%Web.ByteLengthQueuingStrategy{high_water_mark: hwm}, default_hwm),
-    do: {high_water_mark!(hwm, default_hwm), :byte_length}
-
-  # A struct of the user is a strategy object: the function `size/1` of its
-  # module is its size function.
-  def extract!(%module{} = strategy, default_hwm) do
-    size = if function_exported?(module, :size, 1), do: &module.size/1, else: :count
-    {high_water_mark!(Map.get(strategy, :high_water_mark), default_hwm), size}
-  end
 
   def extract!(strategy, default_hwm) when is_list(strategy) or is_map(strategy) do
     size = size!(get(strategy, :size))
@@ -57,11 +70,27 @@ defmodule Web.Internal.QueuingStrategy do
     raise TypeError, "Invalid queuing strategy: #{inspect(strategy)}"
   end
 
-  defp get(strategy, key) when is_list(strategy), do: Keyword.get(strategy, key)
+  # A list that is not a keyword list has no member.
+  defp get(strategy, key) when is_list(strategy) do
+    case List.keyfind(strategy, key, 0) do
+      {^key, value} -> value
+      nil -> nil
+    end
+  end
+
   defp get(strategy, key), do: Map.get(strategy, key)
 
+  # The size functions of the strategies of this library run in the stream
+  # process.
   defp size!(nil), do: :count
-  defp size!(size) when is_function(size, 1), do: size
+
+  defp size!(size) when is_function(size, 1) do
+    cond do
+      size == (&Web.CountQueuingStrategy.__size__/1) -> :count
+      size == (&Web.ByteLengthQueuingStrategy.__size__/1) -> :byte_length
+      true -> size
+    end
+  end
 
   defp size!(size) do
     raise TypeError, "The size of a queuing strategy must be a function, got: #{inspect(size)}"
@@ -92,7 +121,7 @@ defmodule Web.Internal.QueuingStrategy do
   # stacktrace}`.
   @spec call(size(), term()) :: {:ok, term()} | {:thrown, atom(), term(), list()}
   def call(:count, _chunk), do: {:ok, 1}
-  def call(:byte_length, chunk), do: call(&Web.ByteLengthQueuingStrategy.size/1, chunk)
+  def call(:byte_length, chunk), do: call(&Web.ByteLengthQueuingStrategy.__size__/1, chunk)
 
   def call(size, chunk) when is_function(size, 1) do
     {:ok, size.(chunk)}

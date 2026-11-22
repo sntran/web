@@ -335,7 +335,7 @@ defmodule Web.BodyStandardTest do
       chunk = Uint8Array.from("abc")
       stream = stream_of([chunk])
 
-      for branch <- ReadableStream.tee(Web.ReadableStream.__with_process__(stream).controller_pid) do
+      for branch <- ReadableStream.tee(Web.ReadableStream.__with_process__(stream)) do
         assert Enum.to_list(branch) == [chunk]
       end
     end

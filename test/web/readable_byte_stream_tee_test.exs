@@ -194,7 +194,7 @@ defmodule Web.ReadableByteStreamTeeTest do
       right_ref = start_read(fn -> BYOBReader.read(right_reader, view(2)) end)
 
       # A cancel with no lock check: the cancel of a reader.
-      :ok = await(ReadableStream.cancel(stream.controller_pid, :stop))
+      :ok = await(ReadableStream.__cancel__(stream.controller_pid, :stop))
 
       # The cancel dropped the buffer of the read of the stream: the left
       # read ends with a new buffer of the same size.

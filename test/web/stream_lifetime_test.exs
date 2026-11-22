@@ -5,6 +5,8 @@ defmodule Web.StreamLifetimeTest do
 
   use Web
 
+  alias Web.Test.StreamEngine
+
   @linger 100
   @count 200
   @tolerance 20
@@ -196,9 +198,10 @@ defmodule Web.StreamLifetimeTest do
       owner =
         spawn(fn ->
           stream =
-            ReadableStream.new(
+            ReadableStream.__new__(
               %{cancel: fn reason -> send(parent, {:cancelled, reason}) end},
-              linger: 60_000
+              [linger: 60_000],
+              []
             )
 
           send(parent, {:stream, stream})
@@ -218,14 +221,15 @@ defmodule Web.StreamLifetimeTest do
       owner =
         spawn(fn ->
           stream =
-            ReadableStream.new(
+            ReadableStream.__new__(
               %{
                 pull: fn controller ->
                   ReadableStreamDefaultController.enqueue(controller, "x")
                 end,
                 cancel: fn reason -> send(parent, {:cancelled, reason}) end
               },
-              linger: 60_000
+              [linger: 60_000],
+              []
             )
 
           send(parent, {:stream, stream})
@@ -272,7 +276,7 @@ defmodule Web.StreamLifetimeTest do
     end
 
     test "goes to the errored state and stops when no process reads it" do
-      stream = ReadableStream.new(counting_source(self()), unread_timeout: 50)
+      stream = ReadableStream.__new__(counting_source(self()), [unread_timeout: 50], [])
 
       assert_receive {:cancelled, %TypeError{message: message}}, 2_000
       assert message =~ "The stream was not read in 50 ms"
@@ -287,7 +291,7 @@ defmodule Web.StreamLifetimeTest do
     end
 
     test "continues when a process started to read it" do
-      stream = ReadableStream.new(counting_source(self()), unread_timeout: 50)
+      stream = ReadableStream.__new__(counting_source(self()), [unread_timeout: 50], [])
       reader = ReadableStream.get_reader(stream)
       assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "x", done: false}
 
@@ -296,7 +300,7 @@ defmodule Web.StreamLifetimeTest do
     end
 
     test "continues while a process holds its lock" do
-      stream = ReadableStream.new(counting_source(self()), unread_timeout: 50)
+      stream = ReadableStream.__new__(counting_source(self()), [unread_timeout: 50], [])
       _reader = ReadableStream.get_reader(stream)
 
       refute_receive {:cancelled, _reason}, 200
@@ -456,9 +460,7 @@ defmodule Web.StreamLifetimeTest do
       sink = WritableStream.new()
 
       assert %TypeError{message: message} =
-               catch_exit(
-                 await(ReadableStream.pipe_to(source.controller_pid, sink.controller_pid))
-               )
+               catch_exit(await(ReadableStream.pipe_to(source, sink)))
 
       assert message =~ "The stream is not available"
     end
@@ -471,9 +473,7 @@ defmodule Web.StreamLifetimeTest do
       source = ReadableStream.from(["a"])
 
       assert %TypeError{message: message} =
-               catch_exit(
-                 await(ReadableStream.pipe_to(source.controller_pid, sink.controller_pid))
-               )
+               catch_exit(await(ReadableStream.pipe_to(source, sink)))
 
       assert message =~ "The stream is not available"
     end
@@ -538,13 +538,12 @@ defmodule Web.StreamLifetimeTest do
       assert_down(stream.controller_pid)
 
       refute WritableStream.locked?(stream)
-      refute WritableStream.backpressure?(stream)
-      assert WritableStream.desired_size(stream) == nil
+      assert StreamEngine.desired_size(stream) == nil
       assert WritableStreamDefaultWriter.desired_size(writer) == nil
       assert WritableStreamDefaultWriter.release_lock(writer) == :ok
       assert await(WritableStream.close(stream)) == :ok
       assert await(WritableStream.abort(stream, :late)) == :ok
-      assert WritableStream.ready(stream.controller_pid) == {:error, :released}
+      assert StreamEngine.ready(stream.controller_pid, self()) == {:error, :released}
 
       assert %TypeError{message: message} =
                catch_exit(await(WritableStreamDefaultWriter.write(writer, "late")))

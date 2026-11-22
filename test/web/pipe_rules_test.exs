@@ -14,6 +14,7 @@ defmodule Web.PipeRulesTest do
   alias Web.Internal.ReadableStreamPipe
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController, as: Source
+  alias Web.Test.StreamEngine
   alias Web.TypeError
   alias Web.WritableStream
   alias Web.WritableStreamDefaultController, as: Sink
@@ -42,6 +43,8 @@ defmodule Web.PipeRulesTest do
   # A sink that waits for `{:result, value}` before it completes a write.
   # The test gets its controller.
   defp sink(test, extra \\ %{}) do
+    {high_water_mark, extra} = Map.pop(extra, :high_water_mark, 1)
+
     stream =
       WritableStream.new(
         Map.merge(
@@ -59,7 +62,8 @@ defmodule Web.PipeRulesTest do
             abort: fn reason -> send(test, {:abort, reason}) end
           },
           extra
-        )
+        ),
+        high_water_mark: high_water_mark
       )
 
     assert_receive {:sink, controller}
@@ -179,7 +183,7 @@ defmodule Web.PipeRulesTest do
       assert_receive {:close, sink_worker}
       assert :ok = Writer.release_lock(writer)
 
-      pipe = ReadableStream.pipe_to(source, dest, preventCancel: true)
+      pipe = ReadableStream.pipe_to(source, dest, prevent_cancel: true)
       assert %TypeError{} = rejection(pipe)
       refute_received {:cancel, _reason}
 
@@ -207,7 +211,7 @@ defmodule Web.PipeRulesTest do
       {source, _controller} = source(test)
       {dest, sink} = sink(test)
 
-      pipe = ReadableStream.pipe_to(source, dest, preventCancel: true)
+      pipe = ReadableStream.pipe_to(source, dest, prevent_cancel: true)
       waits_for_read(source)
 
       assert :ok = Sink.error(sink, :boom)
@@ -249,7 +253,7 @@ defmodule Web.PipeRulesTest do
         {source, controller} = source(test)
         {dest, _sink} = sink(test, %{high_water_mark: 0})
 
-        pipe = ReadableStream.pipe_to(source, dest, preventAbort: prevent_abort)
+        pipe = ReadableStream.pipe_to(source, dest, prevent_abort: prevent_abort)
         waits_for_ready(dest)
 
         assert :ok = Source.error(controller, :boom)
@@ -321,7 +325,7 @@ defmodule Web.PipeRulesTest do
       {source, controller} = source(test)
       {dest, _sink} = sink(test, %{high_water_mark: 3})
 
-      pipe = ReadableStream.pipe_to(source, dest, preventAbort: true)
+      pipe = ReadableStream.pipe_to(source, dest, prevent_abort: true)
       pipe_pid = pipe_process(source)
       assert :ok = Source.enqueue(controller, "a")
       assert_receive {:write, worker, "a"}
@@ -363,7 +367,7 @@ defmodule Web.PipeRulesTest do
       {source, controller} = source(test)
       {dest, _sink} = sink(test, %{high_water_mark: 2})
 
-      pipe = ReadableStream.pipe_to(source, dest, preventAbort: true)
+      pipe = ReadableStream.pipe_to(source, dest, prevent_abort: true)
       pipe_pid = pipe_process(source)
       assert :ok = Source.enqueue(controller, "a")
       assert_receive {:write, worker, "a"}
@@ -417,12 +421,14 @@ defmodule Web.PipeRulesTest do
         test = self()
 
         dest =
-          WritableStream.new(%{
-            high_water_mark: high_water_mark,
-            write: fn chunk, controller ->
-              send(test, {:written, chunk, Sink.desired_size(controller)})
-            end
-          })
+          WritableStream.new(
+            %{
+              write: fn chunk, controller ->
+                send(test, {:written, chunk, StreamEngine.desired_size(controller)})
+              end
+            },
+            high_water_mark: high_water_mark
+          )
 
         assert :ok = await(ReadableStream.pipe_to(ReadableStream.from(chunks), dest))
 
@@ -486,7 +492,7 @@ defmodule Web.PipeRulesTest do
       abort_controller = AbortController.new()
 
       pipe =
-        ReadableStream.pipe_to(source, dest, signal: abort_controller.signal, preventAbort: true)
+        ReadableStream.pipe_to(source, dest, signal: abort_controller.signal, prevent_abort: true)
 
       waits_for_read(source)
 

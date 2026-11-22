@@ -1,23 +1,10 @@
 defmodule Web.DSL do
-  @moduledoc """
-  Defines macros for the Web DSL.
-  """
+  @moduledoc false
 
-  @doc """
-  DSL helper to create new Web objects with a constructor-style syntax.
+  # The macro `new/2` of `use Web`: `new URL, "https://example.com"` is
+  # `Web.URL.new("https://example.com")`. No Standard has it.
 
-  ## Examples
-
-      iex> use Web
-      iex> url = new URL, "https://example.com"
-      iex> url.hostname
-      "example.com"
-
-      iex> use Web
-      iex> req = new Request, "http://api.internal"
-      iex> req.url.hostname
-      "api.internal"
-  """
+  @doc false
   defmacro new(module, source) do
     quote do
       unquote(module).new(unquote(source))

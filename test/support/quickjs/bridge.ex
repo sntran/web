@@ -882,12 +882,12 @@ defmodule Web.Test.QuickJS.Bridge do
         [] -> {nil, nil}
       end
 
-    options = [
-      writable_strategy: strategy_options([writable]),
-      readable_strategy: strategy_options([readable])
-    ]
-
-    {:ok, Web.TransformStream.new(transformer, options)}
+    {:ok,
+     Web.TransformStream.new(
+       transformer,
+       strategy_options([writable]),
+       strategy_options([readable])
+     )}
   end
 
   defp adapt("ReadableStreamDefaultReader", "constructor", _member, _self, [stream]),
@@ -899,11 +899,15 @@ defmodule Web.Test.QuickJS.Bridge do
   defp adapt("WritableStreamDefaultWriter", "constructor", _member, _self, [stream]),
     do: {:ok, Web.WritableStream.get_writer(stream)}
 
-  defp adapt("ByteLengthQueuingStrategy", "constructor", _member, _self, [%{high_water_mark: hwm}]),
-       do: {:ok, Web.ByteLengthQueuingStrategy.new(hwm)}
-
-  defp adapt("CountQueuingStrategy", "constructor", _member, _self, [%{high_water_mark: hwm}]),
-    do: {:ok, Web.CountQueuingStrategy.new(hwm)}
+  # The attribute `size` of a strategy is a field of the struct: each
+  # strategy has the same function. The layer calls it with the arguments
+  # of the JavaScript call, and an argument that the call does not give is
+  # `undefined`.
+  defp adapt(interface, "static", "size", _self, args)
+       when interface in ["ByteLengthQueuingStrategy", "CountQueuingStrategy"] do
+    %{size: size} = struct(Map.fetch!(@interfaces, interface))
+    {:ok, size.(List.first(args))}
+  end
 
   # The dictionaries of options are keyword lists in the library.
   defp adapt("ReadableStream", "operation", "getReader", self, [options]),

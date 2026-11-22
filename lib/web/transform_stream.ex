@@ -21,7 +21,7 @@ defmodule Web.TransformStream do
 
   Do not await a write before a process reads the readable side. Write and
   close with no await, or read in a different process, or use
-  `Web.ReadableStream.pipe_through/2`.
+  `Web.ReadableStream.pipe_through/3`.
 
   ## The two sides
 
@@ -222,7 +222,8 @@ defmodule Web.TransformStream do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Makes a transform stream.
+  Makes a transform stream, as
+  `new TransformStream(transformer, writableStrategy, readableStrategy)`.
 
   ## The transformer
 
@@ -240,20 +241,15 @@ defmodule Web.TransformStream do
   A value that `transform` or `flush` throws puts the two sides in the
   errored state. A value that `start` throws is thrown by this function.
 
-  ## Options
+  ## The queuing strategies
 
-    * `:writable_strategy` - the queuing strategy of the writable side. The
-      default is `Web.CountQueuingStrategy.new(1)`.
-    * `:readable_strategy` - the queuing strategy of the readable side. The
-      default is `Web.CountQueuingStrategy.new(0)`.
-    * `:high_water_mark` - the limit of the writable side, when
-      `:writable_strategy` is not given.
-
-  A strategy is a `Web.CountQueuingStrategy`, a
-  `Web.ByteLengthQueuingStrategy`, or the dictionary `QueuingStrategy` of
-  the Streams Standard: a keyword list or a map with the keys
-  `:high_water_mark` and `:size`. See `Web.ReadableStream.new/2` and
-  `Web.WritableStream.new/2`.
+  `writable_strategy` is the queuing strategy of the writable side, and
+  `readable_strategy` is the queuing strategy of the readable side. A
+  strategy is the dictionary `QueuingStrategy` of the Streams Standard: a
+  keyword list or a map with the keys `:high_water_mark` and `:size`, or a
+  `Web.CountQueuingStrategy` or a `Web.ByteLengthQueuingStrategy`. See
+  `Web.ReadableStream.new/2` and `Web.WritableStream.new/2`. The default
+  high water mark is 1 for the writable side, and 0 for the readable side.
 
   Raises `Web.TypeError` for a transformer that is not a map, or for a
   callback that is not a function with the correct number of arguments.
@@ -261,28 +257,20 @@ defmodule Web.TransformStream do
   `:writable_type`, and for a high water mark that is NaN or below zero, as
   the Streams Standard specifies.
   """
-  @spec new(map(), keyword()) :: t()
-  def new(transformer \\ %{}, opts \\ []) do
+  @spec new(map(), keyword() | map(), keyword() | map()) :: t()
+  def new(transformer \\ %{}, writable_strategy \\ [], readable_strategy \\ []) do
+    __new__(transformer, writable_strategy, readable_strategy, [])
+  end
+
+  @doc false
+  # `new/3` with the options of the engine that no public function has. Each
+  # option goes to the two sides.
+  def __new__(transformer, writable_strategy, readable_strategy, opts) when is_list(opts) do
     :ok = validate_transformer!(transformer)
-
-    {readable_hwm, readable_size} =
-      QueuingStrategy.extract!(Keyword.get(opts, :readable_strategy), 0)
-
-    {writable_hwm, writable_size} =
-      QueuingStrategy.extract!(
-        Keyword.get(opts, :writable_strategy),
-        Keyword.get(opts, :high_water_mark, 1)
-      )
-
-    writable_hwm = QueuingStrategy.high_water_mark!(writable_hwm, 1)
+    {readable_hwm, readable_size} = QueuingStrategy.extract!(readable_strategy, 0)
+    {writable_hwm, writable_size} = QueuingStrategy.extract!(writable_strategy, 1)
     start_fn = Map.get(transformer, :start)
-
-    # The options of the engine for each side. Each other option goes to
-    # the two sides.
-    opts =
-      opts
-      |> Keyword.drop([:writable_strategy, :readable_strategy, :high_water_mark])
-      |> Keyword.merge(transformer: transformer, has_start: is_function(start_fn))
+    opts = Keyword.merge(opts, transformer: transformer, has_start: is_function(start_fn))
 
     # InitializeTransformStream. The two sides share [[backpressure]]: see
     # "The two sides of a transform stream" in `Web.Stream`. The readable
@@ -296,7 +284,7 @@ defmodule Web.TransformStream do
           [
             transform: {:writable, backpressure, default_transform?(transformer, readable_size)},
             high_water_mark: writable_hwm,
-            strategy: Web.CountQueuingStrategy.new(writable_hwm),
+            strategy: %Web.CountQueuingStrategy{high_water_mark: writable_hwm},
             size: writable_size
           ]
       )
@@ -307,7 +295,7 @@ defmodule Web.TransformStream do
           [
             transform: {:readable, writable, backpressure},
             high_water_mark: readable_hwm,
-            strategy: Web.CountQueuingStrategy.new(readable_hwm),
+            strategy: %Web.CountQueuingStrategy{high_water_mark: readable_hwm},
             size: readable_size
           ]
       )

@@ -61,7 +61,8 @@ defmodule Web.Test.QuickJS.Bridge do
   #   * `getSetCookie` is `get_set_cookie`, and a boolean can end with `?`;
   #   * the setter of an attribute is `name/2` or `set_name/2`;
   #   * the getter of an attribute is `name/1`, or a field of the struct;
-  #   * the pairs of an iterable come from `entries/1` or `to_list/1`;
+  #   * the pairs of an iterable come from `entries/1`, or from the
+  #     `Enumerable` protocol;
   #   * an optional argument that the test does not give is not given to the
   #     library, or is `nil` when the library has no function without it.
   #
@@ -806,8 +807,13 @@ defmodule Web.Test.QuickJS.Bridge do
     apply_first(module, [{name, [self, value]}, {"set_" <> name, [self, value]}])
   end
 
-  defp invoke("iterate", module, _member, self, [], _count),
-    do: apply_first(module, [{"entries", [self]}, {"to_list", [self]}])
+  # The pairs of an iterable: `entries/1`, or the `Enumerable` protocol.
+  defp invoke("iterate", module, _member, self, [], _count) do
+    case apply_first(module, [{"entries", [self]}]) do
+      {:missing, _} = missing -> if Enumerable.impl_for(self), do: {:ok, self}, else: missing
+      found -> found
+    end
+  end
 
   defp invoke("stringify", module, _member, self, [], _count) do
     case apply_first(module, [{"to_string", [self]}, {"href", [self]}]) do
@@ -990,12 +996,6 @@ defmodule Web.Test.QuickJS.Bridge do
     {:ok, Web.AbortSignal.throw_if_aborted(self)}
   catch
     :error, reason when not is_exception(reason) -> throw(reason)
-  end
-
-  # The base URL of a pattern string is an option of the library.
-  defp adapt("URLPattern", "constructor", _member, _self, [input, base, options])
-       when is_binary(base) do
-    {:ok, Web.URLPattern.new(input, Map.put(options, :base_url, base))}
   end
 
   defp adapt(_interface, _kind, _member, _self, _args), do: :default

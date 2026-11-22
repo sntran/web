@@ -29,7 +29,16 @@ defmodule AsyncRuntimePowerExample do
       Console.group("Secure Compressed Proxy")
 
       try do
-        form = FormData.parse(upload_stream(boundary), boundary, signal: controller.signal)
+        request =
+          Request.new("https://example.com/upload",
+            method: "POST",
+            headers: %{"content-type" => "multipart/form-data; boundary=#{boundary}"},
+            body: upload_stream(boundary),
+            duplex: "half",
+            signal: controller.signal
+          )
+
+        form = await(Request.form_data(request))
         parent = self()
         snapshot = AsyncContext.Snapshot.take()
 

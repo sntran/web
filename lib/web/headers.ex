@@ -140,14 +140,22 @@ defmodule Web.Headers do
   end
 
   @doc """
-  Returns a header value as a single string.
+  Returns the values of a header name as one string, joined with `", "`,
+  as `get()` of the Fetch Standard. Returns `nil` (null) when the headers
+  do not have the name.
+
+  ## Examples
+
+      iex> headers = Web.Headers.new([{"accept", "text/html"}, {"Accept", "*/*"}])
+      iex> {Web.Headers.get(headers, "ACCEPT"), Web.Headers.get(headers, "x-missing")}
+      {"text/html, */*", nil}
   """
-  @spec get(t(), term(), term()) :: String.t() | term()
-  def get(%__MODULE__{data: data}, name, default \\ nil) do
+  @spec get(t(), term()) :: String.t() | nil
+  def get(%__MODULE__{data: data}, name) do
     normalized_name = normalize_name(name)
 
     case Map.get(data, normalized_name) do
-      nil -> default
+      nil -> nil
       values -> join_values(normalized_name, values)
     end
   end
@@ -159,8 +167,6 @@ defmodule Web.Headers do
   def get_set_cookie(%__MODULE__{data: data}) do
     Map.get(data, @set_cookie, [])
   end
-
-  def unquote(:getSetCookie)(headers), do: get_set_cookie(headers)
 
   @doc """
   Returns whether a header exists.
@@ -192,9 +198,9 @@ defmodule Web.Headers do
 
   defp check_guard!(_headers), do: :ok
 
-  @doc """
-  Converts headers into a raw list of repeated tuples.
-  """
+  @doc false
+  # The header list with one tuple for each value, and no join of the
+  # values. The HTTP client sends each tuple as a field.
   @spec to_list(t()) :: [{String.t(), String.t()}]
   def to_list(%__MODULE__{data: data}) do
     data

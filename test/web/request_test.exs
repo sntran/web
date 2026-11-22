@@ -58,7 +58,8 @@ defmodule Web.RequestTest do
                "content-type" => "text/plain;charset=UTF-8"
              })
 
-    assert req.dispatcher == MyDispatcher
+    # A key that `RequestInit` does not have changes no field.
+    assert req.dispatcher == nil
     assert req.redirect == "manual"
     assert req.signal == self()
     assert req.options[:extra_option] == true
@@ -614,7 +615,7 @@ defmodule Web.RequestTest do
           Request.new("https://example.com/", method: "POST", body: body, duplex: "half")
         end
 
-        assert_raise TypeError, ~r/already used or locked/, fn -> Web.Response.new(body: body) end
+        assert_raise TypeError, ~r/already used or locked/, fn -> Web.Response.new(body) end
       end
     end
   end

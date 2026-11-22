@@ -199,7 +199,7 @@ defmodule Web.ReadableStreamPropertyTest do
   property "a body gives the bytes of its chunks" do
     check all(chunks <- chunks()) do
       bytes = IO.iodata_to_binary(chunks)
-      response = fn -> Response.new(body: ReadableStream.from(Stream.map(chunks, & &1))) end
+      response = fn -> Response.new(ReadableStream.from(Stream.map(chunks, & &1))) end
 
       assert await(Response.array_buffer(response.())).data == bytes
       assert await(Response.blob(response.())).size == byte_size(bytes)
@@ -212,7 +212,7 @@ defmodule Web.ReadableStreamPropertyTest do
             sizes <- list_of(integer(0..5), max_length: 8)
           ) do
       parts = split(text, sizes)
-      response = Response.new(body: ReadableStream.from(Stream.map(parts, & &1)))
+      response = Response.new(ReadableStream.from(Stream.map(parts, & &1)))
 
       assert await(Response.text(response)) == text
     end
@@ -220,7 +220,7 @@ defmodule Web.ReadableStreamPropertyTest do
 
   property "a clone of a response gives the same body two times" do
     check all(text <- string(:utf8, max_length: 30), max_runs: 30) do
-      {first, second} = Response.clone(Response.new(body: text))
+      {first, second} = Response.clone(Response.new(text))
 
       assert await(Response.text(first)) == text
       assert await(Response.text(second)) == text

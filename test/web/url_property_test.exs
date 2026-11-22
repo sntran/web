@@ -315,7 +315,7 @@ defmodule Web.URLPropertyTest do
       params = URLSearchParams.new(pairs)
 
       assert URLSearchParams.has(params, name, value) == {name, value} in pairs
-      assert URLSearchParams.has(params, name, nil) == URLSearchParams.has?(params, name)
+      assert URLSearchParams.has(params, name, nil) == URLSearchParams.has(params, name)
 
       assert URLSearchParams.to_list(URLSearchParams.delete(params, name, value)) ==
                Enum.reject(pairs, &(&1 == {name, value}))

@@ -85,7 +85,7 @@ defmodule Web.FetchHTTPProtocolsTest do
     {:ok, _pid} = Supervisor.restart_child(Web.Supervisor, Web.Dispatcher.HTTP)
   end
 
-  defp version(response), do: Headers.get(response.headers, "x-http-version", nil)
+  defp version(response), do: Headers.get(response.headers, "x-http-version")
 
   describe "the default" do
     test "is HTTP/1.1, and the status text comes from the table", %{base: base} do

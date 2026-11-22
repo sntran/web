@@ -4,6 +4,13 @@ defmodule Web.URL do
 
   Provides a pure data structure representing a URL, compatible with both standard URLs
   and RClone-style URLs.
+
+  ## The attributes
+
+  Each attribute of the `URL` class has a getter `name/1`, for example
+  `hostname/1`. Each attribute that the Standard lets you set also has a
+  setter `name/2`, for example `hostname/2`. A setter returns the new URL.
+  The fields of the struct are internal: use the functions.
   """
 
   defguardp alpha?(char) when char in ?A..?Z or char in ?a..?z
@@ -199,16 +206,17 @@ defmodule Web.URL do
   def protocol(%__MODULE__{} = url), do: url.protocol
 
   @doc """
-  Sets the protocol of the URL.
+  Sets the protocol of the URL, as the setter of the attribute `protocol`.
+  A value that is not valid gives the URL with no change.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com")
-      iex> Web.URL.set_protocol(url, "ftp") |> Web.URL.protocol()
+      iex> Web.URL.protocol(url, "ftp") |> Web.URL.protocol()
       "ftp:"
   """
-  @spec set_protocol(t(), String.t()) :: t()
-  def set_protocol(%__MODULE__{} = url, value) do
+  @spec protocol(t(), String.t()) :: t()
+  def protocol(%__MODULE__{} = url, value) do
     protocol =
       value
       |> to_string()
@@ -259,6 +267,10 @@ defmodule Web.URL do
     maybe_bracket_ipv6(hostname) <> ":" <> port
   end
 
+  @doc """
+  Sets the host and the port of the URL, as the setter of the attribute
+  `host`. A value that is not valid gives the URL with no change.
+  """
   @spec host(t(), String.t()) :: t()
   def host(%__MODULE__{} = url, value) do
     candidate =
@@ -299,16 +311,17 @@ defmodule Web.URL do
   def hostname(%__MODULE__{} = url), do: maybe_bracket_ipv6(url.hostname)
 
   @doc """
-  Sets the hostname portion of the URL.
+  Sets the hostname of the URL, as the setter of the attribute `hostname`.
+  A value that is not valid gives the URL with no change.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com")
-      iex> Web.URL.set_hostname(url, "google.com") |> Web.URL.hostname()
+      iex> Web.URL.hostname(url, "google.com") |> Web.URL.hostname()
       "google.com"
   """
-  @spec set_hostname(t(), String.t()) :: t()
-  def set_hostname(%__MODULE__{} = url, value) do
+  @spec hostname(t(), String.t()) :: t()
+  def hostname(%__MODULE__{} = url, value) do
     candidate =
       value
       |> to_string()
@@ -338,10 +351,12 @@ defmodule Web.URL do
   def username(%__MODULE__{} = url), do: url.username
 
   @doc """
-  Sets the username portion of the URL using URL userinfo percent-encoding.
+  Sets the username of the URL, as the setter of the attribute `username`.
+  The value gets the percent-encoding of the userinfo. A URL that cannot
+  have credentials does not change.
   """
-  @spec set_username(t(), String.t()) :: t()
-  def set_username(%__MODULE__{} = url, value) do
+  @spec username(t(), String.t()) :: t()
+  def username(%__MODULE__{} = url, value) do
     if url.protocol != "file:" and has_authority?(url) and url.hostname != "" do
       encoded = Encoding.encode_userinfo_component(value)
 
@@ -363,10 +378,12 @@ defmodule Web.URL do
   def password(%__MODULE__{} = url), do: url.password
 
   @doc """
-  Sets the password portion of the URL using URL userinfo percent-encoding.
+  Sets the password of the URL, as the setter of the attribute `password`.
+  The value gets the percent-encoding of the userinfo. A URL that cannot
+  have credentials does not change.
   """
-  @spec set_password(t(), String.t()) :: t()
-  def set_password(%__MODULE__{} = url, value) do
+  @spec password(t(), String.t()) :: t()
+  def password(%__MODULE__{} = url, value) do
     if url.protocol != "file:" and has_authority?(url) and url.hostname != "" do
       encoded = Encoding.encode_userinfo_component(value)
 
@@ -394,16 +411,17 @@ defmodule Web.URL do
   def port(%__MODULE__{} = url), do: url.port
 
   @doc """
-  Sets the port portion of the URL.
+  Sets the port of the URL, as the setter of the attribute `port`. The
+  empty string removes the port. An integer is the same as its text.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com")
-      iex> Web.URL.set_port(url, 8080) |> Web.URL.port()
+      iex> Web.URL.port(url, 8080) |> Web.URL.port()
       "8080"
   """
-  @spec set_port(t(), String.t() | integer() | nil) :: t()
-  def set_port(%__MODULE__{} = url, value) do
+  @spec port(t(), String.t() | integer() | nil) :: t()
+  def port(%__MODULE__{} = url, value) do
     if url.protocol == "file:" or url.hostname == "" do
       %{url | kind: :standard, port: ""}
     else
@@ -439,16 +457,17 @@ defmodule Web.URL do
   def pathname(%__MODULE__{} = url), do: url.pathname
 
   @doc """
-  Sets the pathname portion of the URL.
+  Sets the pathname of the URL, as the setter of the attribute `pathname`.
+  A URL with an opaque path does not change.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com")
-      iex> Web.URL.set_pathname(url, "new-path") |> Web.URL.pathname()
+      iex> Web.URL.pathname(url, "new-path") |> Web.URL.pathname()
       "/new-path"
   """
-  @spec set_pathname(t(), String.t()) :: t()
-  def set_pathname(%__MODULE__{} = url, value) do
+  @spec pathname(t(), String.t()) :: t()
+  def pathname(%__MODULE__{} = url, value) do
     if opaque_path_url?(url) do
       url
     else
@@ -482,6 +501,10 @@ defmodule Web.URL do
     end
   end
 
+  @doc """
+  Sets the query of the URL, as the setter of the attribute `search`. The
+  empty string removes the query.
+  """
   @spec search(t(), String.t()) :: t()
   def search(%__MODULE__{} = url, value) do
     normalized = value |> to_string() |> Encoding.strip_ascii_tab_and_newline()
@@ -520,6 +543,10 @@ defmodule Web.URL do
   def hash(%__MODULE__{fragment: fragment}) when fragment in [nil, ""], do: ""
   def hash(%__MODULE__{fragment: fragment}), do: "#" <> fragment
 
+  @doc """
+  Sets the fragment of the URL, as the setter of the attribute `hash`. The
+  empty string removes the fragment.
+  """
   @spec hash(t(), String.t()) :: t()
   def hash(%__MODULE__{} = url, value) do
     case value |> to_string() |> Encoding.strip_ascii_tab_and_newline() do
@@ -585,6 +612,9 @@ defmodule Web.URL do
   @spec search_params(t()) :: Web.URLSearchParams.t()
   def search_params(%__MODULE__{} = url), do: url.search_params
 
+  @doc false
+  # `true` for an rclone URL, such as `remote:path`. The dispatcher of
+  # `Web.fetch/2` uses it.
   @spec rclone?(t()) :: boolean()
   def rclone?(%__MODULE__{} = url), do: url.kind == :rclone
 

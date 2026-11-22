@@ -11,13 +11,13 @@ defmodule Web.FormData do
   encoded as `multipart/form-data`, as the HTML Standard specifies, and the
   header `content-type` gets the boundary of the form:
 
-      iex> form = Web.FormData.new(boundary: "example") |> Web.FormData.append("name", "value")
-      iex> response = Web.Response.new(body: form)
-      iex> Web.Headers.get(response.headers, "content-type", nil)
-      "multipart/form-data; boundary=example"
+      iex> form = Web.FormData.new() |> Web.FormData.append("name", "value")
+      iex> response = Web.Response.new(form)
+      iex> headers = response.headers
+      iex> "multipart/form-data; boundary=" <> boundary = Web.Headers.get(headers, "content-type")
       iex> text = Web.await(Web.Response.text(response))
-      iex> String.split(text, "\\r\\n")
-      ["--example", ~s(Content-Disposition: form-data; name="name"), "", "value", "--example--", ""]
+      iex> String.split(text, "\\r\\n") -- ["--" <> boundary, "--" <> boundary <> "--"]
+      [~s(Content-Disposition: form-data; name="name"), "", "value", ""]
 
   The bytes of a file are read from its stream chunk by chunk. A form with
   all its data in memory has a content length, and `Web.fetch/2` can send it
@@ -49,13 +49,15 @@ defmodule Web.FormData do
   defstruct entries: [], boundary: nil, coordinator: nil
 
   @doc """
-  Creates a new FormData container.
+  Creates a new FormData with no entries, as `new FormData()` of the
+  XMLHttpRequest Standard. A server runtime has no form element, thus the
+  constructor has no arguments.
+
+  The form gets a new random boundary for its `multipart/form-data`
+  encoding.
   """
-  @spec new(keyword()) :: t()
-  def new(opts \\ []) do
-    boundary = Keyword.get(opts, :boundary, default_boundary())
-    %__MODULE__{entries: [], boundary: normalize_boundary(boundary)}
-  end
+  @spec new() :: t()
+  def new, do: %__MODULE__{entries: [], boundary: default_boundary()}
 
   @doc """
   Appends a value for a field name.
@@ -170,15 +172,16 @@ defmodule Web.FormData do
   end
 
   @doc """
-  Returns whether the field name exists.
+  Returns `true` if an entry has the name, as `has()` of the
+  XMLHttpRequest Standard.
   """
-  @spec has?(t(), term()) :: boolean()
-  def has?(%__MODULE__{coordinator: pid}, name) when is_pid(pid) do
+  @spec has(t(), term()) :: boolean()
+  def has(%__MODULE__{coordinator: pid}, name) when is_pid(pid) do
     normalized_name = to_string(name)
     Parser.has?(pid, normalized_name)
   end
 
-  def has?(%__MODULE__{} = form, name) do
+  def has(%__MODULE__{} = form, name) do
     not is_nil(get(form, name))
   end
 
@@ -190,9 +193,10 @@ defmodule Web.FormData do
     form
   end
 
-  @doc """
-  Parses a multipart/form-data body into a live-backed FormData container.
-  """
+  @doc false
+  # Parses a `multipart/form-data` body into a form that a coordinator
+  # process backs: the step of `formData()` of the Fetch Standard for a
+  # multipart body. See `Web.Request.form_data/1`.
   @spec parse(Web.ReadableStream.t() | binary() | iodata(), String.t(), keyword()) :: t()
   def parse(stream_or_binary, boundary, opts \\ []) do
     normalized_boundary = normalize_boundary(boundary)
@@ -215,18 +219,6 @@ defmodule Web.FormData do
     end
   end
 
-  @doc """
-  Cancels a live-backed FormData coordinator and all open child streams.
-  """
-  @spec cancel(t(), term()) :: :ok
-  def cancel(form, reason \\ :cancelled)
-
-  def cancel(%__MODULE__{coordinator: pid}, reason) when is_pid(pid) do
-    Parser.cancel(pid, reason)
-  end
-
-  def cancel(%__MODULE__{}, _reason), do: :ok
-
   @doc false
   # Returns `true` if the form can be encoded more than one time: its
   # entries are in memory, and no file has a stream that can be read only
@@ -242,9 +234,8 @@ defmodule Web.FormData do
 
   def static?(%__MODULE__{}), do: false
 
-  @doc """
-  Returns the multipart Content-Type header value for this form.
-  """
+  @doc false
+  # The value of the header `content-type` for the body of the form.
   @spec content_type(t()) :: String.t()
   def content_type(%__MODULE__{boundary: boundary}) do
     "multipart/form-data; boundary=" <> boundary

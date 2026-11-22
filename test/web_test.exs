@@ -6,7 +6,6 @@ defmodule WebTest do
   doctest Web
   doctest Web.AbortController
   doctest Web.AbortSignal
-  doctest Web.Body
   doctest Web.ArrayBuffer
   doctest Web.Uint8Array
   doctest Web.Blob
@@ -17,7 +16,6 @@ defmodule WebTest do
   doctest Web.CountQueuingStrategy
   doctest Web.Request
   doctest Web.Response
-  doctest Web.Resolver
   doctest Web.URL
   doctest Web.URLSearchParams
   doctest Web.DSL
@@ -28,7 +26,7 @@ defmodule WebTest do
     def fetch(%Web.Request{} = req) when is_struct(req.url, Web.URL) do
       case Web.URL.href(req.url) do
         "mock://success/" ->
-          {:ok, Web.Response.new(status: 200, url: Web.URL.href(req.url))}
+          {:ok, Web.Response.__network__(status: 200, url: Web.URL.href(req.url))}
 
         "mock://error/" ->
           {:error, :simulated_error}
@@ -46,6 +44,11 @@ defmodule WebTest do
     end
   end
 
+  # The dispatcher of a request is an internal field: the public API has no
+  # option for it.
+  defp mock(input, dispatcher \\ MockDispatcher, init \\ []),
+    do: %{Web.Request.new(input, init) | dispatcher: dispatcher}
+
   defmodule UsingWeb do
     use Web
 
@@ -60,10 +63,8 @@ defmodule WebTest do
 
     def aliases_work? do
       url = URL.new("mock://success")
-      request = Request.new(url, dispatcher: WebTest.MockDispatcher)
-
-      response =
-        Response.new(status: 200, headers: Headers.new(%{"x-test" => "1"}), url: URL.href(url))
+      request = Request.new(url)
+      response = Response.new(nil, status: 200, headers: Headers.new(%{"x-test" => "1"}))
 
       controller = AbortController.new()
       params = URLSearchParams.new("a=1")
@@ -76,20 +77,20 @@ defmodule WebTest do
     end
   end
 
-  test "Web.fetch routes to provided dispatcher directly via options" do
+  test "Web.fetch uses the dispatcher of the request" do
     assert %Web.Response{ok: true, url: "mock://success/"} =
-             await(Web.fetch("mock://success", dispatcher: MockDispatcher))
+             await(Web.fetch(mock("mock://success")))
 
     assert %Web.TypeError{message: "fetch failed", cause: :simulated_error} =
-             catch_exit(await(Web.fetch("mock://error", dispatcher: MockDispatcher)))
+             catch_exit(await(Web.fetch(mock("mock://error"))))
   end
 
   test "Web.fetch accepts a Web.URL input" do
     assert %Web.Response{ok: true, url: "mock://success/"} =
-             await(Web.fetch(Web.URL.new("mock://success"), dispatcher: MockDispatcher))
+             await(Web.fetch(mock(Web.URL.new("mock://success"))))
   end
 
-  test "Web.fetch routes to resolved dispatcher when missing from options" do
+  test "Web.fetch finds the dispatcher of a request that has none" do
     # Resolver.resolve("tcp://localhost:9999") -> Web.Dispatcher.TCP
     # Attempting a real TCP fetch will result in :econnrefused or :nxdomain
     assert _reason = catch_exit(await(Web.fetch("tcp://localhost:59999")))
@@ -97,12 +98,10 @@ defmodule WebTest do
 
   test "use Web imports fetch/1 and fetch/2" do
     assert %Web.Response{ok: true, url: "mock://success/"} =
-             UsingWeb.fetch_with_import("mock://success", dispatcher: MockDispatcher) |> await()
+             UsingWeb.fetch_with_import(mock("mock://success")) |> await()
 
     assert %Web.Response{ok: true, url: "mock://success/"} =
-             UsingWeb.fetch_with_import(Web.URL.new("mock://success"),
-               dispatcher: MockDispatcher
-             )
+             UsingWeb.fetch_with_import(mock(Web.URL.new("mock://success")), [])
              |> await()
   end
 
@@ -116,25 +115,25 @@ defmodule WebTest do
 
   test "fetch rejects with the error of a dispatcher that is a TypeError or a DOMException" do
     assert %Web.TypeError{message: "the dispatcher refused the request", cause: nil} =
-             catch_exit(await(Web.fetch("mock://type-error/", dispatcher: MockDispatcher)))
+             catch_exit(await(Web.fetch(mock("mock://type-error/"))))
 
     assert %Web.DOMException{name: "NetworkError", message: "no network"} =
-             catch_exit(await(Web.fetch("mock://dom-exception/", dispatcher: MockDispatcher)))
+             catch_exit(await(Web.fetch(mock("mock://dom-exception/"))))
   end
 
   test "fetch rejects with the abort reason that a dispatcher throws" do
-    assert catch_exit(await(Web.fetch("mock://abort/", dispatcher: MockDispatcher))) ==
+    assert catch_exit(await(Web.fetch(mock("mock://abort/")))) ==
              :stopped_by_the_caller
   end
 
   test "await returns the value of a promise" do
-    response = await(Web.fetch("mock://success/", dispatcher: MockDispatcher))
+    response = await(Web.fetch(mock("mock://success/")))
     assert %Web.Response{ok: true, url: "mock://success/"} = response
   end
 
   test "await exits with the reason of a rejection" do
     assert %Web.TypeError{message: "fetch failed", cause: :simulated_error} =
-             catch_exit(await(Web.fetch("mock://error/", dispatcher: MockDispatcher)))
+             catch_exit(await(Web.fetch(mock("mock://error/"))))
   end
 
   test "await returns a value that is not a promise, as ECMAScript" do
@@ -148,7 +147,8 @@ defmodule WebTest do
       use Web
 
       def test_await do
-        await(fetch("mock://success/", dispatcher: WebTest.MockDispatcher))
+        request = %{Web.Request.new("mock://success/") | dispatcher: WebTest.MockDispatcher}
+        await(fetch(request))
       end
     end
 
@@ -208,7 +208,7 @@ defmodule WebTest do
     # Tells the test process about each request that gets to the dispatcher.
     def fetch(%Web.Request{} = request) do
       send(request.options[:test], {:dispatched, request})
-      {:ok, Web.Response.new(status: 200, url: Web.URL.href(request.url))}
+      {:ok, Web.Response.__network__(status: 200, url: Web.URL.href(request.url))}
     end
   end
 
@@ -239,7 +239,7 @@ defmodule WebTest do
     end
 
     test "makes no connection" do
-      init = [dispatcher: RecordingDispatcher, test: self()]
+      request = mock("mock://success/", RecordingDispatcher, test: self())
 
       for extra <- [
             [method: "BAD METHOD"],
@@ -248,21 +248,23 @@ defmodule WebTest do
             [redirect: "sometimes"]
           ] do
         assert {:rejected, %Web.TypeError{}} =
-                 Web.Promise.wait(Web.fetch("mock://success/", init ++ extra))
+                 Web.Promise.wait(Web.fetch(request, extra))
       end
 
       refute_receive {:dispatched, _request}, 50
 
       # The same dispatcher gets a request that is valid.
-      assert %Web.Response{status: 200} = await(Web.fetch("mock://success/", init))
+      assert %Web.Response{status: 200} = await(Web.fetch(request))
       assert_receive {:dispatched, %Web.Request{method: "GET"}}
     end
 
     test "rejects when the body of the request is already read, and makes no connection" do
-      init = [dispatcher: RecordingDispatcher, test: self(), method: "POST"]
+      init = [test: self(), method: "POST"]
 
       for body <- ["in memory", Web.ReadableStream.from(["a", "b"])] do
-        request = Web.Request.new("mock://success/", init ++ [body: body, duplex: "half"])
+        request =
+          mock("mock://success/", RecordingDispatcher, init ++ [body: body, duplex: "half"])
+
         assert is_binary(await(Web.Request.text(request)))
 
         assert {:rejected, %Web.TypeError{message: "Request body is already used"}} =
@@ -278,8 +280,7 @@ defmodule WebTest do
 
     test "rejects when the body of the request has a reader" do
       request =
-        Web.Request.new("mock://success/",
-          dispatcher: RecordingDispatcher,
+        mock("mock://success/", RecordingDispatcher,
           test: self(),
           method: "POST",
           body: Web.ReadableStream.from(["a"]),
@@ -300,7 +301,7 @@ defmodule WebTest do
     end
 
     test "applies init to a request that is the input" do
-      request = Web.Request.new("mock://success/", dispatcher: RecordingDispatcher, test: self())
+      request = mock("mock://success/", RecordingDispatcher, test: self())
 
       assert %Web.Response{status: 200} =
                await(Web.fetch(request, method: "post", headers: %{"x-test" => "1"}, body: "x"))

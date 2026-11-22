@@ -15,17 +15,17 @@ defmodule Web.ResponseTest do
   end
 
   test "new/1 normalizes enumerable response bodies through ReadableStream.from/1" do
-    resp = Response.new(body: ["he", "llo"])
+    resp = Response.new(["he", "llo"])
 
     assert "hello" = await(Response.text(resp))
   end
 
   test "text/1 and array_buffer/1 drain the response body" do
-    resp = Response.new(body: "hello")
+    resp = Response.new("hello")
 
     assert "hello" = await(Response.text(resp))
 
-    resp = Response.new(body: "hello")
+    resp = Response.new("hello")
     assert %Web.ArrayBuffer{data: "hello", byte_length: 5} = await(Response.array_buffer(resp))
 
     assert %TypeError{message: "body already used"} =
@@ -33,26 +33,26 @@ defmodule Web.ResponseTest do
   end
 
   test "bytes/1 returns a Uint8Array view over the consumed response body" do
-    resp = Response.new(body: "hello")
+    resp = Response.new("hello")
 
     assert %Web.Uint8Array{byte_length: 5} = bytes = await(Response.bytes(resp))
     assert Web.Uint8Array.to_binary(bytes) == "hello"
   end
 
   test "blob/1 uses content-type header for Blob type" do
-    resp = Response.new(body: "hello", headers: [{"content-type", "text/plain"}])
+    resp = Response.new("hello", headers: [{"content-type", "text/plain"}])
 
     assert %Web.Blob{size: 5, type: "text/plain"} = await(Response.blob(resp))
   end
 
   test "new/1 defaults string bodies to text/plain;charset=UTF-8" do
-    resp = Response.new(body: "hello")
+    resp = Response.new("hello")
 
     assert Web.Headers.get(resp.headers, "content-type") == "text/plain;charset=UTF-8"
   end
 
   test "clone/1 returns updated original and clone with independent streams" do
-    resp = Response.new(body: "hello")
+    resp = Response.new("hello")
 
     assert {resp, clone} = Response.clone(resp)
     assert "hello" = await(Response.text(resp))
@@ -86,13 +86,13 @@ defmodule Web.ResponseTest do
     assert "" = await(Response.text(resp))
   end
 
-  test "new/1 defaults status_text to empty string" do
-    resp = Response.new(status: 599)
+  test "new/2 defaults status_text to empty string" do
+    resp = Response.new(nil, status: 599)
     assert resp.status_text == ""
   end
 
-  test "new/1 allows explicitly setting status_text" do
-    resp = Response.new(status: 250, status_text: "Custom")
+  test "new/2 allows explicitly setting status_text" do
+    resp = Response.new(nil, status: 250, status_text: "Custom")
     assert resp.status_text == "Custom"
   end
 
@@ -115,19 +115,26 @@ defmodule Web.ResponseTest do
 
   test "new/1 infers content-type from Blob body type" do
     blob = Web.Blob.new(["hello"], type: "text/plain")
-    resp = Response.new(body: blob)
+    resp = Response.new(blob)
 
     assert Web.Headers.get(resp.headers, "content-type") == "text/plain"
     assert "hello" = await(Response.text(resp))
   end
 
-  test "new/1 does not overwrite an explicit content-type header" do
-    resp = Response.new(body: "hello", headers: [{"content-type", "text/custom"}])
+  test "new/2 does not overwrite an explicit content-type header" do
+    resp = Response.new("hello", headers: [{"content-type", "text/custom"}])
 
     assert Web.Headers.get(resp.headers, "content-type") == "text/custom"
   end
 
   describe "the checks of the Response constructor" do
+    test "read only the members of ResponseInit" do
+      resp = Response.new("x", url: "https://example.com/", type: "basic", redirected: true)
+
+      assert {resp.url, resp.type, resp.redirected} == {"", "default", false}
+      assert await(Response.text(resp)) == "x"
+    end
+
     test "give the default values of the Fetch Standard" do
       resp = Response.new()
 
@@ -136,40 +143,42 @@ defmodule Web.ResponseTest do
 
       assert resp.body == nil
       assert Enum.to_list(resp.headers) == []
-      assert Response.new([]) == %{resp | snapshot: Response.new([]).snapshot}
+      assert Response.new(nil, []) == %{resp | snapshot: Response.new(nil, []).snapshot}
     end
 
     test "accept each status from 200 to 599, and refuse each other status" do
       for status <- [200, 201, 299, 300, 404, 500, 599] do
-        assert Response.new(status: status).status == status
+        assert Response.new(nil, status: status).status == status
       end
 
       for status <- [-1, 0, 100, 199, 600, 999, 1000] do
-        assert_raise Web.RangeError, ~r/from 200 to 599/, fn -> Response.new(status: status) end
+        assert_raise Web.RangeError, ~r/from 200 to 599/, fn ->
+          Response.new(nil, status: status)
+        end
       end
 
       for status <- ["200", 200.0, nil, :ok] do
         assert_raise TypeError, ~r/status must be an integer/, fn ->
-          Response.new(status: status)
+          Response.new(nil, status: status)
         end
       end
     end
 
     property "give ok only for a status from 200 to 299" do
       check all(status <- integer(200..599)) do
-        assert Response.new(status: status).ok == status < 300
+        assert Response.new(nil, status: status).ok == status < 300
       end
     end
 
     test "refuse a status text that is not a reason phrase" do
       for text <- ["a\r\nb", "a\nb", <<"a", 0, "b">>, "a\x7Fb", :ok, 200] do
         assert_raise TypeError, ~r/Invalid status text/, fn ->
-          Response.new(status_text: text)
+          Response.new(nil, status_text: text)
         end
       end
 
       for text <- ["", "OK", "Not Found", "tab\there", "é"] do
-        assert Response.new(status_text: text).status_text == text
+        assert Response.new(nil, status_text: text).status_text == text
       end
     end
 
@@ -180,10 +189,9 @@ defmodule Web.ResponseTest do
         end
 
         assert_raise TypeError, ~r/null body status cannot have body/, fn ->
-          Response.new(body: "", status: status)
+          Response.new("", status: status)
         end
 
-        assert Response.new(status: status).body == nil
         assert Response.new(nil, status: status).body == nil
       end
     end
@@ -197,7 +205,6 @@ defmodule Web.ResponseTest do
         Response.new("x", headers: [{"x-test", "a\r\nb"}])
       end
 
-      assert_raise TypeError, ~r/init must be a keyword list/, fn -> Response.new(%{}) end
       assert_raise TypeError, ~r/init must be a keyword list/, fn -> Response.new("x", %{}) end
     end
 
@@ -307,7 +314,7 @@ defmodule Web.ResponseTest do
     end
 
     test "that is nil can be cloned" do
-      resp = Response.new(status: 204)
+      resp = Response.new(nil, status: 204)
       assert {first, second} = Response.clone(resp)
       assert first.body == nil and second.body == nil
     end

@@ -53,8 +53,7 @@ source =
 IO.puts("[mem] start bytes=#{:erlang.memory(:total)}")
 
 response =
-  Response.new(
-    body: source,
+  Response.new(source,
     headers: %{"content-type" => "multipart/form-data; boundary=#{boundary}"}
   )
 
@@ -106,8 +105,8 @@ total_written = Agent.get(sink_state, & &1.bytes)
 IO.puts("payload_bytes=#{payload_bytes} written_bytes=#{total_written}")
 IO.puts("[mem] end bytes=#{:erlang.memory(:total)}")
 
-Web.FormData.cancel(form_data, :normal)
-await(ReadableStream.cancel(source, :done))
+# The parser of the form read all the bytes of the source. The parser
+# stops when its owner, this process, stops.
 await(WritableStream.abort(sink, :done))
 
 Enum.each([source.controller_pid, sink.controller_pid], fn pid ->
@@ -121,11 +120,12 @@ Process.sleep(50)
 
 cleanup_pids = [
   {"source", source.controller_pid},
-  {"coordinator", form_data.coordinator},
   {"payload_stream", payload_stream.controller_pid},
   {"sink", sink.controller_pid}
 ]
 
+# The file stream of the form ended. It stops when the linger time goes by
+# (`config :web, linger: ms`).
 Enum.each(cleanup_pids, fn {name, pid} ->
   IO.puts("cleanup #{name}=#{inspect(pid)} alive?=#{Process.alive?(pid)}")
 end)

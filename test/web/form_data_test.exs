@@ -135,7 +135,7 @@ defmodule Web.FormDataTest do
     file = Web.FormData.get(form, "upload")
 
     get_waiter = Task.async(fn -> Web.FormData.get(form, "after") end)
-    has_waiter = Task.async(fn -> Web.FormData.has?(form, "after") end)
+    has_waiter = Task.async(fn -> Web.FormData.has(form, "after") end)
 
     wait_for_pending(form.coordinator, 2)
     assert Task.yield(get_waiter, 0) == nil
@@ -159,7 +159,7 @@ defmodule Web.FormDataTest do
     file = Web.FormData.get(form_data, "upload")
     child_stream = Web.File.stream(file)
 
-    assert :ok = Web.FormData.cancel(form_data, :user_cancelled)
+    assert :ok = cancel_form(form_data, :user_cancelled)
     assert_eventually(fn -> source_cancel_reason(tracker) == :user_cancelled end)
     assert_eventually(fn -> not Process.alive?(form_data.coordinator) end)
     assert_eventually(fn -> not Process.alive?(child_stream.controller_pid) end)
@@ -167,12 +167,12 @@ defmodule Web.FormDataTest do
 
   test "local form data operations remain eager" do
     form =
-      Web.FormData.new(boundary: "  eager-boundary  ")
+      %{Web.FormData.new() | boundary: "eager-boundary"}
       |> Web.FormData.append("a", "1")
       |> Web.FormData.append("b", Web.Blob.new(["blob"], type: "text/plain"), "blob.txt")
 
     assert Web.FormData.get(form, "a") == "1"
-    assert Web.FormData.has?(form, "a") == true
+    assert Web.FormData.has(form, "a") == true
     assert [%Web.File{name: "blob.txt", type: "text/plain"}] = Web.FormData.get_all(form, "b")
     assert Web.FormData.content_type(form) == "multipart/form-data; boundary=eager-boundary"
 
@@ -182,9 +182,9 @@ defmodule Web.FormDataTest do
       |> Web.FormData.delete("b")
 
     assert Web.FormData.get(updated, "a") == "2"
-    assert Web.FormData.has?(updated, "b") == false
+    assert Web.FormData.has(updated, "b") == false
     assert Enum.to_list(Web.FormData.entries(updated)) == [["a", "2"]]
-    assert Web.FormData.cancel(updated) == :ok
+    assert cancel_form(updated) == :ok
   end
 
   test "append gives a blob the file name blob, and a file the given file name" do
@@ -239,7 +239,7 @@ defmodule Web.FormDataTest do
     assert Web.FormData.get(replaced, "a") == "9"
 
     deleted = Web.FormData.delete(static, "b")
-    assert Web.FormData.has?(deleted, "b") == false
+    assert Web.FormData.has(deleted, "b") == false
 
     # Mutations directly on a still-live form trigger internal drain
     form2 =
@@ -271,7 +271,7 @@ defmodule Web.FormDataTest do
       |> Web.FormData.parse(boundary)
 
     deleted2 = Web.FormData.delete(form4, "b")
-    assert Web.FormData.has?(deleted2, "b") == false
+    assert Web.FormData.has(deleted2, "b") == false
   end
 
   test "live forms return nil, false, and [] for missing fields after completion" do
@@ -284,7 +284,7 @@ defmodule Web.FormDataTest do
       |> Web.FormData.parse(boundary)
 
     assert Web.FormData.get(form, "missing") == nil
-    assert Web.FormData.has?(form, "missing") == false
+    assert Web.FormData.has(form, "missing") == false
     assert Web.FormData.get_all(form, "missing") == []
   end
 
@@ -376,8 +376,8 @@ defmodule Web.FormDataTest do
       |> Web.FormData.parse(boundary)
 
     assert is_pid(form.coordinator)
-    assert Web.FormData.has?(form, "first") == true
-    assert Web.FormData.has?(form, "upload") == true
+    assert Web.FormData.has(form, "first") == true
+    assert Web.FormData.has(form, "upload") == true
     file = Web.FormData.get(form, "upload")
 
     later_values = Task.async(fn -> Web.FormData.get_all(form, "tail") end)
@@ -1214,7 +1214,7 @@ defmodule Web.FormDataTest do
       ])
       |> Web.FormData.parse(boundary)
 
-    assert :ok = Web.FormData.cancel(form, :normal)
+    assert :ok = cancel_form(form, :normal)
     assert_raise Web.TypeError, ~r/not available/, fn -> Web.FormData.get(form, "field") end
   end
 
@@ -1235,7 +1235,7 @@ defmodule Web.FormDataTest do
     form_a = Web.FormData.parse(stream_a, boundary)
     _file_a = Web.FormData.get(form_a, "upload")
 
-    assert :ok = Web.FormData.cancel(form_a, nil)
+    assert :ok = cancel_form(form_a, nil)
     assert source_cancel_reason(tracker_a) == nil
     assert_eventually(fn -> not Process.alive?(form_a.coordinator) end)
 
@@ -1243,7 +1243,7 @@ defmodule Web.FormDataTest do
     form_b = Web.FormData.parse(stream_b, boundary)
     _file_b = Web.FormData.get(form_b, "upload")
 
-    assert :ok = Web.FormData.cancel(form_b, :normal)
+    assert :ok = cancel_form(form_b, :normal)
     assert source_cancel_reason(tracker_b) == nil
     assert_eventually(fn -> not Process.alive?(form_b.coordinator) end)
   end
@@ -1318,7 +1318,7 @@ defmodule Web.FormDataTest do
     # A coordinator that is gone cannot give the rest of a file part: the
     # stream gets an error, not an end, thus a reader does not take a short
     # file as complete. The stream ends, thus it does not stay.
-    Web.FormData.cancel(form, :done)
+    cancel_form(form, :done)
 
     assert_eventually(fn -> not Process.alive?(form.coordinator) end)
 
@@ -1559,7 +1559,7 @@ defmodule Web.FormDataTest do
 
     assert Enum.take(form, 1) == [["a", "1"]]
 
-    Web.FormData.cancel(form)
+    cancel_form(form)
   end
 
   test "Enumerable suspend path on live form via Stream.zip" do
@@ -1577,14 +1577,14 @@ defmodule Web.FormDataTest do
     result = Stream.zip(form, [:x, :y]) |> Enum.to_list()
     assert result == [{["a", "1"], :x}, {["b", "2"], :y}]
 
-    Web.FormData.cancel(form)
+    cancel_form(form)
   end
 
   test "Collectable builds static forms from tuple and list entries" do
     form =
       Enum.into(
         [{"a", "1"}, ["b", "2"]],
-        Web.FormData.new(boundary: "collect-static-boundary")
+        %{Web.FormData.new() | boundary: "collect-static-boundary"}
       )
 
     assert Web.FormData.get(form, "a") == "1"
@@ -1746,7 +1746,7 @@ defmodule Web.FormDataTest do
     # Resuming from suspended state completes normally
     {:done, _} = cont.({:cont, :sentinel})
 
-    Web.FormData.cancel(form)
+    cancel_form(form)
   end
 
   test "drain_live with two file parts covers materializing-mode header parse" do
@@ -1825,7 +1825,7 @@ defmodule Web.FormDataTest do
         |> Web.FormData.parse(boundary)
 
       result = Enum.to_list(form)
-      Web.FormData.cancel(form)
+      cancel_form(form)
 
       expected = Enum.map(fields, fn {name, value} -> [name, value] end)
       assert result == expected
@@ -1868,7 +1868,7 @@ defmodule Web.FormDataTest do
           acc ++ [{name, content}]
         end)
 
-      Web.FormData.cancel(form)
+      cancel_form(form)
 
       expected = Enum.map(files, fn {name, _filename, content} -> {name, content} end)
       assert result == expected
@@ -1936,7 +1936,7 @@ defmodule Web.FormDataTest do
       waiter = call_result(fn -> Web.FormData.get(form, "missing") end)
       assert_eventually(fn -> call_queued?(form.coordinator, waiter.pid) end)
 
-      assert :ok = Web.FormData.cancel(form, :user_cancelled)
+      assert :ok = cancel_form(form, :user_cancelled)
       assert Task.await(waiter) == {:exit, :user_cancelled}
       assert :user_cancelled = catch_exit(read_rest(reader))
       assert_eventually(fn -> not Process.alive?(form.coordinator) end)
@@ -1960,7 +1960,7 @@ defmodule Web.FormDataTest do
       end)
 
       assert reading?(form.coordinator)
-      assert :ok = Web.FormData.cancel(form)
+      assert :ok = cancel_form(form)
     end
 
     test "the stop of the owner while the parser waits for a source that stalls is prompt" do
@@ -2300,6 +2300,15 @@ defmodule Web.FormDataTest do
   defp restore_ambient_signal(key, nil), do: Process.delete(key)
   defp restore_ambient_signal(key, previous), do: Process.put(key, previous)
 
+  # Stops the coordinator of a form and its file streams. The public API
+  # has no cancel of a form: the coordinator stops with its owner.
+  defp cancel_form(form, reason \\ :cancelled)
+
+  defp cancel_form(%Web.FormData{coordinator: pid}, reason) when is_pid(pid),
+    do: Web.FormData.Parser.cancel(pid, reason)
+
+  defp cancel_form(%Web.FormData{}, _reason), do: :ok
+
   # The limit is long for a machine that is busy. The function returns when
   # the condition is true.
   defp assert_eventually(fun, attempts \\ 200)
@@ -2321,6 +2330,7 @@ end
 defmodule Web.FormDataEdgeTest do
   use ExUnit.Case, async: false
 
+  alias Web.FormData.Parser
   alias Web.ReadableStream
 
   test "caller death tears down the live coordinator tree" do
@@ -2421,7 +2431,7 @@ defmodule Web.FormDataEdgeTest do
     assert [["upload", %Web.File{name: "large.bin"}], ["after", "done"]] = entries
 
     # Coordinator is still alive after iteration; cancel to free resources
-    Web.FormData.cancel(form)
+    cancel_form(form)
     assert_eventually(fn -> not Process.alive?(form.coordinator) end)
   end
 
@@ -2447,7 +2457,7 @@ defmodule Web.FormDataEdgeTest do
 
     assert ReadableStream.locked?(stream)
 
-    Web.FormData.cancel(form, :done)
+    cancel_form(form, :done)
 
     assert_eventually(fn -> not Process.alive?(form.coordinator) end)
     assert_eventually(fn -> ReadableStream.locked?(stream) == false end)
@@ -2462,7 +2472,7 @@ defmodule Web.FormDataEdgeTest do
       for _ <- 1..1000 do
         form = Web.FormData.parse(payload, boundary)
         _ = Enum.to_list(form)
-        Web.FormData.cancel(form)
+        cancel_form(form)
         form.coordinator
       end
 
@@ -2506,7 +2516,7 @@ defmodule Web.FormDataEdgeTest do
              ["tail", "end"]
            ] = entries
 
-    Web.FormData.cancel(form)
+    cancel_form(form)
     assert_eventually(fn -> not Process.alive?(form.coordinator) end)
   end
 
@@ -2553,7 +2563,7 @@ defmodule Web.FormDataEdgeTest do
     assert [["field", ^field_value], ["upload", %Web.File{name: "big.bin"}], ["tail", "end"]] =
              entries
 
-    Web.FormData.cancel(form)
+    cancel_form(form)
     assert_eventually(fn -> not Process.alive?(form.coordinator) end)
   end
 
@@ -2612,7 +2622,7 @@ defmodule Web.FormDataEdgeTest do
 
     assert [[_, %Web.File{name: "blocked.txt"}], ["after", "done"]] = entries
 
-    Web.FormData.cancel(form)
+    cancel_form(form)
 
     # The blocked reader is interrupted by the discard
     send(reader_task.pid, :continue)
@@ -2698,6 +2708,15 @@ defmodule Web.FormDataEdgeTest do
 
     {stream, tracker}
   end
+
+  # Stops the coordinator of a form and its file streams. The public API
+  # has no cancel of a form: the coordinator stops with its owner.
+  defp cancel_form(form, reason \\ :cancelled)
+
+  defp cancel_form(%Web.FormData{coordinator: pid}, reason) when is_pid(pid),
+    do: Parser.cancel(pid, reason)
+
+  defp cancel_form(%Web.FormData{}, _reason), do: :ok
 
   # The limit is long for a machine that is busy. The function returns when
   # the condition is true.

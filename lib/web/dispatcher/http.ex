@@ -1,5 +1,7 @@
 defmodule Web.Dispatcher.HTTP do
-  @moduledoc "HTTP dispatcher on Mint, with its own connection pools and zero-buffer streaming."
+  @moduledoc false
+
+  # HTTP dispatcher on Mint, with its own connection pools and zero-buffer streaming.
   @behaviour Web.Dispatcher
 
   # ## The process of a request
@@ -292,13 +294,15 @@ defmodule Web.Dispatcher.HTTP do
   end
 
   defp next_request(request, next_url, method, headers, body) do
-    Web.Request.new(
-      next_url,
-      request.options
-      |> Keyword.put(:method, method)
-      |> Keyword.put(:headers, headers)
-      |> Keyword.put(:body, body)
-      |> Keyword.put(:dispatcher, request.dispatcher)
-    )
+    next =
+      Web.Request.new(
+        next_url,
+        request.options
+        |> Keyword.put(:method, method)
+        |> Keyword.put(:headers, headers)
+        |> Keyword.put(:body, body)
+      )
+
+    %{next | dispatcher: request.dispatcher}
   end
 end

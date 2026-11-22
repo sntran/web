@@ -10,7 +10,7 @@ defmodule Web.FormDataEncoderTest do
   doctest Web.FormData
 
   defp form(entries, boundary \\ "test-boundary") do
-    Enum.reduce(entries, FormData.new(boundary: boundary), fn
+    Enum.reduce(entries, %{FormData.new() | boundary: boundary}, fn
       {name, value}, form -> FormData.append(form, name, value)
       {name, value, filename}, form -> FormData.append(form, name, value, filename)
     end)
@@ -29,7 +29,7 @@ defmodule Web.FormDataEncoderTest do
     end)
   end
 
-  defp round_trip(form), do: entries(await(Response.form_data(Response.new(body: form))))
+  defp round_trip(form), do: entries(await(Response.form_data(Response.new(form))))
 
   describe "the encoding" do
     test "gives the parts of the HTML Standard, for a string and for a file" do
@@ -105,10 +105,10 @@ defmodule Web.FormDataEncoderTest do
       form = form([{"field", "value"}])
 
       for carrier <- [
-            Response.new(body: form),
+            Response.new(form),
             Request.new("https://example.com/", method: "POST", body: form)
           ] do
-        assert Headers.get(carrier.headers, "content-type", nil) ==
+        assert Headers.get(carrier.headers, "content-type") ==
                  "multipart/form-data; boundary=test-boundary"
 
         chunks = Enum.to_list(carrier.body)
@@ -118,8 +118,8 @@ defmodule Web.FormDataEncoderTest do
     end
 
     test "keeps a content type that the caller gives" do
-      response = Response.new(body: form([]), headers: %{"content-type" => "text/plain"})
-      assert Headers.get(response.headers, "content-type", nil) == "text/plain"
+      response = Response.new(form([]), headers: %{"content-type" => "text/plain"})
+      assert Headers.get(response.headers, "content-type") == "text/plain"
     end
 
     test "needs no option duplex, and has a source when its data is in memory" do
@@ -136,7 +136,7 @@ defmodule Web.FormDataEncoderTest do
       assert request.body_source == nil
 
       # A form that was parsed from a stream reads its entries one time.
-      parsed = await(Response.form_data(Response.new(body: form)))
+      parsed = await(Response.form_data(Response.new(form)))
       request = Request.new("https://example.com/", method: "POST", body: parsed)
       assert request.body_source == nil
       assert Web.TestBytes.join(request.body) =~ ~s(name="field")
@@ -192,12 +192,12 @@ defmodule Web.FormDataEncoderTest do
 
     test "encodes a form that was parsed from a stream, with its file streams" do
       first = form([{"field", "value"}, {"upload", Web.Blob.new([String.duplicate("x", 5_000)])}])
-      parsed = await(Response.form_data(Response.new(body: first)))
+      parsed = await(Response.form_data(Response.new(first)))
 
       # The parsed form reads its files from the first body. It is encoded
       # again with a new boundary, and gives the same entries.
       assert parsed.coordinator
-      second = Response.new(body: parsed)
+      second = Response.new(parsed)
 
       assert entries(await(Response.form_data(second))) == [
                {"field", "value"},

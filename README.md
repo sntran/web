@@ -337,7 +337,7 @@ encoded =
   |> ReadableStream.pipe_through(DecompressionStream.new("gzip"))
   |> ReadableStream.pipe_through(TextDecoderStream.new())
 
-await(Response.text(Response.new(body: encoded)))
+await(Response.text(Response.new(encoded)))
 # => "Hello, 🌍"
 ```
 
@@ -622,23 +622,18 @@ Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rc
 # WHATWG-style URL parsing
 url = URL.new("https://user:pass@example.com:8080/p/a/t/h?query=string#hash")
 
-# URLPattern for matching and ambient route param injection
+# URLPattern for matching
 pattern = URLPattern.new(%{pathname: "/users/:id"})
 
-URLPattern.match_context(pattern, "https://example.com/users/42", fn ->
-  # Automatically retrieves captured "id" => "42" from context
-  AsyncContext.Variable.get(URLPattern.params())
-end)
+URLPattern.exec(pattern, "https://example.com/users/42").pathname.groups
+# => %{"id" => "42"}
 ```
 
 Standard containers for blobs, files, and forms.
 
 ```elixir
 # The type of a blob comes from the header `content-type`
-html = Response.new(
-  body: "<!doctype html><html>...",
-  headers: [{"content-type", "text/html"}]
-)
+html = Response.new("<!doctype html><html>...", headers: [{"content-type", "text/html"}])
 
 await(Response.blob(html)).type # => "text/html"
 

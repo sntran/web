@@ -163,13 +163,13 @@ defmodule Web.URLTest do
   end
 
   defp apply_setter(url, "href", value), do: URL.href(url, value)
-  defp apply_setter(url, "protocol", value), do: URL.set_protocol(url, value)
-  defp apply_setter(url, "username", value), do: URL.set_username(url, value)
-  defp apply_setter(url, "password", value), do: URL.set_password(url, value)
-  defp apply_setter(url, "hostname", value), do: URL.set_hostname(url, value)
+  defp apply_setter(url, "protocol", value), do: URL.protocol(url, value)
+  defp apply_setter(url, "username", value), do: URL.username(url, value)
+  defp apply_setter(url, "password", value), do: URL.password(url, value)
+  defp apply_setter(url, "hostname", value), do: URL.hostname(url, value)
   defp apply_setter(url, "host", value), do: URL.host(url, value)
-  defp apply_setter(url, "port", value), do: URL.set_port(url, value)
-  defp apply_setter(url, "pathname", value), do: URL.set_pathname(url, value)
+  defp apply_setter(url, "port", value), do: URL.port(url, value)
+  defp apply_setter(url, "pathname", value), do: URL.pathname(url, value)
   defp apply_setter(url, "search", value), do: URL.search(url, value)
   defp apply_setter(url, "hash", value), do: URL.hash(url, value)
   defp apply_setter(url, _property, _value), do: url
@@ -291,8 +291,8 @@ defmodule Web.URLTest do
 
     # The new protocol makes a URL that is not valid: the URL does not change.
     file = URL.new("file:///test")
-    assert URL.set_protocol(file, "https") == file
-    assert URL.protocol(URL.set_protocol(url, "wss")) == "wss:"
+    assert URL.protocol(file, "https") == file
+    assert URL.protocol(URL.protocol(url, "wss")) == "wss:"
     assert URL.origin(URL.new("blob:not a url")) == "null"
   end
 
@@ -335,7 +335,7 @@ defmodule Web.URLTest do
   test "non-special protocol setters preserve empty authority paths" do
     url = URL.new("foo://example.com/")
 
-    assert URL.href(URL.set_protocol(url, "bar")) == "bar://example.com"
+    assert URL.href(URL.protocol(url, "bar")) == "bar://example.com"
     assert URL.href(%URL{protocol: "foo:", pathname: "", kind: :standard}) == "foo:"
   end
 
@@ -355,7 +355,7 @@ defmodule Web.URLTest do
     assert updated_host.password == ""
     assert updated_host.port == ""
 
-    updated_hostname = URL.set_hostname(url, "")
+    updated_hostname = URL.hostname(url, "")
     assert updated_hostname.username == ""
     assert updated_hostname.password == ""
     assert updated_hostname.port == ""
@@ -371,24 +371,24 @@ defmodule Web.URLTest do
 
   test "file origins and path normalization cover file-specific branches" do
     assert URL.origin(URL.new("file:///tmp/test")) == "null"
-    assert URL.pathname(URL.set_pathname(URL.new("file:///c:/dir"), "/c:/..")) == "/c:/"
+    assert URL.pathname(URL.pathname(URL.new("file:///c:/dir"), "/c:/..")) == "/c:/"
 
-    assert URL.pathname(URL.set_pathname(%URL{protocol: "file:", kind: :standard}, "C|")) ==
+    assert URL.pathname(URL.pathname(%URL{protocol: "file:", kind: :standard}, "C|")) ==
              "/C:"
 
-    assert URL.pathname(URL.set_pathname(URL.new("file://example.com"), "drive")) == "/drive"
+    assert URL.pathname(URL.pathname(URL.new("file://example.com"), "drive")) == "/drive"
 
-    assert URL.pathname(URL.set_pathname(%URL{protocol: "file:", kind: :standard}, "drive")) ==
+    assert URL.pathname(URL.pathname(%URL{protocol: "file:", kind: :standard}, "drive")) ==
              "/drive"
 
-    assert URL.pathname(URL.set_pathname(URL.new("http://example.com/path"), "")) == "/"
+    assert URL.pathname(URL.pathname(URL.new("http://example.com/path"), "")) == "/"
   end
 
   test "port setters handle nil and integer inputs" do
     url = URL.new("http://example.com")
 
-    assert URL.port(URL.set_port(url, nil)) == ""
-    assert URL.port(URL.set_port(url, 8080)) == "8080"
+    assert URL.port(URL.port(url, nil)) == ""
+    assert URL.port(URL.port(url, 8080)) == "8080"
   end
 
   test "parser handles opaque bases, invalid bases, and url struct bases" do

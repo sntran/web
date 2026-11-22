@@ -155,7 +155,7 @@ defmodule Web.TextEncodingTest do
 
   test "Response.text/1 decodes multi-byte codepoints split across stream chunks" do
     chunks = [<<"A", 0xF0, 0x9F>>, <<0x8C, 0x8D, "B">>]
-    assert await(Response.text(Response.new(body: chunks))) == "A🌍B"
+    assert await(Response.text(Response.new(chunks))) == "A🌍B"
   end
 
   property "TextEncoder/TextDecoder round-trip UTF-8 strings exactly" do

@@ -44,6 +44,167 @@ defmodule Web.MessagePortTest do
                current_target: nil
              } = event
     end
+
+    test "is an Event: it has the fields of EventInit and of Event" do
+      before = Web.Performance.now()
+      event = MessageEvent.new("message", bubbles: true, cancelable: true, composed: true)
+
+      assert %MessageEvent{bubbles: true, cancelable: true, composed: true, is_trusted: false} =
+               event
+
+      assert event.time_stamp >= before
+
+      assert %MessageEvent{bubbles: false, cancelable: false, composed: false} =
+               MessageEvent.new(:m)
+    end
+
+    test "the functions of Web.Event accept it" do
+      event = MessageEvent.new("message", cancelable: true)
+
+      assert Web.Event.event_phase(event) == 0
+      assert Web.Event.current_target(event) == nil
+      assert Web.Event.composed_path(event) == []
+      assert Web.Event.src_element(event) == nil
+
+      :ok = Web.Event.prevent_default(event)
+      assert Web.Event.default_prevented(event)
+      refute Web.Event.return_value(event)
+
+      :ok = Web.Event.stop_propagation(event)
+      assert Web.Event.cancel_bubble(event)
+
+      again = Web.Event.init_event(event, "again", true, false)
+      assert %MessageEvent{type: "again", bubbles: true, cancelable: false} = again
+      refute Web.Event.default_prevented(again)
+      refute Web.Event.cancel_bubble(again)
+    end
+
+    test "init_message_event/9 initializes the event again, as initMessageEvent()" do
+      {port1, _port2} = channel()
+      event = MessageEvent.new("message", data: :old, origin: "node://a@b")
+      :ok = Web.Event.prevent_default(event)
+
+      assert %MessageEvent{
+               type: "message",
+               bubbles: false,
+               cancelable: false,
+               data: nil,
+               origin: "",
+               last_event_id: "",
+               source: nil,
+               ports: []
+             } = MessageEvent.init_message_event(event, "message")
+
+      assert %MessageEvent{
+               type: "x",
+               bubbles: true,
+               cancelable: true,
+               data: 1,
+               origin: "o",
+               last_event_id: "7",
+               source: :s,
+               ports: [^port1]
+             } = MessageEvent.init_message_event(event, :x, true, true, 1, "o", "7", :s, [port1])
+
+      # Each argument after the type has its default value of Web IDL.
+      arguments = [true, true, :data, "o", "7", :s, [port1]]
+
+      for count <- 1..7 do
+        given = Enum.take(arguments, count)
+        initialized = apply(MessageEvent, :init_message_event, [event, "m" | given])
+
+        assert Enum.take(
+                 [
+                   initialized.bubbles,
+                   initialized.cancelable,
+                   initialized.data,
+                   initialized.origin,
+                   initialized.last_event_id,
+                   initialized.source,
+                   initialized.ports
+                 ],
+                 count
+               ) == given
+      end
+
+      # During a dispatch, the event does not change.
+      Web.Event.__put_flag__(event, :dispatch, 1)
+      assert MessageEvent.init_message_event(event, "y", true) == event
+    end
+  end
+
+  describe "the events of a port" do
+    test "message, messageerror, and close are trusted" do
+      {port1, port2} = channel()
+      MessagePort.onmessage(port2, forward(:message))
+      MessagePort.onmessageerror(port2, forward(:error))
+      MessagePort.onclose(port2, forward(:close))
+
+      :ok = MessagePort.post_message(port1, :hello)
+      assert_receive {:message, %MessageEvent{type: "message", is_trusted: true}}
+
+      # A record that is not correct: see the test of messageerror.
+      record = %StructuredData.Record{
+        plain: false,
+        value: %StructuredData.Node{type: :regex, key: nil, data: {"(", []}}
+      }
+
+      link = :sys.get_state(port1.address).link
+      send(port2.address, {:port_message, link, %{record: record, snapshot: Snapshot.new()}})
+      assert_receive {:error, %MessageEvent{type: "messageerror", is_trusted: true}}
+
+      :ok = MessagePort.close(port1)
+      assert_receive {:close, %Web.Event{type: "close", is_trusted: true}}
+    end
+
+    test "during a listener, the event has the phase AT_TARGET and the current target" do
+      {port1, port2} = channel()
+      test = self()
+
+      MessagePort.onmessage(port2, fn event ->
+        send(test, {:during, Web.Event.event_phase(event), Web.Event.current_target(event)})
+        send(test, {:path, Web.Event.composed_path(event), event})
+      end)
+
+      :ok = MessagePort.post_message(port1, :hello)
+      assert_receive {:during, 2, ^port2}
+      assert_receive {:path, [^port2], event}
+
+      # After the dispatch, the event has no phase and no current target.
+      assert Web.Event.event_phase(event) == 0
+      assert Web.Event.current_target(event) == nil
+    end
+
+    test "stop_immediate_propagation/1 stops the listeners after the listener" do
+      {port1, port2} = channel()
+      test = self()
+
+      port2
+      |> MessagePort.add_event_listener("message", fn event ->
+        send(test, :first)
+        Web.Event.stop_immediate_propagation(event)
+      end)
+      |> MessagePort.add_event_listener("message", fn -> send(test, :second) end)
+      |> MessagePort.add_event_listener("close", fn -> send(test, :closed) end)
+      |> MessagePort.start()
+
+      :ok = MessagePort.post_message(port1, :hello)
+      :ok = MessagePort.close(port1)
+
+      # The close comes after the message: the second listener did not run.
+      assert_receive :first
+      assert_receive :closed
+      refute_received :second
+    end
+
+    test "dispatch_event/2 gives an event that is not trusted" do
+      {_port1, port2} = channel()
+      MessagePort.add_event_listener(port2, "ping", forward(:ping))
+
+      trusted = %{Web.Event.new("ping") | is_trusted: true}
+      assert {^port2, true} = MessagePort.dispatch_event(port2, trusted)
+      assert_receive {:ping, %Web.Event{type: "ping", is_trusted: false}}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -52,7 +213,7 @@ defmodule Web.MessagePortTest do
 
   # Makes a channel, and closes its ports at the end of the test.
   defp channel do
-    {port1, port2} = MessageChannel.new()
+    %{port1: port1, port2: port2} = MessageChannel.new()
 
     on_exit(fn ->
       MessagePort.close(port1)
@@ -114,8 +275,9 @@ defmodule Web.MessagePortTest do
            ]
   end
 
-  test "a channel has two different ports" do
+  test "a channel has two different ports, as port1 and port2" do
     {port1, port2} = channel()
+    assert %MessageChannel{port1: %MessagePort{}, port2: %MessagePort{}} = MessageChannel.new()
 
     assert %MessagePort{} = port1
     assert %MessagePort{} = port2
@@ -647,7 +809,7 @@ defmodule Web.MessagePortTest do
           Process.sleep(:infinity)
         end)
 
-      assert_receive {:ports, {port1, port2}}
+      assert_receive {:ports, %MessageChannel{port1: port1, port2: port2}}
 
       # The test process becomes the holder of the second port.
       moved = Web.structured_clone(port2, transfer: [port2])
@@ -809,7 +971,7 @@ defmodule Web.MessagePortTest do
 
       receiver =
         spawn(fn ->
-          {port1, port2} = MessageChannel.new()
+          %{port1: port1, port2: port2} = MessageChannel.new()
           MessagePort.onmessage(port2, fn event -> send(test, {:received, event.ports}) end)
           send(test, {:port, port1})
           Process.sleep(:infinity)
@@ -1008,7 +1170,7 @@ defmodule Web.MessagePortTest do
               to_port1 <- list_of(term_gen(), max_length: 20),
               max_runs: 50
             ) do
-        {port1, port2} = MessageChannel.new()
+        %{port1: port1, port2: port2} = MessageChannel.new()
         MessagePort.onmessage(port1, forward_data(:port1))
         MessagePort.onmessage(port2, forward_data(:port2))
 
@@ -1031,7 +1193,7 @@ defmodule Web.MessagePortTest do
               start_at <- integer(0..30),
               max_runs: 50
             ) do
-        {port1, port2} = MessageChannel.new()
+        %{port1: port1, port2: port2} = MessageChannel.new()
         MessagePort.add_event_listener(port2, "message", forward_data(:got))
 
         messages
@@ -1055,11 +1217,11 @@ defmodule Web.MessagePortTest do
         channels = for _index <- 1..count, do: MessageChannel.new()
 
         pids =
-          Enum.flat_map(channels, fn {port1, port2} ->
+          Enum.flat_map(channels, fn %{port1: port1, port2: port2} ->
             [port1.address, listener_pid(port1), port2.address, listener_pid(port2)]
           end)
 
-        Enum.each(channels, fn {port1, port2} ->
+        Enum.each(channels, fn %{port1: port1, port2: port2} ->
           if close_first, do: MessagePort.close(port1), else: MessagePort.close(port2)
           if close_first, do: MessagePort.close(port2), else: MessagePort.close(port1)
         end)

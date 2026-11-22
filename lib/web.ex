@@ -265,10 +265,15 @@ defmodule Web do
   API of WinterTC.
 
   `address` is a string `"host:port"`, or a `SocketAddress`: a map or a
-  keyword list with `:hostname` and `:port`. The option of `SocketOptions`
-  that the library has is `:secure_transport`: `"off"` (the default),
-  `"on"`, or `"starttls"`. A dictionary of Web IDL ignores each other
-  member. See `Web.Socket` for the settings of the application.
+  keyword list with `:hostname` and `:port`. The options are the members
+  of `SocketOptions`: `:secure_transport` (`"off"`, the default, `"on"`,
+  or `"starttls"`), `:allow_half_open`, `:sni`, and `:alpn`. See
+  `Web.Socket` for each member and for the settings of the application. A
+  dictionary of Web IDL ignores each other member.
+
+  Raises a `SocketError` (a `Web.TypeError`) for an address or an option
+  that is not valid. The socket connects after the call: see the promise
+  `opened`.
   """
   @spec connect(String.t() | map() | keyword(), map() | keyword()) :: Web.Socket.t()
   def connect(address, options \\ %{}) do
@@ -277,7 +282,7 @@ defmodule Web do
 
   # The members of `SocketOptions` that the library has.
   defp socket_options(options) when is_list(options) or is_map(options) do
-    options |> Map.new() |> Map.take([:secure_transport])
+    options |> Map.new() |> Map.take([:secure_transport, :allow_half_open, :sni, :alpn])
   end
 
   defp socket_options(options), do: options

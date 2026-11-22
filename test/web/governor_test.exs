@@ -442,11 +442,201 @@ defmodule Web.GovernorTest do
     assert 8 == wrapped.(4) |> await()
   end
 
-  test "Governor.wrap/2 rejects unsupported arities" do
-    long_fun = fn _a, _b, _c, _d, _e, _f, _g, _h, _i -> :ok end
+  # A function with `arity` arguments that returns the list of them.
+  defp function_of_arity(arity) do
+    arguments = Enum.map_join(1..arity//1, ", ", &"a#{&1}")
+    {fun, _binding} = Code.eval_string("fn #{arguments} -> [#{arguments}] end")
+    fun
+  end
 
-    assert_raise ArgumentError, ~r/arities 0..8/, fn ->
-      Governor.wrap(CountingGovernor.new(1), long_fun)
+  test "Governor.wrap/2 supports 0 to 20 arguments, and refuses more" do
+    governor = CountingGovernor.new(1)
+    wrapped = Governor.wrap(governor, function_of_arity(20))
+    assert {:arity, 20} = Function.info(wrapped, :arity)
+    assert await(apply(wrapped, Enum.to_list(1..20))) == Enum.to_list(1..20)
+
+    # The evaluator of Erlang makes 20 arguments at most: the function of
+    # 21 arguments is in the code of the test.
+    too_long = fn _a1,
+                  _a2,
+                  _a3,
+                  _a4,
+                  _a5,
+                  _a6,
+                  _a7,
+                  _a8,
+                  _a9,
+                  _a10,
+                  _a11,
+                  _a12,
+                  _a13,
+                  _a14,
+                  _a15,
+                  _a16,
+                  _a17,
+                  _a18,
+                  _a19,
+                  _a20,
+                  _a21 ->
+      :ok
+    end
+
+    assert_raise ArgumentError, ~r/0 to 20 arguments, got: 21/, fn ->
+      Governor.wrap(governor, too_long)
+    end
+  end
+
+  # A governor that gives each token at once, and tells the test about each
+  # acquisition and each release.
+  defmodule TellingGovernor do
+    defstruct [:test]
+
+    def acquire(%__MODULE__{test: test} = governor) do
+      ref = make_ref()
+      send(test, {:acquired, ref})
+      Promise.resolve(%GovernorToken{governor: governor, ref: ref})
+    end
+
+    def release_token(%__MODULE__{test: test}, ref) do
+      send(test, {:released, ref})
+      :ok
+    end
+  end
+
+  describe "Governor.wrap_iterator/2" do
+    alias Web.ReadableStream
+    alias Web.ReadableStreamAsyncIterator, as: Iterator
+
+    # An enumerable that tells the test about each step, with the token
+    # count of the governor at that time.
+    defp watched(values, governor) do
+      test = self()
+
+      Stream.map(values, fn value ->
+        send(test, {:step, value, governor_state(governor).in_use})
+        value
+      end)
+    end
+
+    test "gives the values of an enumerable, one step for each next" do
+      governor = CountingGovernor.new(1)
+      iterator = Governor.wrap_iterator(governor, watched([:a, :b], governor))
+
+      # The iterator takes no value before the first next. The check of an
+      # absence waits a short time: a fault that takes a value too early
+      # does it in that time.
+      refute_receive {:step, _value, _in_use}, 100
+
+      assert await(Iterator.next(iterator)) == %{value: :a, done: false}
+      assert_received {:step, :a, 1}
+      refute_receive {:step, :b, _in_use}, 100
+
+      assert await(Iterator.next(iterator)) == %{value: :b, done: false}
+      assert_received {:step, :b, 1}
+      assert await(Iterator.next(iterator)) == %{value: nil, done: true}
+      eventually(fn -> governor_state(governor).in_use == 0 end)
+    end
+
+    test "a step waits for a token of the governor" do
+      governor = CountingGovernor.new(1)
+      token = await(Governor.acquire(governor))
+      iterator = Governor.wrap_iterator(governor, watched([:a], governor))
+
+      next = Iterator.next(iterator)
+      eventually(fn -> queue_length(governor) == 1 end)
+      assert Promise.peek(next) == :pending
+      refute_received {:step, _value, _in_use}
+
+      GovernorToken.release(token)
+      assert await(next) == %{value: :a, done: false}
+      assert_received {:step, :a, 1}
+    end
+
+    test "the governor limits the steps of two iterators" do
+      governor = CountingGovernor.new(1)
+      test = self()
+
+      blocking = fn name ->
+        Stream.map([name], fn value ->
+          send(test, {:started, value, self()})
+
+          receive do
+            :go -> value
+          end
+        end)
+      end
+
+      first = Governor.wrap_iterator(governor, blocking.(:first))
+      second = Governor.wrap_iterator(governor, blocking.(:second))
+      first_next = Iterator.next(first)
+      second_next = Iterator.next(second)
+
+      assert_receive {:started, started, step}
+      eventually(fn -> queue_length(governor) == 1 end)
+      refute_received {:started, _other, _step}
+
+      send(step, :go)
+      assert_receive {:started, _other, other_step}
+      send(other_step, :go)
+
+      assert Enum.sort([await(first_next).value, await(second_next).value]) == [:first, :second]
+      assert started in [:first, :second]
+    end
+
+    test "each step acquires a token and releases it, also a step that raises" do
+      governor = %TellingGovernor{test: self()}
+
+      source =
+        Stream.map([1, 2], fn value -> if value == 2, do: raise("step failed"), else: value end)
+
+      iterator = Governor.wrap_iterator(governor, source)
+
+      assert await(Iterator.next(iterator)) == %{value: 1, done: false}
+      assert_received {:acquired, first}
+      assert_received {:released, ^first}
+
+      assert %RuntimeError{message: "step failed"} = catch_exit(await(Iterator.next(iterator)))
+      assert_received {:acquired, second}
+      assert_received {:released, ^second}
+    end
+
+    test "an async iterator is a source, and return/2 stops it" do
+      governor = CountingGovernor.new(1)
+      source = ReadableStream.from([1, 2, 3])
+      iterator = Governor.wrap_iterator(governor, ReadableStream.values(source))
+
+      assert await(Iterator.next(iterator)) == %{value: 1, done: false}
+      assert await(Iterator.return(iterator, :enough)) == %{value: :enough, done: true}
+
+      # The return of the source releases its lock.
+      eventually(fn -> not ReadableStream.locked?(source) end)
+
+      ended = Governor.wrap_iterator(governor, ReadableStream.values(ReadableStream.from([:x])))
+      assert await(Iterator.next(ended)) == %{value: :x, done: false}
+      assert await(Iterator.next(ended)) == %{value: nil, done: true}
+    end
+
+    test "return/2 stops an enumerable" do
+      governor = CountingGovernor.new(1)
+      test = self()
+
+      source =
+        Stream.resource(
+          fn -> 0 end,
+          fn count -> {[count], count + 1} end,
+          fn _count -> send(test, :source_halted) end
+        )
+
+      iterator = Governor.wrap_iterator(governor, source)
+      assert await(Iterator.next(iterator)) == %{value: 0, done: false}
+      assert await(Iterator.return(iterator)) == %{value: nil, done: true}
+      assert_receive :source_halted
+    end
+
+    test "raises TypeError for a value that is not an iterator" do
+      assert_raise Web.TypeError, ~r/not an iterator/, fn ->
+        Governor.wrap_iterator(CountingGovernor.new(1), :not_an_iterator)
+      end
     end
   end
 

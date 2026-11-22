@@ -661,6 +661,44 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "SocketClose" do
+    @half_open {"HalfOpen = FALSE", "HalfOpen = TRUE"}
+
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("SocketClose"))
+    end
+
+    test "the design has all its properties with allowHalfOpen" do
+      assert_holds(SpecModel.check("SocketClose", [@half_open]))
+    end
+
+    test "a cancel of the readable side that closes the socket is found" do
+      assert_violates(SpecModel.check("SocketClose", bug("cancel_closes")), "ClosedFulfils")
+    end
+
+    test "a close of the writable side that closes the socket is found" do
+      assert_violates(SpecModel.check("SocketClose", bug("writer_close_closes")), "ClosedFulfils")
+    end
+
+    test "an option allowHalfOpen with no effect is found" do
+      assert_violates(
+        SpecModel.check("SocketClose", [@half_open, bug("half_open_ignored")]),
+        "HalfOpenStays"
+      )
+    end
+
+    test "a close that keeps a pending opened is found" do
+      assert_violates(SpecModel.check("SocketClose", bug("close_keeps_opened")), "OpenedSettled")
+    end
+
+    test "a startTls() that keeps the first socket open is found" do
+      assert_violates(
+        SpecModel.check("SocketClose", bug("upgrade_keeps_first_open")),
+        "FirstSocketClosed"
+      )
+    end
+  end
+
   describe "SharedConnection" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("SharedConnection"))

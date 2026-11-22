@@ -48,7 +48,7 @@ defmodule Web.SymbolTest do
     end
 
     test "a message port closes it" do
-      {port1, port2} = MessageChannel.new()
+      %{port1: port1, port2: port2} = MessageChannel.new()
       test = self()
       MessagePort.onclose(port2, fn -> send(test, :closed) end)
 
@@ -116,7 +116,7 @@ defmodule Web.SymbolTest do
         end
 
       assert result == :used
-      assert Web.Promise.await(socket.closed) != nil
+      assert Web.Promise.await(socket.closed) == nil
       assert :unsupported = Web.Symbol.Protocol.symbol(socket, :iterator, [])
       :gen_tcp.close(listener)
     end

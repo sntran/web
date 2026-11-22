@@ -132,6 +132,10 @@ responses = await(Promise.all(requests))
 
 ```
 
+`Governor.wrap/2` gives a function that holds a token for each call, and
+`Governor.wrap_iterator/2` gives an async iterator that holds a token for
+each step of an enumerable, as `wrapIterator(it)`.
+
 A token belongs to the process that acquired it. When that process stops,
 also with a failure, the governor takes the token back. Thus the capacity
 cannot decrease.
@@ -165,10 +169,12 @@ pair = await Promise.all([
 ```
 
 A promise behaves as it does on the Web. Any process can `await` it, and can
-`await` it more than one time. `Promise.then/2`, `Promise.catch/2`, and
-`Promise.finally/2` return a new promise immediately. `Promise.all/1`,
-`Promise.all_settled/1`, `Promise.any/1`, and `Promise.race/1` accept pending
-promises.
+`await` it more than one time. `Promise.then/3`, `Promise.catch/2`, and
+`Promise.finally/2` return a new promise immediately. `Promise.then/3` takes
+the callbacks `on_fulfilled` and `on_rejected`, and `nil` is `undefined`.
+`Promise.try/2` calls a function now and gives a promise of its result.
+`Promise.all/1`, `Promise.all_settled/1`, `Promise.any/1`, and
+`Promise.race/1` accept pending promises.
 
 The BEAM has one rule that the Web does not have: a pending promise has an
 owner, which is the process that made it. The promise stops when its owner
@@ -207,6 +213,9 @@ AsyncContext.Variable.run(request_id, "req-42", fn ->
 end)
 # => "req-42"
 ```
+
+`AsyncContext.Snapshot.wrap/1` takes the context now, and gives a function
+that runs in that context at a later time, also in a different process.
 
 ### 🌊 Zero-Buffer Streaming
 
@@ -455,6 +464,18 @@ connection only when the readable side wants data: it asks for one message
 of the connection for each pull of the stream. Thus the readable side keeps
 the bytes of its high water mark at most (64 KiB), and one message more.
 
+The socket closes as the Sockets API specifies. `Socket.close/2` cancels
+the readable side and aborts the writable side with its reason, and the
+promise `closed` fulfils with `nil`. A close of the connection by the peer
+closes the socket too, unless the option `allow_half_open: true` keeps the
+writable side open. A cancel of the readable side does not close the
+socket, and a close of the writable side sends only the end of the data
+(a TCP half close). When the connection fails, `opened` and `closed` reject
+with a `SocketError`: a `Web.TypeError` with the reason of Erlang/OTP in
+its field `cause`. The options `:sni` and `:alpn` give the name and the
+protocols of the TLS handshake, and `opened` gives the protocol that the
+server selected.
+
 A TLS socket verifies the certificate of the server and its host name,
 with the trust store of the operating system. `fetch` does the same. The
 setting `:tls_options` gives TLS options to the two functions: a keyword
@@ -470,8 +491,10 @@ The option `verify: :verify_none` of the setting stops the verification.
 Use it only for a test.
 
 `Socket.start_tls/1` starts TLS on a socket of
-`Web.connect(address, secure_transport: "starttls")`, as `startTls()`. For a
-full SMTP handshake example, run:
+`Web.connect(address, secure_transport: "starttls")`, as `startTls()`. It
+returns the new TLS socket at once, and its promise `opened` fulfils after
+the handshake. The first socket closes, and `Socket.upgraded?/1` gives
+`true` for it. For a full SMTP handshake example, run:
 
 ```shell
 mix run examples/smtp_client.exs
@@ -504,14 +527,15 @@ A value that refers to something that runs cannot be cloned: a pid, a
 function, a stream, a promise. The function then raises `Web.DOMException`
 with the name `DataCloneError`, and changes nothing.
 
-`Web.MessageChannel` makes two connected ports. A message that one port
-sends arrives at the other port as an event `message`. A port can move to
+`Web.MessageChannel.new/0` makes a channel with two connected ports, in its
+fields `port1` and `port2`. A message that one port sends arrives at the
+other port as an event `message`. A port can move to
 the listener that gets a message: put it in the transfer list.
 
 ```elixir
 use Web
 
-{port1, port2} = MessageChannel.new()
+%{port1: port1, port2: port2} = MessageChannel.new()
 
 MessagePort.onmessage(port2, fn event ->
   # Answer on the port that got the message.
@@ -783,6 +807,7 @@ easy to make and hard to find with an example test:
 | `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |
 | `ConnectionPool.tla` | The connections of an origin, and the slots of a counting governor: the limit, the queue, and the stops. |
 | `SocketFlow.tla`     | A request reads its socket one message at a time, at the limit. |
+| `SocketClose.tla`    | The close of a socket, the half close, and `startTls()`, as the Sockets API specifies. |
 | `SharedConnection.tla` | HTTP/2 streams: one run of each request, the limit, GOAWAY. |
 | `MessagePort.tla`    | The port message queue, the start, the transfer, and the close. |
 | `BroadcastChannel.tla` | The channels of one name, with a channel that is slow.   |

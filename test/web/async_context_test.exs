@@ -58,7 +58,13 @@ defmodule Web.AsyncContextTest do
     end
   end
 
-  describe "Variable.run/3" do
+  describe "Variable.run/4" do
+    test "gives the arguments to the function, as run(value, fn, ...args)" do
+      var = Variable.new(name: "with_args")
+      assert Variable.run(var, 10, fn a, b -> Variable.get(var) + a + b end, [1, 2]) == 13
+      assert Variable.get(var) == nil
+    end
+
     test "sets value within scope" do
       var = Variable.new(name: "scoped")
       result = Variable.run(var, :hello, fn -> Variable.get(var) end)
@@ -150,6 +156,86 @@ defmodule Web.AsyncContextTest do
       snap = Snapshot.new()
       assert snap.variables == %{}
       assert snap.callers == []
+    end
+  end
+
+  describe "Snapshot.run/3 with arguments" do
+    test "gives the arguments to the function, as run(fn, ...args)" do
+      var = Variable.new(name: "snapshot_args")
+      snap = Variable.run(var, :inside, &Snapshot.new/0)
+
+      assert Snapshot.run(snap, fn a, b -> {Variable.get(var), a, b} end, [1, 2]) ==
+               {:inside, 1, 2}
+
+      assert Variable.get(var) == nil
+    end
+  end
+
+  describe "Snapshot.wrap/1" do
+    test "the function runs in the context of the time of wrap/1, with its arguments" do
+      var = Variable.new(name: "wrap_var")
+
+      wrapped =
+        Variable.run(var, "A", fn -> Snapshot.wrap(fn x -> {Variable.get(var), x} end) end)
+
+      assert {:arity, 1} = Function.info(wrapped, :arity)
+      assert wrapped.(1) == {"A", 1}
+      assert Variable.run(var, "B", fn -> wrapped.(2) end) == {"A", 2}
+      assert Variable.get(var) == nil
+    end
+
+    test "the function keeps the context in a different process" do
+      var = Variable.new(name: "wrap_process")
+
+      wrapped =
+        Variable.run(var, :from_caller, fn -> Snapshot.wrap(fn -> Variable.get(var) end) end)
+
+      assert Task.await(Task.async(wrapped)) == :from_caller
+    end
+
+    test "the context is restored also when the function raises" do
+      var = Variable.new(name: "wrap_raise")
+      wrapped = Variable.run(var, :wrapped, fn -> Snapshot.wrap(fn -> raise "boom" end) end)
+
+      Variable.run(var, :outside, fn ->
+        assert_raise RuntimeError, wrapped
+        assert Variable.get(var) == :outside
+      end)
+    end
+
+    test "accepts 0 to 20 arguments" do
+      arguments = Enum.map_join(1..20, ", ", &"a#{&1}")
+      {fun, _binding} = Code.eval_string("fn #{arguments} -> [#{arguments}] end")
+      wrapped = Snapshot.wrap(fun)
+      assert apply(wrapped, Enum.to_list(1..20)) == Enum.to_list(1..20)
+      assert Snapshot.wrap(fn -> :zero end).() == :zero
+
+      # The evaluator of Erlang makes 20 arguments at most.
+      too_long = fn _a1,
+                    _a2,
+                    _a3,
+                    _a4,
+                    _a5,
+                    _a6,
+                    _a7,
+                    _a8,
+                    _a9,
+                    _a10,
+                    _a11,
+                    _a12,
+                    _a13,
+                    _a14,
+                    _a15,
+                    _a16,
+                    _a17,
+                    _a18,
+                    _a19,
+                    _a20,
+                    _a21 ->
+        :ok
+      end
+
+      assert_raise ArgumentError, ~r/0 to 20 arguments/, fn -> Snapshot.wrap(too_long) end
     end
   end
 

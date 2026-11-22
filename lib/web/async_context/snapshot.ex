@@ -24,7 +24,7 @@ defmodule Web.AsyncContext.Snapshot do
 
   ## Running Inside a Snapshot
 
-  `run/2` temporarily installs the snapshot's captured context for the duration
+  `run/3` temporarily installs the snapshot's captured context for the duration
   of a callback, then restores the previous process context afterward:
 
       snapshot = Web.AsyncContext.Snapshot.new()
@@ -45,6 +45,7 @@ defmodule Web.AsyncContext.Snapshot do
 
   alias Web.AsyncContext
   alias Web.AsyncContext.Variable
+  alias Web.Internal.Arity
 
   defstruct variables: %{},
             variable_registry: MapSet.new(),
@@ -97,9 +98,10 @@ defmodule Web.AsyncContext.Snapshot do
   @doc """
   Runs `fun` with this snapshot installed as the current async context.
 
-  This is `snapshot.run(fn)` of the proposal: variable bindings,
+  This is `snapshot.run(fn, ...args)` of the proposal: variable bindings,
   logger metadata, `$callers`, and the ambient abort signal are made current for
-  `fun`, and the previous process context is restored afterward.
+  `fun`, and the previous process context is restored afterward. `fun` gets
+  the arguments of the list `args`.
 
   The installed context is exact for the duration of the callback: values not
   present in the snapshot are treated as unset while `fun` runs.
@@ -115,17 +117,42 @@ defmodule Web.AsyncContext.Snapshot do
       ...> end)
       :blue
   """
-  @spec run(t(), (-> result)) :: result when result: var
-  def run(%__MODULE__{} = snapshot, fun) when is_function(fun, 0) do
+  @spec run(t(), function(), list()) :: term()
+  def run(%__MODULE__{} = snapshot, fun, args \\ []) when is_function(fun, length(args)) do
     state = capture_run_state(snapshot)
 
     install_snapshot_for_run(snapshot, state.managed_registry)
 
     try do
-      fun.()
+      apply(fun, args)
     after
       restore_run_state(state)
     end
+  end
+
+  @doc """
+  Takes the current context, and returns a function that runs `fun` in it,
+  as the static method `AsyncContext.Snapshot.wrap(fn)`.
+
+  The new function has the arity of `fun`, from 0 to 20 arguments. Each
+  call runs `fun` with its arguments, as `run/3` with a snapshot of the
+  time of `wrap/1`, and returns the result of `fun`.
+
+  ## Examples
+
+      iex> var = Web.AsyncContext.Variable.new(name: "user")
+      iex> greet = Web.AsyncContext.Variable.run(var, "ada", fn ->
+      ...>   Web.AsyncContext.Snapshot.wrap(fn greeting ->
+      ...>     greeting <> ", " <> Web.AsyncContext.Variable.get(var)
+      ...>   end)
+      ...> end)
+      iex> greet.("hello")
+      "hello, ada"
+  """
+  @spec wrap(function()) :: function()
+  def wrap(fun) when is_function(fun) do
+    snapshot = new()
+    Arity.wrap(fun, &run(snapshot, fun, &1))
   end
 
   @doc false
@@ -206,7 +233,7 @@ defmodule Web.AsyncContext.Snapshot do
   end
 
   # ---------------------------------------------------------------------------
-  # Scoped run/2 helpers
+  # Scoped run/3 helpers
   # ---------------------------------------------------------------------------
 
   defp capture_run_state(%__MODULE__{} = snapshot) do

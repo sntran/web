@@ -71,7 +71,7 @@ defmodule Web.TLA.MessagePortConformanceTest do
   # Each event has the reference of its run: an event of a run that ended
   # is not an event of the next run.
   defp start_system do
-    {a, b} = MessageChannel.new()
+    %{port1: a, port2: b} = MessageChannel.new()
     test = self()
     run = make_ref()
     MessagePort.add_event_listener(a, "close", fn -> send(test, {run, :a_close}) end)

@@ -1,5 +1,6 @@
 defmodule Web.PromiseTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   import Web, only: [await: 1]
 
@@ -316,7 +317,99 @@ defmodule Web.PromiseTest do
     end
   end
 
+  describe "then/3" do
+    # A settled or a pending promise with the outcome.
+    defp promise_of({:fulfilled, value}, false), do: Promise.resolve(value)
+    defp promise_of({:rejected, reason}, false), do: Promise.reject(reason)
+    defp promise_of({:fulfilled, value}, true), do: later(value, 1)
+    defp promise_of({:rejected, reason}, true), do: later_rejection(reason, 1)
+
+    property "the callback of the state runs, and nil passes the outcome on" do
+      check all(
+              outcome <-
+                one_of([
+                  tuple({constant(:fulfilled), term()}),
+                  tuple({constant(:rejected), term()})
+                ]),
+              pending? <- boolean(),
+              on_fulfilled? <- boolean(),
+              on_rejected? <- boolean(),
+              max_runs: 40
+            ) do
+        on_fulfilled = if on_fulfilled?, do: &{:fulfilled_with, &1}
+        on_rejected = if on_rejected?, do: &{:rejected_with, &1}
+        promise = Promise.then(promise_of(outcome, pending?), on_fulfilled, on_rejected)
+
+        expected =
+          case {outcome, on_fulfilled?, on_rejected?} do
+            {{:fulfilled, value}, true, _} -> {:fulfilled, {:fulfilled_with, value}}
+            {{:rejected, reason}, _, true} -> {:fulfilled, {:rejected_with, reason}}
+            {outcome, _, _} -> outcome
+          end
+
+        assert Promise.wait(promise) == expected
+      end
+    end
+
+    test "on_rejected does not run for a fulfilled promise, and on_fulfilled not for a rejection" do
+      parent = self()
+      on_fulfilled = fn value -> send(parent, {:on_fulfilled, value}) end
+      on_rejected = fn reason -> send(parent, {:on_rejected, reason}) end
+
+      assert await(Promise.then(later(:value, 1), on_fulfilled, on_rejected)) ==
+               {:on_fulfilled, :value}
+
+      assert await(Promise.then(later_rejection(:bad, 1), on_fulfilled, on_rejected)) ==
+               {:on_rejected, :bad}
+
+      assert_received {:on_fulfilled, :value}
+      assert_received {:on_rejected, :bad}
+      refute_received _other
+    end
+
+    test "an on_rejected that raises rejects the new promise" do
+      promise =
+        Promise.then(Promise.reject(:err), nil, fn _reason -> raise "callback failure" end)
+
+      assert %RuntimeError{message: "callback failure"} = catch_exit(await(promise))
+    end
+
+    test "a settled promise with no callback for its state is returned without a new process" do
+      fulfilled = Promise.resolve(:value)
+      assert Promise.then(fulfilled, nil, fn _reason -> :fallback end) == fulfilled
+      assert Promise.then(fulfilled, nil, nil) == fulfilled
+    end
+  end
+
+  describe "try/2" do
+    test "it calls the function now, in the calling process, with the arguments" do
+      parent = self()
+      promise = Promise.try(fn a, b -> send(parent, {:called, self(), a + b}) end, [1, 2])
+
+      assert_received {:called, ^parent, 3}
+      assert promise == Promise.resolve({:called, parent, 3})
+    end
+
+    test "a raise, a throw, and an exit reject the promise with their value" do
+      assert %RuntimeError{message: "bad"} = catch_exit(await(Promise.try(fn -> raise "bad" end)))
+      assert catch_exit(await(Promise.try(fn -> throw(:thrown) end))) == :thrown
+      assert catch_exit(await(Promise.try(fn -> exit(:exited) end))) == :exited
+    end
+
+    test "a promise of the function is the result" do
+      pending = later(:later, 1)
+      assert Promise.try(fn -> pending end) == pending
+      assert await(Promise.try(fn -> pending end)) == :later
+    end
+  end
+
   describe "catch/2" do
+    test "nil is undefined: the outcome goes through" do
+      assert Promise.catch(Promise.reject(:bad), nil) == Promise.reject(:bad)
+      assert catch_exit(await(Promise.catch(later_rejection(:bad, 1), nil))) == :bad
+      assert await(Promise.catch(later(:value, 1), nil)) == :value
+    end
+
     test "it recovers from a rejection" do
       promise = Promise.catch(Promise.reject(:boom), fn reason -> {:recovered, reason} end)
       assert await(promise) == {:recovered, :boom}
@@ -348,6 +441,12 @@ defmodule Web.PromiseTest do
   end
 
   describe "finally/2" do
+    test "nil is undefined: the outcome goes through" do
+      assert Promise.finally(Promise.resolve(:value), nil) == Promise.resolve(:value)
+      assert await(Promise.finally(later(:value, 1), nil)) == :value
+      assert catch_exit(await(Promise.finally(later_rejection(:bad, 1), nil))) == :bad
+    end
+
     test "it runs the callback and keeps a fulfilled value" do
       parent = self()
       promise = Promise.finally(later(:value, 5), fn -> send(parent, :cleanup) end)

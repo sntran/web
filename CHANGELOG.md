@@ -506,6 +506,105 @@ All notable changes to this project are documented in this file.
   to the process of an enumerable, start no timer now: a read of
   `ReadableStream.from/1` costs approximately 1 µs less for each element.
   See `BENCHMARKS.md`.
+- **Breaking:** the public API has only the names of the Web Standards and
+  of TC39, also of the TC39 proposals. Each name has its Elixir form: snake
+  case, a setter with the name of the attribute (`name/2`), and the suffix
+  `?` only for a boolean attribute. `start_link/1`, `child_spec/1`, and the
+  implementations of the Elixir protocols stay public. An extension point
+  is internal. See `CONTRIBUTING.md`. The changes:
+  - The bytes: `Web.Uint8Array.to_binary/1`, `Web.ArrayBuffer.data/1`, and
+    `Web.ArrayBuffer.detach/1` are internal. Use `to_string/1`: the two
+    structs implement `String.Chars`.
+  - The streams:
+    - `Web.ReadableStream.read/1` is removed, and `get_desired_size/1` and
+      `release_lock/2` are internal. Read and release with a reader.
+    - `Web.WritableStream.write/2`, `ready/1,2`, `desired_size/1`,
+      `backpressure?/1`, `release_lock/1,2`, `close/2`, and `abort/3` are
+      removed. Use a writer.
+    - `Web.WritableStreamDefaultController.desired_size/1` and the
+      `wait_for_capacity/1` of the controllers are removed.
+    - The second argument of `Web.ReadableStream.new/2` and
+      `Web.WritableStream.new/2` is the queuing strategy: a keyword list, a
+      map, or a strategy struct. The options of the engine are internal. A
+      source is a map with the members of `UnderlyingSource`. A pid, a
+      function, or a tuple as a source goes to `start_link/1`.
+    - `Web.TransformStream.new/3` takes `transformer`, `writable_strategy`,
+      and `readable_strategy`, as the constructor of the Standard.
+    - `Web.CountQueuingStrategy.new/1` and `Web.ByteLengthQueuingStrategy.new/1`
+      take the dictionary `QueuingStrategyInit`, for example
+      `new(high_water_mark: 4)`. The field `size` holds the function of the
+      Standard: `strategy.size.(chunk)`.
+    - The functions of a stream take a stream struct, not a pid.
+      `pipe_to/3` and `pipe_through/3` give a `Web.TypeError` for a value
+      that is not a stream.
+    - The pipe options `:preventClose`, `:preventAbort`, and
+      `:preventCancel` are removed: use `:prevent_close`, `:prevent_abort`,
+      and `:prevent_cancel`.
+    - The default reason of `cancel` and `abort` is `nil` (undefined), and
+      each controller has `error/1`.
+    - `Web.Stream`, the engine and its behaviour, and `Web.DSL` are
+      internal.
+  - Fetch, URL, and files:
+    - `Web.URL.set_hostname/2`, `set_password/2`, `set_pathname/2`,
+      `set_port/2`, `set_protocol/2`, and `set_username/2` are
+      `hostname/2`, `password/2`, `pathname/2`, `port/2`, `protocol/2`, and
+      `username/2`. `Web.URL.rclone?/1` is internal.
+    - `Web.Response.new/1` takes a body, as `new Response(body)`, and
+      `new/2` takes a body and the members of `ResponseInit` (`:status`,
+      `:status_text`, and `:headers`). Change
+      `Response.new(body: body, status: 201)` to
+      `Response.new(body, status: 201)`.
+    - `Web.Headers.get/2` has no default argument, `getSetCookie/1` is
+      removed (use `get_set_cookie/1`), and `to_list/1` is internal.
+    - `Web.URLSearchParams.has?/2` is removed (use `has/2`), and `to_list/1`
+      is internal (use `Enum.to_list/1`).
+    - `Web.FormData.has?/2` is `has/2`, and `new/1` is `new/0`.
+      `Web.FormData.cancel/2` is removed, and `content_type/1` and
+      `parse/3` are internal.
+    - `Web.URLPattern.match_context/3`, `params/0`, `compare_component/3`,
+      and the option `:pinned` are removed. `has_reg_exp_groups/1` is
+      `has_reg_exp_groups?/1`, and `new/3` takes the input, the base URL,
+      and the options, as the first constructor of the Standard.
+    - `Web.Blob.json/1` is removed. `Web.Blob.new/0` makes an empty blob.
+    - `Web.Body`, `Web.Resolver`, and `Web.Dispatcher` are internal, and
+      the option `:dispatcher` of `Web.Request.new/2` and `Web.fetch/2` is
+      removed.
+  - The events, the promises, and the other interfaces:
+    - `Web.EventTarget.addEventListener/4`, `dispatchEvent/2`, and
+      `removeEventListener/4` are removed: use the snake_case names.
+      `Web.EventTarget.Protocol` and the callbacks of `use Web.EventTarget`
+      are internal.
+    - `Web.Event.set_cancel_bubble/2` and `set_return_value/2` are
+      `cancel_bubble/2` and `return_value/2`. The options `:target` and
+      `:current_target` of the event constructors are removed.
+    - `Web.AbortSignal.receive_abort/3` and `start_link/0`, and
+      `Web.DOMException.abort_error/0` and `timeout_error/0`, are internal.
+      `Web.DOMException.new/2` is the constructor
+      `new DOMException(message, name)`.
+    - `Web.Promise.new/1` and `Web.Promise.with_resolvers/0` have no
+      options. `Web.Promise.await/1` and `wait/1` are internal: use
+      `Web.await/1`. `Web.Promise.AggregateError` is `Web.AggregateError`.
+    - `Web.Symbol.disposable?/1` and `Web.Symbol.Protocol` are internal.
+    - `Web.AsyncContext.Snapshot.take/0` is `new/0`, and
+      `Web.AsyncContext.Variable.new/1` takes `:name` and `:default_value`,
+      as `new AsyncContext.Variable({name, defaultValue})`.
+    - `Web.Governor.Token` is `Web.GovernorToken`, and `Web.using/2`
+      releases it, as `[Symbol.dispose]()`. `Web.Governor.with/2` calls its
+      function with no argument. `Web.CountingGovernor.start/1` is removed.
+      `Web.CountingGovernor.get/1` stays: it gives the governor that a
+      supervisor started.
+    - `Web.BroadcastChannel.Adapter` is internal.
+    - The fields `entryType` and `startTime` of `Web.Performance.Mark` and
+      `Web.Performance.Measure` are `entry_type` and `start_time`, and the
+      camelCase copies of the functions of `Web.Performance` and
+      `Web.Console` are removed.
+    - `Web.connect/2` takes only the option `:secure_transport`. The other
+      options are settings of the application (`config :web, tls_options:`
+      and `connect_timeout:`). `Web.Socket.start_tls/1` has no argument, as
+      `startTls()`. The keys of `opened` are `remote_address` and
+      `local_address`.
+    - The option `:ignoreBOM` of `Web.TextDecoder.new/2` is removed: use
+      `:ignore_bom`.
 - `Web.Blob` follows the File API: the type becomes ASCII lowercase, and a
   type with a character outside U+0020 to U+007E becomes `""`. The functions
   of `Web.Blob` accept a `Web.File`. `Web.Blob.stream/1` is a byte stream,
@@ -909,8 +1008,8 @@ All notable changes to this project are documented in this file.
     enumerable gives its elements with no change.
 
   Thus `Enum.join/1` on a body does not work. Use `Web.Response.text/1` or
-  `Web.Response.bytes/1` for all the bytes, or `Web.Uint8Array.to_binary/1`
-  for one chunk. A stream that the caller made is not changed.
+  `Web.Response.bytes/1` for all the bytes, or `to_string/1` for one
+  chunk. A stream that the caller made is not changed.
 - Each consumer of bytes accepts a binary, a `Web.Uint8Array`, a
   `Web.ArrayBuffer`, or iodata: the functions of a body, the body of a
   request that a dispatcher sends, a write to a `Web.Socket`, a part of a

@@ -15,10 +15,11 @@ defmodule Web.AsyncContext.Snapshot do
 
       iex> :logger.update_process_metadata(%{request_id: "abc"})
       :ok
-      iex> snap = Web.AsyncContext.Snapshot.take()
-      iex> is_map(snap.logger_metadata)
-      true
-      iex> snap.logger_metadata[:request_id]
+      iex> snapshot = Web.AsyncContext.Snapshot.new()
+      iex> task = Task.async(fn ->
+      ...>   Web.AsyncContext.Snapshot.run(snapshot, fn -> Logger.metadata()[:request_id] end)
+      ...> end)
+      iex> Task.await(task)
       "abc"
 
   ## Running Inside a Snapshot
@@ -26,7 +27,7 @@ defmodule Web.AsyncContext.Snapshot do
   `run/2` temporarily installs the snapshot's captured context for the duration
   of a callback, then restores the previous process context afterward:
 
-      snapshot = Web.AsyncContext.Snapshot.take()
+      snapshot = Web.AsyncContext.Snapshot.new()
 
       spawn(fn ->
         Web.AsyncContext.Snapshot.run(snapshot, fn ->
@@ -51,6 +52,7 @@ defmodule Web.AsyncContext.Snapshot do
             callers: [],
             ambient_signal: nil
 
+  @typedoc "A snapshot. The fields are private."
   @type t :: %__MODULE__{
           variables: %{optional(term()) => term()},
           variable_registry: MapSet.t(),
@@ -60,7 +62,8 @@ defmodule Web.AsyncContext.Snapshot do
         }
 
   @doc """
-  Captures the current async context as an immutable snapshot.
+  Takes the current asynchronous context, as the constructor
+  `new AsyncContext.Snapshot()`.
 
   Collects:
 
@@ -73,12 +76,12 @@ defmodule Web.AsyncContext.Snapshot do
 
   ## Examples
 
-      iex> snap = Web.AsyncContext.Snapshot.take()
+      iex> snap = Web.AsyncContext.Snapshot.new()
       iex> is_struct(snap, Web.AsyncContext.Snapshot)
       true
   """
-  @spec take() :: t()
-  def take do
+  @spec new() :: t()
+  def new do
     registry_key = Variable.registry_key()
     registry = Process.get(registry_key, MapSet.new())
 
@@ -94,7 +97,7 @@ defmodule Web.AsyncContext.Snapshot do
   @doc """
   Runs `fun` with this snapshot installed as the current async context.
 
-  This mirrors the TC39 `snapshot.run(callback)` shape: variable bindings,
+  This is `snapshot.run(fn)` of the proposal: variable bindings,
   logger metadata, `$callers`, and the ambient abort signal are made current for
   `fun`, and the previous process context is restored afterward.
 
@@ -103,9 +106,9 @@ defmodule Web.AsyncContext.Snapshot do
 
   ## Examples
 
-      iex> var = Web.AsyncContext.Variable.new("color")
+      iex> var = Web.AsyncContext.Variable.new(name: "color")
       iex> snap = Web.AsyncContext.Variable.run(var, :blue, fn ->
-      ...>   Web.AsyncContext.Snapshot.take()
+      ...>   Web.AsyncContext.Snapshot.new()
       ...> end)
       iex> Web.AsyncContext.Snapshot.run(snap, fn ->
       ...>   Web.AsyncContext.Variable.get(var)

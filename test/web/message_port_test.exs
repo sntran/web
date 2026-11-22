@@ -14,6 +14,38 @@ defmodule Web.MessagePortTest do
   alias Web.MessageEvent
   alias Web.MessagePort
 
+  doctest Web.MessagePort
+  doctest Web.MessageChannel
+  doctest Web.MessageEvent
+
+  describe "MessageEvent.new/2" do
+    test "has the members of MessageEventInit, and no target" do
+      {port1, _port2} = channel()
+
+      event =
+        MessageEvent.new(:message,
+          data: %{id: 1},
+          origin: "node://a@b",
+          last_event_id: "7",
+          source: :a_source,
+          ports: [port1],
+          target: port1,
+          current_target: port1
+        )
+
+      assert %MessageEvent{
+               type: "message",
+               data: %{id: 1},
+               origin: "node://a@b",
+               last_event_id: "7",
+               source: :a_source,
+               ports: [^port1],
+               target: nil,
+               current_target: nil
+             } = event
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
@@ -185,7 +217,7 @@ defmodule Web.MessagePortTest do
     test "the listener runs in the async context of the sender" do
       {port1, port2} = channel()
       test = self()
-      request_id = Variable.new("request_id")
+      request_id = Variable.new(name: "request_id")
 
       MessagePort.onmessage(port2, fn _event ->
         send(test, {:request_id, Variable.get(request_id)})
@@ -209,7 +241,7 @@ defmodule Web.MessagePortTest do
       assert :ok = MessagePort.post_message(port1, buffer, transfer: [buffer])
 
       assert_receive {:got, %ArrayBuffer{} = moved}
-      assert ArrayBuffer.data(moved) == "bytes"
+      assert to_string(moved) == "bytes"
       assert ArrayBuffer.detached?(buffer)
     end
 
@@ -250,7 +282,7 @@ defmodule Web.MessagePortTest do
     end
   end
 
-  defp snapshot, do: Snapshot.take()
+  defp snapshot, do: Snapshot.new()
 
   # ---------------------------------------------------------------------------
   # The port message queue

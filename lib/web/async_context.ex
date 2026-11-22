@@ -23,10 +23,10 @@ defmodule Web.AsyncContext do
 
       use Web
 
-      request_id = Web.AsyncContext.Variable.new("request_id")
+      request_id = Web.AsyncContext.Variable.new(name: "request_id")
 
       Web.AsyncContext.Variable.run(request_id, "req-42", fn ->
-        snapshot = Web.AsyncContext.Snapshot.take()
+        snapshot = Web.AsyncContext.Snapshot.new()
 
         Task.async(fn ->
           Web.AsyncContext.Snapshot.run(snapshot, fn ->

@@ -62,12 +62,6 @@ defmodule Web.Console do
   that calls the functions. A different process has its own state. The
   depth of the groups goes with `Web.AsyncContext` into the callbacks of a
   promise and of a stream.
-
-  ## Names
-
-  The functions have the names of Elixir. The names of ECMAScript are also
-  there: `groupCollapsed`, `groupEnd`, `timeLog`, `timeEnd`, and
-  `countReset`.
   """
 
   @group_depth_key {__MODULE__, :group_depth}
@@ -303,15 +297,9 @@ defmodule Web.Console do
   @spec group_collapsed(data()) :: :ok
   def group_collapsed(data \\ []), do: group(data)
 
-  @doc false
-  def unquote(:groupCollapsed)(data \\ []), do: group_collapsed(data)
-
   @doc "Closes the group that was opened last. With no open group, it has no effect."
   @spec group_end() :: :ok
   def group_end, do: put_group_depth(max(group_depth() - 1, 0))
-
-  @doc false
-  def unquote(:groupEnd)(), do: group_end()
 
   # ---------------------------------------------------------------------------
   # Timers
@@ -348,9 +336,6 @@ defmodule Web.Console do
     end
   end
 
-  @doc false
-  def unquote(:timeLog)(label \\ "default", data \\ []), do: time_log(label, data)
-
   @doc """
   Writes the time of a timer, and stops it. With no such timer, the
   function writes a warning.
@@ -368,9 +353,6 @@ defmodule Web.Console do
         emit_elapsed(:time_end, label, started_at, [])
     end
   end
-
-  @doc false
-  def unquote(:timeEnd)(label \\ "default"), do: time_end(label)
 
   defp emit_elapsed(method, label, started_at, args) do
     elapsed_ms = :erlang.float_to_binary((monotonic_us() - started_at) / 1000.0, decimals: 3)
@@ -412,9 +394,6 @@ defmodule Web.Console do
       emit(:warning, :count_reset, "Count for '#{label}' does not exist")
     end
   end
-
-  @doc false
-  def unquote(:countReset)(label \\ "default"), do: count_reset(label)
 
   # ---------------------------------------------------------------------------
   # The arguments and the format

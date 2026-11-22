@@ -71,7 +71,7 @@ defmodule Web.Internal.AddressTest do
 
     test "Web.connect/2", %{port: port} do
       socket = Web.connect("127.0.0.1:#{port}")
-      assert %{remoteAddress: remote} = await(socket.opened)
+      assert %{remote_address: remote} = await(socket.opened)
       assert remote == "127.0.0.1:#{port}"
       await(Web.Socket.close(socket))
     end
@@ -118,7 +118,7 @@ defmodule Web.Internal.AddressTest do
         socket = Web.connect(address)
 
         case {context.ipv6?, Web.Promise.wait(socket.opened)} do
-          {true, {:fulfilled, %{remoteAddress: remote}}} ->
+          {true, {:fulfilled, %{remote_address: remote}}} ->
             assert remote == "[::1]:#{port}"
             await(Web.Socket.close(socket))
 

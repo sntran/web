@@ -11,49 +11,62 @@ defmodule Web.AsyncContextTest do
   alias Web.ReadableStreamDefaultReader
   alias Web.WritableStreamDefaultWriter
 
+  doctest Web.AsyncContext.Variable
+  doctest Web.AsyncContext.Snapshot
+
   # ===========================================================================
   # Variable — basic API
   # ===========================================================================
 
-  describe "Variable.new/2" do
+  describe "Variable.new/1" do
     test "creates a named variable" do
-      var = Variable.new("test_var")
+      var = Variable.new(name: "test_var")
       assert var.name == "test_var"
       assert is_tuple(var.key)
     end
 
     test "supports a default value" do
-      var = Variable.new("with_default", default: :fallback)
-      assert var.default == :fallback
+      var = Variable.new(name: "with_default", default_value: :fallback)
+      assert var.default_value == :fallback
     end
 
     test "default is nil when not specified" do
-      var = Variable.new("no_default")
-      assert var.default == nil
+      var = Variable.new(name: "no_default")
+      assert var.default_value == nil
+    end
+
+    test "with no options, the name is the empty string and the default value is nil" do
+      var = Variable.new()
+      assert {var.name, var.default_value, Variable.get(var)} == {"", nil, nil}
+    end
+
+    test "the name becomes a string" do
+      assert Variable.new(name: :trace).name == "trace"
+      assert Variable.new(name: 7).name == "7"
     end
   end
 
   describe "Variable.get/1" do
     test "returns default when unset" do
-      var = Variable.new("unset_var", default: 42)
+      var = Variable.new(name: "unset_var", default_value: 42)
       assert Variable.get(var) == 42
     end
 
     test "returns nil when unset with no default" do
-      var = Variable.new("nil_var")
+      var = Variable.new(name: "nil_var")
       assert Variable.get(var) == nil
     end
   end
 
   describe "Variable.run/3" do
     test "sets value within scope" do
-      var = Variable.new("scoped")
+      var = Variable.new(name: "scoped")
       result = Variable.run(var, :hello, fn -> Variable.get(var) end)
       assert result == :hello
     end
 
     test "restores previous value after scope" do
-      var = Variable.new("restore_test")
+      var = Variable.new(name: "restore_test")
 
       Variable.run(var, :outer, fn ->
         assert Variable.get(var) == :outer
@@ -67,7 +80,7 @@ defmodule Web.AsyncContextTest do
     end
 
     test "restores original (unset) state after scope" do
-      var = Variable.new("unset_restore", default: :default_val)
+      var = Variable.new(name: "unset_restore", default_value: :default_val)
 
       Variable.run(var, :temp, fn ->
         assert Variable.get(var) == :temp
@@ -77,7 +90,7 @@ defmodule Web.AsyncContextTest do
     end
 
     test "restores value even on exception" do
-      var = Variable.new("exception_test")
+      var = Variable.new(name: "exception_test")
 
       Variable.run(var, :safe, fn ->
         assert_raise RuntimeError, fn ->
@@ -95,20 +108,20 @@ defmodule Web.AsyncContextTest do
   # Snapshot — take/run
   # ===========================================================================
 
-  describe "Snapshot.take/0" do
+  describe "Snapshot.new/0" do
     test "captures logger metadata" do
       :logger.update_process_metadata(%{request_id: "snap-test"})
-      snap = Snapshot.take()
+      snap = Snapshot.new()
       assert snap.logger_metadata[:request_id] == "snap-test"
     after
       :logger.set_process_metadata(%{})
     end
 
     test "captures registered variables" do
-      var = Variable.new("snap_var")
+      var = Variable.new(name: "snap_var")
 
       Variable.run(var, "captured", fn ->
-        snap = Snapshot.take()
+        snap = Snapshot.new()
         assert Map.has_key?(snap.variables, var.key)
         assert snap.variables[var.key] == "captured"
       end)
@@ -116,7 +129,7 @@ defmodule Web.AsyncContextTest do
 
     test "captures $callers" do
       Process.put(:"$callers", [self()])
-      snap = Snapshot.take()
+      snap = Snapshot.new()
       assert snap.callers == [self()]
     after
       Process.delete(:"$callers")
@@ -126,7 +139,7 @@ defmodule Web.AsyncContextTest do
       controller = Web.AbortController.new()
 
       AsyncContext.with_signal(controller.signal, fn ->
-        snap = Snapshot.take()
+        snap = Snapshot.new()
         assert snap.ambient_signal == controller.signal
       end)
 
@@ -134,7 +147,7 @@ defmodule Web.AsyncContextTest do
     end
 
     test "empty context produces clean snapshot" do
-      snap = Snapshot.take()
+      snap = Snapshot.new()
       assert snap.variables == %{}
       assert snap.callers == []
     end
@@ -143,7 +156,7 @@ defmodule Web.AsyncContextTest do
   describe "Snapshot.run/2" do
     test "re-enters logger metadata inside a new process" do
       :logger.update_process_metadata(%{trace_id: "t-123"})
-      snap = Snapshot.take()
+      snap = Snapshot.new()
 
       task =
         Task.async(fn ->
@@ -159,10 +172,10 @@ defmodule Web.AsyncContextTest do
     end
 
     test "re-enters variables inside a new process" do
-      var = Variable.new("cross_process")
+      var = Variable.new(name: "cross_process")
 
       Variable.run(var, "propagated", fn ->
-        snap = Snapshot.take()
+        snap = Snapshot.new()
 
         task =
           Task.async(fn ->
@@ -177,7 +190,7 @@ defmodule Web.AsyncContextTest do
 
     test "re-enters $callers inside a new process" do
       Process.put(:"$callers", [self()])
-      snap = Snapshot.take()
+      snap = Snapshot.new()
 
       task =
         Task.async(fn ->
@@ -192,17 +205,17 @@ defmodule Web.AsyncContextTest do
     end
 
     test "allows nested snapshots after re-entry" do
-      var1 = Variable.new("v1")
-      var2 = Variable.new("v2")
+      var1 = Variable.new(name: "v1")
+      var2 = Variable.new(name: "v2")
 
       Variable.run(var1, "a", fn ->
         Variable.run(var2, "b", fn ->
-          snap = Snapshot.take()
+          snap = Snapshot.new()
 
           task =
             Task.async(fn ->
               Snapshot.run(snap, fn ->
-                inner_snap = Snapshot.take()
+                inner_snap = Snapshot.new()
                 {inner_snap.variables[var1.key], inner_snap.variables[var2.key]}
               end)
             end)
@@ -213,10 +226,10 @@ defmodule Web.AsyncContextTest do
     end
 
     test "restores previous variable values after the run scope" do
-      var = Variable.new("snapshot_scope")
+      var = Variable.new(name: "snapshot_scope")
 
       Variable.run(var, :outer, fn ->
-        snap = Variable.run(var, :inner, fn -> Snapshot.take() end)
+        snap = Variable.run(var, :inner, fn -> Snapshot.new() end)
 
         Snapshot.run(snap, fn ->
           assert Variable.get(var) == :inner
@@ -228,7 +241,7 @@ defmodule Web.AsyncContextTest do
 
     test "restores previous logger metadata after the run scope" do
       :logger.update_process_metadata(%{scope: "inner"})
-      snap = Snapshot.take()
+      snap = Snapshot.new()
       :logger.set_process_metadata(%{scope: "outer"})
 
       Snapshot.run(snap, fn ->
@@ -248,26 +261,26 @@ defmodule Web.AsyncContextTest do
 
       AsyncContext.with_signal(outer.signal, fn ->
         AsyncContext.with_signal(inner.signal, fn ->
-          assert Snapshot.take().ambient_signal == inner.signal
+          assert Snapshot.new().ambient_signal == inner.signal
         end)
 
-        assert Snapshot.take().ambient_signal == outer.signal
+        assert Snapshot.new().ambient_signal == outer.signal
       end)
 
-      assert Snapshot.take().ambient_signal == nil
+      assert Snapshot.new().ambient_signal == nil
 
       Web.AbortController.abort(outer)
       Web.AbortController.abort(inner)
     end
 
     test "restore merges snapshot values into the current process" do
-      var = Variable.new("restore_internal")
+      var = Variable.new(name: "restore_internal")
 
       snap =
         Variable.run(var, :captured, fn ->
           :logger.update_process_metadata(%{restore_meta: true})
           Process.put(:"$callers", [self()])
-          Snapshot.take()
+          Snapshot.new()
         end)
 
       Snapshot.restore(snap)
@@ -301,7 +314,7 @@ defmodule Web.AsyncContextTest do
     end
 
     test "variables flow into Promise.new/1" do
-      var = Variable.new("promise_var")
+      var = Variable.new(name: "promise_var")
 
       Variable.run(var, "promise_value", fn ->
         promise =
@@ -325,7 +338,7 @@ defmodule Web.AsyncContextTest do
     end
 
     test "context propagates through chained Promise.new calls" do
-      var = Variable.new("chain_var")
+      var = Variable.new(name: "chain_var")
 
       result =
         Variable.run(var, "chain", fn ->
@@ -371,7 +384,7 @@ defmodule Web.AsyncContextTest do
     end
 
     test "variables flow into ReadableStream pull callback" do
-      var = Variable.new("stream_var")
+      var = Variable.new(name: "stream_var")
 
       Variable.run(var, "stream_value", fn ->
         stream =
@@ -436,7 +449,7 @@ defmodule Web.AsyncContextTest do
     end
 
     test "variables flow into TransformStream flush callback" do
-      var = Variable.new("flush_var")
+      var = Variable.new(name: "flush_var")
       test_pid = self()
 
       Variable.run(var, "flush_val", fn ->
@@ -564,7 +577,7 @@ defmodule Web.AsyncContextTest do
               depth <- integer(1..10),
               ctx_value <- string(:alphanumeric, min_length: 1, max_length: 32)
             ) do
-        var = Variable.new("prop_var")
+        var = Variable.new(name: "prop_var")
 
         result =
           Variable.run(var, ctx_value, fn ->
@@ -607,7 +620,7 @@ defmodule Web.AsyncContextTest do
 
     property "context survives Promise.new spawning" do
       check all(ctx_value <- string(:alphanumeric, min_length: 1, max_length: 32)) do
-        var = Variable.new("spawn_prop")
+        var = Variable.new(name: "spawn_prop")
 
         result =
           Variable.run(var, ctx_value, fn ->
@@ -635,7 +648,7 @@ defmodule Web.AsyncContextTest do
               chunks <-
                 list_of(string(:alphanumeric, min_length: 1), min_length: 1, max_length: 5)
             ) do
-        var = Variable.new("transform_prop")
+        var = Variable.new(name: "transform_prop")
 
         Variable.run(var, value, fn ->
           transform =
@@ -683,7 +696,7 @@ defmodule Web.AsyncContextTest do
       tasks =
         for i <- 1..1000 do
           Task.async(fn ->
-            var = Variable.new("isolation_#{i}")
+            var = Variable.new(name: "isolation_#{i}")
             unique_value = "ctx-#{i}-#{:rand.uniform(1_000_000)}"
 
             Variable.run(var, unique_value, fn ->
@@ -718,7 +731,7 @@ defmodule Web.AsyncContextTest do
       tasks =
         for i <- 1..1000 do
           Task.async(fn ->
-            var = Variable.new("stream_iso_#{i}")
+            var = Variable.new(name: "stream_iso_#{i}")
             unique_value = "stream-#{i}-#{:rand.uniform(1_000_000)}"
 
             Variable.run(var, unique_value, fn ->
@@ -753,20 +766,20 @@ defmodule Web.AsyncContextTest do
 
   describe "edge cases" do
     test "Variable.run with nil value" do
-      var = Variable.new("nil_val", default: :not_nil)
+      var = Variable.new(name: "nil_val", default_value: :not_nil)
       result = Variable.run(var, nil, fn -> Variable.get(var) end)
       assert result == nil
     end
 
     test "multiple variables captured in same snapshot" do
-      v1 = Variable.new("multi_1")
-      v2 = Variable.new("multi_2")
-      v3 = Variable.new("multi_3")
+      v1 = Variable.new(name: "multi_1")
+      v2 = Variable.new(name: "multi_2")
+      v3 = Variable.new(name: "multi_3")
 
       Variable.run(v1, "a", fn ->
         Variable.run(v2, "b", fn ->
           Variable.run(v3, "c", fn ->
-            snap = Snapshot.take()
+            snap = Snapshot.new()
 
             task =
               Task.async(fn ->
@@ -782,14 +795,14 @@ defmodule Web.AsyncContextTest do
     end
 
     test "snapshot does not capture unset variables" do
-      var = Variable.new("unset_snap")
-      snap = Snapshot.take()
+      var = Variable.new(name: "unset_snap")
+      snap = Snapshot.new()
       refute Map.has_key?(snap.variables, var.key)
       _ = var
     end
 
     test "ambient signal nil by default in snapshot" do
-      snap = Snapshot.take()
+      snap = Snapshot.new()
       assert snap.ambient_signal == nil
     end
   end

@@ -20,7 +20,7 @@ defmodule Web.TextEncoderStream do
   ## Examples
 
       iex> stream = Web.ReadableStream.from(["Hi ", "é"]) |> Web.ReadableStream.pipe_through(Web.TextEncoderStream.new())
-      iex> Enum.map(stream, &Web.Uint8Array.to_binary/1)
+      iex> Enum.map(stream, &to_string/1)
       ["Hi ", "é"]
   """
 

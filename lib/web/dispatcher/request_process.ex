@@ -88,7 +88,7 @@ defmodule Web.Dispatcher.RequestProcess do
   def start(%Web.Request{} = request, network, rejection, run)
       when is_atom(network) and is_function(rejection, 1) and is_function(run, 2) do
     owner = Web.Promise.owner()
-    snapshot = Snapshot.take()
+    snapshot = Snapshot.new()
     context = %{rejection: rejection, owner: owner, network: network}
 
     pid =

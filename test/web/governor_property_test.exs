@@ -4,7 +4,7 @@ defmodule Web.GovernorPropertyTest do
 
   alias Web.AbortableGovernor
   alias Web.CountingGovernor
-  alias Web.Governor.Token
+  alias Web.GovernorToken
   alias Web.Promise
 
   @clients [:a, :b, :c]
@@ -93,7 +93,7 @@ defmodule Web.GovernorPropertyTest do
       :release ->
         case held do
           [token | rest] ->
-            :ok = Token.release(token)
+            :ok = GovernorToken.release(token)
             client_loop(governor, pending, rest)
 
           [] ->
@@ -121,7 +121,7 @@ defmodule Web.GovernorPropertyTest do
   defp refresh(pending, held) do
     Enum.reduce(pending, {[], held}, fn acquisition, {still_pending, held} ->
       case Promise.peek(acquisition.promise) do
-        {:fulfilled, %Token{} = token} -> {still_pending, held ++ [token]}
+        {:fulfilled, %GovernorToken{} = token} -> {still_pending, held ++ [token]}
         :pending -> {still_pending ++ [acquisition], held}
       end
     end)

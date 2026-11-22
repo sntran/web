@@ -94,7 +94,7 @@ rates =
         response = Web.await(Web.fetch("tcp://localhost:#{large}"))
 
         Enum.reduce(response.body, 0, fn chunk, size ->
-          size + byte_size(Web.Uint8Array.to_binary(chunk))
+          size + byte_size(to_string(chunk))
         end)
       end)
 

@@ -201,7 +201,7 @@ defmodule Web.Dispatcher.HTTP do
       body: body,
       url: Web.URL.href(request.url),
       redirected: redirect_count > 0,
-      snapshot: Snapshot.take()
+      snapshot: Snapshot.new()
     )
   end
 

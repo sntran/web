@@ -144,7 +144,7 @@ defmodule Web.Response do
       type: Keyword.get(opts, :type, "default"),
       redirected: Keyword.get(opts, :redirected, false),
       # A dispatcher can give the snapshot of the process of the request.
-      snapshot: Keyword.get_lazy(opts, :snapshot, &AsyncContext.Snapshot.take/0)
+      snapshot: Keyword.get_lazy(opts, :snapshot, &AsyncContext.Snapshot.new/0)
     }
   end
 

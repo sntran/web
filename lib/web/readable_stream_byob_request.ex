@@ -30,7 +30,7 @@ defmodule Web.ReadableStreamBYOBRequest do
       iex> reader = Web.ReadableStream.get_reader(stream, mode: "byob")
       iex> view = Web.Uint8Array.new(Web.ArrayBuffer.new(3))
       iex> %{value: value} = Web.await(Web.ReadableStreamBYOBReader.read(reader, view))
-      iex> Web.Uint8Array.to_binary(value)
+      iex> to_string(value)
       "xxx"
   """
 

@@ -10,7 +10,7 @@ defmodule Web.Uint8ArrayTest do
 
     assert uint8.byte_offset == 2
     assert uint8.byte_length == 3
-    assert Uint8Array.to_binary(uint8) == "llo"
+    assert to_string(uint8) == "llo"
   end
 
   test "new/3 raises on invalid offset" do

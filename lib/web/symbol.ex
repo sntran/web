@@ -4,30 +4,23 @@ defmodule Web.Symbol do
 
   In ECMAScript, a well-known symbol is the key of a function that the
   language calls: `Symbol.dispose` is the key of the function that releases
-  a resource at the end of a `using` block. In Elixir, an atom is the key,
-  and the protocol `Web.Symbol.Protocol` has the function.
+  a resource at the end of a `using` block. In Elixir, an atom is the key.
 
   ## Disposable resources
 
-  A value is disposable when its type has an implementation of
-  `Web.Symbol.Protocol`. `Web.using/2` releases such a value at the end of
-  its block. The library has implementations for:
+  `Web.using/2` releases a disposable value at the end of its block. These
+  values are disposable:
 
     * `Web.MessagePort` and `Web.BroadcastChannel` - closes it;
     * `Web.Socket` - closes it;
     * `Web.ReadableStreamDefaultReader`, `Web.ReadableStreamBYOBReader`, and
       `Web.WritableStreamDefaultWriter` - releases the lock;
+    * `Web.GovernorToken` - releases the token, as
+      `GovernorToken.prototype[Symbol.dispose]()`;
     * `Port` - closes it.
 
   The Streams Standard does not specify the disposal of a reader and a
   writer at this time. The library follows the proposal for that Standard.
-
-  To make a struct disposable, implement the protocol:
-
-      defimpl Web.Symbol.Protocol, for: MyApp.Connection do
-        def symbol(connection, :dispose, _args), do: MyApp.Connection.close(connection)
-        def symbol(_connection, _symbol, _args), do: :unsupported
-      end
   """
 
   @type t :: :dispose | :async_dispose | :iterator | :async_iterator
@@ -51,20 +44,9 @@ defmodule Web.Symbol do
   @spec async_iterator() :: :async_iterator
   def async_iterator, do: :async_iterator
 
-  @doc """
-  Tells if a value is disposable: its type has an implementation of
-  `Web.Symbol.Protocol`.
-
-  ## Examples
-
-      iex> {port1, port2} = Web.MessageChannel.new()
-      iex> Web.Symbol.disposable?(port1)
-      true
-      iex> Web.MessagePort.close(port1)
-      iex> Web.MessagePort.close(port2)
-      iex> Web.Symbol.disposable?("text")
-      false
-  """
+  @doc false
+  # Tells if a value is disposable: its type has an implementation of
+  # `Web.Symbol.Protocol`.
   @spec disposable?(term()) :: boolean()
   def disposable?(value), do: Web.Symbol.Protocol.impl_for(value) != Web.Symbol.Protocol.Any
 
@@ -143,22 +125,18 @@ defmodule Web.Symbol do
 end
 
 defprotocol Web.Symbol.Protocol do
-  @moduledoc """
-  The functions of a value for the well-known symbols of `Web.Symbol`.
+  @moduledoc false
 
-  An implementation returns `:unsupported` for a symbol that the value does
-  not have.
-  """
+  # The functions of a value for the well-known symbols of `Web.Symbol`.
+  # Only the library implements this protocol. An implementation returns
+  # `:unsupported` for a symbol that the value does not have.
 
   @fallback_to_any true
 
-  @doc """
-  Calls the function of the value for the symbol, with the arguments.
-
-  For `:dispose` and `:async_dispose`, the function releases the resource.
-  It can return a `Web.Promise`: `Web.using/2` awaits it. The function must
-  accept a resource that is released already.
-  """
+  # Calls the function of the value for the symbol, with the arguments. For
+  # `:dispose` and `:async_dispose`, the function releases the resource. It
+  # can return a `Web.Promise`: `Web.using/2` awaits it. The function must
+  # accept a resource that is released already.
   @spec symbol(term(), Web.Symbol.t(), list()) :: term()
   def symbol(resource, symbol_type, args)
 end
@@ -220,4 +198,12 @@ defimpl Web.Symbol.Protocol, for: Web.WritableStreamDefaultWriter do
   end
 
   def symbol(_writer, _symbol, _args), do: :unsupported
+end
+
+defimpl Web.Symbol.Protocol, for: Web.GovernorToken do
+  def symbol(token, symbol, _args) when symbol in [:dispose, :async_dispose] do
+    Web.GovernorToken.release(token)
+  end
+
+  def symbol(_token, _symbol, _args), do: :unsupported
 end

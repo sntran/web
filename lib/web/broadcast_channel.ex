@@ -47,11 +47,9 @@ defmodule Web.BroadcastChannel do
 
   ## Settings
 
-    * `config :web, broadcast_adapter: module` - the transport. See
-      `Web.BroadcastChannel.Adapter`.
-    * `config :web, broadcast_governor: governor` - a `Web.Governor` that
-      limits the rate of `post_message/2`. The process that sends a message
-      waits for the governor.
+    * `config :web, broadcast_governor: governor` - a governor, for example
+      a `Web.CountingGovernor`, that limits the rate of `post_message/2`.
+      The process that sends a message waits for the governor.
   """
 
   alias Web.EventTarget

@@ -57,7 +57,7 @@ IO.puts("   status=#{response.status} type=#{Headers.get(response.headers, "cont
 IO.puts("2. the body is a stream: each chunk arrives when the server sends it")
 
 for chunk <- response.body do
-  IO.puts("   chunk of #{chunk.byte_length} bytes: #{inspect(Uint8Array.to_binary(chunk))}")
+  IO.puts("   chunk of #{chunk.byte_length} bytes: #{inspect(to_string(chunk))}")
 end
 
 IO.puts("3. a pipeline: split the stream, decode one branch, count the other")
@@ -70,7 +70,7 @@ IO.puts("4. an abort signal stops a response that has no end")
 response = await(fetch(base <> "/slow", signal: AbortSignal.timeout(350)))
 
 try do
-  for chunk <- response.body, do: IO.puts("   got #{inspect(Uint8Array.to_binary(chunk))}")
+  for chunk <- response.body, do: IO.puts("   got #{inspect(to_string(chunk))}")
 rescue
   error in DOMException -> IO.puts("   the body stopped: #{error.name}")
 end

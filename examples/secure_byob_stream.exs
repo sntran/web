@@ -131,7 +131,7 @@ defmodule SecureByobStreamExample do
     end
   end
 
-  defp await_promise(%Web.Promise{} = promise), do: Web.Promise.await(promise)
+  defp await_promise(%Web.Promise{} = promise), do: Web.await(promise)
 end
 
 SecureByobStreamExample.run()

@@ -63,7 +63,7 @@ defmodule LineTransformStream do
   end
 
   defp normalize_chunk!(chunk) when is_binary(chunk), do: chunk
-  defp normalize_chunk!(%Web.Uint8Array{} = chunk), do: Web.Uint8Array.to_binary(chunk)
+  defp normalize_chunk!(%Web.Uint8Array{} = chunk), do: to_string(chunk)
 
   defp normalize_chunk!(chunk) do
     IO.iodata_to_binary(chunk)

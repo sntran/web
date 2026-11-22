@@ -44,7 +44,7 @@ defmodule Web.BroadcastChannelTest do
     def acquire(%__MODULE__{pid: pid} = governor) do
       ref = make_ref()
       send(pid, {:spy_governor, :acquire, ref})
-      Web.Promise.resolve(%Web.Governor.Token{governor: governor, ref: ref})
+      Web.Promise.resolve(%Web.GovernorToken{governor: governor, ref: ref})
     end
 
     def release_token(%__MODULE__{pid: pid}, ref) do
@@ -214,18 +214,18 @@ defmodule Web.BroadcastChannelTest do
       assert_receive {:first, %{"buffer" => first}}
       assert_receive {:second, %{"buffer" => second}}
 
-      assert ArrayBuffer.data(first) == "shared"
+      assert to_string(first) == "shared"
       refute first.id == second.id
       refute first.id == buffer.id
 
       ArrayBuffer.detach(first)
-      assert ArrayBuffer.data(second) == "shared"
-      assert ArrayBuffer.data(buffer) == "shared"
+      assert to_string(second) == "shared"
+      assert to_string(buffer) == "shared"
     end
 
     test "the listener runs in the async context of the sender", %{name: name} do
       test = self()
-      request_id = Variable.new("request_id")
+      request_id = Variable.new(name: "request_id")
       sender = open(name)
 
       BroadcastChannel.onmessage(open(name), fn _event ->
@@ -263,7 +263,7 @@ defmodule Web.BroadcastChannelTest do
         value: %StructuredData.Node{type: :regex, key: nil, data: {"(", []}}
       }
 
-      payload = %{record: record, origin: "node://other@host", snapshot: Snapshot.take()}
+      payload = %{record: record, origin: "node://other@host", snapshot: Snapshot.new()}
       send(receiver.address, {:broadcast_channel_message, payload})
 
       assert_receive {:error, %MessageEvent{type: "messageerror", origin: "node://other@host"}}
@@ -277,7 +277,7 @@ defmodule Web.BroadcastChannelTest do
       payload = %{
         record: StructuredData.serialize("from a different node"),
         origin: "node://remote@example",
-        snapshot: Snapshot.take()
+        snapshot: Snapshot.new()
       }
 
       send(receiver.address, {:broadcast_channel_message, payload})

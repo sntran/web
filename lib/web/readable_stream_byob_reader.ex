@@ -17,12 +17,12 @@ defmodule Web.ReadableStreamBYOBReader do
       iex> reader = Web.ReadableStream.get_reader(stream, mode: "byob")
       iex> view = Web.Uint8Array.new(Web.ArrayBuffer.new(4))
       iex> %{value: value, done: false} = Web.await(Web.ReadableStreamBYOBReader.read(reader, view))
-      iex> {Web.Uint8Array.to_binary(value), Web.ArrayBuffer.detached?(view.buffer)}
+      iex> {to_string(value), Web.ArrayBuffer.detached?(view.buffer)}
       {"hell", true}
       iex> # Use the buffer of the result for the subsequent read.
       iex> view = Web.Uint8Array.new(value.buffer)
       iex> %{value: value} = Web.await(Web.ReadableStreamBYOBReader.read(reader, view))
-      iex> Web.Uint8Array.to_binary(value)
+      iex> to_string(value)
       "o"
 
   A binary of the BEAM is immutable. Thus a BYOB read does not decrease the

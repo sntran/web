@@ -262,7 +262,7 @@ defmodule Web.ReadableStream do
       ["a", "b"]
 
       iex> stream = Web.ReadableStream.from("hello")
-      iex> Enum.map(stream, &Web.Uint8Array.to_binary/1)
+      iex> Enum.map(stream, &to_string/1)
       ["hello"]
 
       iex> stream = Web.ReadableStream.from(nil)
@@ -1090,7 +1090,7 @@ defmodule Web.ReadableStream do
   # stay until its owner stops, thus this function makes no promise. Returns
   # `:ok` when the pipe has the two locks, or the error of the locks.
   defp start_pipe(readable, writable, options) do
-    snapshot = Snapshot.take()
+    snapshot = Snapshot.new()
     ignore = fn _outcome -> :ok end
     {ready, wait_for_locks} = pipe_lock_signal()
 

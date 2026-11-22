@@ -97,7 +97,7 @@ defmodule Web.Internal.MessagePort do
     # The server of the peer keeps a transferred port until the peer
     # delivers the message.
     record = StructuredData.serialize(message, transfer: transfer, port_holder: peer || self())
-    payload = %{record: record, snapshot: Snapshot.take()}
+    payload = %{record: record, snapshot: Snapshot.new()}
 
     if peer == nil or doomed? or MessageTarget.call(port, {:post, payload}) != :sent do
       discard(record)
@@ -154,14 +154,14 @@ defmodule Web.Internal.MessagePort do
   @doc false
   def message_event(record, target) do
     {data, ports} = StructuredData.deserialize_with_ports(record)
-    MessageEvent.new("message", data: data, ports: ports, target: target)
+    MessageEvent.__new__("message", data: data, ports: ports, target: target)
   rescue
     # The Standard fires `messageerror` when the message cannot be made.
-    _exception -> MessageEvent.new("messageerror", target: target)
+    _exception -> MessageEvent.__new__("messageerror", target: target)
   end
 
   @doc false
-  def close_event(target), do: Web.Event.new("close", target: target)
+  def close_event(target), do: Web.Event.__new__("close", target: target)
 
   # ---------------------------------------------------------------------------
   # The server
@@ -347,7 +347,7 @@ defmodule Web.Internal.MessagePort do
     if state.started? do
       state |> enqueue(:close) |> pump()
     else
-      MessageTarget.run(state.target, close_build(state), Snapshot.take())
+      MessageTarget.run(state.target, close_build(state), Snapshot.new())
       state
     end
   end
@@ -392,7 +392,7 @@ defmodule Web.Internal.MessagePort do
   end
 
   defp deliver(:close, number, state) do
-    MessageTarget.run(state.target, close_build(state), Snapshot.take(), {self(), number})
+    MessageTarget.run(state.target, close_build(state), Snapshot.new(), {self(), number})
   end
 
   defp detached_error do

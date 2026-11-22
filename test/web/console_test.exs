@@ -368,10 +368,10 @@ defmodule Web.ConsoleTest do
       assert text() == "flat"
     end
 
-    test "the names of ECMAScript" do
-      Console.groupCollapsed("label")
+    test "group_collapsed/1 opens a group, as group/1" do
+      Console.group_collapsed("label")
       Console.log("inside")
-      Console.groupEnd()
+      Console.group_end()
       Console.log("outside")
 
       assert text() == "label"
@@ -444,15 +444,15 @@ defmodule Web.ConsoleTest do
       assert text() == "Timer 'once' does not exist"
     end
 
-    test "the default label, and the names of ECMAScript" do
+    test "the default label" do
       Console.time()
-      Console.timeLog()
+      Console.time_log()
       assert "default: " <> _time = text()
-      Console.timeLog("default", "data")
+      Console.time_log("default", "data")
       assert text() =~ ~r/^default: .* ms data$/
-      Console.timeEnd()
+      Console.time_end()
       assert {:info, "default: " <> _time, :time_end} = output()
-      Console.timeEnd("default")
+      Console.time_end("default")
       assert text() == "Timer 'default' does not exist"
     end
 
@@ -496,7 +496,7 @@ defmodule Web.ConsoleTest do
       Console.count_reset("missing")
       assert output() == {:warning, "Count for 'missing' does not exist", :count_reset}
 
-      Console.countReset()
+      Console.count_reset()
       assert text() == "Count for 'default' does not exist"
     end
   end

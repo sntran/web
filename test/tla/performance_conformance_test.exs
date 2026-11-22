@@ -52,13 +52,13 @@ defmodule Web.TLA.PerformanceConformanceTest do
   # Does the call, and returns the times that it read from the clock.
   defp call({"Mark", name}, _last, samples) do
     wait_for_new_time(samples)
-    [Performance.mark(name).startTime]
+    [Performance.mark(name).start_time]
   end
 
   defp call({"Measure", name, from, to}, %{"ok" => true}, samples) do
     wait_for_new_time(samples)
     measure = Performance.measure(name, moment(from), moment(to))
-    if to == "none", do: [measure.startTime + measure.duration], else: []
+    if to == "none", do: [measure.start_time + measure.duration], else: []
   end
 
   defp call({"Measure", name, from, to}, %{"ok" => false}, _samples) do
@@ -94,9 +94,9 @@ defmodule Web.TLA.PerformanceConformanceTest do
     Enum.map(Performance.get_entries(), fn entry ->
       %{
         "name" => entry.name,
-        "type" => entry.entryType,
-        "start" => clock(entry.startTime, samples),
-        "finish" => clock(entry.startTime + entry.duration, samples)
+        "type" => entry.entry_type,
+        "start" => clock(entry.start_time, samples),
+        "finish" => clock(entry.start_time + entry.duration, samples)
       }
     end)
   end

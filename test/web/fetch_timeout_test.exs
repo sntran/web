@@ -227,11 +227,16 @@ defmodule Web.FetchTimeoutTest do
         {:error, :timeout}
       end
 
-      socket = Web.connect("localhost:1", %{connect_fun: connect})
+      socket = Web.Socket.start_socket(self(), "localhost:1", %{connect_fun: connect})
       assert_receive {:connect_timeout, 4_321}
       assert catch_exit(await(socket.opened))
 
-      socket = Web.connect("localhost:1", %{connect_fun: connect, connect_timeout: 77})
+      socket =
+        Web.Socket.start_socket(self(), "localhost:1", %{
+          connect_fun: connect,
+          connect_timeout: 77
+        })
+
       assert_receive {:connect_timeout, 77}
       assert catch_exit(await(socket.opened))
     end

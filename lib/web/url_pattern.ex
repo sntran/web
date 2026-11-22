@@ -67,7 +67,7 @@ defmodule Web.URLPattern do
   The same `Snapshot` keeps the variables of `Web.AsyncContext` and the
   groups of `URLPattern`:
 
-      user_var = Web.AsyncContext.Variable.new("user")
+      user_var = Web.AsyncContext.Variable.new(name: "user")
 
       Web.AsyncContext.Variable.run(user_var, "alice", fn ->
         pattern = Web.URLPattern.new(%{pathname: "/items/:id"})
@@ -152,7 +152,7 @@ defmodule Web.URLPattern do
     var =
       case :persistent_term.get(@params_term_key, nil) do
         nil ->
-          v = Variable.new("url_params")
+          v = Variable.new(name: "url_params")
           :persistent_term.put(@params_term_key, v)
           v
 
@@ -160,9 +160,9 @@ defmodule Web.URLPattern do
           v
       end
 
-    # `Variable.new/2` registers the key only in the process that makes the
+    # `Variable.new/1` registers the key only in the process that makes the
     # variable. Another process gets the variable from `:persistent_term`
-    # without the key in its registry, and `Snapshot.take/0` then does not
+    # without the key in its registry, and `Snapshot.new/0` then does not
     # find the key. Thus each process registers the key here.
     registry_key = Variable.registry_key()
     registry = Process.get(registry_key, MapSet.new())

@@ -1,19 +1,28 @@
 defmodule Web.Governor do
   @moduledoc """
-  TC39 proposal-aligned governor helpers for limiting concurrent async work.
+  The functions of a governor, as `Governor` of the TC39 proposal
+  "concurrency control".
 
-  A governor controls access to a bounded resource by handing out
-  `Web.Governor.Token` values. The concrete governor implementation decides how
-  acquisition, queueing, and release behave.
+  A governor limits the work that runs at the same time. It gives a
+  `Web.GovernorToken` for each acquisition. The module of the governor, for
+  example `Web.CountingGovernor`, decides when an acquisition gets its
+  token.
+
+  ## Examples
+
+      iex> governor = Web.CountingGovernor.new(2)
+      iex> Web.await(Web.Governor.with(governor, fn -> :done end))
+      :done
   """
 
-  alias Web.Governor.Token
+  alias Web.GovernorToken
   alias Web.Promise
 
   @type t :: struct()
 
   @doc """
-  Acquires a token from the governor.
+  Acquires a token from the governor, as `acquire()`. Returns a promise of
+  a `Web.GovernorToken`.
   """
   @spec acquire(t()) :: Promise.t()
   def acquire(%module{} = governor) do
@@ -21,26 +30,26 @@ defmodule Web.Governor do
   end
 
   @doc """
-  Runs `fun` while holding a governor token.
+  Runs `fun` with no argument while the work holds a token, as `with(fn)`.
+  Returns a promise of the result of `fun`.
 
-  The token is released after `fun` settles, even if the callback raises or
-  returns a rejected `%Web.Promise{}`.
+  The token is released after `fun` settles, also when the callback raises
+  or returns a `Web.Promise` that rejects.
   """
-  @spec with(t(), function()) :: Promise.t()
-  def with(%_{} = governor, fun) when is_function(fun) do
+  @spec with(t(), (-> term())) :: Promise.t()
+  def with(%_{} = governor, fun) when is_function(fun, 0) do
     Promise.new(fn resolve, reject ->
       case await_settled(acquire(governor)) do
         {:ok, token} ->
           try do
-            fun
-            |> invoke_fun(token)
+            fun.()
             |> await_settled()
             |> settle(resolve, reject)
           catch
             _, reason ->
               reject.(reason)
           after
-            Token.release(token)
+            GovernorToken.release(token)
           end
 
         {:error, reason} ->
@@ -50,7 +59,9 @@ defmodule Web.Governor do
   end
 
   @doc """
-  Wraps a function so each call runs under the governor.
+  Returns a function that calls `fun` with `with/2`, as `wrap(fn)`. The new
+  function takes the arguments of `fun` and returns a promise. `fun` can
+  have 0 to 8 arguments.
   """
   @spec wrap(t(), function()) :: function()
   def wrap(%_{} = governor, fun) when is_function(fun) do
@@ -92,9 +103,6 @@ defmodule Web.Governor do
   defp wrap_with_arity(_governor, _fun, arity) do
     raise ArgumentError, "wrap/2 supports function arities 0..8, got: #{arity}"
   end
-
-  defp invoke_fun(fun, _token) when is_function(fun, 0), do: fun.()
-  defp invoke_fun(fun, token) when is_function(fun, 1), do: fun.(token)
 
   defp await_settled(%Promise{} = promise) do
     case Promise.wait(promise) do

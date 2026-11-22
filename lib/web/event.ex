@@ -22,7 +22,8 @@ defmodule Web.Event do
   copies of one event share them: a call of `prevent_default/1` in a
   listener changes the result of the dispatch. Read them with
   `default_prevented/1`, `event_phase/1`, `cancel_bubble/1`, and
-  `return_value/1`.
+  `return_value/1`. Set the legacy attributes with `cancel_bubble/2` and
+  `return_value/2`.
 
   The value of `current_target/1` and of `composed_path/1` is only there
   during a dispatch, as the DOM Standard specifies.
@@ -74,12 +75,17 @@ defmodule Web.Event do
   ## Options
 
     * `:bubbles`, `:cancelable`, and `:composed` - the members of
-      `EventInit`. The default is `false`;
-    * `:target` - the object that gets the event;
-    * `:current_target` - the default is the target.
+      `EventInit`. The default is `false`.
   """
   @spec new(String.t() | atom(), keyword()) :: t()
-  def new(type, opts \\ []) do
+  def new(type, opts \\ []),
+    do: __new__(type, Keyword.take(opts, [:bubbles, :cancelable, :composed]))
+
+  @doc false
+  # An event with the fields of a dispatch: the options of `new/2`, and
+  # `:target` and `:current_target` (the default is the target).
+  @spec __new__(String.t() | atom(), keyword()) :: t()
+  def __new__(type, opts) do
     target = Keyword.get(opts, :target)
 
     %__MODULE__{
@@ -103,7 +109,7 @@ defmodule Web.Event do
   # An event that the library makes, as "create an event" of the DOM
   # Standard: `isTrusted` is true.
   @spec __create__(String.t() | atom(), keyword()) :: t()
-  def __create__(type, opts \\ []), do: %{new(type, opts) | is_trusted: true}
+  def __create__(type, opts \\ []), do: %{__new__(type, opts) | is_trusted: true}
 
   @doc """
   Returns the target of the event, as the legacy attribute `srcElement`.
@@ -168,9 +174,9 @@ defmodule Web.Event do
   Sets the stop propagation flag when the value is `true`, as the setter of
   the legacy attribute `cancelBubble`.
   """
-  @spec set_cancel_bubble(event(), boolean()) :: :ok
-  def set_cancel_bubble(event, true), do: stop_propagation(event)
-  def set_cancel_bubble(_event, _value), do: :ok
+  @spec cancel_bubble(event(), boolean()) :: :ok
+  def cancel_bubble(event, true), do: stop_propagation(event)
+  def cancel_bubble(_event, _value), do: :ok
 
   @doc """
   Cancels the event, as `preventDefault()`. The call has no effect for an
@@ -202,9 +208,9 @@ defmodule Web.Event do
   Cancels the event when the value is `false`, as the setter of the legacy
   attribute `returnValue`.
   """
-  @spec set_return_value(event(), boolean()) :: :ok
-  def set_return_value(event, false), do: prevent_default(event)
-  def set_return_value(_event, _value), do: :ok
+  @spec return_value(event(), boolean()) :: :ok
+  def return_value(event, false), do: prevent_default(event)
+  def return_value(_event, _value), do: :ok
 
   @doc """
   Initializes the event again, as the legacy `initEvent(type, bubbles,

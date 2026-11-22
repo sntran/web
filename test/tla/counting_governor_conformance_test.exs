@@ -13,7 +13,7 @@ defmodule Web.TLA.CountingGovernorConformanceTest do
 
   alias Web.AbortableGovernor
   alias Web.CountingGovernor
-  alias Web.Governor.Token
+  alias Web.GovernorToken
   alias Web.Promise
   alias Web.Test.SpecModel
 
@@ -54,7 +54,7 @@ defmodule Web.TLA.CountingGovernorConformanceTest do
   # ---------------------------------------------------------------------------
 
   defp start_system do
-    {:ok, pid} = CountingGovernor.start(capacity: @size)
+    {:ok, pid} = CountingGovernor.start_link(capacity: @size)
     system = %{governor: CountingGovernor.get(pid), clients: %{}}
     Enum.reduce(@procs, system, &start_client(&2, &1))
   end
@@ -92,7 +92,7 @@ defmodule Web.TLA.CountingGovernorConformanceTest do
   end
 
   defp client_command("Release", _governor, state) do
-    :ok = Token.release(state.token)
+    :ok = GovernorToken.release(state.token)
     %{holder: "none", acquisition: nil, token: nil}
   end
 

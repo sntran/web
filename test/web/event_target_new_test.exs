@@ -75,7 +75,7 @@ defmodule Web.EventTargetNewTest do
     assert dispatch(target, Event.new("x"))
     assert received() == [:a]
 
-    target = EventTarget.removeEventListener(target, "x", callback)
+    target = EventTarget.remove_event_listener(target, "x", callback)
     assert dispatch(target, Event.new("x"))
     assert received() == []
   end
@@ -93,7 +93,7 @@ defmodule Web.EventTargetNewTest do
     target =
       EventTarget.new()
       |> EventTarget.add_event_listener("x", recorder(:bubbling))
-      |> EventTarget.addEventListener("x", recorder(:capturing), capture: true)
+      |> EventTarget.add_event_listener("x", recorder(:capturing), capture: true)
 
     assert dispatch(target, Event.new("x"))
     assert received() == [:capturing, :bubbling]

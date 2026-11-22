@@ -28,7 +28,7 @@ defmodule Web.CompressionStream do
       iex> write = Web.WritableStreamDefaultWriter.write(writer, "hello")
       iex> close = Web.WritableStreamDefaultWriter.close(writer)
       iex> [%Web.Uint8Array{} | _] = chunks = Enum.to_list(cs.readable)
-      iex> chunks |> Enum.map_join(&Web.Uint8Array.to_binary/1) |> :zlib.gunzip()
+      iex> chunks |> Enum.map_join(&to_string/1) |> :zlib.gunzip()
       "hello"
       iex> {Web.await(write), Web.await(close)}
       {:ok, :ok}

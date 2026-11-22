@@ -196,7 +196,7 @@ defmodule Web.PromisePropertyTest do
 
       if values == [] do
         reasons = for {:rejected, reason} <- outcomes(specs), do: reason
-        assert result == {:rejected, %Promise.AggregateError{errors: reasons}}
+        assert result == {:rejected, %Web.AggregateError{errors: reasons}}
       else
         assert {:fulfilled, value} = result
         assert value in values

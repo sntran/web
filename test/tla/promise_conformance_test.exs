@@ -47,7 +47,7 @@ defmodule Web.TLA.PromiseConformanceTest do
 
     owner =
       spawn(fn ->
-        send(test, {:promise, Promise.with_resolvers(linger: @linger)})
+        send(test, {:promise, Promise.__with_resolvers__(linger: @linger)})
         Process.sleep(:infinity)
       end)
 

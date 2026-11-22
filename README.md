@@ -102,11 +102,11 @@ using channel <- BroadcastChannel.new("audit-log") do
 end
 ```
 
-A message port, a broadcast channel, a socket, a reader, and a writer are
-disposable. A value that is not disposable raises `Web.TypeError` before
-the block runs. When the block and the disposal fail, the macro raises
-`Web.SuppressedError` with the two errors. See `Web.Symbol` to make a
-struct disposable.
+A message port, a broadcast channel, a socket, a reader, a writer, and a
+`GovernorToken` are disposable: see `Web.Symbol`. A value that is not
+disposable raises `Web.TypeError` before the block runs. When the block and
+the disposal fail, the macro raises `Web.SuppressedError` with the two
+errors.
 
 📖 API Usage & Examples
 -----------------------
@@ -199,7 +199,7 @@ await(promise)
 ```elixir
 use Web
 
-request_id = AsyncContext.Variable.new("request_id")
+request_id = AsyncContext.Variable.new(name: "request_id")
 
 AsyncContext.Variable.run(request_id, "req-42", fn ->
   # Spawning a task or promise here still has access to the request_id
@@ -356,7 +356,7 @@ text = await(Response.text(response))
 
 # Chunk by chunk: each chunk is a `Uint8Array`.
 for chunk <- response.body do
-  IO.write(Uint8Array.to_binary(chunk))
+  IO.write(to_string(chunk))
 end
 ```
 
@@ -395,7 +395,7 @@ reader = ReadableStream.get_reader(stream, mode: "byob")
 view = Uint8Array.new(ArrayBuffer.new(5))
 
 %{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
-Uint8Array.to_binary(value)
+to_string(value)
 # => "hello"
 
 # The first buffer is detached. Use the buffer of the result again.
@@ -437,7 +437,7 @@ the same backpressure-aware primitives as the rest of the runtime.
 ```elixir
 use Web
 
-socket = Web.connect("example.com:443", secureTransport: "on")
+socket = Web.connect("example.com:443", secure_transport: "on")
 await(socket.opened)
 
 writer = WritableStream.get_writer(socket.writable)
@@ -446,16 +446,15 @@ reader = ReadableStream.get_reader(socket.readable)
 await(WritableStreamDefaultWriter.write(writer, "GET / HTTP/1.1\r\nhost: example.com\r\n\r\n"))
 chunk = await(ReadableStreamDefaultReader.read(reader))
 
-# Each chunk of bytes is a `Uint8Array`.
-Uint8Array.to_binary(chunk.value)
+# Each chunk of bytes is a `Uint8Array`. `to_string/1` gives its bytes.
+to_string(chunk.value)
 ```
 
 An IPv6 address has brackets, as in a URL: `Web.connect("[::1]:8080")`, or
 `Web.connect(%{hostname: "::1", port: 8080})`. The socket reads its
 connection only when the readable side wants data: it asks for one message
 of the connection for each pull of the stream. Thus the readable side keeps
-the bytes of its high water mark at most (64 KiB, or the option
-`:readable_high_water_mark`), and one message more.
+the bytes of its high water mark at most (64 KiB), and one message more.
 
 A TLS socket verifies the certificate of the server and its host name,
 with the trust store of the operating system. `fetch` does the same. The
@@ -468,12 +467,11 @@ certificate authorities:
 config :web, tls_options: [cacertfile: "/etc/ssl/private-ca.pem"]
 ```
 
-One socket can have its own options, which come before the setting:
-`Web.connect(address, secureTransport: "on", ssl_options: [cacertfile: path])`.
-The option `verify: :verify_none` stops the verification. Use it only for a
-test.
+The option `verify: :verify_none` of the setting stops the verification.
+Use it only for a test.
 
-Explicit `STARTTLS` upgrades are supported through `Socket.start_tls/2`. For a
+`Socket.start_tls/1` starts TLS on a socket of
+`Web.connect(address, secure_transport: "starttls")`, as `startTls()`. For a
 full SMTP handshake example, run:
 
 ```shell
@@ -496,7 +494,7 @@ buffer = ArrayBuffer.new("hello")
 clone =
   structured_clone(%{payload: buffer, tags: [:a, :b]}, transfer: [buffer])
 
-ArrayBuffer.data(clone.payload)
+to_string(clone.payload)
 # => "hello"
 
 ArrayBuffer.detached?(buffer)
@@ -550,7 +548,7 @@ sender.
 ```elixir
 use Web
 
-request_id = AsyncContext.Variable.new("request_id")
+request_id = AsyncContext.Variable.new(name: "request_id")
 
 sender = BroadcastChannel.new("auth-sync")
 

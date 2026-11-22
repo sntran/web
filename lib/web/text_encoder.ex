@@ -1,14 +1,15 @@
 defmodule Web.TextEncoder do
   @moduledoc """
-  WHATWG-style UTF-8 text encoder.
+  An encoder from text to UTF-8 bytes, as `TextEncoder` of the Encoding
+  Standard.
 
-  `TextEncoder` only supports UTF-8.
+  The field `encoding` is always `"utf-8"`.
 
   ## Examples
 
       iex> encoder = Web.TextEncoder.new()
       iex> bytes = Web.TextEncoder.encode(encoder, "hello")
-      iex> Web.Uint8Array.to_binary(bytes)
+      iex> to_string(bytes)
       "hello"
   """
 
@@ -20,12 +21,24 @@ defmodule Web.TextEncoder do
 
   @type t :: %__MODULE__{encoding: String.t()}
 
+  @doc """
+  Makes an encoder, as the constructor `new TextEncoder()`.
+  """
   @spec new() :: t()
   def new do
     %__MODULE__{}
   end
 
+  @doc """
+  Encodes `input` as UTF-8, as the method `encode(input)`. Returns a
+  `Web.Uint8Array`. The default input is `""`.
+
+  Each byte sequence of `input` that is not valid UTF-8 becomes U+FFFD, as
+  a lone surrogate does in the Standard.
+  """
   @spec encode(t(), String.t()) :: Uint8Array.t()
+  def encode(encoder, input \\ "")
+
   def encode(%__MODULE__{encoding: "utf-8"}, input) when is_binary(input) do
     # A string of the BEAM can contain bytes that are not valid UTF-8. They
     # become U+FFFD, as the Encoding Standard does for a lone surrogate.
@@ -67,7 +80,7 @@ defmodule Web.TextEncoder do
       iex> {result, destination} = Web.TextEncoder.encode_into(encoder, "aé😀", destination)
       iex> result
       %{read: 2, written: 3}
-      iex> Web.Uint8Array.to_binary(destination)
+      iex> to_string(destination)
       "aé..."
   """
   @spec encode_into(t(), String.t(), Uint8Array.t()) ::

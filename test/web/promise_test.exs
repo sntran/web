@@ -7,6 +7,8 @@ defmodule Web.PromiseTest do
   alias Web.Promise
   alias Web.TypeError
 
+  doctest Web.Promise
+
   # Returns a promise that is fulfilled with `value` after `ms` milliseconds.
   defp later(value, ms) do
     Promise.new(fn resolve, _reject ->
@@ -30,7 +32,7 @@ defmodule Web.PromiseTest do
 
   describe "AggregateError" do
     test "the message contains the list of errors" do
-      error = %Promise.AggregateError{errors: [:a, :b]}
+      error = %Web.AggregateError{errors: [:a, :b]}
       assert Exception.message(error) =~ "All promises were rejected"
       assert Exception.message(error) =~ ":a"
     end
@@ -171,7 +173,7 @@ defmodule Web.PromiseTest do
     end
 
     test "the executor gets the AsyncContext values of the caller" do
-      variable = Variable.new("promise_new_context")
+      variable = Variable.new(name: "promise_new_context")
 
       promise =
         Variable.run(variable, :from_caller, fn ->
@@ -301,7 +303,7 @@ defmodule Web.PromiseTest do
     end
 
     test "the callback runs in a different process with the context of the caller" do
-      variable = Variable.new("promise_then_context")
+      variable = Variable.new(name: "promise_then_context")
       caller = self()
 
       promise =
@@ -440,11 +442,11 @@ defmodule Web.PromiseTest do
 
     test "it rejects with AggregateError when all promises reject" do
       promise = Promise.any([later_rejection(:a, 10), Promise.reject(:b)])
-      assert %Promise.AggregateError{errors: [:a, :b]} = catch_exit(await(promise))
+      assert %Web.AggregateError{errors: [:a, :b]} = catch_exit(await(promise))
     end
 
     test "an empty input rejects with AggregateError" do
-      assert %Promise.AggregateError{errors: []} = catch_exit(await(Promise.any([])))
+      assert %Web.AggregateError{errors: []} = catch_exit(await(Promise.any([])))
     end
   end
 
@@ -543,7 +545,7 @@ defmodule Web.PromiseTest do
       owner =
         spawn(fn ->
           promise =
-            Promise.new(
+            Promise.__new__(
               fn resolve, _reject ->
                 send(parent, {:executor, self()})
 
@@ -583,7 +585,7 @@ defmodule Web.PromiseTest do
     end
 
     test "an outcome that was not delivered stays available" do
-      promise = Promise.new(fn resolve, _reject -> resolve.(:kept) end, linger: 10)
+      promise = Promise.__new__(fn resolve, _reject -> resolve.(:kept) end, linger: 10)
 
       # The wait is longer than the linger time. This negative check has no
       # other end than a time limit.
@@ -593,7 +595,7 @@ defmodule Web.PromiseTest do
     end
 
     test "a promise stops when the linger time after the first delivery is completed" do
-      promise = Promise.new(fn resolve, _reject -> resolve.(:value) end, linger: 20)
+      promise = Promise.__new__(fn resolve, _reject -> resolve.(:value) end, linger: 20)
 
       assert await(promise) == :value
       assert await(promise) == :value
@@ -605,7 +607,7 @@ defmodule Web.PromiseTest do
     end
 
     test "a chained promise on a released promise rejects with TypeError" do
-      promise = Promise.new(fn resolve, _reject -> resolve.(:value) end, linger: 0)
+      promise = Promise.__new__(fn resolve, _reject -> resolve.(:value) end, linger: 0)
       assert await(promise) == :value
       assert_down(promise.pid)
 
@@ -615,7 +617,7 @@ defmodule Web.PromiseTest do
     end
 
     test "the linger time :infinity keeps the outcome until the owner stops" do
-      {promise, resolve, _reject} = Promise.with_resolvers(linger: :infinity)
+      {promise, resolve, _reject} = Promise.__with_resolvers__(linger: :infinity)
       resolve.(:kept)
 
       assert await(promise) == :kept

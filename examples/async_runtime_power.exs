@@ -14,7 +14,7 @@ defmodule AsyncRuntimePowerExample do
   alias Web.File
 
   def run do
-    user = AsyncContext.Variable.new("user")
+    user = AsyncContext.Variable.new(name: "user")
     controller = AbortController.new()
     boundary = "runtime-power-boundary"
     request_id = "req-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -31,7 +31,7 @@ defmodule AsyncRuntimePowerExample do
       try do
         form = FormData.parse(upload_stream(boundary), boundary, signal: controller.signal)
         parent = self()
-        snapshot = AsyncContext.Snapshot.take()
+        snapshot = AsyncContext.Snapshot.new()
 
         proxy_task =
           Task.async(fn ->

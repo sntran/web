@@ -25,7 +25,7 @@ defmodule Web.ReadableByteStreamController do
       ...>   })
       iex> reader = Web.ReadableStream.get_reader(stream)
       iex> %{value: value, done: false} = Web.await(Web.ReadableStreamDefaultReader.read(reader))
-      iex> Web.Uint8Array.to_binary(value)
+      iex> to_string(value)
       "abc"
   """
 

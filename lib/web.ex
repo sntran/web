@@ -107,9 +107,8 @@ defmodule Web do
   @doc """
   Waits for a `Web.Promise` and returns its value, as `await` of ECMAScript.
 
-  If the promise rejects, the calling process exits with the reason. See
-  `Web.Promise.await/1`. A value that is not a promise is returned with no
-  change, as in ECMAScript.
+  If the promise rejects, the calling process exits with the reason. A
+  value that is not a promise is returned with no change, as in ECMAScript.
 
   ## Examples
 
@@ -250,7 +249,7 @@ defmodule Web do
 
       iex> buffer = Web.ArrayBuffer.new("hello")
       iex> clone = Web.structured_clone(buffer, transfer: [buffer])
-      iex> {Web.ArrayBuffer.data(clone), Web.ArrayBuffer.detached?(buffer)}
+      iex> {to_string(clone), Web.ArrayBuffer.detached?(buffer)}
       {"hello", true}
 
       iex> Web.structured_clone(self())
@@ -262,12 +261,26 @@ defmodule Web do
   end
 
   @doc """
-  Opens a capability-gated TCP or TLS socket.
+  Opens a TCP or TLS socket, as `connect(address, options)` of the Sockets
+  API of WinterTC.
+
+  `address` is a string `"host:port"`, or a `SocketAddress`: a map or a
+  keyword list with `:hostname` and `:port`. The option of `SocketOptions`
+  that the library has is `:secure_transport`: `"off"` (the default),
+  `"on"`, or `"starttls"`. A dictionary of Web IDL ignores each other
+  member. See `Web.Socket` for the settings of the application.
   """
   @spec connect(String.t() | map() | keyword(), map() | keyword()) :: Web.Socket.t()
   def connect(address, options \\ %{}) do
-    Web.Socket.start_socket(self(), address, options)
+    Web.Socket.start_socket(self(), address, socket_options(options))
   end
+
+  # The members of `SocketOptions` that the library has.
+  defp socket_options(options) when is_list(options) or is_map(options) do
+    options |> Map.new() |> Map.take([:secure_transport])
+  end
+
+  defp socket_options(options), do: options
 
   @doc """
   Initiates a network fetch.

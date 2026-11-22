@@ -20,7 +20,13 @@ defmodule SMTPClientExample do
 
   def run do
     config = load_config()
-    socket = Web.connect(%{hostname: config.host, port: config.port}, secureTransport: "starttls")
+
+    # The TLS options of each TLS connection, also of `Socket.start_tls/1`.
+    Application.put_env(:web, :tls_options, tls_options(config.verify))
+
+    socket =
+      Web.connect(%{hostname: config.host, port: config.port}, secure_transport: "starttls")
+
     await(socket.opened)
 
     reader = line_reader(socket)
@@ -44,7 +50,7 @@ defmodule SMTPClientExample do
     ReadableStreamDefaultReader.release_lock(reader)
     WritableStreamDefaultWriter.release_lock(writer)
 
-    socket = await(Socket.start_tls(socket, tls_options(config.verify)))
+    socket = await(Socket.start_tls(socket))
     await(socket.opened)
 
     reader = line_reader(socket)

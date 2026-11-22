@@ -40,7 +40,6 @@ defmodule Web.PerformanceTest do
 
     test "the time origin and now give the time of the system" do
       assert is_float(Performance.time_origin())
-      assert Performance.time_origin() == Performance.timeOrigin()
 
       from_origin = Performance.time_origin() + Performance.now()
       system = System.os_time(:microsecond) / 1000.0
@@ -53,7 +52,6 @@ defmodule Web.PerformanceTest do
 
     test "to_json has the time origin" do
       assert Performance.to_json() == %{"timeOrigin" => Performance.time_origin()}
-      assert Performance.toJSON() == Performance.to_json()
     end
   end
 
@@ -67,8 +65,8 @@ defmodule Web.PerformanceTest do
       mark = Performance.mark("start")
       later = Performance.now()
 
-      assert %Mark{name: "start", entryType: "mark", duration: +0.0, detail: nil} = mark
-      assert mark.startTime >= before and mark.startTime <= later
+      assert %Mark{name: "start", entry_type: "mark", duration: +0.0, detail: nil} = mark
+      assert mark.start_time >= before and mark.start_time <= later
       assert Performance.get_entries() == [mark]
     end
 
@@ -82,8 +80,8 @@ defmodule Web.PerformanceTest do
     end
 
     test "the option :start_time gives the time of the mark" do
-      assert Performance.mark("early", start_time: 12.5).startTime == 12.5
-      assert Performance.mark("integer", start_time: 3).startTime === 3.0
+      assert Performance.mark("early", start_time: 12.5).start_time == 12.5
+      assert Performance.mark("integer", start_time: 3).start_time === 3.0
 
       assert_raise Web.TypeError, ~r/not below zero/, fn ->
         Performance.mark("negative", start_time: -1)
@@ -98,7 +96,7 @@ defmodule Web.PerformanceTest do
       mark = Performance.mark("with detail", detail: %{buffer: buffer, step: 1})
 
       assert mark.detail.step == 1
-      assert Web.ArrayBuffer.data(mark.detail.buffer) == "bytes"
+      assert to_string(mark.detail.buffer) == "bytes"
       refute mark.detail.buffer.id == buffer.id
 
       exception =
@@ -126,7 +124,7 @@ defmodule Web.PerformanceTest do
       before = Performance.now()
       measure = Performance.measure("all")
 
-      assert %Measure{name: "all", entryType: "measure", startTime: +0.0, detail: nil} = measure
+      assert %Measure{name: "all", entry_type: "measure", start_time: +0.0, detail: nil} = measure
       assert measure.duration >= before
       assert measure.duration <= Performance.now()
     end
@@ -136,9 +134,9 @@ defmodule Web.PerformanceTest do
       Process.sleep(3)
       measure = Performance.measure("elapsed", "start")
 
-      assert measure.startTime == mark.startTime
+      assert measure.start_time == mark.start_time
       assert measure.duration >= 3.0
-      assert measure.duration <= Performance.now() - mark.startTime
+      assert measure.duration <= Performance.now() - mark.start_time
     end
 
     test "with two marks is the time between them" do
@@ -146,27 +144,27 @@ defmodule Web.PerformanceTest do
       Performance.mark("b", start_time: 25)
 
       measure = Performance.measure("a to b", "a", "b")
-      assert {measure.startTime, measure.duration} == {10.0, 15.0}
+      assert {measure.start_time, measure.duration} == {10.0, 15.0}
 
       # The end can be before the start.
       assert Performance.measure("b to a", "b", "a").duration == -15.0
 
       # With no start mark, the measure starts at the time origin.
-      assert %Measure{startTime: +0.0, duration: 25.0} = Performance.measure("to b", nil, "b")
+      assert %Measure{start_time: +0.0, duration: 25.0} = Performance.measure("to b", nil, "b")
     end
 
     test "uses the mark that was made last with a name" do
       Performance.mark("step", start_time: 50)
       Performance.mark("step", start_time: 20)
 
-      assert Performance.measure("from step", "step", "step").startTime == 20.0
+      assert Performance.measure("from step", "step", "step").start_time == 20.0
     end
 
     test "finds a mark when a measure has the same name" do
       Performance.mark("same", start_time: 5)
       Performance.measure("same", "same")
 
-      assert Performance.measure("again", "same").startTime == 5.0
+      assert Performance.measure("again", "same").start_time == 5.0
     end
 
     test "a mark that does not exist raises SyntaxError, and adds no entry" do
@@ -184,7 +182,7 @@ defmodule Web.PerformanceTest do
 
     test "a time is a moment too" do
       measure = Performance.measure("times", 4, 10.5)
-      assert {measure.startTime, measure.duration} == {4.0, 6.5}
+      assert {measure.start_time, measure.duration} == {4.0, 6.5}
 
       assert_raise Web.TypeError, fn -> Performance.measure("negative", -1) end
     end
@@ -193,21 +191,21 @@ defmodule Web.PerformanceTest do
       Performance.mark("a", start_time: 10)
 
       measure = Performance.measure("m", start: "a", end: 40, detail: [1, 2])
-      assert {measure.startTime, measure.duration, measure.detail} == {10.0, 30.0, [1, 2]}
+      assert {measure.start_time, measure.duration, measure.detail} == {10.0, 30.0, [1, 2]}
 
       before = Performance.now()
       measure = Performance.measure("to now", start: 5)
-      assert measure.startTime == 5.0
-      assert measure.startTime + measure.duration >= before
+      assert measure.start_time == 5.0
+      assert measure.start_time + measure.duration >= before
 
-      assert %Measure{startTime: +0.0, duration: 10.0} = Performance.measure("m", end: "a")
+      assert %Measure{start_time: +0.0, duration: 10.0} = Performance.measure("m", end: "a")
     end
 
     test "with the option :duration" do
-      assert %Measure{startTime: 10.0, duration: 5.0} =
+      assert %Measure{start_time: 10.0, duration: 5.0} =
                Performance.measure("m", start: 10, duration: 5)
 
-      assert %Measure{startTime: 15.0, duration: 5.0} =
+      assert %Measure{start_time: 15.0, duration: 5.0} =
                Performance.measure("m", end: 20, duration: 5)
     end
 
@@ -243,7 +241,7 @@ defmodule Web.PerformanceTest do
     end
 
     test "an empty list of options is no options" do
-      assert %Measure{startTime: +0.0} = Performance.measure("m", [])
+      assert %Measure{start_time: +0.0} = Performance.measure("m", [])
     end
   end
 
@@ -259,7 +257,6 @@ defmodule Web.PerformanceTest do
       Performance.mark("first again", start_time: 10)
 
       assert names(Performance.get_entries()) == ["first", "first again", "second", "third"]
-      assert Performance.getEntries() == Performance.get_entries()
     end
 
     test "can be read by type and by name" do
@@ -269,13 +266,11 @@ defmodule Web.PerformanceTest do
 
       assert names(Performance.get_entries_by_type("mark")) == ["a", "b"]
       assert names(Performance.get_entries_by_type(:measure)) == ["a"]
-      assert Performance.getEntriesByType("mark") == Performance.get_entries_by_type("mark")
       assert Performance.get_entries_by_type("other") == []
 
       assert [%Mark{name: "a"}, %Measure{name: "a"}] = Performance.get_entries_by_name("a")
       assert [%Measure{}] = Performance.get_entries_by_name(:a, "measure")
-      assert [%Mark{}] = Performance.getEntriesByName("a", :mark)
-      assert Performance.getEntriesByName("a") == Performance.get_entries_by_name("a")
+      assert [%Mark{}] = Performance.get_entries_by_name("a", :mark)
       assert Performance.get_entries_by_name("missing") == []
     end
 
@@ -287,7 +282,7 @@ defmodule Web.PerformanceTest do
       assert :ok = Performance.clear_marks("a")
       assert [%Mark{name: "b"}, %Measure{name: "a"}] = Enum.sort(Performance.get_entries())
 
-      assert :ok = Performance.clearMarks()
+      assert :ok = Performance.clear_marks()
       assert [%Measure{name: "a"}] = Performance.get_entries()
     end
 
@@ -299,7 +294,7 @@ defmodule Web.PerformanceTest do
       assert :ok = Performance.clear_measures(:a)
       assert names(Performance.get_entries_by_type("measure")) == ["b"]
 
-      assert :ok = Performance.clearMeasures("b")
+      assert :ok = Performance.clear_measures("b")
       assert [%Mark{name: "a"}] = Performance.get_entries()
       assert :ok = Performance.clear_measures()
     end
@@ -332,11 +327,11 @@ defmodule Web.PerformanceTest do
         entries = Performance.get_entries()
 
         assert Enum.sort(entries) == Enum.sort(marks)
-        assert Enum.map(entries, & &1.startTime) == Enum.sort(Enum.map(times, &(&1 * 1.0)))
+        assert Enum.map(entries, & &1.start_time) == Enum.sort(Enum.map(times, &(&1 * 1.0)))
 
         # Two marks with the same time stay in the sequence of their calls.
         for [first, second] <- Enum.chunk_every(entries, 2, 1, :discard),
-            first.startTime == second.startTime do
+            first.start_time == second.start_time do
           assert String.to_integer(first.name) < String.to_integer(second.name)
         end
       end
@@ -352,16 +347,19 @@ defmodule Web.PerformanceTest do
         by_times = Performance.measure("m", start: start, end: finish)
         by_duration = Performance.measure("m", start: start, duration: abs(finish - start))
 
-        assert by_marks.startTime == start
+        assert by_marks.start_time == start
         assert by_marks.duration == finish - start
-        assert {by_times.startTime, by_times.duration} == {by_marks.startTime, by_marks.duration}
+
+        assert {by_times.start_time, by_times.duration} ==
+                 {by_marks.start_time, by_marks.duration}
+
         assert by_duration.duration == abs(finish - start)
       end
     end
 
     property "the times of the marks do not go back" do
       check all(count <- integer(2..20), max_runs: 50) do
-        times = for index <- 1..count, do: Performance.mark(index).startTime
+        times = for index <- 1..count, do: Performance.mark(index).start_time
         assert times == Enum.sort(times)
       end
     end

@@ -136,16 +136,17 @@ defmodule Web.ReadableStreamDefaultReader do
   end
 
   @doc """
-  Cancels the stream, returning the `%Web.Promise{}` from the underlying
-  stream cancellation so callers can await cleanup completion.
+  Cancels the stream, as `cancel(reason)`. Returns a `Web.Promise` that
+  fulfils when the cancel is complete. The default reason is `nil`, as
+  `undefined` in the Streams Standard.
 
   The reader keeps its lock, as in the Streams Standard. A reader that
   released its lock gives a promise that rejects with `Web.TypeError`.
   """
-  def cancel(reader, reason \\ :cancelled)
+  def cancel(reader, reason \\ nil)
 
   def cancel(%__MODULE__{lock: nil, controller_pid: pid}, reason) do
-    ReadableStream.cancel(pid, reason)
+    ReadableStream.__cancel__(pid, reason)
   end
 
   def cancel(%__MODULE__{controller_pid: pid} = reader, reason) do

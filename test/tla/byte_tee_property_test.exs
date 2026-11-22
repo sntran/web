@@ -200,9 +200,14 @@ defmodule Web.TLA.ByteTeePropertyTest do
   defp end_source(system, ending) do
     if MapSet.size(system.canceled) < 2 do
       case ending do
-        :close -> close_source(system.controller)
-        :error -> Controller.error(system.controller, :failed)
-        :cancel_source -> :ok = await(ReadableStream.cancel(system.source.controller_pid, :stop))
+        :close ->
+          close_source(system.controller)
+
+        :error ->
+          Controller.error(system.controller, :failed)
+
+        :cancel_source ->
+          :ok = await(ReadableStream.__cancel__(system.source.controller_pid, :stop))
       end
     end
   end

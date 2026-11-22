@@ -370,7 +370,7 @@ defmodule Web.WPT.Streams.BadUnderlyingSourcesTest do
             send(parent, :pulled)
           end
         },
-        strategy: Web.CountQueuingStrategy.new(1)
+        Web.CountQueuingStrategy.new(high_water_mark: 1)
       )
 
     reader = ReadableStream.get_reader(rs)

@@ -196,7 +196,7 @@ defmodule Web.Request do
       Web.ReadableStream.disturbed?(body) ->
         raise Web.TypeError, "Request body is already used"
 
-      Web.ReadableStream.locked?(body) ->
+      Web.ReadableStream.__locked__(body) ->
         raise Web.TypeError, "Request body is locked"
 
       true ->

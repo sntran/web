@@ -80,13 +80,12 @@ defmodule Web.StreamTest do
 
   defmodule InvalidReadableHwmStrategy do
     defstruct high_water_mark: :invalid
-
-    def size(_chunk), do: 1
   end
 
   alias Web.ReadableStream
   alias Web.ReadableStreamBYOBReader
   alias Web.ReadableStreamDefaultReader
+  alias Web.Test.StreamEngine
   alias Web.TransformStream
   alias Web.TypeError
   alias Web.Uint8Array
@@ -210,8 +209,8 @@ defmodule Web.StreamTest do
       stream = %ReadableStream{controller_pid: pid}
       _reader = ReadableStream.get_reader(stream)
 
-      assert {:ok, "x"} = ReadableStream.read(pid)
-      assert :done = ReadableStream.read(pid)
+      assert {:ok, "x"} = StreamEngine.read(pid)
+      assert :done = StreamEngine.read(pid)
     end
 
     test "byte stream BYOB reads preserve queued remainders in engine state" do
@@ -281,16 +280,16 @@ defmodule Web.StreamTest do
         })
 
       pid = stream.controller_pid
-      assert WritableStream.backpressure?(stream) == false
+      assert StreamEngine.backpressure?(stream) == false
 
       writer = WritableStream.get_writer(stream)
       write_task = Task.async(fn -> await(WritableStreamDefaultWriter.write(writer, "a")) end)
       assert_receive {:sink_write, sink_pid, "a"}
 
-      assert WritableStream.backpressure?(stream) == true
+      assert StreamEngine.backpressure?(stream) == true
       send(sink_pid, :continue)
       assert {:ok, :ok} = Task.yield(write_task, 1_000)
-      assert WritableStream.backpressure?(stream) == false
+      assert StreamEngine.backpressure?(stream) == false
       WritableStreamDefaultWriter.release_lock(writer)
       _ = pid
     end
@@ -313,14 +312,14 @@ defmodule Web.StreamTest do
         })
 
       _reader = ReadableStream.get_reader(stream)
-      _read_task = Task.async(fn -> ReadableStream.read(stream.controller_pid) end)
+      _read_task = Task.async(fn -> StreamEngine.read(stream.controller_pid) end)
 
       # The pull runs. Thus the stream has an active task.
       assert_receive :pull_started
 
       # Cancel the stream
       assert :ok =
-               Web.Promise.await(ReadableStream.cancel(stream.controller_pid, :user_cancel))
+               Web.Promise.await(ReadableStream.__cancel__(stream.controller_pid, :user_cancel))
 
       assert_receive {:cancelled, :user_cancel}
       assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
@@ -421,7 +420,7 @@ defmodule Web.StreamTest do
       assert ReadableStream.disturbed?(stream) == false
 
       _reader = ReadableStream.get_reader(stream)
-      assert {:ok, "x"} = ReadableStream.read(stream.controller_pid)
+      assert {:ok, "x"} = StreamEngine.read(stream.controller_pid)
 
       assert ReadableStream.disturbed?(stream) == true
     end
@@ -429,7 +428,7 @@ defmodule Web.StreamTest do
     test "disturbed prevents tee on a disturbed stream" do
       stream = ReadableStream.from("hello")
       reader = ReadableStream.get_reader(stream)
-      _ = ReadableStream.read(reader.controller_pid)
+      _ = StreamEngine.read(reader.controller_pid)
 
       assert_raise Web.TypeError, ~r/already locked/, fn ->
         ReadableStream.tee(stream)
@@ -538,7 +537,7 @@ defmodule Web.StreamTest do
         })
 
       assert :ok =
-               Web.Promise.await(ReadableStream.cancel(ts.readable.controller_pid, :stop))
+               Web.Promise.await(ReadableStream.__cancel__(ts.readable.controller_pid, :stop))
 
       assert_receive {:transform_cancelled, :stop}
     end
@@ -572,10 +571,7 @@ defmodule Web.StreamTest do
 
     test "TransformStream refuses a readable strategy with a high water mark that is not a number" do
       assert_raise Web.RangeError, ~r/Invalid high water mark/, fn ->
-        TransformStream.new(%{},
-          high_water_mark: 3,
-          readable_strategy: %InvalidReadableHwmStrategy{}
-        )
+        TransformStream.new(%{}, [high_water_mark: 3], %InvalidReadableHwmStrategy{})
       end
 
       # The engine has no check: the readable side of a stream of the type
@@ -632,7 +628,7 @@ defmodule Web.StreamTest do
 
     test "terminate without cancel function completes gracefully on cancel" do
       ts = TransformStream.new(%{})
-      assert :ok = Web.Promise.await(ReadableStream.cancel(ts.readable.controller_pid))
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(ts.readable.controller_pid, nil))
       slots = ReadableStream.__get_slots__(ts.readable.controller_pid)
       assert slots.state == :closed
     end
@@ -685,10 +681,10 @@ defmodule Web.StreamTest do
                catch_exit(await(WritableStreamDefaultWriter.write(writer, :late)))
 
       assert %TypeError{} = catch_exit(await(WritableStreamDefaultWriter.close(writer)))
-      assert WritableStream.desired_size(stream) == nil
+      assert StreamEngine.desired_size(stream) == nil
 
       assert {:error, {:errored, %TypeError{}}} =
-               WritableStream.ready(pid, writer.owner_pid)
+               StreamEngine.ready(pid, writer.owner_pid)
 
       # A second terminate has no effect.
       :gen_statem.cast(pid, :terminate_transform)
@@ -732,7 +728,9 @@ defmodule Web.StreamTest do
         gated_write(test).(chunk, ctrl)
       end
 
-      {pid, writer} = callback_stream(write: write, strategy: Web.CountQueuingStrategy.new(1))
+      {pid, writer} =
+        callback_stream(write: write, strategy: Web.CountQueuingStrategy.new(high_water_mark: 1))
+
       pending = WritableStreamDefaultWriter.write(writer, :chunk)
       assert_receive {:write, worker, :chunk}
       assert :ok = ReadableStream.controller_close(pid)
@@ -759,7 +757,7 @@ defmodule Web.StreamTest do
       terminate = fn _event -> throw(:callback_failed) end
 
       {pid, writer} = callback_stream(write: fn _chunk, _ctrl -> :ok end, terminate: terminate)
-      assert :callback_failed = catch_exit(await(ReadableStream.cancel(pid, :no_interest)))
+      assert :callback_failed = catch_exit(await(ReadableStream.__cancel__(pid, :no_interest)))
 
       assert :callback_failed =
                catch_exit(await(WritableStreamDefaultWriter.write(writer, :late)))
@@ -774,7 +772,7 @@ defmodule Web.StreamTest do
 
     test "a pipe to a stream whose readable side was cancelled rejects with the reason" do
       {:ok, pid} = ProducerConsumerStream.start_link([])
-      assert :ok = await(ReadableStream.cancel(pid, :no_interest))
+      assert :ok = await(ReadableStream.__cancel__(pid, :no_interest))
 
       pipe =
         ReadableStream.pipe_to(ReadableStream.from([1]), %WritableStream{controller_pid: pid})
@@ -790,7 +788,7 @@ defmodule Web.StreamTest do
       pid = stream.controller_pid
       other = spawn(fn -> Process.sleep(:infinity) end)
 
-      assert {:error, :not_locked_by_writer} = WritableStream.abort(pid, other, :stop)
+      assert {:error, :not_locked_by_writer} = StreamEngine.abort(pid, other, :stop)
       assert :ok = await(WritableStreamDefaultWriter.abort(writer, :stop))
       assert {:error, {:errored, :stop}} = :gen_statem.call(pid, {:ready, writer.owner_pid})
       Process.exit(other, :kill)
@@ -847,7 +845,7 @@ defmodule Web.StreamTest do
       closed_writer = WritableStream.get_writer(closed_stream)
 
       assert :ok = await(WritableStreamDefaultWriter.close(closed_writer))
-      assert WritableStream.desired_size(closed_stream) == 0
+      assert StreamEngine.desired_size(closed_stream) == 0
       assert :ok = WritableStreamDefaultWriter.release_lock(closed_writer)
 
       errored_stream = WritableStream.new()
@@ -859,11 +857,11 @@ defmodule Web.StreamTest do
         WritableStream.__get_slots__(errored_stream.controller_pid).state == :errored
       end)
 
-      assert WritableStream.desired_size(errored_stream) == nil
+      assert StreamEngine.desired_size(errored_stream) == nil
       # The writer keeps its lock until it releases it.
-      assert WritableStream.locked?(errored_stream.controller_pid) == true
+      assert StreamEngine.writer_locked?(errored_stream.controller_pid) == true
       assert :ok = WritableStreamDefaultWriter.release_lock(errored_writer)
-      assert WritableStream.locked?(errored_stream.controller_pid) == false
+      assert StreamEngine.writer_locked?(errored_stream.controller_pid) == false
     end
 
     test "pid wrappers expose writable stream state helpers" do
@@ -871,13 +869,13 @@ defmodule Web.StreamTest do
       pid = stream.controller_pid
 
       assert WritableStream.locked?(stream) == false
-      assert WritableStream.locked?(pid) == false
-      assert WritableStream.backpressure?(stream) == false
-      assert WritableStream.backpressure?(pid) == false
+      assert StreamEngine.writer_locked?(pid) == false
+      assert StreamEngine.backpressure?(stream) == false
+      assert StreamEngine.backpressure?(pid) == false
 
       writer = WritableStream.get_writer(stream)
       assert WritableStream.locked?(stream) == true
-      assert WritableStream.locked?(pid) == true
+      assert StreamEngine.writer_locked?(pid) == true
       assert :ok = WritableStreamDefaultWriter.release_lock(writer)
       assert WritableStream.locked?(stream) == false
     end
@@ -963,7 +961,7 @@ defmodule Web.StreamTest do
       assert ReadableStream.__get_slots__(ts.readable.controller_pid).readable_desired_size == 0
       assert WritableStream.__get_slots__(ts.writable.controller_pid).writable_desired_size == 1
 
-      assert WritableStream.desired_size(ts.writable) == 1
+      assert StreamEngine.desired_size(ts.writable) == 1
       assert :ok = WritableStreamDefaultWriter.release_lock(writer)
     end
 
@@ -1462,7 +1460,7 @@ defmodule Web.StreamTest do
     test "WritableStream.release_lock/2 accepts explicit owner_pid" do
       stream = WritableStream.new()
       _writer = WritableStream.get_writer(stream)
-      assert :ok = WritableStream.release_lock(stream.controller_pid, self())
+      assert :ok = StreamEngine.release_writer(stream.controller_pid, self())
     end
 
     # --- writable_stream.ex line 156: close/1 struct overload ---
@@ -1488,17 +1486,19 @@ defmodule Web.StreamTest do
       other_owner = spawn(fn -> Process.sleep(:infinity) end)
 
       assert {:error, :not_locked_by_writer} =
-               WritableStream.ready(stream.controller_pid, other_owner)
+               StreamEngine.ready(stream.controller_pid, other_owner)
 
       assert :ok = await(WritableStreamDefaultWriter.close(writer))
-      assert :ok = WritableStream.ready(stream.controller_pid, writer.owner_pid)
+      assert :ok = StreamEngine.ready(stream.controller_pid, writer.owner_pid)
 
       Process.exit(other_owner, :kill)
     end
 
     test "legacy enqueue_ready call still supports immediate and parked backpressure checks" do
       {:ok, pid} =
-        Web.Stream.start_link(ProducerConsumerStream, strategy: Web.CountQueuingStrategy.new(1))
+        Web.Stream.start_link(ProducerConsumerStream,
+          strategy: Web.CountQueuingStrategy.new(high_water_mark: 1)
+        )
 
       readable = %ReadableStream{controller_pid: pid}
 
@@ -1523,7 +1523,7 @@ defmodule Web.StreamTest do
 
       # A cancel of the readable side puts the writable side in the errored
       # state, with the reason of the cancel.
-      assert :ok = await(ReadableStream.cancel(pid, :no_interest))
+      assert :ok = await(ReadableStream.__cancel__(pid, :no_interest))
       assert :no_interest = catch_exit(await(WritableStreamDefaultWriter.ready(writer)))
       assert :no_interest = catch_exit(await(WritableStreamDefaultWriter.closed(writer)))
     end
@@ -1554,7 +1554,7 @@ defmodule Web.StreamTest do
     # runs when the stream takes more than one polling cycle to reach the target state.
 
     test "close waits through multiple polling cycles if stream takes time to settle" do
-      # WritableStream.close(pid) polls via await_settled_state; the sleep branch
+      # StreamEngine.terminate(pid, :close, nil) polls via await_settled_state; the sleep branch
       # is exercised when the close callback takes more than one poll cycle
       stream =
         WritableStream.new(%{
@@ -1565,11 +1565,11 @@ defmodule Web.StreamTest do
         })
 
       # Use close(pid) directly so await_settled_state/2 is called
-      assert :ok = await(WritableStream.close(stream.controller_pid))
+      assert :ok = await(StreamEngine.terminate(stream.controller_pid, :close, nil))
     end
 
     test "abort waits through multiple polling cycles if stream takes time to abort" do
-      # WritableStream.abort(pid, reason) polls via await_abort_completion; the sleep
+      # StreamEngine.terminate(pid, :abort, reason) polls via await_abort_completion; the sleep
       # branch is hit when the abort callback takes more than one polling cycle
       stream =
         WritableStream.new(%{
@@ -1580,7 +1580,8 @@ defmodule Web.StreamTest do
         })
 
       # Use abort(pid, reason) so await_abort_completion is polled
-      assert :ok = await(WritableStream.abort(stream.controller_pid, :slow_abort))
+      assert :ok =
+               await(StreamEngine.terminate(stream.controller_pid, :abort, :slow_abort))
     end
 
     # --- writable_stream.ex line 252: safe_get_slots catch when pid dead ---

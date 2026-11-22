@@ -68,7 +68,7 @@ defmodule Web.ReadableStreamReaderTest do
   describe "a reader with no reference of its lock" do
     test "has the lock of its process" do
       {stream, _controller} = readable()
-      :ok = ReadableStream.get_reader(stream.controller_pid)
+      :ok = ReadableStream.__get_reader__(stream.controller_pid)
       reader = %Reader{controller_pid: stream.controller_pid}
       closed = Reader.closed(reader)
 
@@ -80,13 +80,13 @@ defmodule Web.ReadableStreamReaderTest do
 
     test "gets the error of the stream, or a TypeError after the release, from closed" do
       {stream, controller} = readable()
-      :ok = ReadableStream.get_reader(stream.controller_pid)
+      :ok = ReadableStream.__get_reader__(stream.controller_pid)
       reader = %Reader{controller_pid: stream.controller_pid}
       closed = Reader.closed(reader)
       :ok = Reader.release_lock(reader)
       assert %Web.TypeError{} = rejection(closed)
 
-      :ok = ReadableStream.get_reader(stream.controller_pid)
+      :ok = ReadableStream.__get_reader__(stream.controller_pid)
       Controller.error(controller, :failed)
       assert rejection(Reader.closed(reader)) == :failed
     end
@@ -231,7 +231,7 @@ defmodule Web.ReadableStreamReaderTest do
       }
 
       transform =
-        TransformStream.new(transformer, readable_strategy: Web.CountQueuingStrategy.new(1))
+        TransformStream.new(transformer, [], Web.CountQueuingStrategy.new(high_water_mark: 1))
 
       writer = WritableStream.get_writer(transform.writable)
       reader = ReadableStream.get_reader(transform.readable)
@@ -254,9 +254,7 @@ defmodule Web.ReadableStreamReaderTest do
       end
 
       transform =
-        TransformStream.new(%{start: start},
-          readable_strategy: [size: size, high_water_mark: :infinity]
-        )
+        TransformStream.new(%{start: start}, [], size: size, high_water_mark: :infinity)
 
       writer = WritableStream.get_writer(transform.writable)
       assert :ok = await(Writer.write(writer, "a"))

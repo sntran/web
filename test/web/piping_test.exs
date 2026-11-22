@@ -78,7 +78,7 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise = ReadableStream.pipe_to(source, sink, preventClose: true)
+    promise = ReadableStream.pipe_to(source, sink, prevent_close: true)
 
     assert Web.Promise.await(promise) == :ok
     refute_received :sink_closed
@@ -165,7 +165,7 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise_2 = ReadableStream.pipe_to(source_2, sink_2, preventAbort: true)
+    promise_2 = ReadableStream.pipe_to(source_2, sink_2, prevent_abort: true)
 
     assert catch_exit(await(promise_2)) == :boom
     refute_received {:sink_aborted_prevented, _reason}
@@ -217,22 +217,31 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise_2 = ReadableStream.pipe_to(source_2, sink_2, preventCancel: true)
+    promise_2 = ReadableStream.pipe_to(source_2, sink_2, prevent_cancel: true)
 
     assert catch_exit(await(promise_2)) == :sink_boom
     refute_received {:source_cancelled_prevented, _reason}
   end
 
-  test "pipe_to/3 accepts readable and writable pids" do
-    source = ReadableStream.from(["pid-path"])
+  test "pipe_to/3 rejects and pipe_through/3 raises for a value that is not a stream" do
+    source = ReadableStream.from(["a"])
+    sink = WritableStream.new(%{})
 
-    sink =
-      WritableStream.new(%{
-        write: fn _chunk, _controller -> :ok end
-      })
+    assert %Web.TypeError{message: "The source of a pipe must be a ReadableStream" <> _} =
+             catch_exit(await(ReadableStream.pipe_to(source.controller_pid, sink)))
 
-    promise = ReadableStream.pipe_to(source.controller_pid, sink.controller_pid)
-    assert Web.Promise.await(promise) == :ok
+    assert %Web.TypeError{message: "The destination of a pipe must be a WritableStream" <> _} =
+             catch_exit(await(ReadableStream.pipe_to(source, sink.controller_pid)))
+
+    refute ReadableStream.locked?(source)
+
+    assert_raise Web.TypeError, ~r/must be a ReadableStream/, fn ->
+      ReadableStream.pipe_through(:not_a_stream, TransformStream.new())
+    end
+
+    assert_raise Web.TypeError, ~r/must be a WritableStream/, fn ->
+      ReadableStream.pipe_through(source, %{readable: source, writable: :not_a_stream})
+    end
   end
 
   test "pipe_to/3 fails fast when source or sink is already locked" do
@@ -241,7 +250,7 @@ defmodule Web.PipingTest do
 
     sink = WritableStream.new(%{})
 
-    promise = ReadableStream.pipe_to(source.controller_pid, sink)
+    promise = ReadableStream.pipe_to(source, sink)
 
     assert %Web.TypeError{message: "ReadableStream is already locked"} =
              catch_exit(await(promise))
@@ -250,7 +259,7 @@ defmodule Web.PipingTest do
     sink_2 = WritableStream.new(%{})
     _writer = WritableStream.get_writer(sink_2)
 
-    promise_2 = ReadableStream.pipe_to(source_2, sink_2.controller_pid)
+    promise_2 = ReadableStream.pipe_to(source_2, sink_2)
 
     assert %Web.TypeError{message: "WritableStream is already locked"} =
              catch_exit(await(promise_2))
@@ -261,12 +270,12 @@ defmodule Web.PipingTest do
     sink = WritableStream.new(%{})
     _writer = WritableStream.get_writer(sink)
 
-    promise = ReadableStream.pipe_to(source.controller_pid, sink.controller_pid)
+    promise = ReadableStream.pipe_to(source, sink)
 
     assert %Web.TypeError{message: "WritableStream is already locked"} =
              catch_exit(await(promise))
 
-    assert :ok = ReadableStream.get_reader(source.controller_pid)
+    assert :ok = ReadableStream.__get_reader__(source.controller_pid)
     assert :ok = ReadableStream.release_lock(source.controller_pid)
   end
 

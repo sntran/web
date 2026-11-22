@@ -14,6 +14,7 @@ defmodule Web.ReadableByteStreamTest do
   alias Web.ReadableStreamBYOBReader, as: BYOBReader
   alias Web.ReadableStreamBYOBRequest, as: Request
   alias Web.ReadableStreamDefaultReader, as: Reader
+  alias Web.Test.StreamEngine
   alias Web.TextDecoderStream
   alias Web.TypeError
   alias Web.Uint8Array
@@ -169,7 +170,7 @@ defmodule Web.ReadableByteStreamTest do
     end
 
     test "lock the stream for BYOB reads only", %{reader: reader} do
-      assert ReadableStream.read(reader.controller_pid) == {:error, :not_locked_by_reader}
+      assert StreamEngine.read(reader.controller_pid) == {:error, :not_locked_by_reader}
     end
   end
 
@@ -482,7 +483,7 @@ defmodule Web.ReadableByteStreamTest do
 
       # A request that names a process with no BYOB lock: the default lock
       # of this process, and no lock.
-      :ok = ReadableStream.get_reader(pid)
+      :ok = ReadableStream.__get_reader__(pid)
       read = {:byob_read, self(), view(1), 1}
       assert :gen_statem.call(pid, read) == {:error, :not_locked_by_reader}
       :ok = ReadableStream.release_lock(pid)
@@ -669,29 +670,6 @@ defmodule Web.ReadableByteStreamTest do
       Controller.error(controller, :boom)
       assert_raise TypeError, fn -> Controller.close(controller) end
       assert Controller.desired_size(controller) == nil
-    end
-
-    test "waits for capacity until a read takes the bytes of the queue" do
-      {stream, controller} = byte_stream(%{high_water_mark: 2})
-      Controller.enqueue(controller, "ab")
-
-      waiter = Task.async(fn -> Controller.wait_for_capacity(controller) end)
-      assert Task.yield(waiter, 20) == nil
-
-      reader = ReadableStream.get_reader(stream)
-      assert %{value: value} = await(Reader.read(reader))
-      assert bytes(value) == "ab"
-      assert Task.await(waiter) == :ok
-    end
-
-    test "waits for capacity until the stream errors" do
-      {_stream, controller} = byte_stream()
-      Controller.enqueue(controller, "ab")
-
-      waiter = Task.async(fn -> Controller.wait_for_capacity(controller) end)
-      assert Task.yield(waiter, 20) == nil
-      Controller.error(controller, :boom)
-      assert Task.await(waiter) == :ok
     end
 
     test "gives the chunks to the default reads that wait" do

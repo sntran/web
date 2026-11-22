@@ -9,6 +9,7 @@ defmodule Web.ReadableStreamTest do
   alias Web.ReadableStreamBYOBReader
   alias Web.ReadableStreamDefaultController
   alias Web.ReadableStreamDefaultReader
+  alias Web.Test.StreamEngine
   alias Web.TypeError
 
   setup do
@@ -110,16 +111,12 @@ defmodule Web.ReadableStreamTest do
   end
 
   describe "ReadableStream process" do
-    test "a source that is a process gets each pull from new/2" do
-      stream = ReadableStream.new(self())
-      pid = stream.controller_pid
-      assert_receive {:pull, ^pid}
-
-      # The queue is full with one chunk: the next pull comes after a read.
-      ReadableStream.enqueue(pid, "a")
-      reader = ReadableStream.get_reader(stream)
-      assert %{value: "a"} = Web.await(Web.ReadableStreamDefaultReader.read(reader))
-      assert_receive {:pull, ^pid}
+    test "new/2 refuses an underlying source that is not a map" do
+      for source <- [self(), fn _controller -> :ok end, {Kernel, :send, [self()]}, %URI{}, nil] do
+        assert_raise Web.TypeError, ~r/Invalid underlying source/, fn ->
+          ReadableStream.new(source)
+        end
+      end
     end
 
     test "various sources" do
@@ -128,55 +125,47 @@ defmodule Web.ReadableStreamTest do
       # PID source
       {:ok, p1} = ReadableStream.start_link(source: parent)
       receive do: ({:pull, ^p1} -> :ok)
-      assert :ok = Web.Promise.await(ReadableStream.cancel(p1, :r1))
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(p1, :r1))
       receive do: ({:web_stream_cancel, ^p1, :r1} -> :ok)
 
       # Function source
       {:ok, p2} = ReadableStream.start_link(source: fn x -> send(parent, {:f, x}) end)
       receive do: ({:f, %Web.ReadableStreamDefaultController{pid: ^p2}} -> :ok)
-      assert :ok = Web.Promise.await(ReadableStream.cancel(p2, :r2))
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(p2, :r2))
       receive do: ({:f, :r2} -> :ok)
 
       # MFA source
       {:ok, p3} = ReadableStream.start_link(source: {Kernel, :send, [parent]})
       receive do: (%Web.ReadableStreamDefaultController{pid: ^p3} -> :ok)
-      assert :ok = Web.Promise.await(ReadableStream.cancel(p3, :r3))
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(p3, :r3))
       receive do: (:r3 -> :ok)
 
       # Nil source
       {:ok, p4} = ReadableStream.start_link(source: nil)
       ReadableStream.enqueue(p4, "a")
-      assert :ok = Web.Promise.await(ReadableStream.cancel(p4, :r4))
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(p4, :r4))
     end
 
     test "new/2 honors byte-length strategies for desired size" do
-      stream =
-        ReadableStream.new(%{},
-          high_water_mark: 5,
-          strategy: Web.ByteLengthQueuingStrategy.new(5)
-        )
+      stream = ReadableStream.new(%{}, Web.ByteLengthQueuingStrategy.new(high_water_mark: 5))
 
       ReadableStream.enqueue(stream.controller_pid, "ab")
 
       assert ReadableStream.get_desired_size(stream.controller_pid) == 3
     end
 
-    test "new/2 normalizes defaults and source strategy metadata" do
-      function_stream = ReadableStream.new(fn _controller -> :ok end)
+    test "new/2 takes only the members of UnderlyingSource from the source" do
+      source_strategy = Web.ByteLengthQueuingStrategy.new(high_water_mark: 7)
 
-      assert ReadableStream.get_desired_size(function_stream.controller_pid) == 1
-
-      source_strategy = Web.ByteLengthQueuingStrategy.new(7)
-
-      # A source with no pull function does not change the queue. Thus the
-      # size is stable.
+      # The keys :high_water_mark and :strategy of a source have no effect,
+      # as each key that is not a member of the dictionary. A source with no
+      # pull function does not change the queue: the size is stable.
       idle_stream = ReadableStream.new(%{high_water_mark: 7, strategy: source_strategy})
-      assert ReadableStream.get_desired_size(idle_stream.controller_pid) == 7
+      assert ReadableStream.get_desired_size(idle_stream.controller_pid) == 1
 
       source_stream =
         ReadableStream.new(%{
           high_water_mark: 7,
-          strategy: source_strategy,
           pull: fn controller ->
             ReadableStreamDefaultController.enqueue(controller, "abc")
             ReadableStreamDefaultController.close(controller)
@@ -278,7 +267,7 @@ defmodule Web.ReadableStreamTest do
     end
 
     test "unlocked actions", %{controller_pid: pid} do
-      assert {:error, :not_locked_by_reader} = ReadableStream.read(pid)
+      assert {:error, :not_locked_by_reader} = StreamEngine.read(pid)
 
       # A release by a process that has no lock has no effect, as in the
       # Streams Standard.
@@ -489,17 +478,17 @@ defmodule Web.ReadableStreamTest do
 
     test "from/1 enumerable cancellation and nil-source cancel paths do not crash" do
       stream = ReadableStream.from(1..10)
-      assert :ok = Web.Promise.await(ReadableStream.cancel(stream.controller_pid, :stop_now))
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(stream.controller_pid, :stop_now))
 
       {:ok, nil_pid} = ReadableStream.start_link(source: nil)
-      assert :ok = Web.Promise.await(ReadableStream.cancel(nil_pid, :noop))
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(nil_pid, :noop))
       assert ReadableStream.__get_slots__(nil_pid).state == :closed
     end
 
     test "from/1 blob cancellation stops the lazy parts queue" do
       stream = ReadableStream.from(Web.Blob.new(["a", "b", "c"]))
 
-      assert :ok = Web.Promise.await(ReadableStream.cancel(stream.controller_pid, :stop_now))
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(stream.controller_pid, :stop_now))
 
       assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
     end
@@ -670,8 +659,8 @@ defmodule Web.ReadableStreamTest do
       parent = self()
 
       spawn_link(fn ->
-        ReadableStream.get_reader(pid)
-        res = ReadableStream.read(pid)
+        ReadableStream.__get_reader__(pid)
+        res = StreamEngine.read(pid)
         send(parent, {:res, res})
       end)
 
@@ -693,18 +682,18 @@ defmodule Web.ReadableStreamTest do
       {:ok, p4} = ReadableStream.start_link(high_water_mark: 1)
       ReadableStream.enqueue(p4, "a")
       ReadableStream.enqueue(p4, "b")
-      ReadableStream.get_reader(p4)
+      ReadableStream.__get_reader__(p4)
       # queue was 2, now 1. 1 < 1 is false.
-      ReadableStream.read(p4)
+      StreamEngine.read(p4)
 
       # One pending request on close
       {:ok, p5} = ReadableStream.start_link()
       parent = self()
 
       spawn_link(fn ->
-        ReadableStream.get_reader(p5)
+        ReadableStream.__get_reader__(p5)
         send(parent, :locked)
-        send(parent, {:r1, ReadableStream.read(p5)})
+        send(parent, {:r1, StreamEngine.read(p5)})
       end)
 
       receive do: (:locked -> :ok)
@@ -716,9 +705,9 @@ defmodule Web.ReadableStreamTest do
       {:ok, p6} = ReadableStream.start_link()
 
       spawn_link(fn ->
-        ReadableStream.get_reader(p6)
+        ReadableStream.__get_reader__(p6)
         send(parent, :locked_too)
-        send(parent, {:r3, ReadableStream.read(p6)})
+        send(parent, {:r3, StreamEngine.read(p6)})
       end)
 
       receive do: (:locked_too -> :ok)
@@ -931,7 +920,7 @@ defmodule Web.ReadableStreamTest do
       task_monitor = Process.monitor(task_pid)
 
       # Cancel stream
-      assert :ok = Web.Promise.await(ReadableStream.cancel(stream.controller_pid, :abort))
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(stream.controller_pid, :abort))
 
       # Task should be shut down
       assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, _reason}
@@ -1075,12 +1064,11 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStream.disturbed?(:some_atom) == false
     end
 
-    test "locked?/1 returns false for nil, binary, list, and unknown types" do
-      assert ReadableStream.locked?(nil) == false
-      assert ReadableStream.locked?("binary") == false
-      assert ReadableStream.locked?(["list"]) == false
-      # Catch-all clause (line 387)
-      assert ReadableStream.locked?(:some_atom) == false
+    test "the lock of a body is false for nil, binary, list, and unknown types" do
+      assert ReadableStream.__locked__(nil) == false
+      assert ReadableStream.__locked__("binary") == false
+      assert ReadableStream.__locked__(["list"]) == false
+      assert ReadableStream.__locked__(:some_atom) == false
     end
 
     # --- cancel/2 struct overload (line 453) ---

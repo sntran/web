@@ -8,6 +8,7 @@ defmodule Web.AbortSignalEventTest do
   alias Web.AbortSignal
   alias Web.Event
   alias Web.EventTarget
+  alias Web.Test.StreamEngine
 
   defp listen(signal, name) do
     me = self()
@@ -199,7 +200,7 @@ defmodule Web.AbortSignalEventTest do
         send(me, {:listener, self()})
 
         receive do
-          {:call, pid} -> send(me, {:locked, Web.WritableStream.locked?(pid)})
+          {:call, pid} -> send(me, {:locked, StreamEngine.writer_locked?(pid)})
         end
       end)
 

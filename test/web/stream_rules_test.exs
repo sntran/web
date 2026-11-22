@@ -14,6 +14,7 @@ defmodule Web.StreamRulesTest do
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController
   alias Web.ReadableStreamDefaultReader
+  alias Web.Test.StreamEngine
   alias Web.TextEncoderStream
   alias Web.TransformStream
   alias Web.TransformStreamDefaultController
@@ -70,7 +71,7 @@ defmodule Web.StreamRulesTest do
       send(pid, :unknown)
       :gen_statem.cast(pid, :unknown)
 
-      assert WritableStream.desired_size(stream) == 1
+      assert StreamEngine.desired_size(stream) == 1
       assert :ok = await(WritableStream.close(stream))
     end
   end
@@ -128,7 +129,7 @@ defmodule Web.StreamRulesTest do
 
       owner =
         spawn(fn ->
-          send(test, {:stream, ReadableStream.new(%{}, linger: :infinity)})
+          send(test, {:stream, ReadableStream.__new__(%{}, [linger: :infinity], [])})
 
           receive do
             :stop -> :ok
@@ -191,35 +192,6 @@ defmodule Web.StreamRulesTest do
     end
   end
 
-  describe "wait_for_capacity of a transform controller" do
-    test "makes a transform with many results wait for the reader" do
-      stream =
-        TransformStream.new(%{
-          transform: fn parts, controller ->
-            for part <- parts do
-              TransformStreamDefaultController.wait_for_capacity(controller)
-              TransformStreamDefaultController.enqueue(controller, part)
-            end
-          end
-        })
-
-      writer = WritableStream.get_writer(stream.writable)
-      write = WritableStreamDefaultWriter.write(writer, [1, 2, 3])
-      _close = WritableStreamDefaultWriter.close(writer)
-
-      # No process reads: the transform does not fill the queue. This call
-      # comes after the write and the close from the same process. Thus the
-      # stream handled them when the call returns. It holds the write, and
-      # no transform runs.
-      slots = ReadableStream.__get_slots__(stream.readable.controller_pid)
-      assert slots.total_queued_size == 0
-      assert slots.active_operation == nil
-
-      assert Enum.to_list(stream.readable) == [1, 2, 3]
-      assert :ok = await(write)
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # Callbacks that fail
   # ---------------------------------------------------------------------------
@@ -238,7 +210,7 @@ defmodule Web.StreamRulesTest do
       pid = stream.controller_pid
 
       assert %RuntimeError{message: "the close failed"} =
-               catch_exit(await(WritableStream.close(pid)))
+               catch_exit(await(StreamEngine.terminate(pid, :close, nil)))
 
       assert WritableStream.__get_slots__(pid).state == :errored
     end
@@ -246,15 +218,13 @@ defmodule Web.StreamRulesTest do
     test "an abort callback that throws gives its value as the rejection reason" do
       stream = WritableStream.new(%{abort: fn _reason -> throw(:the_abort_failed) end})
 
-      assert catch_exit(await(WritableStream.abort(stream.controller_pid, :stop))) ==
-               :the_abort_failed
+      assert catch_exit(await(WritableStream.abort(stream, :stop))) == :the_abort_failed
     end
 
     test "a cancel callback that throws gives its value as the rejection reason" do
       stream = ReadableStream.new(%{cancel: fn _reason -> throw(:the_cancel_failed) end})
 
-      assert catch_exit(await(ReadableStream.cancel(stream.controller_pid, :stop))) ==
-               :the_cancel_failed
+      assert catch_exit(await(ReadableStream.cancel(stream, :stop))) == :the_cancel_failed
     end
   end
 

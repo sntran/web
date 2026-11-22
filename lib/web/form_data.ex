@@ -1289,7 +1289,7 @@ defmodule Web.FormData do
     defp maybe_cancel_source(_data, nil), do: :ok
 
     defp maybe_cancel_source(%{source_pid: source_pid}, reason) do
-      _outcome = Web.Promise.wait(ReadableStream.cancel(source_pid, reason))
+      _outcome = Web.Promise.wait(ReadableStream.__cancel__(source_pid, reason))
       :ok
     end
 
@@ -1365,7 +1365,7 @@ defmodule Web.FormData do
     end
 
     defp safe_get_reader(pid) do
-      with :ok <- ReadableStream.get_reader(pid), do: {:ok, pid}
+      with :ok <- ReadableStream.__get_reader__(pid), do: {:ok, pid}
     catch
       :exit, reason ->
         {:error, normalize_call_exit(reason)}

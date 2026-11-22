@@ -154,13 +154,14 @@ defmodule Web.ReadableStreamBYOBReader do
 
   @doc """
   Cancels the stream, as `cancel(reason)`. The reads that wait fulfil with
-  `%{value: nil, done: true}`.
+  `%{value: nil, done: true}`. The default reason is `nil`, as `undefined`
+  in the Streams Standard.
 
   The reader keeps its lock, as in the Streams Standard. A reader that
   released its lock gives a promise that rejects with `Web.TypeError`.
   """
   @spec cancel(t(), term()) :: Promise.t()
-  def cancel(%__MODULE__{controller_pid: pid} = reader, reason \\ :cancelled) do
+  def cancel(%__MODULE__{controller_pid: pid} = reader, reason \\ nil) do
     message = as_reader(reader, {:terminate, :cancel, reason})
 
     Web.Stream.promise_call(pid, message, :ok, fn

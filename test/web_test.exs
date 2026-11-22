@@ -18,7 +18,6 @@ defmodule WebTest do
   doctest Web.Response
   doctest Web.URL
   doctest Web.URLSearchParams
-  doctest Web.DSL
 
   defmodule MockDispatcher do
     @behaviour Web.Dispatcher

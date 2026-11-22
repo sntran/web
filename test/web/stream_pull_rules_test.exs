@@ -98,10 +98,12 @@ defmodule Web.StreamPullRulesTest do
     test = self()
 
     sink =
-      WritableStream.new(%{
-        high_water_mark: high_water_mark,
-        write: fn chunk, _controller -> send(test, {:w, chunk}) end
-      })
+      WritableStream.new(
+        %{
+          write: fn chunk, _controller -> send(test, {:w, chunk}) end
+        },
+        high_water_mark: high_water_mark
+      )
 
     assert :ok = await(ReadableStream.pipe_to(stream, sink))
     for _index <- 1..@chunks, do: receive(do: ({:w, chunk} -> chunk))
@@ -199,10 +201,12 @@ defmodule Web.StreamPullRulesTest do
       test = self()
 
       sink =
-        WritableStream.new(%{
-          high_water_mark: 2,
-          write: fn chunk, _controller -> send(test, {:w, chunk, :counters.get(counter, 1)}) end
-        })
+        WritableStream.new(
+          %{
+            write: fn chunk, _controller -> send(test, {:w, chunk, :counters.get(counter, 1)}) end
+          },
+          high_water_mark: 2
+        )
 
       stream = ReadableStream.from(counting_enumerable(counter))
       assert :ok = await(ReadableStream.pipe_to(stream, sink))

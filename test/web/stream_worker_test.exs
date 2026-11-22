@@ -216,7 +216,7 @@ defmodule Web.StreamWorkerTest do
         pull: fn controller -> ReadableStreamDefaultController.enqueue(controller, "x") end
       }
 
-      stream = ReadableStream.new(source, strategy: Web.ByteLengthQueuingStrategy.new(1))
+      stream = ReadableStream.new(source, Web.ByteLengthQueuingStrategy.new(high_water_mark: 1))
 
       reader = ReadableStream.get_reader(stream)
       assert {:ok, ["x"]} = ReadableStreamDefaultReader.read_batch_now(reader, 64)
@@ -297,16 +297,18 @@ defmodule Web.StreamWorkerTest do
       stream = ReadableStream.new(counting_source(test, 1_000))
 
       sink =
-        WritableStream.new(%{
-          high_water_mark: 2,
-          write: fn chunk, _controller ->
-            send(test, {:written, chunk})
+        WritableStream.new(
+          %{
+            write: fn chunk, _controller ->
+              send(test, {:written, chunk})
 
-            receive do
-              :continue -> :ok
+              receive do
+                :continue -> :ok
+              end
             end
-          end
-        })
+          },
+          high_water_mark: 2
+        )
 
       _pipe = ReadableStream.pipe_to(stream, sink)
       assert_receive {:written, 1}
@@ -327,10 +329,12 @@ defmodule Web.StreamWorkerTest do
       test = self()
 
       sink =
-        WritableStream.new(%{
-          high_water_mark: 16,
-          write: fn chunk, _controller -> send(test, {:written, chunk}) end
-        })
+        WritableStream.new(
+          %{
+            write: fn chunk, _controller -> send(test, {:written, chunk}) end
+          },
+          high_water_mark: 16
+        )
 
       assert :ok = await(ReadableStream.pipe_to(ReadableStream.from(1..200), sink))
 
@@ -342,19 +346,21 @@ defmodule Web.StreamWorkerTest do
       counter = :counters.new(1, [])
 
       sink =
-        WritableStream.new(%{
-          high_water_mark: 4,
-          write: fn _chunk, _controller ->
-            :counters.add(counter, 1, 1)
-            send(test, {:writing, self(), :counters.get(counter, 1)})
+        WritableStream.new(
+          %{
+            write: fn _chunk, _controller ->
+              :counters.add(counter, 1, 1)
+              send(test, {:writing, self(), :counters.get(counter, 1)})
 
-            # The first write waits for the test. The next writes wait with
-            # no end.
-            receive do
-              :go -> :ok
+              # The first write waits for the test. The next writes wait with
+              # no end.
+              receive do
+                :go -> :ok
+              end
             end
-          end
-        })
+          },
+          high_water_mark: 4
+        )
 
       # The queue of the source has 8 chunks when the first write ends.
       source = ReadableStream.from_enumerable(Stream.cycle([1]), high_water_mark: 8)
@@ -376,10 +382,12 @@ defmodule Web.StreamWorkerTest do
 
     test "gives the first failure of a batch of writes" do
       sink =
-        WritableStream.new(%{
-          high_water_mark: 8,
-          write: fn chunk, _controller -> if chunk == 3, do: raise("write #{chunk} failed") end
-        })
+        WritableStream.new(
+          %{
+            write: fn chunk, _controller -> if chunk == 3, do: raise("write #{chunk} failed") end
+          },
+          high_water_mark: 8
+        )
 
       pipe = ReadableStream.pipe_to(ReadableStream.from(1..20), sink)
 

@@ -75,10 +75,11 @@ defmodule Web.ReadableByteStreamController do
 
   @doc """
   Puts the stream in the errored state, as `error(e)`. The chunks in the
-  queue are discarded.
+  queue are discarded. The default reason is `nil`, as `undefined` in the
+  Streams Standard.
   """
   @spec error(t(), term()) :: :ok
-  def error(%__MODULE__{pid: pid}, reason) do
+  def error(%__MODULE__{pid: pid}, reason \\ nil) do
     ReadableStream.error(pid, reason)
   end
 
@@ -99,23 +100,6 @@ defmodule Web.ReadableByteStreamController do
   @spec desired_size(t()) :: number() | nil
   def desired_size(%__MODULE__{pid: pid}) do
     ReadableStream.get_desired_size(pid)
-  end
-
-  @doc """
-  Waits until the stream wants more bytes, or until the stream ends.
-  """
-  @spec wait_for_capacity(t()) :: :ok
-  def wait_for_capacity(%__MODULE__{pid: pid}) do
-    ref = make_ref()
-    Web.Stream.control_cast(pid, {:register_enqueue_waiter, self(), ref})
-
-    receive do
-      {:ready, ^ref} ->
-        :ok
-
-      {:stream_error, ^ref, _reason} ->
-        :ok
-    end
   end
 
   @stopped "The stream is not available. It ended, or its owner stopped."

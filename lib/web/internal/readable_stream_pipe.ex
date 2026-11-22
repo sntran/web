@@ -63,9 +63,9 @@ defmodule Web.Internal.ReadableStreamPipe do
       source_monitor: Process.monitor(source),
       dest_monitor: Process.monitor(dest),
       signal: Keyword.get(options, :signal),
-      prevent_close: option(options, :prevent_close, :preventClose),
-      prevent_abort: option(options, :prevent_abort, :preventAbort),
-      prevent_cancel: option(options, :prevent_cancel, :preventCancel)
+      prevent_close: option(options, :prevent_close),
+      prevent_abort: option(options, :prevent_abort),
+      prevent_cancel: option(options, :prevent_cancel)
     }
 
     case AbortSignal.subscribe(state.signal) do
@@ -83,11 +83,8 @@ defmodule Web.Internal.ReadableStreamPipe do
     end
   end
 
-  # An option of a pipe, with its Elixir name or its name in the Streams
-  # Standard.
-  defp option(options, name, standard_name) do
-    Keyword.get(options, name, Keyword.get(options, standard_name, false)) == true
-  end
+  # A member of the dictionary `StreamPipeOptions`.
+  defp option(options, name), do: Keyword.get(options, name, false) == true
 
   defp signal_reason(signal), do: AbortSignal.reason(signal) || AbortSignal.default_reason()
 

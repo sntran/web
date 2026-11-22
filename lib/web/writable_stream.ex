@@ -1,10 +1,11 @@
 defmodule Web.WritableStream do
   @moduledoc """
-  An Elixir implementation of the WHATWG WritableStream standard.
+  A writable stream, as `WritableStream` of the Streams Standard.
 
-  This process-backed stream mirrors the ReadableStream architecture in this project:
-  a `Web.Stream` engine owns the internal slots, sink callbacks run in supervised tasks,
-  and a writer lock grants exclusive write access.
+  The stream is a process, as a `Web.ReadableStream` is. The process keeps
+  the slots of the stream, and the functions of the underlying sink run in
+  the worker of the stream. A writer from `get_writer/1` has the lock: only
+  that writer can write to the stream.
   """
 
   use Web.Stream
@@ -45,10 +46,6 @@ defmodule Web.WritableStream do
     {:ok, state}
   end
 
-  def write(pid, owner_pid, chunk) when is_pid(pid) and is_pid(owner_pid) do
-    Web.Stream.call(pid, {:write, owner_pid, chunk}, {:error, :released})
-  end
-
   @impl Web.Stream
   def flush(_ctrl, %{sink: sink, pid: pid} = state) do
     ctrl = %WritableStreamDefaultController{pid: pid}
@@ -82,7 +79,16 @@ defmodule Web.WritableStream do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Creates a new WritableStream with the given underlying sink.
+  Creates a new WritableStream with the given underlying sink, as
+  `new WritableStream(underlyingSink, strategy)`.
+
+  ## The underlying sink
+
+  A map with the functions of the dictionary `UnderlyingSink` of the
+  Streams Standard: `start: fn controller -> ... end`,
+  `write: fn chunk, controller -> ... end`, `close: fn controller -> ... end`,
+  and `abort: fn reason -> ... end`. Each function returns a value or a
+  `Web.Promise`. The controller is a `Web.WritableStreamDefaultController`.
 
   ## The queuing strategy
 
@@ -98,16 +104,15 @@ defmodule Web.WritableStream do
       state, and the write rejects.
 
   Raises `Web.RangeError` for a high water mark that is NaN or below zero,
-  and `Web.TypeError` for a size that is not a function.
+  and for a sink with the key `:type`. Raises `Web.TypeError` for a size
+  that is not a function, and for a sink that is not a map.
   """
   def new(underlying_sink \\ %{}, strategy \\ [])
 
   def new(underlying_sink, strategy)
       when is_map(underlying_sink) and not is_struct(underlying_sink) do
     :ok = validate_sink!(underlying_sink)
-    # The key `:high_water_mark` of the sink is the default high water mark.
-    default_hwm = Map.get(underlying_sink, :high_water_mark, 1)
-    {hwm, size} = QueuingStrategy.extract!(strategy, default_hwm)
+    {hwm, size} = QueuingStrategy.extract!(strategy, 1)
     hwm = QueuingStrategy.high_water_mark!(hwm, 1)
     start_fn = Map.get(underlying_sink, :start)
 
@@ -115,7 +120,7 @@ defmodule Web.WritableStream do
       start_link(
         underlying_sink: underlying_sink,
         high_water_mark: hwm,
-        strategy: Web.CountQueuingStrategy.new(hwm),
+        strategy: %Web.CountQueuingStrategy{high_water_mark: hwm},
         size: size,
         has_start: is_function(start_fn)
       )
@@ -151,41 +156,27 @@ defmodule Web.WritableStream do
   end
 
   @doc """
-  Returns whether the stream has an active writer lock.
+  Returns `true` when the stream is locked to a writer, as the attribute
+  `locked`.
   """
-  def locked?(%__MODULE__{controller_pid: pid}), do: locked?(pid)
-  def locked?(pid) when is_pid(pid), do: Web.Stream.call(pid, {:locked?, :writer}, false)
+  @spec locked?(t()) :: boolean()
+  def locked?(%__MODULE__{controller_pid: pid}),
+    do: Web.Stream.call(pid, {:locked?, :writer}, false)
 
   @doc """
-  Returns the stream desired size or `nil` once it is closed or errored.
-  """
-  def desired_size(%__MODULE__{controller_pid: pid}), do: desired_size(pid)
-  def desired_size(pid) when is_pid(pid), do: Web.Stream.call(pid, :desired_size, nil)
+  Locks the stream and returns a `Web.WritableStreamDefaultWriter`, as
+  `getWriter()`.
 
-  @doc """
-  Returns whether the stream is currently applying backpressure.
+  Raises `Web.TypeError` if the stream is locked.
   """
-  def backpressure?(%__MODULE__{controller_pid: pid}), do: backpressure?(pid)
-  def backpressure?(pid) when is_pid(pid), do: Web.Stream.call(pid, :backpressure?, false)
-
-  @doc """
-  Locks the stream and returns a default writer.
-  """
-  def get_writer(target), do: get_writer(target, :writer)
+  @spec get_writer(t()) :: WritableStreamDefaultWriter.t()
+  def get_writer(%__MODULE__{} = stream), do: get_writer(stream, :writer)
 
   @doc false
   # The kind `:pipe` is for the writer lock of a pipe. Such a lock does not
-  # keep the stream after its owner stopped.
-  def get_writer(pid, kind) when is_pid(pid) and kind in [:writer, :pipe] do
-    case lock_writer(pid, kind) do
-      {:ok, _lock} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  # The writer keeps the reference of its lock: see
-  # `Web.WritableStreamDefaultWriter`.
-  def get_writer(%__MODULE__{controller_pid: pid}, kind) do
+  # keep the stream after its owner stopped. The writer keeps the reference
+  # of its lock: see `Web.WritableStreamDefaultWriter`.
+  def get_writer(%__MODULE__{controller_pid: pid}, kind) when kind in [:writer, :pipe] do
     case lock_writer(pid, kind) do
       {:ok, lock} ->
         %WritableStreamDefaultWriter{controller_pid: pid, owner_pid: self(), lock: lock}
@@ -204,53 +195,31 @@ defmodule Web.WritableStream do
     Web.Stream.call(pid, {:get_writer, self(), kind}, {:error, :released})
   end
 
-  def write(pid, chunk) when is_pid(pid) do
-    Web.Stream.call(pid, {:write, self(), chunk}, {:error, :released})
-  end
+  @doc """
+  Closes the stream, as `close()`. Returns a `Web.Promise` that fulfils
+  when the sink closed.
 
-  def ready(pid) when is_pid(pid) do
-    ready(pid, self())
-  end
-
-  def ready(pid, owner_pid) when is_pid(pid) and is_pid(owner_pid) do
-    ref = make_ref()
-    monitor = Process.monitor(pid)
-    Web.Stream.control_cast(pid, {:register_ready_waiter, self(), owner_pid, ref})
-
-    receive do
-      {:ready, ^ref} ->
-        Process.demonitor(monitor, [:flush])
-        :ok
-
-      {:stream_error, ^ref, reason} ->
-        Process.demonitor(monitor, [:flush])
-        {:error, reason}
-
-      {:DOWN, ^monitor, :process, ^pid, _reason} ->
-        {:error, :released}
-    end
-  end
-
-  # A close of the stream object. The Streams Standard refuses it when the
-  # stream has a writer: use the close function of the writer.
+  The promise rejects with `Web.TypeError` when the stream is locked (use
+  the close function of the writer), and when the stream is closing,
+  closed, or errored.
+  """
+  @spec close(t()) :: Web.Promise.t()
   def close(%__MODULE__{controller_pid: pid}) do
     terminate_unlocked(pid, :close, nil)
   end
 
-  def close(pid) when is_pid(pid) do
-    Web.Stream.promise_call(pid, {:terminate, :close, nil}, :ok, fn
-      :ok -> {:ok, :ok}
-      {:error, thrown} -> {:error, thrown}
-    end)
-  end
+  @doc """
+  Aborts the stream, as `abort(reason)`. The function `abort` of the sink
+  gets the reason. The default reason is `nil`, as `undefined` in the
+  Streams Standard.
 
-  def close(pid, owner_pid) when is_pid(pid) and is_pid(owner_pid) do
-    Web.Stream.control_call(pid, {:close, owner_pid})
-  end
-
-  # The listeners of the signal of the controller run in the calling
-  # process, as for the abort of a writer.
-  def abort(%__MODULE__{controller_pid: pid}, reason) do
+  The listeners of the signal of the controller run in the calling process
+  before this function returns, as the Streams Standard specifies. The
+  promise rejects with `Web.TypeError` when the stream is locked: use the
+  abort function of the writer.
+  """
+  @spec abort(t(), term()) :: Web.Promise.t()
+  def abort(%__MODULE__{controller_pid: pid}, reason \\ nil) do
     Web.Stream.__abort__(
       pid,
       {{:abort_first_steps, nil, reason}, {:terminate_unlocked, :abort, reason}},
@@ -258,25 +227,6 @@ defmodule Web.WritableStream do
       :ok,
       &unlocked_result(:abort, &1)
     )
-  end
-
-  def abort(pid, reason) when is_pid(pid) do
-    Web.Stream.promise_call(pid, {:terminate, :abort, reason}, :ok, fn
-      :ok -> {:ok, :ok}
-      {:error, thrown} -> {:error, thrown}
-    end)
-  end
-
-  def abort(pid, owner_pid, reason) when is_pid(pid) and is_pid(owner_pid) do
-    Web.Stream.control_call(pid, {:abort, owner_pid, reason})
-  end
-
-  def release_lock(pid) when is_pid(pid) do
-    Web.Stream.call(pid, {:release_lock, :writer, self()}, :ok)
-  end
-
-  def release_lock(pid, owner_pid) when is_pid(pid) and is_pid(owner_pid) do
-    Web.Stream.call(pid, {:release_lock, :writer, owner_pid}, :ok)
   end
 
   defp terminate_unlocked(pid, type, reason) do

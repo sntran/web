@@ -1,36 +1,10 @@
-defmodule ByteCounterStream do
+defmodule ByteCounterSink do
   @moduledoc """
-  A custom stream that counts the total number of bytes written through it.
-  Used to demonstrate streaming and byte counting in the Web.Stream API.
+  A writable stream that counts the total number of bytes written to it.
+  Its underlying sink is a map of functions, as in the Streams Standard.
   """
 
-  use Web.Stream
-
-  alias Web.ReadableStream
-  alias Web.ReadableStreamDefaultController
-
-  @doc """
-  Initializes the stream state, tracking the target pid and an optional notify pid.
-  """
-  @spec start(pid(), keyword()) :: {:producer_consumer, map()}
-  def start(pid, opts) do
-    {:producer_consumer,
-     %{
-       pid: pid,
-       notify: Keyword.get(opts, :notify),
-       total_bytes: 0
-     }}
-  end
-
-  @doc """
-  Handles each chunk, enqueues it, and updates the total byte count.
-  """
-  @spec write(iodata(), term(), map()) :: {:ok, map()}
-  def write(chunk, controller, state) do
-    ReadableStreamDefaultController.enqueue(controller, chunk)
-
-    {:ok, %{state | total_bytes: state.total_bytes + chunk_size(chunk)}}
-  end
+  alias Web.WritableStream
 
   @doc """
   Returns the number of bytes of a chunk. A chunk of a response body is a
@@ -41,37 +15,30 @@ defmodule ByteCounterStream do
   def chunk_size(chunk), do: IO.iodata_length(chunk)
 
   @doc """
-  Closes the stream and notifies the parent process of the total byte count.
+  Makes the writable stream. At the close, the process `notify` gets the
+  total number of bytes.
   """
-  @spec flush(term(), map()) :: {:ok, map()}
-  def flush(_ctrl, state) do
-    ReadableStream.close(state.pid)
+  @spec new(pid()) :: WritableStream.t()
+  def new(notify) do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
 
-    if state.notify do
-      send(state.notify, {:custom_counter_total, state.total_bytes})
-    end
-
-    {:ok, state}
-  end
-
-  @doc """
-  Creates a new ByteCounterStream, returning readable and writable endpoints.
-  """
-  @spec new(keyword()) :: %{readable: Web.ReadableStream.t(), writable: Web.WritableStream.t()}
-  def new(opts \\ []) do
-    {:ok, pid} = start_link(opts)
-
-    %{
-      readable: %Web.ReadableStream{controller_pid: pid},
-      writable: %Web.WritableStream{controller_pid: pid}
-    }
+    WritableStream.new(%{
+      write: fn chunk, _controller ->
+        Agent.update(counter, &(&1 + chunk_size(chunk)))
+      end,
+      close: fn _controller ->
+        send(notify, {:sink_counter_total, Agent.get(counter, & &1)})
+        Agent.stop(counter)
+      end
+    })
   end
 end
 
 defmodule StreamByteCounterDemo do
   @moduledoc """
   Example demo that fetches a web resource using Web.fetch/1, then streams the response body
-  through two pipelines to count the total bytes using a custom stream and a transform stream.
+  through two pipelines to count the total bytes: a pipe to a writable stream, and a pipe
+  through a transform stream.
 
   Usage:
     mix run examples/stream/byte_counter_stream.exs [url]
@@ -104,7 +71,7 @@ defmodule StreamByteCounterDemo do
       %Response{body: body_stream} = await(fetch(url))
       [left, right] = ReadableStream.tee(body_stream)
 
-      custom_counter = ByteCounterStream.new(notify: self())
+      sink_counter = ByteCounterSink.new(self())
       {:ok, transform_counter_pid} = Agent.start_link(fn -> 0 end)
 
       transform_counter =
@@ -113,7 +80,7 @@ defmodule StreamByteCounterDemo do
             ReadableStreamDefaultController.enqueue(controller, chunk)
 
             Agent.update(transform_counter_pid, fn total ->
-              total + ByteCounterStream.chunk_size(chunk)
+              total + ByteCounterSink.chunk_size(chunk)
             end)
 
             :ok
@@ -125,26 +92,26 @@ defmodule StreamByteCounterDemo do
           end
         })
 
-      custom_pipe_task = ReadableStream.pipe_to(left, custom_counter.writable)
+      sink_pipe = ReadableStream.pipe_to(left, sink_counter)
       transformed_readable = ReadableStream.pipe_through(right, transform_counter)
 
-      # Drain both output streams concurrently so backpressure does not stall the pipes.
+      # Read the transform while the pipe runs: a branch of a tee that no
+      # process reads keeps its chunks.
       combined =
         Promise.all([
-          custom_pipe_task,
-          Response.text(Response.new(custom_counter.readable)),
+          sink_pipe,
           Response.text(Response.new(transformed_readable))
         ])
 
-      [_pipe_ok, _custom_body, _transform_body] = await(combined)
+      [_pipe_ok, _transform_body] = await(combined)
 
-      custom_total = await_total(:custom_counter_total)
+      sink_total = await_total(:sink_counter_total)
       transform_total = await_total(:transform_counter_total)
 
       IO.puts("URL: #{url}")
-      IO.puts("Custom bytes:    #{custom_total}")
+      IO.puts("Sink bytes:      #{sink_total}")
       IO.puts("Transform bytes: #{transform_total}")
-      IO.puts("Totals match?:   #{custom_total == transform_total}")
+      IO.puts("Totals match?:   #{sink_total == transform_total}")
 
       Agent.stop(transform_counter_pid)
     rescue

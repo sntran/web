@@ -12,6 +12,7 @@ defmodule Web.QueuingStrategyTest do
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController, as: Controller
   alias Web.ReadableStreamDefaultReader, as: Reader
+  alias Web.Test.StreamEngine
   alias Web.TransformStream
   alias Web.TransformStreamDefaultController, as: TransformController
   alias Web.WritableStream
@@ -60,30 +61,55 @@ defmodule Web.QueuingStrategyTest do
   describe "the strategy objects" do
     test "keep the high water mark with no check, as the Standard specifies" do
       for value <- [-1, 0.5, :infinity, :neg_infinity, :nan] do
-        assert CountQueuingStrategy.new(value).high_water_mark == value
-        assert ByteLengthQueuingStrategy.new(value).high_water_mark == value
+        assert CountQueuingStrategy.new(high_water_mark: value).high_water_mark == value
+        assert ByteLengthQueuingStrategy.new(high_water_mark: value).high_water_mark == value
       end
     end
 
-    test "refuse a high water mark that is not a number" do
-      for value <- ["1", :big, nil] do
-        assert_raise Web.TypeError, ~r/must be a number/, fn ->
-          CountQueuingStrategy.new(value)
+    test "refuse an init that is not a dictionary QueuingStrategyInit" do
+      for module <- [CountQueuingStrategy, ByteLengthQueuingStrategy] do
+        for value <- ["1", :big] do
+          assert_raise Web.TypeError, ~r/must be a number/, fn ->
+            module.new(high_water_mark: value)
+          end
         end
 
-        assert_raise Web.TypeError, ~r/must be a number/, fn ->
-          ByteLengthQueuingStrategy.new(value)
+        # The member `highWaterMark` is required.
+        for init <- [[], %{}, [size: 1], %{high_water_mark: nil}] do
+          assert_raise Web.TypeError, ~r/needs the key :high_water_mark/, fn ->
+            module.new(init)
+          end
         end
+
+        for init <- [4, nil, "init"] do
+          assert_raise Web.TypeError, ~r/must be the dictionary QueuingStrategyInit/, fn ->
+            module.new(init)
+          end
+        end
+
+        # A map, also a strategy, is a dictionary.
+        assert module.new(%{high_water_mark: 2}) == module.new(high_water_mark: 2)
+        assert module.new(module.new(high_water_mark: 3)).high_water_mark == 3
       end
     end
 
-    test "give the size of a chunk" do
-      assert CountQueuingStrategy.size() == 1
-      assert CountQueuingStrategy.size(:any) == 1
-      assert ByteLengthQueuingStrategy.size("abc") == 3
-      assert ByteLengthQueuingStrategy.size(%{byte_length: 7}) == 7
-      assert ByteLengthQueuingStrategy.size(:no_bytes) == nil
-      assert_raise Web.TypeError, fn -> ByteLengthQueuingStrategy.size(nil) end
+    test "have the attribute size: the same function for each strategy" do
+      count = CountQueuingStrategy.new(high_water_mark: 1)
+      bytes = ByteLengthQueuingStrategy.new(high_water_mark: 1)
+
+      assert count.size == CountQueuingStrategy.new(high_water_mark: 5).size
+      assert bytes.size == ByteLengthQueuingStrategy.new(high_water_mark: 5).size
+      assert count.size == %CountQueuingStrategy{}.size
+      assert bytes.size == %ByteLengthQueuingStrategy{}.size
+
+      assert count.size.(:any) == 1
+      assert count.size.(nil) == 1
+      assert bytes.size.("abc") == 3
+      assert bytes.size.(%{byte_length: 7}) == 7
+      assert bytes.size.(Web.ArrayBuffer.new(5)) == 5
+      assert bytes.size.(Web.Uint8Array.from("ab")) == 2
+      assert bytes.size.(:no_bytes) == nil
+      assert_raise Web.TypeError, fn -> bytes.size.(nil) end
     end
   end
 
@@ -94,24 +120,46 @@ defmodule Web.QueuingStrategyTest do
       assert Controller.desired_size(controller) == :infinity
 
       writable = WritableStream.new(%{}, high_water_mark: :infinity)
-      assert WritableStream.desired_size(writable) == :infinity
+      assert StreamEngine.desired_size(writable) == :infinity
 
-      transform = TransformStream.new(%{}, readable_strategy: [high_water_mark: :infinity])
+      transform = TransformStream.new(%{}, [], high_water_mark: :infinity)
       assert ReadableStream.get_desired_size(transform.readable.controller_pid) == :infinity
     end
 
-    test "comes from a strategy object, or from a struct with the field and a function size/1" do
-      {_stream, controller} = readable(strategy: CountQueuingStrategy.new(3))
+    test "comes from a strategy object, or from a struct with the two fields" do
+      {_stream, controller} = readable(CountQueuingStrategy.new(high_water_mark: 3))
       assert Controller.desired_size(controller) == 3
 
-      writable = WritableStream.new(%{}, ByteLengthQueuingStrategy.new(10))
+      {_stream, controller} = readable(ByteLengthQueuingStrategy.new(high_water_mark: 10))
+      Controller.enqueue(controller, "abc")
+      assert Controller.desired_size(controller) == 7
+
+      writable = WritableStream.new(%{}, ByteLengthQueuingStrategy.new(high_water_mark: 10))
       writer = WritableStream.get_writer(writable)
       assert :ok = await(Writer.write(writer, "abc"))
       assert Writer.desired_size(writer) == 10
 
-      # A struct of the user with no function size/1 counts each chunk as 1.
-      {_stream, controller} = readable(strategy: %URI{})
+      # A struct of the user is a dictionary: a struct with no fields of a
+      # strategy counts each chunk as 1, with the default limit.
+      {_stream, controller} = readable(%URI{})
       assert Controller.desired_size(controller) == 1
+
+      # The keys of a keyword list that are not members have no effect.
+      {_stream, controller} = readable(strategy: CountQueuingStrategy.new(high_water_mark: 3))
+      assert Controller.desired_size(controller) == 1
+    end
+
+    test "of a byte stream refuses the size function of a strategy object" do
+      for strategy <- [
+            CountQueuingStrategy.new(high_water_mark: 1),
+            ByteLengthQueuingStrategy.new(high_water_mark: 1)
+          ] do
+        assert_raise Web.RangeError, ~r/size function/, fn ->
+          ReadableStream.new(%{type: "bytes"}, strategy)
+        end
+      end
+
+      assert %ReadableStream{} = ReadableStream.new(%{type: "bytes"}, %{high_water_mark: 4})
     end
 
     test "refuses a byte stream with a size function, and a size that is not a function" do
@@ -127,8 +175,10 @@ defmodule Web.QueuingStrategyTest do
         WritableStream.new(%{}, size: 1)
       end
 
-      assert_raise Web.TypeError, ~r/Invalid queuing strategy/, fn ->
-        WritableStream.new(%{}, :not_a_strategy)
+      for constructor <- [&ReadableStream.new/2, &WritableStream.new/2] do
+        assert_raise Web.TypeError, ~r/Invalid queuing strategy/, fn ->
+          constructor.(%{}, :not_a_strategy)
+        end
       end
     end
   end
@@ -276,19 +326,19 @@ defmodule Web.QueuingStrategyTest do
 
   describe "the size of a strategy of the library" do
     test "that is not valid errors the stream, and enqueue raises" do
-      {stream, controller} = readable(strategy: ByteLengthQueuingStrategy.new(10))
+      {stream, controller} = readable(ByteLengthQueuingStrategy.new(high_water_mark: 10))
       assert_raise Web.RangeError, fn -> Controller.enqueue(controller, :no_bytes) end
       assert %Web.RangeError{} = rejection(Reader.read(ReadableStream.get_reader(stream)))
 
-      {_stream, controller} = readable(strategy: ByteLengthQueuingStrategy.new(10))
+      {_stream, controller} = readable(ByteLengthQueuingStrategy.new(high_water_mark: 10))
       assert_raise Web.TypeError, fn -> Controller.enqueue(controller, nil) end
     end
 
     test "that is not valid errors a stream that gets its chunks from a process" do
-      strategy = ByteLengthQueuingStrategy.new(4)
+      strategy = ByteLengthQueuingStrategy.new(high_water_mark: 4)
       {:ok, pid} = Web.Stream.start_link(ReadableStream, strategy: strategy, high_water_mark: 4)
       :ok = ReadableStream.enqueue(pid, :no_bytes)
-      assert {:error, {:errored, %Web.RangeError{}}} = ReadableStream.read(pid)
+      assert {:error, {:errored, %Web.RangeError{}}} = StreamEngine.read(pid)
     end
   end
 
@@ -349,8 +399,8 @@ defmodule Web.QueuingStrategyTest do
     test "runs in the stream for a write with no writer, as for a pipe" do
       test = self()
       stream = WritableStream.new(%{}, size: fn _chunk -> recorded(test, {:size, self()}, 1) end)
-      assert :ok = WritableStream.get_writer(stream.controller_pid, :pipe)
-      assert :ok = WritableStream.write(stream.controller_pid, "a")
+      assert %Web.WritableStreamDefaultWriter{} = WritableStream.get_writer(stream, :pipe)
+      assert :ok = StreamEngine.write(stream.controller_pid, self(), "a")
       assert_received {:size, pid} when pid == stream.controller_pid
     end
 
@@ -397,9 +447,10 @@ defmodule Web.QueuingStrategyTest do
       test = self()
 
       transform =
-        TransformStream.new(%{},
-          writable_strategy: [high_water_mark: 4, size: &byte_size/1],
-          readable_strategy: %{
+        TransformStream.new(
+          %{},
+          [high_water_mark: 4, size: &byte_size/1],
+          %{
             high_water_mark: 6,
             size: fn chunk -> recorded(test, :size, 2 * byte_size(chunk)) end
           }
@@ -423,13 +474,13 @@ defmodule Web.QueuingStrategyTest do
         -1
       end
 
-      _transform = TransformStream.new(%{start: start}, readable_strategy: [size: size])
+      _transform = TransformStream.new(%{start: start}, [], size: size)
       assert_receive {:controller, controller}
       Process.put(:controller, controller)
       assert catch_throw(TransformController.enqueue(controller, "a")) == :first
 
       # With no error before, the controller raises the RangeError.
-      _transform = TransformStream.new(%{start: start}, readable_strategy: [size: fn _ -> -1 end])
+      _transform = TransformStream.new(%{start: start}, [], size: fn _ -> -1 end)
       assert_receive {:controller, controller}
       assert_raise Web.RangeError, fn -> TransformController.enqueue(controller, "a") end
     end

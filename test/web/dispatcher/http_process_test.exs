@@ -369,7 +369,7 @@ defmodule Web.Dispatcher.HTTPProcessTest do
 
       # The stream releases the lock of a reader that stopped before a read,
       # and does not cancel: the process of the request keeps the bytes.
-      eventually(fn -> not ReadableStream.locked?(stream) end)
+      eventually(fn -> not ReadableStream.__locked__(stream) end)
       assert Process.alive?(request)
       assert Web.await(Web.Response.text(resp)) == "datamore"
     end

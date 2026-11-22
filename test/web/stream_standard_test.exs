@@ -6,6 +6,7 @@ defmodule Web.StreamStandardTest do
   use Web
 
   alias Web.ReadableStreamDefaultReader, as: Reader
+  alias Web.TransformStreamDefaultController
   alias Web.WritableStreamDefaultWriter, as: Writer
 
   defp rejection(promise), do: catch_exit(await(promise))
@@ -64,7 +65,7 @@ defmodule Web.StreamStandardTest do
 
     property "a transform gives the chunks in the sequence of the writes" do
       check all(chunks <- list_of(binary(), max_length: 20), max_runs: 50) do
-        transform = TransformStream.new(%{}, readable_strategy: CountQueuingStrategy.new(100))
+        transform = TransformStream.new(%{}, [], CountQueuingStrategy.new(high_water_mark: 100))
         writer = WritableStream.get_writer(transform.writable)
 
         Enum.each(chunks, &Writer.write(writer, &1))
@@ -528,11 +529,11 @@ defmodule Web.StreamStandardTest do
         end
 
         assert_raise Web.RangeError, ~r/Invalid high water mark/, fn ->
-          WritableStream.new(%{high_water_mark: limit})
+          WritableStream.new(%{}, high_water_mark: limit)
         end
 
         assert_raise Web.RangeError, ~r/Invalid high water mark/, fn ->
-          TransformStream.new(%{}, readable_strategy: [high_water_mark: limit])
+          TransformStream.new(%{}, [], high_water_mark: limit)
         end
       end
 
@@ -565,9 +566,10 @@ defmodule Web.StreamStandardTest do
     end
 
     test "give the size of each kind of byte chunk" do
-      assert ByteLengthQueuingStrategy.size("abc") == 3
-      assert ByteLengthQueuingStrategy.size(Uint8Array.new(ArrayBuffer.new("abcd"), 1, 2)) == 2
-      assert ByteLengthQueuingStrategy.size(ArrayBuffer.new("abcde")) == 5
+      %{size: size} = ByteLengthQueuingStrategy.new(high_water_mark: 1)
+      assert size.("abc") == 3
+      assert size.(Uint8Array.new(ArrayBuffer.new("abcd"), 1, 2)) == 2
+      assert size.(ArrayBuffer.new("abcde")) == 5
     end
   end
 
@@ -631,18 +633,18 @@ defmodule Web.StreamStandardTest do
       end
     end
 
-    test "accepts each option with its Elixir name and with its name in the Standard" do
-      for option <- [:prevent_close, :preventClose] do
+    test "takes the options of StreamPipeOptions with their snake_case names only" do
+      for {option, closed} <- [prevent_close: [], preventClose: [:close]] do
         destination = WritableStream.new(recording_sink(self()))
 
         assert await(
                  ReadableStream.pipe_to(ReadableStream.from([1]), destination, [{option, true}])
                ) == :ok
 
-        assert events() == [{:write, 1}]
+        assert events() == [{:write, 1} | closed]
       end
 
-      for option <- [:prevent_abort, :preventAbort] do
+      for option <- [:prevent_abort] do
         source = ReadableStream.new(%{})
         destination = WritableStream.new(recording_sink(self()))
         pipe = ReadableStream.pipe_to(source, destination, [{option, true}])
@@ -651,7 +653,7 @@ defmodule Web.StreamStandardTest do
         assert events() == []
       end
 
-      for option <- [:prevent_cancel, :preventCancel] do
+      for option <- [:prevent_cancel] do
         test = self()
 
         source =
@@ -1015,6 +1017,68 @@ defmodule Web.StreamStandardTest do
       errored = ReadableStream.new(%{})
       ReadableStream.error(errored.controller_pid, :failed)
       assert ReadableStream.get_desired_size(errored.controller_pid) == nil
+    end
+  end
+
+  describe "an optional reason" do
+    # The argument `reason` of `cancel(reason)`, `abort(reason)`, and
+    # `error(e)` is optional: a call with no argument gives `undefined`,
+    # which is `nil`.
+    test "is nil for a cancel of a stream and of a reader" do
+      test = self()
+      source = %{cancel: fn reason -> send(test, {:cancel, reason}) end}
+
+      assert :ok = await(ReadableStream.cancel(ReadableStream.new(source)))
+      assert_received {:cancel, nil}
+
+      reader = ReadableStream.get_reader(ReadableStream.new(source))
+      assert :ok = await(Reader.cancel(reader))
+      assert_received {:cancel, nil}
+
+      reader =
+        ReadableStream.get_reader(ReadableStream.new(Map.put(source, :type, "bytes")),
+          mode: "byob"
+        )
+
+      assert :ok = await(ReadableStreamBYOBReader.cancel(reader))
+      assert_received {:cancel, nil}
+    end
+
+    test "is nil for an abort of a stream and of a writer" do
+      test = self()
+      sink = %{abort: fn reason -> send(test, {:abort, reason}) end}
+
+      assert :ok = await(WritableStream.abort(WritableStream.new(sink)))
+      assert_received {:abort, nil}
+
+      writer = WritableStream.get_writer(WritableStream.new(sink))
+      assert :ok = await(Writer.abort(writer))
+      assert_received {:abort, nil}
+    end
+
+    test "is nil for an error of each controller" do
+      test = self()
+      start = fn controller -> send(test, {:controller, controller}) end
+
+      readable = ReadableStream.new(%{start: start})
+      assert_receive {:controller, controller}
+      assert :ok = ReadableStreamDefaultController.error(controller)
+      assert rejection(Reader.read(ReadableStream.get_reader(readable))) == nil
+
+      bytes = ReadableStream.new(%{type: "bytes", start: start})
+      assert_receive {:controller, controller}
+      assert :ok = ReadableByteStreamController.error(controller)
+      assert rejection(Reader.read(ReadableStream.get_reader(bytes))) == nil
+
+      writable = WritableStream.new(%{start: start})
+      assert_receive {:controller, controller}
+      assert :ok = WritableStreamDefaultController.error(controller)
+      assert rejection(Writer.closed(WritableStream.get_writer(writable))) == nil
+
+      transform = TransformStream.new(%{start: start})
+      assert_receive {:controller, controller}
+      assert :ok = TransformStreamDefaultController.error(controller)
+      assert rejection(Reader.read(ReadableStream.get_reader(transform.readable))) == nil
     end
   end
 end

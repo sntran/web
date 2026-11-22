@@ -23,6 +23,7 @@ defmodule Web.TLA.PipeToPropertyTest do
   alias Web.Internal.ReadableStreamPipe
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultController, as: Source
+  alias Web.Test.StreamEngine
   alias Web.TypeError
   alias Web.WritableStream
   alias Web.WritableStreamDefaultController, as: Sink
@@ -62,7 +63,7 @@ defmodule Web.TLA.PipeToPropertyTest do
         %{
           start: fn controller -> send(test, {:sink, controller}) end,
           write: fn chunk, controller ->
-            send(test, {:write, self(), chunk, Sink.desired_size(controller)})
+            send(test, {:write, self(), chunk, StreamEngine.desired_size(controller)})
             receive(do: (:go -> :ok))
           end,
           close: fn _controller -> send(test, :close) end,
@@ -140,8 +141,8 @@ defmodule Web.TLA.PipeToPropertyTest do
     test = self()
 
     spawn_link(fn ->
-      :ok = ReadableStream.get_reader(source.controller_pid)
-      :ok = WritableStream.get_writer(dest.controller_pid, :pipe)
+      :ok = ReadableStream.__get_reader__(source.controller_pid)
+      %Web.WritableStreamDefaultWriter{} = WritableStream.get_writer(dest, :pipe)
       result = ReadableStreamPipe.run(source.controller_pid, dest.controller_pid, options)
       send(test, {:pipe, outcome(result)})
       receive(do: (:stop -> :ok))

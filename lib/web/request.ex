@@ -8,10 +8,12 @@ defmodule Web.Request do
   ## The attributes
 
   The fields of the struct are the attributes of the `Request` class of the
-  Fetch Standard, in snake case: `method`, `url`, `headers`, `destination`,
+  Fetch Standard, in snake case: `method`, `headers`, `destination`,
   `referrer`, `referrer_policy`, `mode`, `credentials`, `cache`, `redirect`,
   `integrity`, `keepalive`, `is_reload_navigation`, `is_history_navigation`,
-  `signal`, and `duplex`. The other fields are internal.
+  `signal`, and `duplex`. The attribute `url` is a string: `url/1` gives
+  it. The field `url` is the parsed `Web.URL`. The other fields are
+  internal.
 
   A server runtime has no page and no CORS, as Node.js and Deno. Thus the
   values of `mode`, `credentials`, `cache`, `referrer`, `referrer_policy`,
@@ -68,7 +70,7 @@ defmodule Web.Request do
           body_source: term(),
           dispatcher: module() | nil,
           redirect: String.t(),
-          signal: Web.AbortSignal.t() | pid() | reference() | nil,
+          signal: Web.AbortSignal.t() | nil,
           snapshot: AsyncContext.Snapshot.t() | nil,
           options: keyword(),
           destination: String.t(),
@@ -104,6 +106,8 @@ defmodule Web.Request do
 
     * a URL that is not valid, or that includes credentials;
     * an option `:window` that is not `nil`;
+    * an option `:signal` that is not a `Web.AbortSignal` or `nil`, as the
+      type `AbortSignal?` of the member `signal` specifies;
     * a referrer that is not a valid URL. The BEAM has no base URL, thus
       the referrer must be an absolute URL, `"about:client"`, or `""`;
     * a value that is not in the enumeration of its option, for example the
@@ -185,6 +189,18 @@ defmodule Web.Request do
     raise Web.TypeError, "Request init must be a keyword list, got: #{inspect(init)}"
   end
 
+  @doc """
+  Returns the URL of the request as a string, as the attribute `url` of the
+  Fetch Standard: the serialized URL, with its fragment.
+
+  ## Examples
+
+      iex> Web.Request.url(Web.Request.new("HTTP://Example.com/a b#top"))
+      "http://example.com/a%20b#top"
+  """
+  @spec url(t()) :: String.t()
+  def url(%__MODULE__{url: url}), do: Web.URL.href(url)
+
   @doc false
   # A body that is read, or that has a reader, cannot be sent. The Fetch
   # Standard refuses such a request.
@@ -255,6 +271,7 @@ defmodule Web.Request do
   # the body of its input.
   defp construct(request, init, input, fallback_mode) do
     :ok = validate_window!(init)
+    :ok = validate_signal!(init)
 
     request =
       request
@@ -302,6 +319,20 @@ defmodule Web.Request do
     case Keyword.get(init, :window) do
       nil -> :ok
       window -> raise Web.TypeError, "The option window must be nil, got: #{inspect(window)}"
+    end
+  end
+
+  # The member `signal` of `RequestInit` has the type `AbortSignal?`: the
+  # conversion of Web IDL raises `TypeError` for each other value. `nil` is
+  # a member that is not given.
+  defp validate_signal!(init) do
+    case Keyword.get(init, :signal) do
+      nil ->
+        :ok
+
+      signal ->
+        _signal = Web.AbortSignal.__convert__(signal)
+        :ok
     end
   end
 

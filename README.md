@@ -634,6 +634,10 @@ html = Response.new("<!doctype html><html>...", headers: [{"content-type", "text
 
 await(Response.blob(html)).type # => "text/html"
 
+# The methods of a blob return promises, as the File API specifies
+blob = Blob.new(["line 1\r\nline 2"], type: "text/plain", endings: "native")
+await(Blob.text(blob)) # => "line 1\nline 2" (on each host but Windows)
+
 # Live FormData iteration with O(1) memory usage
 form = await(Response.form_data(response))
 Enum.to_list(form)
@@ -698,11 +702,11 @@ systems, and examine its SHA-256 hash.
 | `URLPattern` | 373 | 373 | 0 | 0 | 0 | 0 |
 | The streams, the readers, the writers, and the strategies | 1157 | 1030 | 109 | 1 | 0 | 17 |
 | `CompressionStream` and `DecompressionStream` | 318 | 309 | 1 | 0 | 0 | 8 |
-| `Request`, `Response`, and the body | 697 | 521 | 119 | 5 | 2 | 50 |
+| `Request`, `Response`, the body, and `data:` URLs | 851 | 675 | 118 | 6 | 2 | 50 |
 | `Blob`, `File`, and `FormData` | 527 | 402 | 51 | 3 | 0 | 71 |
 | `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 71 | 5 | 0 | 0 | 0 |
 
-19579 of 20405 tests pass. The tests that are not in the scope of the library
+19733 of 20559 tests pass. The tests that are not in the scope of the library
 use `XMLHttpRequest` or `FileReader`, the guard of the forbidden headers of a
 browser, the shared memory of JavaScript, or the conversion of JavaScript of
 a value to a string. The library will not have them: `Web.fetch/2` and the

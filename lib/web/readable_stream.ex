@@ -1086,7 +1086,8 @@ defmodule Web.ReadableStream do
       an error or closes.
     * `:signal` - a `Web.AbortSignal` that stops the pipe: the pipe aborts
       the destination and cancels the source, and rejects with the reason
-      of the signal.
+      of the signal. Each other value except `nil` rejects with
+      `Web.TypeError`, as the type `AbortSignal` of the member specifies.
   """
   @spec pipe_to(t(), WritableStream.t(), keyword()) :: Promise.t()
   def pipe_to(readable, writable, options \\ []) do
@@ -1146,7 +1147,7 @@ defmodule Web.ReadableStream do
   end
 
   defp run_pipe(readable, writable, options, resolve, reject, ready) do
-    case acquire_pipe_locks(readable, writable) do
+    case acquire_pipe_locks(readable, writable, options) do
       {:ok, reader, writer} ->
         # ReadableStreamPipeTo: "Set source.[[disturbed]] to true." The
         # source is disturbed when `pipe_to/3` returns, also when the pipe
@@ -1166,7 +1167,11 @@ defmodule Web.ReadableStream do
     end
   end
 
-  defp acquire_pipe_locks(readable, writable) do
+  defp acquire_pipe_locks(readable, writable, options) do
+    # The conversion of the dictionary `StreamPipeOptions` comes before the
+    # steps of the method: a signal that is not an `AbortSignal` throws a
+    # `TypeError`.
+    :ok = options |> Keyword.get(:signal) |> check_pipe_signal!()
     reader = acquire_reader_for_pipe(readable)
 
     try do
@@ -1207,6 +1212,14 @@ defmodule Web.ReadableStream do
   # ---------------------------------------------------------------------------
   # Private pipe helpers
   # ---------------------------------------------------------------------------
+
+  # A member of `StreamPipeOptions` that is not given is `nil`.
+  defp check_pipe_signal!(nil), do: :ok
+
+  defp check_pipe_signal!(signal) do
+    _signal = Web.AbortSignal.__convert__(signal)
+    :ok
+  end
 
   # The steps "If ! IsReadableStream(this) is false" and "If !
   # IsWritableStream(destination) is false": `pipe_to/3` rejects, and

@@ -387,8 +387,10 @@ defmodule Web.URLTest do
   test "port setters handle nil and integer inputs" do
     url = URL.new("http://example.com")
 
+    # `nil` is the text "null", which has no port number.
     assert URL.port(URL.port(url, nil)) == ""
     assert URL.port(URL.port(url, 8080)) == "8080"
+    assert URL.port(URL.port(URL.port(url, 8080), nil)) == "8080"
   end
 
   test "parser handles opaque bases, invalid bases, and url struct bases" do

@@ -354,6 +354,83 @@ defmodule Web.URLPropertyTest do
     end
   end
 
+  # Web IDL converts the value of a `USVString` setter to a string: the
+  # JavaScript `null`, which is `nil`, becomes "null".
+  @setters [:href, :protocol, :username, :password, :host, :hostname, :port, :pathname] ++
+             [:search, :hash]
+
+  property "each setter of URL gives for nil the result of the text \"null\"" do
+    check all(
+            text <- one_of([url_text(), constant("foo://host:1/p?q#f"), constant("data:,x")]),
+            setter <- member_of(@setters)
+          ) do
+      url = URL.new(text)
+
+      expected =
+        try do
+          apply(URL, setter, [url, "null"])
+        rescue
+          error in Web.TypeError -> error
+        end
+
+      result =
+        try do
+          apply(URL, setter, [url, nil])
+        rescue
+          error in Web.TypeError -> error
+        end
+
+      assert result == expected
+    end
+  end
+
+  test "the setters of URL with nil: the port stays, and a part becomes \"null\"" do
+    url = URL.new("http://user:pw@example.com:8080/path?query#fragment")
+
+    assert url |> URL.port(nil) |> URL.port() == "8080"
+    assert url |> URL.search(nil) |> URL.search() == "?null"
+    assert url |> URL.hash(nil) |> URL.hash() == "#null"
+    assert url |> URL.pathname(nil) |> URL.pathname() == "/null"
+    assert url |> URL.hostname(nil) |> URL.hostname() == "null"
+    assert url |> URL.host(nil) |> URL.host() == "null:8080"
+    assert url |> URL.username(nil) |> URL.username() == "null"
+    assert url |> URL.password(nil) |> URL.password() == "null"
+    assert url |> URL.protocol(nil) |> URL.protocol() == "http:"
+    assert URL.new("foo:bar") |> URL.protocol(nil) |> URL.protocol() == "null:"
+    assert_raise Web.TypeError, fn -> URL.href(url, nil) end
+
+    # A port number is from 0 to 65535: each other integer changes nothing.
+    assert url |> URL.port(-1) |> URL.port() == "8080"
+    assert url |> URL.port(65_536) |> URL.port() == "8080"
+    assert url |> URL.port(0) |> URL.port() == "0"
+  end
+
+  property "each method of URLSearchParams gives for nil the result of the text \"null\"" do
+    small = string([?a, ?b, ?n, ?u, ?l], max_length: 4)
+
+    check all(
+            pairs <- list_of(tuple({one_of([small, constant("null")]), small}), max_length: 5),
+            other <- small
+          ) do
+      params = URLSearchParams.new(pairs)
+
+      assert URLSearchParams.append(params, nil, nil) ==
+               URLSearchParams.append(params, "null", "null")
+
+      assert URLSearchParams.set(params, nil, other) == URLSearchParams.set(params, "null", other)
+      assert URLSearchParams.set(params, other, nil) == URLSearchParams.set(params, other, "null")
+      assert URLSearchParams.get(params, nil) == URLSearchParams.get(params, "null")
+      assert URLSearchParams.get_all(params, nil) == URLSearchParams.get_all(params, "null")
+      assert URLSearchParams.has(params, nil) == URLSearchParams.has(params, "null")
+      assert URLSearchParams.delete(params, nil) == URLSearchParams.delete(params, "null")
+
+      assert URLSearchParams.new([{nil, other}, [other, nil]]) ==
+               URLSearchParams.new([{"null", other}, [other, "null"]])
+
+      assert URLSearchParams.new(%{nil => nil}) == URLSearchParams.new(%{"null" => "null"})
+    end
+  end
+
   property "the search of a URL and its parameters agree" do
     check all(text <- url_text(), pairs <- pairs()) do
       query =

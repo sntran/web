@@ -473,7 +473,11 @@ defmodule Web.Dispatcher.HTTPTest do
         true
       )
 
-    req = Request.new("http://localhost:#{port}/token-close", signal: :queued_abort)
+    req =
+      Request.new("http://localhost:#{port}/token-close",
+        signal: Web.AbortController.new().signal
+      )
+
     {:ok, resp} = HTTP.fetch(req)
 
     task =

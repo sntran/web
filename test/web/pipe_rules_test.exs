@@ -522,30 +522,16 @@ defmodule Web.PipeRulesTest do
       refute_received {:abort, _reason}
     end
 
-    test "can be a process: its stop is the abort, with its exit reason" do
-      test = self()
-      {source, _controller} = source(test)
-      {dest, _sink} = sink(test)
-      signal = spawn(fn -> receive(do: (:stop -> exit(:signal_stopped))) end)
-
-      pipe = ReadableStream.pipe_to(source, dest, signal: signal)
-      waits_for_read(source)
-
-      send(signal, :stop)
-      assert rejection(pipe) == :signal_stopped
-      assert_received {:cancel, :signal_stopped}
-      assert_received {:abort, :signal_stopped}
-    end
-
-    test "can be a process that sends the abort" do
+    test "must be an AbortSignal: a process rejects the pipe with TypeError, with no lock" do
       test = self()
       {source, _controller} = source(test)
       {dest, _sink} = sink(test)
       signal = spawn(fn -> Process.sleep(:infinity) end)
 
       pipe = ReadableStream.pipe_to(source, dest, signal: signal)
-      send(pipe_process(source), {:abort, signal, :sent_reason})
-      assert rejection(pipe) == :sent_reason
+      assert %TypeError{} = rejection(pipe)
+      refute ReadableStream.locked?(source)
+      refute WritableStream.locked?(dest)
       Process.exit(signal, :kill)
     end
 
@@ -567,9 +553,10 @@ defmodule Web.PipeRulesTest do
       {source, controller} = source(test)
       {dest, _sink} = sink(test)
 
-      pipe = ReadableStream.pipe_to(source, dest, signal: :pipe_token)
+      abort_controller = AbortController.new()
+      pipe = ReadableStream.pipe_to(source, dest, signal: abort_controller.signal)
       pipe_pid = pipe_process(source)
-      send(pipe_pid, {:abort, :other_token, :other_reason})
+      send(pipe_pid, {:abort, make_ref(), :other_reason})
       send(pipe_pid, {:abort, :other_token})
 
       assert :ok = Source.close(controller)
@@ -697,6 +684,21 @@ defmodule Web.PipeRulesTest do
       assert_received {:cancel, ^error}
     end
 
+    test "the destination while a write waits: the pipe cancels the source" do
+      test = self()
+      {source, controller} = source(test)
+      {dest, _sink} = sink(test)
+
+      pipe = ReadableStream.pipe_to(source, dest)
+      assert :ok = Source.enqueue(controller, "a")
+      assert_receive {:write, _worker, "a"}
+
+      # The write does not end: the stop of the destination ends it.
+      Process.exit(dest.controller_pid, :kill)
+      assert %TypeError{} = error = rejection(pipe)
+      assert_received {:cancel, ^error}
+    end
+
     test "the destination while the shutdown waits for the writes" do
       test = self()
       {source, controller} = source(test)
@@ -781,6 +783,18 @@ defmodule Web.PipeRulesTest do
       test = self()
       {source, _controller} = source(test)
       transform = Web.TransformStream.new()
+      assert :ok = await(ReadableStream.cancel(transform.readable, :gone))
+
+      assert rejection(ReadableStream.pipe_to(source, transform.writable)) == :gone
+      assert_received {:cancel, :gone}
+    end
+
+    test "of one process, with a cancelled readable side, cancels the source with the reason" do
+      # The two sides of a `CompressionStream` are one process: the writable
+      # side is errored with the reason of the cancel.
+      test = self()
+      {source, _controller} = source(test)
+      transform = Web.CompressionStream.new("gzip")
       assert :ok = await(ReadableStream.cancel(transform.readable, :gone))
 
       assert rejection(ReadableStream.pipe_to(source, transform.writable)) == :gone

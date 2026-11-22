@@ -11,6 +11,12 @@ defmodule Web.URL do
   `hostname/1`. Each attribute that the Standard lets you set also has a
   setter `name/2`, for example `hostname/2`. A setter returns the new URL.
   The fields of the struct are internal: use the functions.
+
+  A setter converts its value to a string, as Web IDL converts a value to
+  a `USVString`: `nil` is the JavaScript `null`, thus the text `"null"`.
+  For example, `port(url, nil)` does not change the port, and
+  `hash(url, nil)` gives the fragment `"null"`. The empty string clears a
+  port, a query, or a fragment.
   """
 
   defguardp alpha?(char) when char in ?A..?Z or char in ?a..?z
@@ -190,7 +196,7 @@ defmodule Web.URL do
   """
   @spec href(t(), String.t()) :: t()
   def href(%__MODULE__{} = _url, value) do
-    new(value)
+    value |> usv_string() |> new()
   end
 
   @doc """
@@ -219,7 +225,7 @@ defmodule Web.URL do
   def protocol(%__MODULE__{} = url, value) do
     protocol =
       value
-      |> to_string()
+      |> usv_string()
       |> Encoding.strip_ascii_tab_and_newline()
       |> String.split(":", parts: 2)
       |> hd()
@@ -275,7 +281,7 @@ defmodule Web.URL do
   def host(%__MODULE__{} = url, value) do
     candidate =
       value
-      |> to_string()
+      |> usv_string()
       |> Encoding.strip_ascii_tab_and_newline()
       |> String.split(host_setter_delimiters(url.protocol), parts: 2)
       |> hd()
@@ -324,7 +330,7 @@ defmodule Web.URL do
   def hostname(%__MODULE__{} = url, value) do
     candidate =
       value
-      |> to_string()
+      |> usv_string()
       |> Encoding.strip_ascii_tab_and_newline()
       |> String.split(host_setter_delimiters(url.protocol), parts: 2)
       |> hd()
@@ -358,7 +364,7 @@ defmodule Web.URL do
   @spec username(t(), String.t()) :: t()
   def username(%__MODULE__{} = url, value) do
     if url.protocol != "file:" and has_authority?(url) and url.hostname != "" do
-      encoded = Encoding.encode_userinfo_component(value)
+      encoded = value |> usv_string() |> Encoding.encode_userinfo_component()
 
       %{
         url
@@ -385,7 +391,7 @@ defmodule Web.URL do
   @spec password(t(), String.t()) :: t()
   def password(%__MODULE__{} = url, value) do
     if url.protocol != "file:" and has_authority?(url) and url.hostname != "" do
-      encoded = Encoding.encode_userinfo_component(value)
+      encoded = value |> usv_string() |> Encoding.encode_userinfo_component()
 
       %{
         url
@@ -412,13 +418,19 @@ defmodule Web.URL do
 
   @doc """
   Sets the port of the URL, as the setter of the attribute `port`. The
-  empty string removes the port. An integer is the same as its text.
+  empty string removes the port. An integer is the same as its text. A
+  value that does not start with a port number from 0 to 65535 gives the
+  URL with no change, also `nil`, which is the text `"null"`.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com")
       iex> Web.URL.port(url, 8080) |> Web.URL.port()
       "8080"
+
+      iex> url = Web.URL.new("https://example.com:8080")
+      iex> {url |> Web.URL.port(nil) |> Web.URL.port(), url |> Web.URL.port("") |> Web.URL.port()}
+      {"8080", ""}
   """
   @spec port(t(), String.t() | integer() | nil) :: t()
   def port(%__MODULE__{} = url, value) do
@@ -426,18 +438,9 @@ defmodule Web.URL do
       %{url | kind: :standard, port: ""}
     else
       port =
-        case value do
-          nil ->
-            ""
-
-          "" ->
-            ""
-
-          int when is_integer(int) ->
-            Integer.to_string(int)
-
-          binary ->
-            normalize_port_setter_value(url.port, binary)
+        case usv_string(value) do
+          "" -> ""
+          text -> normalize_port_setter_value(url.port, text)
         end
 
       %{url | kind: :standard, port: normalize_default_port_for_setter(url.protocol, port)}
@@ -474,7 +477,7 @@ defmodule Web.URL do
       %{
         url
         | pathname:
-            normalize_path(url, value |> to_string() |> Encoding.strip_ascii_tab_and_newline())
+            normalize_path(url, value |> usv_string() |> Encoding.strip_ascii_tab_and_newline())
       }
     end
   end
@@ -507,7 +510,7 @@ defmodule Web.URL do
   """
   @spec search(t(), String.t()) :: t()
   def search(%__MODULE__{} = url, value) do
-    normalized = value |> to_string() |> Encoding.strip_ascii_tab_and_newline()
+    normalized = value |> usv_string() |> Encoding.strip_ascii_tab_and_newline()
 
     case normalized do
       "" ->
@@ -549,7 +552,7 @@ defmodule Web.URL do
   """
   @spec hash(t(), String.t()) :: t()
   def hash(%__MODULE__{} = url, value) do
-    case value |> to_string() |> Encoding.strip_ascii_tab_and_newline() do
+    case value |> usv_string() |> Encoding.strip_ascii_tab_and_newline() do
       "" ->
         put_fragment(url, nil)
 
@@ -630,6 +633,11 @@ defmodule Web.URL do
   defp rclone_remote?(<<?:, ?/, ?/, _rest::binary>>, _underscore?), do: false
   defp rclone_remote?(<<?:, _rest::binary>>, underscore?), do: underscore?
   defp rclone_remote?(_value, _underscore?), do: false
+
+  # The conversion of Web IDL to a `USVString` for a setter: `nil` is the
+  # JavaScript `null`, which becomes the text "null".
+  defp usv_string(nil), do: "null"
+  defp usv_string(value), do: to_string(value)
 
   # A lower-case letter, then lower-case letters, digits, "+", "-", and ".".
   defp scheme_name?(<<char, rest::binary>>) when char in ?a..?z, do: scheme_rest?(rest)

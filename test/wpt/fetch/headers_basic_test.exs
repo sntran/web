@@ -6,10 +6,10 @@
 #     list of `{name, value}` tuples. A JS record is a map.
 #   - A `Web.Headers` is a value. A JS method that changes the headers is a
 #     function that gives new headers.
-#   - JS `null` is `nil`. JS `String(v)` is `to_string(v)`. Thus a `nil`
-#     value gives "", as JS `null` gives "null".
+#   - JS `null` is `nil`. JS `String(v)` is `string/1`: `nil` gives "null",
+#     and each other value gives `to_string(v)`.
 #   - `headers[Symbol.iterator]()` is the `Enumerable` protocol.
-#     `headers.forEach(f)` is `Enum.each(headers, f)`.
+#     `headers.forEach(f)` is `Web.Headers.for_each/2`.
 #
 # Not ported:
 #   - "Create headers from undefined parameter": Elixir has no `undefined`.
@@ -36,8 +36,6 @@
 #     property descriptor of `next` of a JS iterator. An Elixir stream has no
 #     prototype and no `next`. For the same reason, the check that `next()`
 #     stays done after the end is not ported.
-#   - In "Check forEach method", the third argument of the callback (the
-#     headers object). `Enum.each/2` gives no such argument.
 
 defmodule Web.WPT.Fetch.HeadersBasicTest do
   use ExUnit.Case, async: true
@@ -57,6 +55,10 @@ defmodule Web.WPT.Fetch.HeadersBasicTest do
 
   # `headerDict` as a record.
   @header_dict Map.new(@header_seq)
+
+  # `String(v)` of JavaScript.
+  defp string(nil), do: "null"
+  defp string(value), do: to_string(value)
 
   # `headerEntriesDict` of the WPT file.
   @header_entries_dict %{
@@ -94,7 +96,7 @@ defmodule Web.WPT.Fetch.HeadersBasicTest do
     headers = Headers.new(@header_seq)
 
     for {name, value} <- @header_seq do
-      assert Headers.get(headers, name) == to_string(value),
+      assert Headers.get(headers, name) == string(value),
              "name: #{name} has value: #{inspect(value)}"
     end
 
@@ -106,7 +108,7 @@ defmodule Web.WPT.Fetch.HeadersBasicTest do
     headers = Headers.new(@header_dict)
 
     for {name, value} <- @header_seq do
-      assert Headers.get(headers, name) == to_string(value),
+      assert Headers.get(headers, name) == string(value),
              "name: #{name} has value: #{inspect(value)}"
     end
   end
@@ -116,7 +118,7 @@ defmodule Web.WPT.Fetch.HeadersBasicTest do
     headers2 = Headers.new(headers)
 
     for {name, value} <- @header_seq do
-      assert Headers.get(headers2, name) == to_string(value),
+      assert Headers.get(headers2, name) == string(value),
              "name: #{name} has value: #{inspect(value)}"
     end
   end
@@ -125,7 +127,7 @@ defmodule Web.WPT.Fetch.HeadersBasicTest do
     Enum.reduce(@header_seq, Headers.new(), fn {name, value}, headers ->
       headers = Headers.append(headers, name, value)
 
-      assert Headers.get(headers, name) == to_string(value),
+      assert Headers.get(headers, name) == string(value),
              "name: #{name} has value: #{inspect(value)}"
 
       headers
@@ -136,7 +138,7 @@ defmodule Web.WPT.Fetch.HeadersBasicTest do
     Enum.reduce(@header_seq, Headers.new(), fn {name, value}, headers ->
       headers = Headers.set(headers, name, value)
 
-      assert Headers.get(headers, name) == to_string(value),
+      assert Headers.get(headers, name) == string(value),
              "name: #{name} has value: #{inspect(value)}"
 
       headers
@@ -167,7 +169,7 @@ defmodule Web.WPT.Fetch.HeadersBasicTest do
     headers = Headers.new(@header_dict)
 
     for {name, value} <- @header_seq do
-      assert Headers.get(headers, name) == to_string(value),
+      assert Headers.get(headers, name) == string(value),
              "name: #{name} has value: #{inspect(value)}"
     end
 
@@ -227,16 +229,19 @@ defmodule Web.WPT.Fetch.HeadersBasicTest do
     headers = Headers.new(@header_entries_dict)
     test_pid = self()
 
-    Enum.each(headers, fn {key, value} -> send(test_pid, {:for_each, key, value}) end)
+    Headers.for_each(headers, fn value, key, object ->
+      send(test_pid, {:for_each, key, value, object})
+    end)
 
     # Each message has the same form. Thus `assert_received` gets the oldest
     # message, and the sequence of the messages is the sequence of the calls.
     for expected_key <- @sorted_header_keys do
-      assert_received {:for_each, key, value}
+      assert_received {:for_each, key, value, object}
       assert key == expected_key
       assert value == @sorted_header_dict[expected_key]
+      assert object == headers
     end
 
-    refute_received {:for_each, _key, _value}
+    refute_received {:for_each, _key, _value, _object}
   end
 end

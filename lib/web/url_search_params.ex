@@ -6,9 +6,16 @@ defmodule Web.URLSearchParams do
 
   The struct is an `Enumerable` of `{name, value}` tuples, as the iterable
   of the Standard. Thus `Enum.to_list/1` gives the pairs.
+
+  A name or a value becomes a string, as Web IDL converts a value to a
+  `USVString`: `nil` is the JavaScript `null`, thus the text `"null"`. The
+  optional value of `delete/3` and `has/3` is the exception: `nil` there is
+  a value that is not given.
   """
 
   import Kernel, except: [to_string: 1]
+
+  alias Web.Internal.Iterable
 
   defguardp hex?(char) when char in ?0..?9 or char in ?a..?f or char in ?A..?F
 
@@ -81,7 +88,7 @@ defmodule Web.URLSearchParams do
   """
   @spec append(t(), String.t(), String.t()) :: t()
   def append(%__MODULE__{} = params, name, value) do
-    update(params, params.pairs ++ [{Kernel.to_string(name), Kernel.to_string(value)}])
+    update(params, params.pairs ++ [{usv_string(name), usv_string(value)}])
   end
 
   @doc """
@@ -116,7 +123,7 @@ defmodule Web.URLSearchParams do
   """
   @spec get(t(), String.t()) :: String.t() | nil
   def get(%__MODULE__{} = params, name) do
-    name = Kernel.to_string(name)
+    name = usv_string(name)
 
     Enum.find_value(params.pairs, fn
       {^name, value} -> value
@@ -135,7 +142,7 @@ defmodule Web.URLSearchParams do
   """
   @spec get_all(t(), String.t()) :: [String.t()]
   def get_all(%__MODULE__{} = params, name) do
-    name = Kernel.to_string(name)
+    name = usv_string(name)
 
     Enum.flat_map(params.pairs, fn
       {^name, value} -> [value]
@@ -190,8 +197,8 @@ defmodule Web.URLSearchParams do
   """
   @spec set(t(), String.t(), String.t()) :: t()
   def set(%__MODULE__{} = params, name, value) do
-    name = Kernel.to_string(name)
-    value = Kernel.to_string(value)
+    name = usv_string(name)
+    value = usv_string(value)
 
     {pairs, seen?} =
       Enum.reduce(params.pairs, {[], false}, fn
@@ -248,6 +255,68 @@ defmodule Web.URLSearchParams do
     end)
   end
 
+  @doc """
+  Returns the pairs, as `entries()` of the iterable of the URL Standard:
+  an enumerable of `{name, value}` tuples. The struct itself is the same
+  enumerable.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("a=1&b=2")
+      iex> params |> Web.URLSearchParams.entries() |> Enum.to_list()
+      [{"a", "1"}, {"b", "2"}]
+  """
+  @spec entries(t()) :: Enumerable.t()
+  def entries(%__MODULE__{} = params), do: Stream.map(params.pairs, & &1)
+
+  @doc """
+  Returns the names of the pairs, as `keys()` of the iterable of the URL
+  Standard. A name of more than one pair comes one time for each pair.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("a=1&b=2&a=3")
+      iex> params |> Web.URLSearchParams.keys() |> Enum.to_list()
+      ["a", "b", "a"]
+  """
+  @spec keys(t()) :: Enumerable.t()
+  def keys(%__MODULE__{} = params), do: Stream.map(params.pairs, &elem(&1, 0))
+
+  @doc """
+  Returns the values of the pairs, as `values()` of the iterable of the URL
+  Standard.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("a=1&b=2&a=3")
+      iex> params |> Web.URLSearchParams.values() |> Enum.to_list()
+      ["1", "2", "3"]
+  """
+  @spec values(t()) :: Enumerable.t()
+  def values(%__MODULE__{} = params), do: Stream.map(params.pairs, &elem(&1, 1))
+
+  @doc """
+  Calls `callback` for each pair, as `forEach()` of the iterable of the URL
+  Standard. Returns `:ok`.
+
+  The callback gets the value, the name, and the struct, in this sequence,
+  as Web IDL specifies. A callback of arity 0, 1, or 2 gets the first
+  arguments, as a JavaScript function that ignores the other arguments.
+  Each other callback raises `Web.TypeError`.
+
+  ## Examples
+
+      iex> params = Web.URLSearchParams.new("a=1&b=2")
+      iex> Web.URLSearchParams.for_each(params, fn value, name -> send(self(), {name, value}) end)
+      :ok
+      iex> {:messages, messages} = Process.info(self(), :messages)
+      iex> messages
+      [{"a", "1"}, {"b", "2"}]
+  """
+  @spec for_each(t(), function()) :: :ok
+  def for_each(%__MODULE__{} = params, callback),
+    do: Iterable.for_each(params.pairs, params, callback)
+
   @doc false
   # The list of the pairs. Use `Enum.to_list/1`: the struct is an
   # `Enumerable` of its pairs, as the iterable of the Standard.
@@ -284,6 +353,11 @@ defmodule Web.URLSearchParams do
     {current, delete(params, key)}
   end
 
+  # The conversion of Web IDL to a `USVString`: `nil` is the JavaScript
+  # `null`, which becomes the text "null".
+  defp usv_string(nil), do: "null"
+  defp usv_string(value), do: Kernel.to_string(value)
+
   # A change of the list: the list is not the query of its URL now.
   defp update(params, pairs), do: %{params | pairs: pairs, url_query: nil}
 
@@ -292,8 +366,8 @@ defmodule Web.URLSearchParams do
   defp normalize_init(init), do: Enum.map(init, &pair!/1)
 
   # A map gives tuples. A sequence of sequences gives lists.
-  defp pair!({name, value}), do: {Kernel.to_string(name), Kernel.to_string(value)}
-  defp pair!([name, value]), do: {Kernel.to_string(name), Kernel.to_string(value)}
+  defp pair!({name, value}), do: {usv_string(name), usv_string(value)}
+  defp pair!([name, value]), do: {usv_string(name), usv_string(value)}
 
   defp pair!(item) do
     raise Web.TypeError, "Each item of the sequence must have two items, not #{inspect(item)}."
@@ -302,12 +376,12 @@ defmodule Web.URLSearchParams do
   # A function that finds the pairs with the name, and with the value when
   # the value is not nil.
   defp matcher(name, nil) do
-    name = Kernel.to_string(name)
+    name = usv_string(name)
     fn {key, _value} -> key == name end
   end
 
   defp matcher(name, value) do
-    pair = {Kernel.to_string(name), Kernel.to_string(value)}
+    pair = {usv_string(name), usv_string(value)}
     &(&1 == pair)
   end
 

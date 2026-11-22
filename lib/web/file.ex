@@ -36,6 +36,8 @@ defmodule Web.File do
 
     * `:type` - the type of the file. The type follows the rules of the
       type of `Web.Blob.new/2`. The default is the empty string.
+    * `:endings` - `"transparent"` (the default) or `"native"`, as for
+      `Web.Blob.new/2`.
     * `:last_modified` - the time of the last change, in milliseconds from
       the Unix epoch. The default is the time now.
 
@@ -48,7 +50,7 @@ defmodule Web.File do
   @spec new([Web.Blob.blob_part()], String.t(), keyword()) :: t()
   def new(file_bits, file_name, options \\ [])
       when is_list(file_bits) and is_binary(file_name) and is_list(options) do
-    blob = Web.Blob.new(file_bits, type: Keyword.get(options, :type, ""))
+    blob = Web.Blob.new(file_bits, Keyword.take(options, [:type, :endings]))
 
     %__MODULE__{
       id: make_ref(),

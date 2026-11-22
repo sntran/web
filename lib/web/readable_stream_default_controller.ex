@@ -12,7 +12,9 @@ defmodule Web.ReadableStreamDefaultController do
   alias Web.ReadableStream
 
   @doc """
-  Enqueues a chunk into the stream's internal queue.
+  Puts a chunk in the queue of the stream, as `enqueue(chunk)` of the
+  Streams Standard. The chunk is optional: the default is `nil`, as
+  `undefined` in the Standard.
 
   ## Examples
 
@@ -29,7 +31,7 @@ defmodule Web.ReadableStreamDefaultController do
   Raises `Web.TypeError` when the stream is closed or errored, as the
   Streams Standard specifies.
   """
-  def enqueue(%_{pid: pid}, chunk) do
+  def enqueue(%_{pid: pid}, chunk \\ nil) do
     ReadableStream.controller_enqueue(pid, chunk)
   end
 

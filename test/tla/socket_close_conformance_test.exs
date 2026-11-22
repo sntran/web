@@ -127,30 +127,30 @@ defmodule Web.TLA.SocketCloseConformanceTest do
     end
   end
 
+  # The peer accepts the connection when it needs it, with no timer. The
+  # specification permits `PeerFin` only after `Connected`, thus the
+  # connection comes. A connection that the system made is in the backlog
+  # of the listener: an accept with no wait finds it.
   defp peer_loop(listener, socket) do
     receive do
       {:fin, from} ->
+        socket = socket || accept(listener, :infinity)
         :ok = :gen_tcp.shutdown(socket, :write)
         send(from, :fin_sent)
         peer_loop(listener, socket)
 
       {:eof?, from} ->
+        socket = socket || accept(listener, 0)
         send(from, {:eof, socket != nil and :gen_tcp.recv(socket, 0, 0) == {:error, :closed}})
         peer_loop(listener, socket)
 
       :stop ->
         :ok
-    after
-      5 ->
-        case socket do
-          nil -> peer_loop(listener, accept(listener))
-          socket -> peer_loop(listener, socket)
-        end
     end
   end
 
-  defp accept(listener) do
-    case :gen_tcp.accept(listener, 0) do
+  defp accept(listener, timeout) do
+    case :gen_tcp.accept(listener, timeout) do
       {:ok, socket} -> socket
       {:error, :timeout} -> nil
     end

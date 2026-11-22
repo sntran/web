@@ -16,11 +16,32 @@ the comments in the code, the names, the log text, and the commit messages.
 ## Web Standards compliance
 
 The public API of this library is the API of the Web Standards (WHATWG, W3C,
-and TC39). Its users must find what a Standard specifies, and nothing that
-the Standard does not specify.
+WICG, and WinterTC) and of TC39, also of the TC39 proposals, for example
+AsyncContext and the governors of the proposal for concurrency control. Its
+users must find what a Standard specifies, and nothing that the Standard
+does not specify.
 
 - Do not add a public function, callback, option, or field that a Standard
   does not have. An option of a public function is also a public API.
+- Give each name of a Standard its Elixir form:
+  - functions and fields in snake_case, for example `get_set_cookie/1`
+    and `entry_type`;
+  - a getter is `name/1`, and its setter is `name/2`, with the name of the
+    attribute, for example `Web.URL.hostname/1` and `Web.URL.hostname/2`.
+    Do not use a prefix `set_`;
+  - a method has the snake_case name of the Standard, for example
+    `has/2`, not `has?/2`;
+  - the suffix `?` is only for an attribute that is a boolean, for example
+    `locked?/1` and `aborted?/1`;
+  - a constructor is `new/n`, and a static method is a function of the
+    module, for example `Web.Response.json/2`.
+- Two kinds of Elixir glue stay public: `start_link/1` and `child_spec/1`,
+  so that a supervisor can own a process, and the implementations of the
+  Elixir protocols, for example `Enumerable`, `Inspect`, and
+  `String.Chars`. For example, `to_string/1` gives the bytes of a
+  `Web.Uint8Array` as a binary.
+- An extension point, for example a behaviour, or a protocol that only the
+  library implements, is internal.
 - Keep the calling signature of each public function.
 - Put each internal need in a private function, in a function with a name
   that starts and ends with two underscores and `@doc false` (for example

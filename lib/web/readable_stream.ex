@@ -266,21 +266,14 @@ defmodule Web.ReadableStream do
   defp source_start(_source), do: nil
 
   @doc """
-  Makes a `ReadableStream` from an enumerable, or from a value of bytes.
+  Makes a `ReadableStream` from an enumerable, as `ReadableStream.from()`
+  of the Streams Standard does for an iterable. The stream gives one chunk
+  for each element, with no change. A `ReadableStream` is an enumerable:
+  the new stream reads it, and holds its lock.
 
-    * An enumerable gives one chunk for each of its elements, with no
-      change, as `ReadableStream.from()` of the Streams Standard does for
-      an iterable.
-    * A value of bytes gives a stream of bytes: each chunk is a
-      `Web.Uint8Array`. A value of bytes is a binary, a `Web.Blob`, a
-      `Web.ArrayBuffer`, a `Web.Uint8Array`, or a `Web.URLSearchParams` (its
-      text). A binary gives one chunk. In ECMAScript, a string is an
-      iterable of its code points. A binary of the BEAM is not an
-      enumerable, thus this function reads it as bytes.
-    * `nil` gives a stream with no chunks.
-    * A `ReadableStream` is returned with no change.
-
-  Raises `Web.TypeError` for each other value.
+  Raises `Web.TypeError` for a value that is not an enumerable. For a
+  stream of bytes, use the body of a response
+  (`Web.Response.new(binary).body`) or `Web.Blob.stream/1`.
 
   ## Examples
 
@@ -288,30 +281,29 @@ defmodule Web.ReadableStream do
       iex> Enum.to_list(stream)
       ["a", "b"]
 
-      iex> stream = Web.ReadableStream.from("hello")
-      iex> Enum.map(stream, &to_string/1)
-      ["hello"]
-
-      iex> stream = Web.ReadableStream.from(nil)
-      iex> Enum.to_list(stream)
-      []
-
-      iex> existing = Web.ReadableStream.new()
-      iex> Web.ReadableStream.from(existing) == existing
-      true
+      iex> Web.ReadableStream.from(Web.ReadableStream.from([1, 2])) |> Enum.to_list()
+      [1, 2]
   """
-  def from(nil) do
+  def from(enumerable), do: from_enumerable(enumerable, [])
+
+  @doc false
+  # `from/1` with the values of bytes of the library: a binary gives one
+  # chunk, a `Web.Blob` its parts, a `Web.ArrayBuffer` or a
+  # `Web.Uint8Array` one chunk, a `Web.URLSearchParams` its text, and `nil`
+  # no chunk. A `ReadableStream` stays the same. Each chunk is a
+  # `Web.Uint8Array`. `Web.Body` and `Web.FormData` use it.
+  def __from__(nil) do
     new(%{start: &Web.ReadableStreamDefaultController.close/1})
   end
 
-  def from(%URLSearchParams{} = params) do
-    from(URLSearchParams.to_string(params))
+  def __from__(%URLSearchParams{} = params) do
+    __from__(URLSearchParams.to_string(params))
   end
 
   # A value of bytes in memory gives a stream with no process: see
   # `Web.Internal.LazyStream`.
 
-  def from(%Blob{parts: parts}) do
+  def __from__(%Blob{parts: parts}) do
     blob_parts_pid = start_blob_parts_queue(parts)
 
     new(%{
@@ -333,14 +325,14 @@ defmodule Web.ReadableStream do
   end
 
   # A buffer or a view gives one chunk, which is a `Web.Uint8Array`.
-  def from(%ArrayBuffer{} = buffer), do: from_chunk(ArrayBuffer.data(buffer))
-  def from(%Uint8Array{} = bytes), do: %__MODULE__{lazy: LazyStream.new({:view, bytes})}
+  def __from__(%ArrayBuffer{} = buffer), do: from_chunk(ArrayBuffer.data(buffer))
+  def __from__(%Uint8Array{} = bytes), do: %__MODULE__{lazy: LazyStream.new({:view, bytes})}
 
-  def from(data) when is_binary(data), do: from_chunk(data)
+  def __from__(data) when is_binary(data), do: from_chunk(data)
 
-  def from(%__MODULE__{} = stream), do: stream
+  def __from__(%__MODULE__{} = stream), do: stream
 
-  def from(enumerable), do: from_enumerable(enumerable, [])
+  def __from__(enumerable), do: from(enumerable)
 
   defp from_chunk(binary), do: %__MODULE__{lazy: LazyStream.new({:chunk, binary})}
 

@@ -444,7 +444,7 @@ defmodule Web.FetchRulesTest do
     end
 
     test "is released when the request is complete, for a body with a process", %{port: port} do
-      body = ReadableStream.__with_process__(ReadableStream.from("payload"))
+      body = ReadableStream.__with_process__(ReadableStream.__from__("payload"))
       request = Request.new(url(port, "/echo"), method: "POST", body: body, duplex: "half")
       assert %{body: "payload"} = echo(await(fetch(request)))
       assert_down(body.controller_pid)

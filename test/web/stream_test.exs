@@ -391,7 +391,7 @@ defmodule Web.StreamTest do
 
   describe "Web.Stream disturbed flag" do
     test "disturbed/locked behavior tracks stream usage" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
 
       assert ReadableStream.disturbed?(stream) == false
       assert ReadableStream.locked?(stream) == false
@@ -426,7 +426,7 @@ defmodule Web.StreamTest do
     end
 
     test "disturbed prevents tee on a disturbed stream" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       reader = ReadableStream.get_reader(stream)
       _ = StreamEngine.read(reader.controller_pid)
 

@@ -3,8 +3,8 @@ defmodule Web.Internal.LazyStream do
 
   # A readable stream that has no process yet.
   #
-  # A body that has all its bytes, such as `ReadableStream.from("text")`,
-  # the body of `Web.Response.new/1`, or the body of a `fetch` response that
+  # A body that has all its bytes, such as the body of
+  # `Web.Response.new/1`, or the body of a `fetch` response that
   # was complete with its headers, needs no process for a read of all its
   # bytes: `text/1`, `json/1`, and the other body functions take the bytes.
   # A stream read, such as `get_reader/1`, a pipe, `tee/1` of a body that a

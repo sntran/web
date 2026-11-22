@@ -174,7 +174,7 @@ defmodule Web.Body do
     if Enumerable.impl_for(body) do
       body |> Stream.map(&Bytes.chunk/1) |> Web.ReadableStream.from()
     else
-      Web.ReadableStream.from(body)
+      Web.ReadableStream.__from__(body)
     end
   end
 
@@ -320,7 +320,7 @@ defmodule Web.Body do
   # The steps of `textStream()`: the body piped through a `TextDecoderStream`
   # for UTF-8. The `content-type` of the body has no effect. A struct with
   # no body gives a new closed stream.
-  def text_stream(%{body: nil}), do: Web.ReadableStream.from(nil)
+  def text_stream(%{body: nil}), do: Web.ReadableStream.__from__(nil)
 
   def text_stream(%{body: body}) do
     :ok = ensure_usable!(body)

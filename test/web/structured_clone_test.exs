@@ -291,7 +291,7 @@ defmodule Web.StructuredCloneTest do
     end
 
     test "the message names the struct that has the value" do
-      stream = Web.ReadableStream.from("payload")
+      stream = Web.ReadableStream.__from__("payload")
 
       assert data_clone_error(fn -> Web.structured_clone(%{"body" => stream}) end) ==
                "A Web.ReadableStream cannot be cloned."
@@ -316,7 +316,7 @@ defmodule Web.StructuredCloneTest do
     test "a file that has a stream" do
       file = %{
         File.new([], "stream.txt", type: "text/plain")
-        | stream: Web.ReadableStream.from("payload")
+        | stream: Web.ReadableStream.__from__("payload")
       }
 
       assert data_clone_error(fn -> Web.structured_clone(file) end) ==

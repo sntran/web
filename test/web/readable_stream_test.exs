@@ -368,34 +368,49 @@ defmodule Web.ReadableStreamTest do
       assert :ok = await(ReadableStream.cancel(stream, :stop))
     end
 
-    test "from/1 normalizes URLSearchParams, Blob, ArrayBuffer, and Uint8Array" do
+    # ReadableStream.from(asyncIterable) of the Streams Standard.
+    test "from/1 takes an iterable, and refuses a value that is not one" do
+      params = Web.URLSearchParams.new(%{"a" => "1"})
+      assert [{"a", "1"}] = params |> ReadableStream.from() |> Enum.to_list()
+
+      for value <- ["text", nil, Web.Blob.new(["a"]), Web.ArrayBuffer.new("a")] do
+        assert_raise Web.TypeError, fn -> ReadableStream.from(value) end
+      end
+
+      source = ReadableStream.from([1, 2])
+      copy = ReadableStream.from(source)
+      assert copy != source
+      assert Enum.to_list(copy) == [1, 2]
+    end
+
+    test "the internal from gives the bytes of URLSearchParams, Blob, ArrayBuffer, and Uint8Array" do
       params = Web.URLSearchParams.new(%{"a" => "1", "b" => "2"})
-      assert "a=1&b=2" = params |> ReadableStream.from() |> Web.TestBytes.join()
+      assert "a=1&b=2" = params |> ReadableStream.__from__() |> Web.TestBytes.join()
 
       blob = Web.Blob.new(["he", "ll", "o"])
-      assert "hello" = blob |> ReadableStream.from() |> Web.TestBytes.join()
+      assert "hello" = blob |> ReadableStream.__from__() |> Web.TestBytes.join()
 
       # A stream of bytes gives each chunk as a Uint8Array.
       buffer = Web.ArrayBuffer.new("hello")
 
       assert [%Web.Uint8Array{byte_length: 5} = chunk] =
-               buffer |> ReadableStream.from() |> Enum.to_list()
+               buffer |> ReadableStream.__from__() |> Enum.to_list()
 
-      assert Web.Uint8Array.to_binary(chunk) == "hello"
+      assert to_string(chunk) == "hello"
 
       bytes = Web.Uint8Array.new(Web.ArrayBuffer.new("hello"), 1, 3)
-      assert [^bytes] = bytes |> ReadableStream.from() |> Enum.to_list()
+      assert [^bytes] = bytes |> ReadableStream.__from__() |> Enum.to_list()
 
       nested_blob = Web.Blob.new(["a", Web.Blob.new(["b", "c"]), "d"])
 
       assert ["a", "b", "c", "d"] =
-               nested_blob |> ReadableStream.from() |> Web.TestBytes.binaries()
+               nested_blob |> ReadableStream.__from__() |> Web.TestBytes.binaries()
     end
 
-    test "from/1 streams blob parts lazily across multiple pull cycles" do
+    test "the internal from streams blob parts lazily across multiple pull cycles" do
       parts = Enum.map(1..1_000, &Integer.to_string/1)
       blob = Web.Blob.new(parts)
-      stream = ReadableStream.from(blob)
+      stream = ReadableStream.__from__(blob)
       reader = ReadableStream.get_reader(stream)
 
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
@@ -418,7 +433,7 @@ defmodule Web.ReadableStreamTest do
       assert :ok = ReadableStreamDefaultReader.release_lock(reader)
     end
 
-    test "from/1 traverses nested blobs lazily without preloading controller queue" do
+    test "the internal from traverses nested blobs lazily without preloading controller queue" do
       chunk_a = :binary.copy("a", 64_000)
       chunk_b = :binary.copy("b", 64_000)
       chunk_c = :binary.copy("c", 64_000)
@@ -432,7 +447,7 @@ defmodule Web.ReadableStreamTest do
           Web.Blob.new([chunk_c])
         ])
 
-      stream = ReadableStream.from(blob)
+      stream = ReadableStream.__from__(blob)
       reader = ReadableStream.get_reader(stream)
 
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
@@ -485,8 +500,8 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStream.__get_slots__(nil_pid).state == :closed
     end
 
-    test "from/1 blob cancellation stops the lazy parts queue" do
-      stream = ReadableStream.from(Web.Blob.new(["a", "b", "c"]))
+    test "the internal from stops the lazy parts queue of a blob at a cancel" do
+      stream = ReadableStream.__from__(Web.Blob.new(["a", "b", "c"]))
 
       assert :ok = Web.Promise.await(ReadableStream.__cancel__(stream.controller_pid, :stop_now))
 
@@ -523,7 +538,7 @@ defmodule Web.ReadableStreamTest do
     end
 
     test "tee/1 marks the source as disturbed" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       assert ReadableStream.disturbed?(stream) == false
 
       _branches = ReadableStream.tee(stream)

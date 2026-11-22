@@ -12,20 +12,20 @@ defmodule Web.BodyTest do
     defstruct [:body, headers: Web.Headers.new()]
   end
 
-  test "ReadableStream.from/1 gives one Uint8Array for a binary, also for bytes that are not text" do
+  test "a body of a binary gives one Uint8Array, also for bytes that are not text" do
     for binary <- ["hello", <<0, 255, 1>>, ""] do
-      assert [%Web.Uint8Array{} = chunk] = binary |> ReadableStream.from() |> Enum.to_list()
+      assert [%Web.Uint8Array{} = chunk] = binary |> ReadableStream.__from__() |> Enum.to_list()
       assert Web.Uint8Array.to_binary(chunk) == binary
     end
   end
 
-  test "ReadableStream.from/1 returns an existing stream as-is" do
+  test "a body of a stream is that stream" do
     stream = ReadableStream.new()
-    assert ReadableStream.from(stream) == stream
+    assert ReadableStream.__from__(stream) == stream
   end
 
-  test "ReadableStream.from/1 normalizes nil into an empty stream" do
-    assert "" == nil |> ReadableStream.from() |> Enum.join("")
+  test "a body of nil is an empty stream" do
+    assert "" == nil |> ReadableStream.__from__() |> Enum.join("")
   end
 
   test "Response.text/1 marks the body as disturbed and rejects a second read" do
@@ -74,7 +74,7 @@ defmodule Web.BodyTest do
   end
 
   test "clone of locked stream raises TypeError" do
-    response = Response.new(ReadableStream.from("hello"))
+    response = Response.new(ReadableStream.__from__("hello"))
     _reader = ReadableStream.get_reader(response.body)
 
     assert_raise Web.TypeError, "ReadableStream is already locked", fn ->
@@ -83,7 +83,7 @@ defmodule Web.BodyTest do
   end
 
   test "Web.Body.blob/1 uses empty type when headers are missing" do
-    input = %{body: ReadableStream.from("hello")}
+    input = %{body: ReadableStream.__from__("hello")}
 
     assert %Web.Blob{size: 5, type: ""} = await(Web.Body.blob(input))
   end
@@ -104,7 +104,7 @@ defmodule Web.BodyTest do
   end
 
   test "Response.text/1 rejects when stream is already locked" do
-    response = Response.new(ReadableStream.from("hello"))
+    response = Response.new(ReadableStream.__from__("hello"))
     _reader = ReadableStream.get_reader(response.body)
 
     assert %Web.TypeError{} = catch_exit(await(Response.text(response)))
@@ -151,7 +151,7 @@ defmodule Web.BodyTest do
   end
 
   test "Response.array_buffer/1 rejects when body stream is already locked" do
-    response = Response.new(ReadableStream.from("hello"))
+    response = Response.new(ReadableStream.__from__("hello"))
     _reader = ReadableStream.get_reader(response.body)
 
     assert %Web.TypeError{message: "ReadableStream is already locked"} =
@@ -250,13 +250,15 @@ defmodule Web.BodyTest do
                })
              )
 
-    assert {original, clone} = BodyHarness.clone(%BodyHarness{body: ReadableStream.from("hello")})
+    assert {original, clone} =
+             BodyHarness.clone(%BodyHarness{body: ReadableStream.__from__("hello")})
+
     assert "hello" == await(BodyHarness.text(original))
     assert "hello" == await(BodyHarness.text(clone))
   end
 
   test "a body whose stream stopped rejects with TypeError" do
-    stream = ReadableStream.__with_process__(ReadableStream.from("hello"))
+    stream = ReadableStream.__with_process__(ReadableStream.__from__("hello"))
     Web.Stream.stop(stream.controller_pid)
 
     for read <- [&BodyHarness.text/1, &BodyHarness.bytes/1] do

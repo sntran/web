@@ -218,8 +218,7 @@ when its owner stops and no process has locked it. A halt, such as
 `Enum.take/2`, cancels the stream.
 
 A stream of bytes in memory has no process until a stream read: the body of
-`Web.Response.new/1` for a binary, `ReadableStream.from("text")`, and the
-body of a small `fetch` response. The body functions, such as
+`Web.Response.new/1` for a binary, and the body of a small `fetch` response. The body functions, such as
 `Web.Response.text/1`, take its bytes with no process. `get_reader/1`, a
 pipe, and `Enum` start the stream process at that time.
 

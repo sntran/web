@@ -67,7 +67,7 @@ defmodule Web.StreamLifetimeTest do
     end
 
     test "stays while its owner is alive and its chunks are not read" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       refute_down(stream.controller_pid, 4 * @linger)
       assert Web.TestBytes.join(stream) == "hello"
     end

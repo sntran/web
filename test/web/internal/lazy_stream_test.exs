@@ -64,7 +64,7 @@ defmodule Web.Internal.LazyStreamTest do
 
   describe "a stream of bytes with no process" do
     test "has no process until a stream read, and each copy finds the process" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       assert stream.controller_pid == nil
       assert LazyStream.state(stream.lazy) == :readable
 
@@ -78,7 +78,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "gives a closed stream to a stream read after a cancel" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       assert :ok = Web.await(ReadableStream.cancel(stream))
       assert LazyStream.state(stream.lazy) == :canceled
       assert ReadableStream.disturbed?(stream)
@@ -87,7 +87,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a cancel of a stream that was read to its end has no effect" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       assert Enum.map(stream, &Uint8Array.to_binary/1) == ["hello"]
 
       assert :ok = Web.await(ReadableStream.cancel(stream))
@@ -95,7 +95,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a cancel after the start of the process cancels the process" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       reader = ReadableStream.get_reader(stream)
       :ok = ReadableStreamDefaultReader.release_lock(reader)
 
@@ -104,7 +104,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "an enumeration after the start of the process reads the process" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       reader = ReadableStream.get_reader(stream)
       :ok = ReadableStreamDefaultReader.release_lock(reader)
 
@@ -112,7 +112,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a halt before the chunk cancels the stream" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
 
       assert {:halted, :acc} =
                Enumerable.reduce(stream, {:halt, :acc}, fn _, acc -> {:cont, acc} end)
@@ -121,7 +121,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "the source of a tee is locked" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       [left, right] = ReadableStream.tee(stream)
 
       assert ReadableStream.locked?(stream)
@@ -136,7 +136,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "gives the bytes to the next read when its process stopped before a read" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       {:ok, pid} = ReadableStream.__process__(stream)
       stop(pid)
 
@@ -149,7 +149,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "gives the bytes to a claim when its process stopped before a read" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       {:ok, pid} = ReadableStream.__process__(stream)
       stop(pid)
 
@@ -158,7 +158,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "is not available when its process stopped after a read" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       reader = ReadableStream.get_reader(stream)
       assert read_all(reader) == ["hello"]
       stop(reader.controller_pid)
@@ -174,7 +174,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a cancel of its process takes the bytes" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       {:ok, pid} = ReadableStream.__process__(stream)
       Web.await(ReadableStream.cancel(stream))
       stop(pid)
@@ -183,7 +183,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a copy waits for the end of the starter that has the key" do
-      lazy = ReadableStream.from("hello").lazy
+      lazy = ReadableStream.__from__("hello").lazy
       test = self()
 
       # A process in the place of a starter: it has the key and the state
@@ -220,7 +220,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a claim that waits for a start gets the bytes when the new process stopped" do
-      lazy = ReadableStream.from("hello").lazy
+      lazy = ReadableStream.__from__("hello").lazy
       test = self()
 
       # A process in the place of a starter: it has the key and the state
@@ -245,7 +245,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a starter that finds the key of a different starter waits for its end" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       lazy = stream.lazy
       test = self()
 
@@ -271,7 +271,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a copy asks again when the stream process stops before the copy keeps it" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       {:ok, pid} = ReadableStream.__process__(stream)
 
       # The stream process does not answer: the keep of the second copy
@@ -286,7 +286,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a start of a stream process after the bytes went out stops in its start" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       assert text(stream) == "hello"
 
       assert Web.ReadableStream.__new__(%{type: "bytes"}, [], registry_key: stream.lazy.ref) ==
@@ -297,7 +297,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a cancel of a stream process that a reader locked rejects" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       _reader = ReadableStream.get_reader(stream)
 
       assert %Web.TypeError{message: "Cannot cancel a locked stream."} =
@@ -305,7 +305,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a copy continues the start of a starter that stopped before the stream process" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
 
       # The cell has "starting", and no process has the key.
       :atomics.put(stream.lazy.ref, 1, 4)
@@ -315,7 +315,7 @@ defmodule Web.Internal.LazyStreamTest do
     end
 
     test "a copy sets the state of a stream process whose starter stopped" do
-      lazy = ReadableStream.from("hello").lazy
+      lazy = ReadableStream.__from__("hello").lazy
 
       # The stream process registered itself, and its starter stopped before
       # it set "process".
@@ -341,7 +341,7 @@ defmodule Web.Internal.LazyStreamTest do
 
     property "a look at the state after a start that stopped starts no process" do
       check all({cell, state, disturbed?, chunks} <- member_of(@stopped_starts)) do
-        stream = ReadableStream.from("hello")
+        stream = ReadableStream.__from__("hello")
 
         # The cell has the value of a start, no process has the key, and the
         # registry has no stream process.
@@ -394,13 +394,13 @@ defmodule Web.Internal.LazyStreamTest do
 
   describe "a body of a view" do
     test "gives the bytes of the view to a read of all the bytes" do
-      body = ReadableStream.from(Uint8Array.from("view"))
+      body = ReadableStream.__from__(Uint8Array.from("view"))
       assert text(body) == "view"
       assert %Web.TypeError{message: "body already used"} = catch_exit(text(body))
     end
 
     test "the source of a tee is locked for a read of all the bytes" do
-      body = ReadableStream.from(Uint8Array.from("view"))
+      body = ReadableStream.__from__(Uint8Array.from("view"))
       [_left, _right] = ReadableStream.tee(body)
 
       assert ReadableStream.locked?(body)
@@ -416,7 +416,7 @@ defmodule Web.Internal.LazyStreamTest do
 
       # An agent on the second node keeps one copy of each stream there.
       start = fn bytes ->
-        {:ok, agent} = :erpc.call(node, Agent, :start, [ReadableStream, :from, [bytes]])
+        {:ok, agent} = :erpc.call(node, Agent, :start, [ReadableStream, :__from__, [bytes]])
         :erpc.call(node, Agent, :get, [agent, Function, :identity, []])
       end
 

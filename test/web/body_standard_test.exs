@@ -439,7 +439,7 @@ defmodule Web.BodyStandardTest do
     end
 
     test "refuses a stream with no process that is locked" do
-      body = ReadableStream.from("abc")
+      body = ReadableStream.__from__("abc")
       [_left, _right] = ReadableStream.tee(body)
 
       assert_raise TypeError, "ReadableStream is already locked", fn ->
@@ -448,7 +448,7 @@ defmodule Web.BodyStandardTest do
     end
 
     test "of a stream with no process that has a process now goes through a stream" do
-      body = ReadableStream.from("abc")
+      body = ReadableStream.__from__("abc")
       reader = ReadableStream.get_reader(body)
       :ok = Reader.release_lock(reader)
 

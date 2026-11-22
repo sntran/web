@@ -201,7 +201,7 @@ defmodule Web.FormData do
   def parse(stream_or_binary, boundary, opts \\ []) do
     normalized_boundary = normalize_boundary(boundary)
     # The parser takes the lock of the stream process in its start.
-    source = Web.ReadableStream.from(stream_or_binary)
+    source = Web.ReadableStream.__from__(stream_or_binary)
 
     case Parser.start_link(source, normalized_boundary, opts) do
       {:ok, pid} ->

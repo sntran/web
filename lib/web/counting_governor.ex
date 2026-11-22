@@ -1,6 +1,8 @@
 defmodule Web.CountingGovernor do
   @moduledoc """
-  A governor that limits concurrent work to a fixed number of active tokens.
+  A governor with a fixed number of tokens, as `CountingGovernor` of the
+  TC39 proposal "concurrency control": a counting semaphore. Use it with
+  the functions of `Web.Governor` and `Web.AbortableGovernor`.
 
   ## The holder of a token
 
@@ -22,7 +24,8 @@ defmodule Web.CountingGovernor do
   A governor is a process. There are two procedures to make one:
 
     * `new/1` makes a governor that belongs to the process that calls it,
-      as a stream or an abort signal. The governor stops after its owner
+      as a stream or an abort signal. It is the constructor
+      `new CountingGovernor(capacity)`. The governor stops after its owner
       stopped, when no token is in use and no acquisition waits. It stays
       for the linger time before it stops, thus a different process that got
       the governor in a message can use it. This is the equivalent of an
@@ -30,7 +33,7 @@ defmodule Web.CountingGovernor do
 
     * `start_link/1` makes a governor for a supervision tree. Such a
       governor has no owner, and limits the work of all the processes of an
-      application:
+      application. `get/1` gives the governor of the process:
 
           children = [
             {Web.CountingGovernor, capacity: 4, name: MyApp.FetchLimit}
@@ -42,7 +45,7 @@ defmodule Web.CountingGovernor do
 
   use GenServer
 
-  alias Web.Governor.Token
+  alias Web.GovernorToken
   alias Web.Promise
 
   defstruct [:pid, :capacity]
@@ -52,6 +55,7 @@ defmodule Web.CountingGovernor do
           capacity: non_neg_integer()
         }
 
+  @typedoc false
   @type waiter :: %{
           waiter_ref: reference(),
           pid: pid(),
@@ -59,6 +63,7 @@ defmodule Web.CountingGovernor do
           monitor_ref: reference()
         }
 
+  @typedoc false
   @type state :: %{
           owner: reference() | {:down, term()} | nil,
           linger: non_neg_integer() | :infinity | nil,
@@ -98,30 +103,20 @@ defmodule Web.CountingGovernor do
     * `:name` - a name for the process, as for `GenServer.start_link/3`.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts) when is_list(opts), do: start_server(:start_link, opts)
-
-  @doc """
-  Starts a governor that has no owner and no link, as `GenServer.start/3`.
-  The options are the options of `start_link/1`.
-
-  Such a governor stays until the VM stops. Use this function only for a
-  governor that all the processes of the VM use, when no supervision tree is
-  available.
-  """
-  @spec start(keyword()) :: GenServer.on_start()
-  def start(opts) when is_list(opts), do: start_server(:start, opts)
-
-  defp start_server(function, opts) do
+  def start_link(opts) when is_list(opts) do
     capacity = Keyword.fetch!(opts, :capacity)
     validate_capacity!(capacity)
     init = %{capacity: capacity, owner: nil, linger: nil}
 
-    apply(GenServer, function, [__MODULE__, init, Keyword.take(opts, [:name])])
+    GenServer.start_link(__MODULE__, init, Keyword.take(opts, [:name]))
   end
 
   @doc """
-  Returns the governor of a process that `start_link/1` or `start/1` started.
-  `server` is the pid or the name of the process.
+  Returns the governor of a process that `start_link/1` started. `server`
+  is the pid or the name of the process.
+
+  The proposal has no such function: a supervisor starts a process, and the
+  functions of `Web.Governor` need the struct of the governor.
   """
   @spec get(GenServer.server()) :: t()
   def get(server) do
@@ -347,7 +342,7 @@ defmodule Web.CountingGovernor do
 
       receive do
         {:governor_granted, ^waiter_ref, token_ref} ->
-          resolve.(%Token{governor: governor, ref: token_ref})
+          resolve.(%GovernorToken{governor: governor, ref: token_ref})
 
         {:governor_rejected, ^waiter_ref, reason} ->
           reject.(reason)

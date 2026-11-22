@@ -305,7 +305,7 @@ defmodule Web.FormData do
       caller = self()
       owner = Keyword.get(opts, :owner, self())
       reply_ref = make_ref()
-      snapshot = Snapshot.take()
+      snapshot = Snapshot.new()
 
       {_owner_pid, owner_ref} =
         spawn_monitor(fn ->

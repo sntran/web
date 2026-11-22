@@ -7,10 +7,10 @@ defmodule Web.ArrayBufferTest do
 
   describe "new/1" do
     test "makes a buffer from a binary or from a byte length" do
-      assert ArrayBuffer.data(ArrayBuffer.new("hello")) == "hello"
+      assert to_string(ArrayBuffer.new("hello")) == "hello"
 
       buffer = ArrayBuffer.new(4)
-      assert ArrayBuffer.data(buffer) == <<0, 0, 0, 0>>
+      assert to_string(buffer) == <<0, 0, 0, 0>>
       assert ArrayBuffer.byte_length(buffer) == 4
       assert is_reference(ArrayBuffer.identity(buffer))
       refute ArrayBuffer.detached?(buffer)
@@ -38,7 +38,7 @@ defmodule Web.ArrayBufferTest do
     end
   end
 
-  describe "detach/1" do
+  describe "the detach of a buffer" do
     test "makes each copy of the buffer detached" do
       buffer = ArrayBuffer.new("hello")
       copy = buffer
@@ -52,7 +52,7 @@ defmodule Web.ArrayBufferTest do
         assert ArrayBuffer.byte_length(value) == 0
 
         assert_raise Web.TypeError, "Cannot access a detached ArrayBuffer", fn ->
-          ArrayBuffer.data(value)
+          to_string(value)
         end
       end
     end
@@ -87,7 +87,7 @@ defmodule Web.ArrayBufferTest do
       ArrayBuffer.detach(first)
 
       refute ArrayBuffer.detached?(second)
-      assert ArrayBuffer.data(second) == "same"
+      assert to_string(second) == "same"
     end
 
     test "makes the views of the buffer not readable" do
@@ -96,7 +96,7 @@ defmodule Web.ArrayBufferTest do
       ArrayBuffer.detach(buffer)
 
       assert_raise Web.TypeError, "Cannot access a detached ArrayBuffer", fn ->
-        Uint8Array.to_binary(view)
+        to_string(view)
       end
 
       assert_raise Web.TypeError, ~r/detached ArrayBuffer/, fn -> Uint8Array.new(buffer) end
@@ -109,7 +109,7 @@ defmodule Web.ArrayBufferTest do
       emptied = ArrayBuffer.detach(plain)
 
       assert ArrayBuffer.identity(plain) == nil
-      assert ArrayBuffer.data(plain) == "plain"
+      assert to_string(plain) == "plain"
       assert ArrayBuffer.byte_length(plain) == 5
       refute ArrayBuffer.detached?(plain)
       assert emptied.data == <<>>
@@ -120,10 +120,28 @@ defmodule Web.ArrayBufferTest do
       foreign = %ArrayBuffer{id: make_ref(), data: "foreign", byte_length: 7}
 
       refute ArrayBuffer.detached?(foreign)
-      assert ArrayBuffer.data(foreign) == "foreign"
+      assert to_string(foreign) == "foreign"
       assert ArrayBuffer.detach(foreign).byte_length == 0
       refute ArrayBuffer.detached?(foreign)
-      assert ArrayBuffer.data(ArrayBuffer.transfer(foreign)) == "foreign"
+      assert to_string(ArrayBuffer.transfer(foreign)) == "foreign"
+    end
+  end
+
+  describe "to_string/1" do
+    test "gives the bytes of a buffer and of a view, also in an interpolation" do
+      buffer = ArrayBuffer.new("hello")
+      view = Uint8Array.new(buffer, 1, 3)
+
+      assert to_string(buffer) == "hello"
+      assert to_string(view) == "ell"
+      assert "#{buffer} #{view}" == "hello ell"
+    end
+
+    test "gives bytes that are not valid UTF-8 with no change" do
+      bytes = <<0xFF, 0, 0xC3>>
+
+      assert to_string(ArrayBuffer.new(bytes)) == bytes
+      assert to_string(Uint8Array.from(bytes)) == bytes
     end
   end
 
@@ -132,16 +150,16 @@ defmodule Web.ArrayBufferTest do
       buffer = ArrayBuffer.new("hello")
       moved = ArrayBuffer.transfer(buffer)
 
-      assert ArrayBuffer.data(moved) == "hello"
+      assert to_string(moved) == "hello"
       refute ArrayBuffer.detached?(moved)
       assert ArrayBuffer.detached?(buffer)
       refute ArrayBuffer.identity(moved) == ArrayBuffer.identity(buffer)
     end
 
     test "cuts the bytes, or adds zero bytes, for a new length" do
-      assert ArrayBuffer.data(ArrayBuffer.transfer(ArrayBuffer.new("hello"), 2)) == "he"
-      assert ArrayBuffer.data(ArrayBuffer.transfer(ArrayBuffer.new("hello"), 0)) == ""
-      assert ArrayBuffer.data(ArrayBuffer.transfer(ArrayBuffer.new("hi"), 4)) == <<"hi", 0, 0>>
+      assert to_string(ArrayBuffer.transfer(ArrayBuffer.new("hello"), 2)) == "he"
+      assert to_string(ArrayBuffer.transfer(ArrayBuffer.new("hello"), 0)) == ""
+      assert to_string(ArrayBuffer.transfer(ArrayBuffer.new("hi"), 4)) == <<"hi", 0, 0>>
     end
 
     test "refuses a detached buffer and a length that is not valid" do
@@ -164,7 +182,7 @@ defmodule Web.ArrayBufferTest do
     property "a buffer gives the bytes and the length of its binary" do
       check all(data <- binary()) do
         buffer = ArrayBuffer.new(data)
-        assert ArrayBuffer.data(buffer) == data
+        assert to_string(buffer) == data
         assert ArrayBuffer.byte_length(buffer) == byte_size(data)
       end
     end
@@ -173,7 +191,7 @@ defmodule Web.ArrayBufferTest do
       check all(data <- binary(), length <- integer(0..64)) do
         buffer = ArrayBuffer.new(data)
         moved = ArrayBuffer.transfer(buffer, length)
-        result = ArrayBuffer.data(moved)
+        result = to_string(moved)
 
         assert byte_size(result) == length
         kept = min(length, byte_size(data))
@@ -190,7 +208,7 @@ defmodule Web.ArrayBufferTest do
               chunk <- binary(max_length: byte_size(data) - offset)
             ) do
         buffer = ArrayBuffer.new(data)
-        result = ArrayBuffer.data(ArrayBuffer.replace(buffer, offset, chunk))
+        result = to_string(ArrayBuffer.replace(buffer, offset, chunk))
         chunk_end = offset + byte_size(chunk)
 
         assert byte_size(result) == byte_size(data)
@@ -209,9 +227,9 @@ defmodule Web.ArrayBufferTest do
               length <- integer(0..(byte_size(data) - offset))
             ) do
         view = Uint8Array.new(ArrayBuffer.new(data), offset, length)
-        assert Uint8Array.to_binary(view) == binary_part(data, offset, length)
+        assert to_string(view) == binary_part(data, offset, length)
 
-        assert Uint8Array.to_binary(Uint8Array.new(ArrayBuffer.new(data), offset)) ==
+        assert to_string(Uint8Array.new(ArrayBuffer.new(data), offset)) ==
                  binary_part(data, offset, byte_size(data) - offset)
       end
     end

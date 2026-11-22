@@ -48,7 +48,7 @@ defmodule Web.Internal.BroadcastChannel do
   def post_message(%BroadcastChannel{} = channel, message) do
     record = serialize(channel, message)
 
-    payload = %{record: record, origin: origin(), snapshot: Snapshot.take()}
+    payload = %{record: record, origin: origin(), snapshot: Snapshot.new()}
 
     case with_governor(fn -> MessageTarget.call(channel, {:post, payload}) end) do
       :ok -> :ok
@@ -101,14 +101,14 @@ defmodule Web.Internal.BroadcastChannel do
 
   @doc false
   def message_event(%{record: record, origin: origin}, target) do
-    MessageEvent.new("message",
+    MessageEvent.__new__("message",
       data: StructuredData.deserialize(record),
       origin: origin,
       target: target
     )
   rescue
     # The Standard fires `messageerror` when the message cannot be made.
-    _exception -> MessageEvent.new("messageerror", origin: origin, target: target)
+    _exception -> MessageEvent.__new__("messageerror", origin: origin, target: target)
   end
 
   # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ defmodule Web.Socket do
       Web.await(Web.WritableStreamDefaultWriter.write(writer, "GET / HTTP/1.0\r\n\r\n"))
 
       for chunk <- socket.readable do
-        IO.write(Web.Uint8Array.to_binary(chunk))
+        IO.write(to_string(chunk))
       end
 
   ## The fields
@@ -22,24 +22,29 @@ defmodule Web.Socket do
       write is complete when the operating system has the bytes: a slow
       peer makes the writes wait, and does not stop the reads.
     * `opened` - a `Web.Promise` that fulfils with the information of the
-      connection, or rejects when the connection fails.
+      connection, a `SocketInfo` map with the keys `:remote_address`,
+      `:local_address`, and `:alpn`. It rejects when the connection fails.
     * `closed` - a `Web.Promise` that fulfils when the socket closes, with
       the cause: `:closed`, `:upgraded`, or `{:readable_cancel, reason}`. It
       rejects with the error when the socket fails.
     * `upgraded` - a `Web.Promise` that fulfils with the TLS socket after
-      `start_tls/2`.
+      `start_tls/1`.
 
   ## Options of `Web.connect/2`
 
     * `:secure_transport` - `"off"` (the default), `"on"` for TLS, or
-      `"starttls"` for a connection that becomes TLS with `start_tls/2`;
-    * `:ssl_options` - options of the Erlang application `:ssl`. The socket
-      verifies the certificate of the server and its host name, unless the
-      options have `verify: :verify_none`;
-    * `:tcp_options` - options of `:gen_tcp`;
-    * `:connect_timeout` - the time to open the connection, in
-      milliseconds;
-    * `:readable_high_water_mark` - the bytes that the readable side keeps.
+      `"starttls"` for a connection that becomes TLS with `start_tls/1`.
+
+  The other members of `SocketOptions` (`allowHalfOpen`, `sni`, and
+  `alpn`) have no effect.
+
+  ## Settings
+
+    * `config :web, tls_options: [...]` - options of the Erlang application
+      `:ssl` for each TLS connection. The socket verifies the certificate of
+      the server and its host name, unless the options have
+      `verify: :verify_none`;
+    * `config :web, connect_timeout: ms` - the time to open the connection.
 
   ## Lifetime
 
@@ -61,7 +66,7 @@ defmodule Web.Socket do
 
   defstruct [:address, :token, :opened, :closed, :upgraded, :readable, :writable]
 
-  # The time for the TLS handshake of `start_tls/2`.
+  # The time for the TLS handshake of `start_tls/1`.
   @handshake_timeout 5_000
   @readable_hwm 65_536
 
@@ -77,6 +82,20 @@ defmodule Web.Socket do
         }
 
   @doc false
+  # Makes a socket for `Web.connect/2`. The options are the options of
+  # `Web.connect/2`, and these options of the library, for its tests:
+  #
+  #   * `:ssl_options` - options of `:ssl`. They come before the setting
+  #     `:tls_options`;
+  #   * `:tcp_options` - options of `:gen_tcp`;
+  #   * `:connect_timeout` - the time to open the connection, in
+  #     milliseconds. The default is the setting `:connect_timeout`;
+  #   * `:readable_high_water_mark` - the bytes that the readable side
+  #     keeps;
+  #   * `:writable_high_water_mark` - the chunks that the writable side
+  #     keeps;
+  #   * `:connect_fun` and `:ssl_connect_fun` - a function in the place of
+  #     the connect function of Erlang/OTP.
   @spec start_socket(pid(), String.t() | map() | keyword(), map() | keyword()) :: t()
   def start_socket(holder_pid, address, options \\ %{}) when is_pid(holder_pid) do
     {host, port} = normalize_address!(address)
@@ -99,7 +118,8 @@ defmodule Web.Socket do
   end
 
   @doc """
-  Closes the socket and its two streams. Returns the promise `closed`.
+  Closes the socket and its two streams, as `close(reason)`. Returns the
+  promise `closed`.
 
   A second call has no effect.
   """
@@ -110,18 +130,26 @@ defmodule Web.Socket do
   end
 
   @doc """
-  Starts TLS on a socket that was made with `secure_transport: "starttls"`.
+  Starts TLS on a socket that was made with `secure_transport: "starttls"`,
+  as `startTls()`.
 
   Returns a promise of the TLS socket. The first socket closes: its promise
-  `closed` fulfils with `:upgraded`, and its streams end. `options` are
-  options of the Erlang application `:ssl`.
+  `closed` fulfils with `:upgraded`, and its streams end. The TLS options
+  come from the setting `config :web, tls_options: [...]`.
 
   The promise rejects with `:not_starttls` or `:already_tls` when the socket
-  cannot start TLS, and with `:closed` when the socket is closed. It rejects with `{:tls_upgrade_failed, reason}`
-  when the handshake fails: the socket then closes.
+  cannot start TLS, and with `:closed` when the socket is closed. It rejects
+  with `{:tls_upgrade_failed, reason}` when the handshake fails: the socket
+  then closes.
   """
-  @spec start_tls(t(), map() | keyword()) :: Web.Promise.t()
-  def start_tls(%__MODULE__{} = socket, options \\ %{}) do
+  @spec start_tls(t()) :: Web.Promise.t()
+  def start_tls(%__MODULE__{} = socket), do: __start_tls__(socket, [])
+
+  @doc false
+  # `start_tls/1` with options of `:ssl`, for the tests of this library. The
+  # options come before the setting `:tls_options`.
+  @spec __start_tls__(t(), map() | keyword()) :: Web.Promise.t()
+  def __start_tls__(%__MODULE__{} = socket, options) do
     promises = deferred_socket_promises()
     request = {:start_tls, normalize_ssl_options(options), promises}
 
@@ -667,7 +695,7 @@ defmodule Web.Socket do
   end
 
   defp socket_info(state) do
-    %{remoteAddress: Address.format(state.host, state.port), localAddress: nil, alpn: nil}
+    %{remote_address: Address.format(state.host, state.port), local_address: nil, alpn: nil}
   end
 
   # A message of the socket has 64 KiB at most. The default buffer of
@@ -782,7 +810,7 @@ defmodule Web.Socket do
   defp deferred_promise do
     # The `opened`, `closed`, and `upgraded` promises are attributes of the
     # socket. A caller can await them at any time, thus they do not expire.
-    {promise, resolve, reject} = Promise.with_resolvers(linger: :infinity)
+    {promise, resolve, reject} = Promise.__with_resolvers__(linger: :infinity)
     {promise, %{resolve: resolve, reject: reject}}
   end
 
@@ -912,12 +940,7 @@ defmodule Web.Socket do
     do: options |> Enum.into(%{}) |> normalize_options()
 
   defp normalize_options(options) when is_map(options) do
-    secure_transport =
-      Map.get(options, :secure_transport) ||
-        Map.get(options, :secureTransport) ||
-        Map.get(options, "secure_transport") ||
-        Map.get(options, "secureTransport") ||
-        "off"
+    secure_transport = Map.get(options, :secure_transport) || "off"
 
     options
     |> Map.put(:secure_transport, secure_transport)

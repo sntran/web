@@ -58,7 +58,7 @@ web_read = fn ->
 
   ^size =
     Enum.reduce(socket.readable, 0, fn chunk, total ->
-      total + byte_size(Web.Uint8Array.to_binary(chunk))
+      total + byte_size(to_string(chunk))
     end)
 end
 

@@ -93,14 +93,14 @@ defmodule Web.AbortSignal do
       {false, nil, true, true}
       iex> timeout_signal = Web.AbortSignal.timeout(1)
       iex> Process.sleep(10)
-      iex> Web.AbortSignal.subscribe(timeout_signal)
-      {:error, :aborted}
+      iex> Web.AbortSignal.aborted?(timeout_signal)
+      true
       iex> aborted_signal = Web.AbortSignal.abort(:manual_cancel)
       iex> {aborted_signal.aborted, aborted_signal.reason}
       {true, :manual_cancel}
       iex> any_signal = Web.AbortSignal.any([signal, aborted_signal])
-      iex> Web.AbortSignal.subscribe(any_signal)
-      {:error, :aborted}
+      iex> Web.AbortSignal.aborted?(any_signal)
+      true
       iex> Web.AbortController.abort(controller)
       :ok
   """
@@ -125,6 +125,7 @@ defmodule Web.AbortSignal do
           ref: reference() | nil
         }
 
+  @typedoc false
   @type subscription ::
           nil
           | %{type: :abort_signal, pid: pid(), ref: reference(), monitor_ref: reference()}
@@ -158,8 +159,8 @@ defmodule Web.AbortSignal do
       iex> is_pid(signal.pid) and is_reference(signal.ref)
       true
       iex> Process.sleep(10)
-      iex> Web.AbortSignal.subscribe(signal)
-      {:error, :aborted}
+      iex> Web.AbortSignal.reason(signal).name
+      "TimeoutError"
   """
   def timeout(ms) do
     controller = Web.AbortController.new()
@@ -254,6 +255,9 @@ defmodule Web.AbortSignal do
     :exit, _reason -> __signal_abort__(result, reason(source))
   end
 
+  @doc false
+  # Starts the process of a signal of `Web.AbortController.new/0`. The
+  # process has no link: it monitors the process that made it.
   def start_link do
     GenServer.start(__MODULE__, %{ref: make_ref(), subscribers: %{}, owner: Web.Promise.owner()})
   end
@@ -558,6 +562,9 @@ defmodule Web.AbortSignal do
 
   defp remembered_reason(ref) when is_reference(ref), do: Reasons.get(ref)
 
+  @doc false
+  # Waits `timeout` milliseconds for the abort of a subscription of
+  # `subscribe/1`. Returns `:ok`, or `{:error, :aborted, reason}`.
   def receive_abort(nil, _timeout, _with_reason?), do: :ok
 
   def receive_abort(

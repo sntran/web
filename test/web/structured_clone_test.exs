@@ -80,7 +80,7 @@ defmodule Web.StructuredCloneTest do
     buffer = ArrayBuffer.new(IO.iodata_to_binary(bytes))
     clone = Web.structured_clone(buffer, transfer: [buffer])
 
-    assert ArrayBuffer.data(clone) == IO.iodata_to_binary(bytes)
+    assert to_string(clone) == IO.iodata_to_binary(bytes)
     assert ArrayBuffer.byte_length(clone) == length(bytes)
     assert ArrayBuffer.byte_length(buffer) == 0
   end
@@ -158,11 +158,11 @@ defmodule Web.StructuredCloneTest do
       buffer = ArrayBuffer.new("hello")
       clone = Web.structured_clone(buffer)
 
-      assert ArrayBuffer.data(clone) == "hello"
+      assert to_string(clone) == "hello"
       refute clone.id == buffer.id
 
-      ArrayBuffer.detach(clone)
-      assert ArrayBuffer.data(buffer) == "hello"
+      _moved = ArrayBuffer.transfer(clone)
+      assert to_string(buffer) == "hello"
     end
 
     test "a view is a view on the clone of its buffer" do
@@ -171,7 +171,7 @@ defmodule Web.StructuredCloneTest do
 
       clone = Web.structured_clone(%{"buffer" => buffer, "view" => view, "again" => view})
 
-      assert Uint8Array.to_binary(clone["view"]) == "ell"
+      assert to_string(clone["view"]) == "ell"
       assert clone["view"].buffer.id == clone["buffer"].id
       assert clone["again"].id == clone["view"].id
       refute clone["view"].id == view.id
@@ -232,11 +232,11 @@ defmodule Web.StructuredCloneTest do
 
       [first, second] = Web.structured_clone([buffer, buffer])
 
-      assert ArrayBuffer.data(first) == "legacy"
+      assert to_string(first) == "legacy"
       refute first.id == second.id
 
       clone = Web.structured_clone(buffer, transfer: [buffer])
-      assert ArrayBuffer.data(clone) == "legacy"
+      assert to_string(clone) == "legacy"
     end
 
     test "a Regex is compiled again" do
@@ -326,7 +326,7 @@ defmodule Web.StructuredCloneTest do
     test "a detached ArrayBuffer, also below a view" do
       buffer = ArrayBuffer.new("hello")
       view = Uint8Array.new(buffer)
-      ArrayBuffer.detach(buffer)
+      _moved = ArrayBuffer.transfer(buffer)
 
       assert data_clone_error(fn -> Web.structured_clone(buffer) end) ==
                "A detached ArrayBuffer cannot be cloned."
@@ -358,7 +358,7 @@ defmodule Web.StructuredCloneTest do
       buffer = ArrayBuffer.new("hello")
       clone = Web.structured_clone(%{"buffer" => buffer}, transfer: [buffer])
 
-      assert ArrayBuffer.data(clone["buffer"]) == "hello"
+      assert to_string(clone["buffer"]) == "hello"
       assert ArrayBuffer.byte_length(clone["buffer"]) == 5
       assert ArrayBuffer.detached?(buffer)
       assert ArrayBuffer.byte_length(buffer) == 0
@@ -373,7 +373,7 @@ defmodule Web.StructuredCloneTest do
 
     test "a detached ArrayBuffer cannot be transferred" do
       buffer = ArrayBuffer.new("hello")
-      ArrayBuffer.detach(buffer)
+      _moved = ArrayBuffer.transfer(buffer)
 
       assert data_clone_error(fn -> Web.structured_clone("message", transfer: [buffer]) end) ==
                "A detached ArrayBuffer cannot be transferred."
@@ -462,7 +462,7 @@ defmodule Web.StructuredCloneTest do
       buffer = ArrayBuffer.new("hi")
       clone = UsingWeb.clone(buffer, transfer: [buffer])
 
-      assert ArrayBuffer.data(clone) == "hi"
+      assert to_string(clone) == "hi"
       assert ArrayBuffer.byte_length(buffer) == 0
     end
 
@@ -542,7 +542,7 @@ defmodule Web.StructuredCloneTest do
 
         clone = Web.structured_clone(buffers, transfer: moved)
 
-        assert Enum.map(clone, &ArrayBuffer.data/1) == data
+        assert Enum.map(clone, &to_string/1) == data
 
         for {buffer, moved?} <- Enum.zip(buffers, picks) do
           assert ArrayBuffer.detached?(buffer) == moved?
@@ -769,7 +769,7 @@ defmodule Web.StructuredCloneTest do
   end
 
   defp canonicalize(%ArrayBuffer{} = value) do
-    {:array_buffer, ArrayBuffer.data(value), ArrayBuffer.byte_length(value)}
+    {:array_buffer, to_string(value), ArrayBuffer.byte_length(value)}
   end
 
   defp canonicalize(%Uint8Array{} = value) do

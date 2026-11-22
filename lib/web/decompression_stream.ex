@@ -29,7 +29,7 @@ defmodule Web.DecompressionStream do
       iex> compressed = :zlib.gzip("hello world")
       iex> write = Web.WritableStreamDefaultWriter.write(writer, compressed)
       iex> close = Web.WritableStreamDefaultWriter.close(writer)
-      iex> Enum.map_join(ds.readable, &Web.Uint8Array.to_binary/1)
+      iex> Enum.map_join(ds.readable, &to_string/1)
       "hello world"
       iex> {Web.await(write), Web.await(close)}
       {:ok, :ok}

@@ -603,7 +603,7 @@ defmodule Web.Platform.Test do
   defp fetch_context_variable do
     case :persistent_term.get(@context_key, nil) do
       nil ->
-        variable = Variable.new("wpt_url")
+        variable = Variable.new(name: "wpt_url")
         :persistent_term.put(@context_key, variable)
         variable
 
@@ -635,8 +635,10 @@ defmodule Web.Platform.Test do
   end
 
   defp new_fetch_governor do
-    # All the test processes use this governor, thus it has no owner.
-    {:ok, pid} = CountingGovernor.start(capacity: governor_capacity())
+    # All the test processes use this governor, thus it has no owner and no
+    # link.
+    {:ok, pid} = CountingGovernor.start_link(capacity: governor_capacity())
+    true = Process.unlink(pid)
     governor = CountingGovernor.get(pid)
     :persistent_term.put(@governor_key, governor)
     governor

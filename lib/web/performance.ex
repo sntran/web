@@ -22,20 +22,14 @@ defmodule Web.Performance do
   ## Entries
 
   `mark/2` makes an entry for one moment, and `measure/3` makes an entry
-  for the time between two moments. An entry is a struct with the fields
-  of the Standard, with their names: `name`, `entryType`, `startTime`,
-  `duration`, and `detail`.
+  for the time between two moments. An entry is a struct with the
+  attributes of the Standard as fields, in snake_case: `name`,
+  `entry_type`, `start_time`, `duration`, and `detail`.
 
   The entries are the state of the process that makes them. A different
   process has its own entries, and the entries of a process go away with
   the process. The list has no limit, as in a browser: a process that
   runs for a long time must call `clear_marks/1` and `clear_measures/1`.
-
-  ## Names
-
-  The functions have the names of Elixir. The names of ECMAScript are also
-  there: `getEntries`, `getEntriesByType`, `getEntriesByName`, `clearMarks`,
-  `clearMeasures`, `timeOrigin`, and `toJSON`.
   """
 
   alias Web.DOMException
@@ -46,12 +40,12 @@ defmodule Web.Performance do
     The entry of one moment, as `PerformanceMark`.
     """
 
-    defstruct name: "", entryType: "mark", startTime: 0.0, duration: 0.0, detail: nil
+    defstruct name: "", entry_type: "mark", start_time: 0.0, duration: 0.0, detail: nil
 
     @type t :: %__MODULE__{
             name: String.t(),
-            entryType: String.t(),
-            startTime: float(),
+            entry_type: String.t(),
+            start_time: float(),
             duration: float(),
             detail: term()
           }
@@ -62,12 +56,12 @@ defmodule Web.Performance do
     The entry of the time between two moments, as `PerformanceMeasure`.
     """
 
-    defstruct name: "", entryType: "measure", startTime: 0.0, duration: 0.0, detail: nil
+    defstruct name: "", entry_type: "measure", start_time: 0.0, duration: 0.0, detail: nil
 
     @type t :: %__MODULE__{
             name: String.t(),
-            entryType: String.t(),
-            startTime: float(),
+            entry_type: String.t(),
+            start_time: float(),
             duration: float(),
             detail: term()
           }
@@ -124,17 +118,11 @@ defmodule Web.Performance do
     system_us / 1000.0
   end
 
-  @doc false
-  def unquote(:timeOrigin)(), do: time_origin()
-
   @doc """
   Returns the data of `toJSON()`: a map with the time origin.
   """
   @spec to_json() :: %{String.t() => float()}
   def to_json, do: %{"timeOrigin" => time_origin()}
-
-  @doc false
-  def unquote(:toJSON)(), do: to_json()
 
   # The origin is there after the start of the application. A call before
   # that sets it.
@@ -169,7 +157,7 @@ defmodule Web.Performance do
   ## Examples
 
       iex> mark = Web.Performance.mark("start", detail: %{step: 1})
-      iex> {mark.name, mark.entryType, mark.duration, mark.detail}
+      iex> {mark.name, mark.entry_type, mark.duration, mark.detail}
       {"start", "mark", 0.0, %{step: 1}}
       iex> Web.Performance.clear_marks("start")
       :ok
@@ -184,7 +172,7 @@ defmodule Web.Performance do
         :error -> now()
       end
 
-    put_entry(%Mark{name: text(name), startTime: start_time, detail: detail(options)})
+    put_entry(%Mark{name: text(name), start_time: start_time, detail: detail(options)})
   end
 
   @doc """
@@ -218,9 +206,9 @@ defmodule Web.Performance do
       iex> Web.Performance.mark("a", start_time: 10.0)
       iex> Web.Performance.mark("b", start_time: 25.0)
       iex> measure = Web.Performance.measure("a to b", "a", "b")
-      iex> {measure.startTime, measure.duration}
+      iex> {measure.start_time, measure.duration}
       {10.0, 15.0}
-      iex> Web.Performance.measure("by options", end: "b", duration: 5.0).startTime
+      iex> Web.Performance.measure("by options", end: "b", duration: 5.0).start_time
       20.0
       iex> Web.Performance.clear_marks()
       iex> Web.Performance.clear_measures()
@@ -276,7 +264,7 @@ defmodule Web.Performance do
   defp put_measure(name, start_time, end_time, detail) do
     put_entry(%Measure{
       name: text(name),
-      startTime: start_time,
+      start_time: start_time,
       duration: end_time - start_time,
       detail: detail
     })
@@ -296,11 +284,8 @@ defmodule Web.Performance do
     @entries_key
     |> Process.get([])
     |> Enum.reverse()
-    |> Enum.sort_by(& &1.startTime)
+    |> Enum.sort_by(& &1.start_time)
   end
-
-  @doc false
-  def unquote(:getEntries)(), do: get_entries()
 
   @doc """
   Returns the entries of the process with the given type: `"mark"` or
@@ -309,11 +294,8 @@ defmodule Web.Performance do
   @spec get_entries_by_type(name()) :: [entry()]
   def get_entries_by_type(type) do
     type = text(type)
-    Enum.filter(get_entries(), &(&1.entryType == type))
+    Enum.filter(get_entries(), &(&1.entry_type == type))
   end
-
-  @doc false
-  def unquote(:getEntriesByType)(type), do: get_entries_by_type(type)
 
   @doc """
   Returns the entries of the process with the given name, and with the
@@ -325,12 +307,9 @@ defmodule Web.Performance do
     type = type && text(type)
 
     Enum.filter(get_entries(), fn entry ->
-      entry.name == name and (type == nil or entry.entryType == type)
+      entry.name == name and (type == nil or entry.entry_type == type)
     end)
   end
-
-  @doc false
-  def unquote(:getEntriesByName)(name, type \\ nil), do: get_entries_by_name(name, type)
 
   @doc """
   Removes the marks of the process with the given name, or all its marks.
@@ -338,18 +317,12 @@ defmodule Web.Performance do
   @spec clear_marks(name() | nil) :: :ok
   def clear_marks(name \\ nil), do: clear_entries("mark", name)
 
-  @doc false
-  def unquote(:clearMarks)(name \\ nil), do: clear_marks(name)
-
   @doc """
   Removes the measures of the process with the given name, or all its
   measures.
   """
   @spec clear_measures(name() | nil) :: :ok
   def clear_measures(name \\ nil), do: clear_entries("measure", name)
-
-  @doc false
-  def unquote(:clearMeasures)(name \\ nil), do: clear_measures(name)
 
   defp put_entry(entry) do
     Process.put(@entries_key, [entry | Process.get(@entries_key, [])])
@@ -361,7 +334,7 @@ defmodule Web.Performance do
 
     entries =
       Enum.reject(Process.get(@entries_key, []), fn entry ->
-        entry.entryType == type and (name == nil or entry.name == name)
+        entry.entry_type == type and (name == nil or entry.name == name)
       end)
 
     Process.put(@entries_key, entries)
@@ -381,7 +354,7 @@ defmodule Web.Performance do
 
     # The list has the last entry first.
     case Enum.find(Process.get(@entries_key, []), &match?(%Mark{name: ^name}, &1)) do
-      %Mark{startTime: start_time} ->
+      %Mark{start_time: start_time} ->
         start_time
 
       nil ->

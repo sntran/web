@@ -119,7 +119,7 @@ defmodule Web.Internal.LazyStream do
   defp abort_signal(%AbortSignal{} = signal), do: signal
   defp abort_signal(_other), do: nil
 
-  defp ambient_signal, do: Snapshot.take().ambient_signal
+  defp ambient_signal, do: Snapshot.new().ambient_signal
 
   # ---------------------------------------------------------------------------
   # The state
@@ -446,7 +446,7 @@ defmodule Web.Internal.LazyStream do
   # The work runs in a short process with the key, the starter, with the
   # context of the copy: the stream process has the values of the copy.
   defp run_keyed(lazy, work) do
-    snapshot = Snapshot.take()
+    snapshot = Snapshot.new()
 
     {starter, monitor} =
       spawn_monitor(fn -> Snapshot.run(snapshot, fn -> starter(lazy, work) end) end)

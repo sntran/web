@@ -250,7 +250,7 @@ defmodule Web.Stream do
   #     with no process permits it: else `__start__/3` returns `:ignore`.
   #   * `:disturbed` — the stream starts disturbed.
   def __start__(module, opts, internal) when is_atom(module) and is_list(internal) do
-    snapshot = Snapshot.take()
+    snapshot = Snapshot.new()
     owner = Keyword.get_lazy(opts, :owner, &Web.Promise.owner/0)
     :gen_statem.start(__MODULE__, {module, opts, internal, snapshot, owner}, [])
   end

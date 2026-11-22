@@ -9,6 +9,11 @@ defmodule Web.SocketTest do
   alias Web.TypeError
   alias Web.WritableStreamDefaultWriter
 
+  # A socket with the options of the library for its tests: see
+  # `Web.Socket.start_socket/3`. `Web.connect/2` has only the options of the
+  # Sockets API.
+  defp connect(address, options), do: Socket.start_socket(self(), address, options)
+
   test "connect/2 streams data over tcp and closes cleanly" do
     parent = self()
 
@@ -46,7 +51,7 @@ defmodule Web.SocketTest do
 
     assert %{value: %Web.Uint8Array{}} = first = await(ReadableStreamDefaultReader.read(reader))
     rest = read_bytes!(reader, 8 - first.value.byte_length)
-    assert Web.Uint8Array.to_binary(first.value) <> rest == "abcdefgh"
+    assert to_string(first.value) <> rest == "abcdefgh"
 
     assert %TypeError{message: message} =
              catch_exit(await(WritableStreamDefaultWriter.write(writer, :not_bytes)))
@@ -104,7 +109,7 @@ defmodule Web.SocketTest do
 
   test "opened and closed reject when the connection fails" do
     socket =
-      Web.connect("localhost:9",
+      connect("localhost:9",
         connect_fun: fn _host, _port, _opts, _timeout -> {:error, :timeout} end
       )
 
@@ -113,8 +118,27 @@ defmodule Web.SocketTest do
     assert :timeout = catch_exit(await(socket.upgraded))
   end
 
+  test "connect/2 ignores each option that is not a member of SocketOptions" do
+    {port, _task} = start_tcp_server(&wait_for_tcp_stop_or_close/1)
+
+    # A dictionary of Web IDL has only its members: `secureTransport` is
+    # `secure_transport`, and the options of the library have no effect.
+    socket =
+      Web.connect("localhost:#{port}",
+        secureTransport: "udp",
+        connect_fun: fn _host, _port, _opts, _timeout -> {:error, :from_the_test} end,
+        readable_high_water_mark: 1
+      )
+
+    assert_opened_remote(socket, "localhost:#{port}")
+    assert :closed = await(Socket.close(socket))
+
+    socket = Web.connect("localhost:#{port}", %{secure_transport: "udp", tcp_options: :bogus})
+    assert {:unsupported_secure_transport, "udp"} = catch_exit(await(socket.opened))
+  end
+
   test "opened rejects for unsupported secure transport kinds" do
-    socket = Web.connect("localhost:25", secureTransport: "udp")
+    socket = Web.connect("localhost:25", secure_transport: "udp")
 
     assert {:unsupported_secure_transport, "udp"} = catch_exit(await(socket.opened))
     assert catch_exit(await(socket.closed)) == {:unsupported_secure_transport, "udp"}
@@ -122,8 +146,8 @@ defmodule Web.SocketTest do
 
   test "initial tls connect failures reject the opened promise" do
     socket =
-      Web.connect("localhost:465",
-        secureTransport: "on",
+      connect("localhost:465",
+        secure_transport: "on",
         ssl_connect_fun: fn _host, _port, _opts, _timeout -> {:error, :ssl_timeout} end
       )
 
@@ -152,7 +176,7 @@ defmodule Web.SocketTest do
         wait_for_tcp_stop_or_close(socket)
       end)
 
-    socket = Web.connect("localhost:#{port}", readable_high_water_mark: 4)
+    socket = connect("localhost:#{port}", readable_high_water_mark: 4)
     assert_opened_remote(socket, "localhost:#{port}")
     assert_receive :first_two_chunks_sent, 1_000
 
@@ -277,7 +301,7 @@ defmodule Web.SocketTest do
         :ssl.close(ssl_socket)
       end)
 
-    socket = Web.connect(%{hostname: "localhost", port: port}, secureTransport: "starttls")
+    socket = Web.connect(%{hostname: "localhost", port: port}, secure_transport: "starttls")
     assert_opened_remote(socket, "localhost:#{port}")
 
     reader = ReadableStream.get_reader(socket.readable)
@@ -288,9 +312,18 @@ defmodule Web.SocketTest do
     assert_receive :saw_starttls, 1_000
     assert read_chunk!(reader) == "220 Ready to start TLS\r\n"
 
-    # The socket verifies the certificate of the server with this
-    # certificate authority, and it verifies the host name.
-    upgraded = await(Socket.start_tls(socket, cacertfile: fixture_path("test_ca.pem")))
+    # The socket verifies the certificate of the server with the certificate
+    # authority of the setting `:tls_options`, and it verifies the host name.
+    previous = Application.get_env(:web, :tls_options)
+    Application.put_env(:web, :tls_options, cacertfile: fixture_path("test_ca.pem"))
+
+    on_exit(fn ->
+      if previous == nil,
+        do: Application.delete_env(:web, :tls_options),
+        else: Application.put_env(:web, :tls_options, previous)
+    end)
+
+    upgraded = await(Socket.start_tls(socket))
     assert %Socket{} = upgraded
     # The TLS socket is a new handle to the same process.
     assert upgraded.token != socket.token
@@ -322,7 +355,7 @@ defmodule Web.SocketTest do
         end
       end)
 
-    socket = Web.connect("localhost:#{port}", secureTransport: "starttls")
+    socket = Web.connect("localhost:#{port}", secure_transport: "starttls")
     assert_opened_remote(socket, "localhost:#{port}")
 
     reader = ReadableStream.get_reader(socket.readable)
@@ -332,7 +365,7 @@ defmodule Web.SocketTest do
     assert :ok = await(WritableStreamDefaultWriter.write(writer, "STARTTLS\r\n"))
     assert read_chunk!(reader) == "220 Ready to start TLS\r\n"
 
-    reason = catch_exit(await(Socket.start_tls(socket, verify: :verify_none)))
+    reason = catch_exit(await(Socket.__start_tls__(socket, verify: :verify_none)))
     assert match?({:tls_upgrade_failed, _}, reason)
     assert match?({:tls_upgrade_failed, _}, catch_exit(await(socket.closed)))
     assert match?({:tls_upgrade_failed, _}, catch_exit(await(socket.upgraded)))
@@ -387,8 +420,8 @@ defmodule Web.SocketTest do
       port = start_verified_server(self())
 
       socket =
-        Web.connect("localhost:#{port}",
-          secureTransport: "on",
+        connect("localhost:#{port}",
+          secure_transport: "on",
           ssl_options: [cacertfile: fixture_path("test_ca.pem")]
         )
 
@@ -399,7 +432,7 @@ defmodule Web.SocketTest do
     @tag :capture_log
     test "refuses a certificate from a certificate authority that is not known" do
       port = start_verified_server(self())
-      socket = Web.connect("localhost:#{port}", secureTransport: "on")
+      socket = Web.connect("localhost:#{port}", secure_transport: "on")
 
       assert tls_alert(socket) == :unknown_ca
     end
@@ -410,8 +443,8 @@ defmodule Web.SocketTest do
 
       # The certificate is for the name `localhost`.
       socket =
-        Web.connect(%{hostname: "127.0.0.1", port: port},
-          secureTransport: "on",
+        connect(%{hostname: "127.0.0.1", port: port},
+          secure_transport: "on",
           ssl_options: [cacertfile: fixture_path("test_ca.pem")]
         )
 
@@ -422,8 +455,8 @@ defmodule Web.SocketTest do
       port = start_verified_server(self())
 
       socket =
-        Web.connect(%{hostname: "127.0.0.1", port: port},
-          secureTransport: "on",
+        connect(%{hostname: "127.0.0.1", port: port},
+          secure_transport: "on",
           ssl_options: [verify: :verify_none]
         )
 
@@ -441,7 +474,7 @@ defmodule Web.SocketTest do
       end)
 
       port = start_verified_server(self())
-      socket = Web.connect("localhost:#{port}", secureTransport: "on")
+      socket = Web.connect("localhost:#{port}", secure_transport: "on")
 
       assert_opened_remote(socket, "localhost:#{port}")
     end
@@ -464,7 +497,7 @@ defmodule Web.SocketTest do
       )
 
     socket =
-      Web.connect("localhost:#{port}", secureTransport: "on", ssl_options: [verify: :verify_none])
+      connect("localhost:#{port}", secure_transport: "on", ssl_options: [verify: :verify_none])
 
     assert_opened_remote(socket, "localhost:#{port}")
 
@@ -490,11 +523,11 @@ defmodule Web.SocketTest do
       )
 
     socket =
-      Web.connect("localhost:#{port}", secureTransport: "on", ssl_options: [verify: :verify_none])
+      connect("localhost:#{port}", secure_transport: "on", ssl_options: [verify: :verify_none])
 
     assert_opened_remote(socket, "localhost:#{port}")
 
-    reason = catch_exit(await(Socket.start_tls(socket, verify: :verify_none)))
+    reason = catch_exit(await(Socket.__start_tls__(socket, verify: :verify_none)))
     assert :not_starttls = reason
     assert :closed = await(Socket.close(socket))
   end
@@ -514,7 +547,7 @@ defmodule Web.SocketTest do
         wait_for_ssl_stop_or_close(ssl_socket)
       end)
 
-    socket = Web.connect("localhost:#{port}", secureTransport: "starttls")
+    socket = Web.connect("localhost:#{port}", secure_transport: "starttls")
     assert_opened_remote(socket, "localhost:#{port}")
 
     reader = ReadableStream.get_reader(socket.readable)
@@ -523,10 +556,10 @@ defmodule Web.SocketTest do
     assert :ok = await(WritableStreamDefaultWriter.write(writer, "STARTTLS\r\n"))
     assert read_chunk!(reader) == "220 Ready to start TLS\r\n"
 
-    upgraded = await(Socket.start_tls(socket, verify: :verify_none))
+    upgraded = await(Socket.__start_tls__(socket, verify: :verify_none))
     assert_receive :tls_upgrade_complete, 1_000
 
-    reason = catch_exit(await(Socket.start_tls(upgraded, verify: :verify_none)))
+    reason = catch_exit(await(Socket.__start_tls__(upgraded, verify: :verify_none)))
     assert :already_tls = reason
     assert :closed = await(Socket.close(upgraded))
   end
@@ -535,7 +568,7 @@ defmodule Web.SocketTest do
     tcp_error_handle = {:fake_tcp, make_ref()}
 
     tcp_error_socket =
-      Web.connect("localhost:0",
+      connect("localhost:0",
         connect_fun: fn _host, _port, _opts, _timeout -> {:ok, tcp_error_handle} end
       )
 
@@ -547,7 +580,7 @@ defmodule Web.SocketTest do
     tcp_closed_handle = {:fake_tcp, make_ref()}
 
     tcp_closed_socket =
-      Web.connect("localhost:0",
+      connect("localhost:0",
         connect_fun: fn _host, _port, _opts, _timeout -> {:ok, tcp_closed_handle} end
       )
 
@@ -559,8 +592,8 @@ defmodule Web.SocketTest do
     ssl_error_handle = {:fake_ssl, make_ref()}
 
     ssl_error_socket =
-      Web.connect("localhost:0",
-        secureTransport: "on",
+      connect("localhost:0",
+        secure_transport: "on",
         ssl_connect_fun: fn _host, _port, _opts, _timeout -> {:ok, ssl_error_handle} end
       )
 
@@ -572,8 +605,8 @@ defmodule Web.SocketTest do
     ssl_closed_handle = {:fake_ssl, make_ref()}
 
     ssl_closed_socket =
-      Web.connect("localhost:0",
-        secureTransport: "on",
+      connect("localhost:0",
+        secure_transport: "on",
         ssl_connect_fun: fn _host, _port, _opts, _timeout -> {:ok, ssl_closed_handle} end
       )
 
@@ -649,8 +682,8 @@ defmodule Web.SocketTest do
 
   test "starttls connection failures reject opened and closed" do
     socket =
-      Web.connect("localhost:25",
-        secureTransport: "starttls",
+      connect("localhost:25",
+        secure_transport: "starttls",
         connect_fun: fn _host, _port, _opts, _timeout -> {:error, :starttls_timeout} end
       )
 
@@ -664,7 +697,7 @@ defmodule Web.SocketTest do
     :ok = :gen_tcp.close(closed)
 
     socket =
-      Web.connect("localhost:0",
+      connect("localhost:0",
         connect_fun: fn _host, _port, _opts, _timeout -> {:ok, closed} end
       )
 
@@ -680,7 +713,7 @@ defmodule Web.SocketTest do
 
   test "a close of the writer waits for the connection, then closes the socket" do
     gate = make_ref()
-    socket = Web.connect("localhost:0", connect_fun: blocking_connect(self(), gate))
+    socket = connect("localhost:0", connect_fun: blocking_connect(self(), gate))
     assert_receive {:connect_blocked, ^gate}, 1_000
 
     writer = Web.WritableStream.get_writer(socket.writable)
@@ -699,7 +732,7 @@ defmodule Web.SocketTest do
 
   test "a close of the writer rejects when the connection fails" do
     gate = make_ref()
-    socket = Web.connect("localhost:0", connect_fun: blocking_connect(self(), gate))
+    socket = connect("localhost:0", connect_fun: blocking_connect(self(), gate))
     assert_receive {:connect_blocked, ^gate}, 1_000
 
     writer = Web.WritableStream.get_writer(socket.writable)
@@ -801,7 +834,7 @@ defmodule Web.SocketTest do
     {tcp_port, _task} = start_tcp_server(&wait_for_tcp_stop_or_close/1)
 
     socket =
-      Web.connect(%{"hostname" => "localhost", port: tcp_port},
+      connect(%{"hostname" => "localhost", port: tcp_port},
         secure_transport: "off",
         tcp_options: nil
       )
@@ -812,7 +845,7 @@ defmodule Web.SocketTest do
     {tcp_port2, _task2} = start_tcp_server(&wait_for_tcp_stop_or_close/1)
 
     socket2 =
-      Web.connect("localhost:#{tcp_port2}",
+      connect("localhost:#{tcp_port2}",
         tcp_options: {:send_timeout, 1000},
         ssl_options: :bogus
       )
@@ -833,7 +866,7 @@ defmodule Web.SocketTest do
       )
 
     socket3 =
-      Web.connect("localhost:#{ssl_port}",
+      connect("localhost:#{ssl_port}",
         secure_transport: "on",
         ssl_options: %{verify: :verify_none}
       )
@@ -1007,7 +1040,7 @@ defmodule Web.SocketTest do
   end
 
   defp assert_opened_remote(socket, expected_remote_address) do
-    assert %{remoteAddress: remote_address} = await(socket.opened)
+    assert %{remote_address: remote_address} = await(socket.opened)
     assert remote_address == expected_remote_address
   end
 

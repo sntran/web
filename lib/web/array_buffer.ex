@@ -16,9 +16,9 @@ defmodule Web.ArrayBuffer do
     * a read with `Web.ReadableStreamBYOBReader`.
 
   All the copies of the struct on the same node see the detached state. Use
-  `data/1` and `byte_length/1` to read a buffer: `data/1` raises
-  `Web.TypeError` for a detached buffer. The field `:data` of the struct does
-  not show the detached state.
+  `to_string/1` and `byte_length/1` to read a buffer: `to_string/1` gives
+  the bytes as a binary, and raises `Web.TypeError` for a detached buffer.
+  The field `:data` of the struct does not show the detached state.
 
   The detached state is one flag in an `:atomics` array. The VM collects the
   flag together with the last copy of the struct. A struct that came from a
@@ -28,7 +28,7 @@ defmodule Web.ArrayBuffer do
 
       iex> buffer = Web.ArrayBuffer.new("hello")
       iex> moved = Web.ArrayBuffer.transfer(buffer)
-      iex> {Web.ArrayBuffer.data(moved), Web.ArrayBuffer.detached?(buffer)}
+      iex> {to_string(moved), Web.ArrayBuffer.detached?(buffer)}
       {"hello", true}
       iex> Web.ArrayBuffer.byte_length(buffer)
       0
@@ -53,11 +53,11 @@ defmodule Web.ArrayBuffer do
   ## Examples
 
       iex> buffer = Web.ArrayBuffer.new("hello")
-      iex> {Web.ArrayBuffer.data(buffer), Web.ArrayBuffer.byte_length(buffer)}
+      iex> {to_string(buffer), Web.ArrayBuffer.byte_length(buffer)}
       {"hello", 5}
 
       iex> buffer = Web.ArrayBuffer.new(4)
-      iex> {Web.ArrayBuffer.data(buffer), Web.ArrayBuffer.byte_length(buffer)}
+      iex> {to_string(buffer), Web.ArrayBuffer.byte_length(buffer)}
       {<<0, 0, 0, 0>>, 4}
   """
   @spec new(binary() | non_neg_integer()) :: t()
@@ -74,11 +74,10 @@ defmodule Web.ArrayBuffer do
           "ArrayBuffer input must be a binary or a byte length, got: #{inspect(other)}"
   end
 
-  @doc """
-  Returns the bytes of the buffer.
-
-  Raises `Web.TypeError` when the buffer is detached.
-  """
+  @doc false
+  # The bytes of the buffer. Raises `Web.TypeError` when the buffer is
+  # detached. A caller of the library uses `to_string/1`: see the
+  # implementation of `String.Chars`.
   @spec data(t()) :: binary()
   def data(%__MODULE__{} = buffer) do
     if detached?(buffer) do
@@ -109,11 +108,10 @@ defmodule Web.ArrayBuffer do
 
   def detached?(%__MODULE__{}), do: false
 
-  @doc """
-  Detaches the buffer and returns it with no bytes.
-
-  All the copies of the struct on this node become detached.
-  """
+  @doc false
+  # Detaches the buffer and returns it with no bytes. All the copies of the
+  # struct on this node become detached. In ECMAScript, only `transfer()`
+  # and a transfer of `structuredClone()` or of a message detach a buffer.
   @spec detach(t()) :: t()
   def detach(%__MODULE__{id: id} = buffer) do
     if is_reference(id), do: set_detached(id)
@@ -132,11 +130,11 @@ defmodule Web.ArrayBuffer do
   ## Examples
 
       iex> buffer = Web.ArrayBuffer.new("hello")
-      iex> Web.ArrayBuffer.data(Web.ArrayBuffer.transfer(buffer, 2))
+      iex> to_string(Web.ArrayBuffer.transfer(buffer, 2))
       "he"
 
       iex> buffer = Web.ArrayBuffer.new("hi")
-      iex> Web.ArrayBuffer.data(Web.ArrayBuffer.transfer(buffer, 4))
+      iex> to_string(Web.ArrayBuffer.transfer(buffer, 4))
       <<"hi", 0, 0>>
   """
   @spec transfer(t(), non_neg_integer() | nil) :: t()
@@ -194,4 +192,10 @@ defmodule Web.ArrayBuffer do
   defp resize(data, nil), do: data
   defp resize(data, length) when length <= byte_size(data), do: binary_part(data, 0, length)
   defp resize(data, length), do: data <> :binary.copy(<<0>>, length - byte_size(data))
+end
+
+defimpl String.Chars, for: Web.ArrayBuffer do
+  # The bytes of the buffer, as a binary. A detached buffer raises
+  # `Web.TypeError`.
+  def to_string(buffer), do: Web.ArrayBuffer.data(buffer)
 end

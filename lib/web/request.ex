@@ -531,7 +531,7 @@ defmodule Web.Request do
   defp take_input_body(request, _input), do: request
 
   defp finish(request, headers, init) do
-    snapshot = request.snapshot || AsyncContext.Snapshot.take()
+    snapshot = request.snapshot || AsyncContext.Snapshot.new()
     signal = Keyword.get(init, :signal) || request.signal || snapshot.ambient_signal
 
     options =

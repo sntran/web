@@ -418,7 +418,7 @@ defmodule Web.URLPatternTest do
 
       captured =
         URLPattern.match_context(pattern, %{pathname: "/api/v3"}, fn ->
-          snapshot = Snapshot.take()
+          snapshot = Snapshot.new()
 
           Task.async(fn ->
             Snapshot.run(snapshot, fn -> Variable.get(URLPattern.params()) end)

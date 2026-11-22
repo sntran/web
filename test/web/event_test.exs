@@ -39,7 +39,7 @@ defmodule Web.EventTest do
       listener = fn event ->
         case cancel do
           :prevent_default -> :ok = Event.prevent_default(event)
-          :return_value -> :ok = Event.set_return_value(event, false)
+          :return_value -> :ok = Event.return_value(event, false)
         end
 
         send(me, {:canceled, Event.default_prevented(event), Event.return_value(event)})
@@ -54,15 +54,23 @@ defmodule Web.EventTest do
     end
   end
 
-  test "set_return_value/2 with true and set_cancel_bubble/2 with false change nothing" do
+  test "new/2 has only the members of EventInit" do
+    event = Event.new("x", target: :a_target, current_target: :a_target, bubbles: true)
+    assert {event.target, event.current_target, event.bubbles} == {nil, nil, true}
+
+    event = Web.CustomEvent.new("x", target: :a_target, detail: 1, composed: true)
+    assert {event.target, event.detail, event.composed} == {nil, 1, true}
+  end
+
+  test "return_value/2 with true and cancel_bubble/2 with false change nothing" do
     event = Event.new("x", cancelable: true)
 
-    assert :ok = Event.set_return_value(event, true)
-    assert :ok = Event.set_cancel_bubble(event, false)
+    assert :ok = Event.return_value(event, true)
+    assert :ok = Event.cancel_bubble(event, false)
     refute Event.default_prevented(event)
     refute Event.cancel_bubble(event)
 
-    assert :ok = Event.set_cancel_bubble(event, true)
+    assert :ok = Event.cancel_bubble(event, true)
     assert Event.cancel_bubble(event)
   end
 

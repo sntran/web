@@ -14,15 +14,15 @@ defmodule Web.EventTargetTest do
     defstruct [:ref, :label]
   end
 
-  test "dispatchEvent invokes registered listeners, fires callbacks, and removes once listeners" do
+  test "dispatch_event/2 invokes registered listeners, fires callbacks, and removes once listeners" do
     parent = self()
 
     target =
       FixtureTarget.new(parent)
-      |> Web.EventTarget.addEventListener("message", fn event ->
+      |> Web.EventTarget.add_event_listener("message", fn event ->
         send(parent, {:persistent, event.detail})
       end)
-      |> Web.EventTarget.addEventListener(
+      |> Web.EventTarget.add_event_listener(
         "message",
         fn event ->
           send(parent, {:once, event.detail})
@@ -35,13 +35,13 @@ defmodule Web.EventTargetTest do
     assert_receive {:handle_add_listener, "message"}
     assert_receive {:handle_add_listener, "message"}
 
-    {target, true} = Web.EventTarget.dispatchEvent(target, event)
+    {target, true} = Web.EventTarget.dispatch_event(target, event)
 
     assert_receive {:handle_dispatch, "message"}
     assert_receive {:persistent, %{value: 1}}
     assert_receive {:once, %{value: 1}}
 
-    {target, true} = Web.EventTarget.dispatchEvent(target, event)
+    {target, true} = Web.EventTarget.dispatch_event(target, event)
 
     assert_receive {:handle_dispatch, "message"}
     assert_receive {:persistent, %{value: 1}}
@@ -50,16 +50,16 @@ defmodule Web.EventTargetTest do
     assert map_size(listeners(target)) == 1
   end
 
-  test "removeEventListener removes matching callbacks and keeps non-matching ones" do
+  test "remove_event_listener/4 removes matching callbacks and keeps non-matching ones" do
     keep = &Kernel.is_nil/1
     drop = fn _event -> :ok end
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("shared", keep)
-      |> Web.EventTarget.addEventListener("shared", drop)
+      |> Web.EventTarget.add_event_listener("shared", keep)
+      |> Web.EventTarget.add_event_listener("shared", drop)
 
-    target = Web.EventTarget.removeEventListener(target, "shared", drop)
+    target = Web.EventTarget.remove_event_listener(target, "shared", drop)
 
     assert [%{callback: ^keep}] = listeners(target)["shared"]
   end
@@ -70,15 +70,15 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new(parent)
-      |> Web.EventTarget.addEventListener(:tick, callback, %{once: false})
-      |> Web.EventTarget.addEventListener(:tick, callback)
+      |> Web.EventTarget.add_event_listener(:tick, callback, %{once: false})
+      |> Web.EventTarget.add_event_listener(:tick, callback)
 
     assert [%{watcher: nil}] = listeners(target)["tick"]
 
-    {target, true} = Web.EventTarget.dispatchEvent(target, Web.CustomEvent.new(:tick))
+    {target, true} = Web.EventTarget.dispatch_event(target, Web.CustomEvent.new(:tick))
     assert_receive :ping
 
-    target = Web.EventTarget.removeEventListener(target, :tick, callback)
+    target = Web.EventTarget.remove_event_listener(target, :tick, callback)
     assert listeners(target) == %{}
   end
 
@@ -87,7 +87,7 @@ defmodule Web.EventTargetTest do
 
     skipped =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("aborted", callback,
+      |> Web.EventTarget.add_event_listener("aborted", callback,
         signal: Web.AbortSignal.abort(:done)
       )
 
@@ -95,7 +95,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("pid-signal", callback, signal: self())
+      |> Web.EventTarget.add_event_listener("pid-signal", callback, signal: self())
 
     assert [%{watcher: watcher}] = listeners(target)["pid-signal"]
     send(watcher, :noise)
@@ -108,7 +108,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("pid-down", callback, signal: signal)
+      |> Web.EventTarget.add_event_listener("pid-down", callback, signal: signal)
 
     assert [%{watcher: pid_down_watcher}] = listeners(target)["pid-down"]
     await_watcher_monitor(pid_down_watcher, signal)
@@ -123,7 +123,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("token", callback, signal: :token_signal)
+      |> Web.EventTarget.add_event_listener("token", callback, signal: :token_signal)
 
     assert [%{watcher: watcher}] = listeners(target)["token"]
     send(watcher, :noise)
@@ -133,7 +133,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("token-2", callback, signal: :token_signal_2)
+      |> Web.EventTarget.add_event_listener("token-2", callback, signal: :token_signal_2)
 
     assert [%{watcher: watcher2}] = listeners(target)["token-2"]
     send(watcher2, {:abort, :token_signal_2, :stop})
@@ -146,7 +146,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("signal", fn _event -> :ok end,
+      |> Web.EventTarget.add_event_listener("signal", fn _event -> :ok end,
         signal: controller.signal
       )
 
@@ -161,7 +161,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("signal-down", fn _event -> :ok end,
+      |> Web.EventTarget.add_event_listener("signal-down", fn _event -> :ok end,
         signal: controller.signal
       )
 
@@ -179,12 +179,12 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("loop", callback, signal: self())
+      |> Web.EventTarget.add_event_listener("loop", callback, signal: self())
 
     assert [%{watcher: watcher}] = listeners(target)["loop"]
     assert is_pid(watcher)
 
-    target = Web.EventTarget.removeEventListener(target, "loop", callback)
+    target = Web.EventTarget.remove_event_listener(target, "loop", callback)
 
     assert listeners(target) == %{}
     await_process_exit(watcher)
@@ -245,7 +245,7 @@ defmodule Web.EventTargetTest do
     def build_failure, do: raise("the event cannot be made")
 
     defp task(build, reply_to \\ nil) do
-      task = %{build: build, snapshot: Snapshot.take()}
+      task = %{build: build, snapshot: Snapshot.new()}
       if reply_to, do: Map.put(task, :reply_to, reply_to), else: task
     end
 
@@ -259,13 +259,13 @@ defmodule Web.EventTargetTest do
       :ok = Server.add_event_listener(server, "tick", note.(:after), %{})
       :ok = Server.set_handler(server, "tick", note.(:handler_2))
 
-      Server.dispatch_event(server, Web.CustomEvent.new("tick", detail: 1), Snapshot.take())
+      Server.dispatch_event(server, Web.CustomEvent.new("tick", detail: 1), Snapshot.new())
 
       assert {:messages, [before: 1, handler_2: 1, after: 1]} = Process.info(self(), :messages)
 
       # A handler of nil keeps its place, and does not run.
       :ok = Server.set_handler(server, "tick", nil)
-      Server.dispatch_event(server, Web.CustomEvent.new("tick", detail: 2), Snapshot.take())
+      Server.dispatch_event(server, Web.CustomEvent.new("tick", detail: 2), Snapshot.new())
       assert_received {:before, 2}
       assert_received {:after, 2}
       refute_received {:handler_2, 2}
@@ -323,8 +323,8 @@ defmodule Web.EventTargetTest do
       assert_receive {:event_returned, :one}
 
       :ok = Server.run_task(server, task({__MODULE__, :build_event, ["made", 2]}))
-      GenServer.cast(server, {:dispatch_event, Web.CustomEvent.new("made"), Snapshot.take()})
-      assert Server.dispatch_event(server, Web.CustomEvent.new("made"), Snapshot.take())
+      GenServer.cast(server, {:dispatch_event, Web.CustomEvent.new("made"), Snapshot.new()})
+      assert Server.dispatch_event(server, Web.CustomEvent.new("made"), Snapshot.new())
 
       refute_received %Web.CustomEvent{}
     end
@@ -337,7 +337,7 @@ defmodule Web.EventTargetTest do
 
       log =
         capture_log(fn ->
-          Server.dispatch_event(server, Web.CustomEvent.new("tick"), Snapshot.take())
+          Server.dispatch_event(server, Web.CustomEvent.new("tick"), Snapshot.new())
         end)
 
       assert log =~ ~s(A listener of the event "tick" failed.)
@@ -357,7 +357,7 @@ defmodule Web.EventTargetTest do
       assert length(:sys.get_state(server).listeners["tick"]) == 2
 
       :ok = Server.remove_event_listener(server, "tick", make.(1))
-      Server.dispatch_event(server, Web.CustomEvent.new("tick"), Snapshot.take())
+      Server.dispatch_event(server, Web.CustomEvent.new("tick"), Snapshot.new())
 
       assert_received 2
       refute_received 1
@@ -368,7 +368,7 @@ defmodule Web.EventTargetTest do
       monitor = Process.monitor(server)
 
       send(server, :unexpected)
-      assert Server.dispatch_event(server, Web.CustomEvent.new("tick"), Snapshot.take())
+      assert Server.dispatch_event(server, Web.CustomEvent.new("tick"), Snapshot.new())
 
       Process.unlink(server)
       :ok = Server.stop(server)
@@ -421,7 +421,7 @@ defmodule Web.EventTargetTest do
       )
 
     assert :ok = Server.add_event_listener(ok_pid, "ok", callback, %{})
-    assert true = Server.dispatch_event(ok_pid, %{type: "ok", target: target}, Snapshot.take())
+    assert true = Server.dispatch_event(ok_pid, %{type: "ok", target: target}, Snapshot.new())
     assert :ok = Server.remove_event_listener(ok_pid, "ok", callback)
     assert :ok = GenServer.stop(ok_pid)
 
@@ -438,7 +438,7 @@ defmodule Web.EventTargetTest do
              Server.dispatch_event(
                fallback_pid,
                %{type: "plain", target: target},
-               Snapshot.take()
+               Snapshot.new()
              )
 
     assert :ok = GenServer.stop(fallback_pid)
@@ -450,7 +450,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("dead", fn _event -> :ok end, signal: dead_signal)
+      |> Web.EventTarget.add_event_listener("dead", fn _event -> :ok end, signal: dead_signal)
 
     await_no_listeners(target)
     assert listeners(target) == %{}
@@ -461,7 +461,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("abort-owner", fn _event -> :ok end,
+      |> Web.EventTarget.add_event_listener("abort-owner", fn _event -> :ok end,
         signal: controller.signal
       )
 
@@ -473,7 +473,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("pid-owner", fn _event -> :ok end, signal: self())
+      |> Web.EventTarget.add_event_listener("pid-owner", fn _event -> :ok end, signal: self())
 
     assert [%{watcher: pid_watcher}] = listeners(target)["pid-owner"]
     server_pid = event_target_pid(target)
@@ -483,7 +483,7 @@ defmodule Web.EventTargetTest do
 
     target =
       FixtureTarget.new()
-      |> Web.EventTarget.addEventListener("token-owner", fn _event -> :ok end,
+      |> Web.EventTarget.add_event_listener("token-owner", fn _event -> :ok end,
         signal: :owner_bound_token
       )
 

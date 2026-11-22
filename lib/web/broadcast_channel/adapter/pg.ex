@@ -1,13 +1,13 @@
 defmodule Web.BroadcastChannel.Adapter.PG do
-  @moduledoc """
-  The default adapter of `Web.BroadcastChannel`. It uses the module `:pg` of
-  Erlang/OTP.
+  @moduledoc false
 
-  The groups are in a scope of `:pg` that only this library uses. The scope
-  connects to the same scope on each node of the cluster, thus a message
-  goes to the channels of all the connected nodes. No node and no process is
-  necessary for the other nodes to continue.
-  """
+  # The default adapter of `Web.BroadcastChannel`. It uses the module `:pg`
+  # of Erlang/OTP.
+  #
+  # The groups are in a scope of `:pg` that only this library uses. The
+  # scope connects to the same scope on each node of the cluster, thus a
+  # message goes to the channels of all the connected nodes. No node and no
+  # process is necessary for the other nodes to continue.
 
   @behaviour Web.BroadcastChannel.Adapter
 

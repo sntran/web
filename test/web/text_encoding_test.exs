@@ -21,7 +21,7 @@ defmodule Web.TextEncodingTest do
     bytes = TextEncoder.encode(encoder, "Hello, 🌍")
 
     assert %Uint8Array{} = bytes
-    assert Uint8Array.to_binary(bytes) == "Hello, 🌍"
+    assert to_string(bytes) == "Hello, 🌍"
   end
 
   test "TextEncoder rejects non-string input" do
@@ -55,15 +55,25 @@ defmodule Web.TextEncodingTest do
   end
 
   test "TextDecoder handles valid complete input in fatal mode, and starts again after the end of the data" do
-    decoder = TextDecoder.new("utf-8", %{fatal: true, ignoreBOM: true})
+    decoder = TextDecoder.new("utf-8", %{fatal: true, ignore_bom: true})
 
     assert TextDecoder.decode(decoder, "hello") == "hello"
     assert TextDecoder.decode(decoder, "", %{stream: true}) == ""
     assert %{bom_seen: false, carry: ""} = :sys.get_state(decoder.state_pid)
   end
 
+  test "TextDecoder has the option ignore_bom, the snake_case name of ignoreBOM" do
+    assert TextDecoder.new("utf-8", ignore_bom: true).ignore_bom
+    refute TextDecoder.new("utf-8", %{ignoreBOM: true}).ignore_bom
+  end
+
+  test "TextEncoder.encode/1 encodes the empty string, the default input" do
+    bytes = TextEncoder.encode(TextEncoder.new())
+    assert {bytes.byte_length, to_string(bytes)} == {0, ""}
+  end
+
   test "TextDecoder empty decodes exercise fresh BOM state branches" do
-    ignore_bom_decoder = TextDecoder.new("utf-8", %{ignoreBOM: true})
+    ignore_bom_decoder = TextDecoder.new("utf-8", %{ignore_bom: true})
     assert TextDecoder.decode(ignore_bom_decoder, "", %{stream: true}) == ""
     assert %{bom_seen: false, carry: ""} = :sys.get_state(ignore_bom_decoder.state_pid)
 
@@ -205,8 +215,8 @@ defmodule Web.TextEncodingTest do
 
   property "ignoreBOM false strips only the initial BOM and ignoreBOM true preserves it" do
     check all(text <- string(:utf8, min_length: 0), max_runs: 100) do
-      stripped_decoder = TextDecoder.new("utf-8", %{ignoreBOM: false})
-      preserved_decoder = TextDecoder.new("utf-8", %{ignoreBOM: true})
+      stripped_decoder = TextDecoder.new("utf-8", %{ignore_bom: false})
+      preserved_decoder = TextDecoder.new("utf-8", %{ignore_bom: true})
       input = @bom <> text
 
       assert TextDecoder.decode(stripped_decoder, input) == text
@@ -220,7 +230,7 @@ defmodule Web.TextEncodingTest do
             suffix <- string(:utf8, min_length: 0),
             max_runs: 100
           ) do
-      decoder = TextDecoder.new("utf-8", %{ignoreBOM: false})
+      decoder = TextDecoder.new("utf-8", %{ignore_bom: false})
 
       first = TextDecoder.decode(decoder, prefix, %{stream: true})
       second = TextDecoder.decode(decoder, @bom <> suffix, %{stream: false})
@@ -276,7 +286,7 @@ defmodule Web.TextEncodingTest do
     WritableStreamDefaultWriter.write(writer, "🌍")
     WritableStreamDefaultWriter.close(writer)
 
-    assert Enum.map(stream.readable, &Uint8Array.to_binary/1) == ["Hi ", "🌍"]
+    assert Enum.map(stream.readable, &to_string/1) == ["Hi ", "🌍"]
   end
 
   test "TextEncoderStream errors when a chunk with no String.Chars is written" do
@@ -305,7 +315,7 @@ defmodule Web.TextEncodingTest do
       stream = TextEncoderStream.new()
       assert stream.encoding == "utf-8"
 
-      assert ["", "a", "", "b", ""] |> through(stream) |> Enum.map(&Uint8Array.to_binary/1) == [
+      assert ["", "a", "", "b", ""] |> through(stream) |> Enum.map(&to_string/1) == [
                "a",
                "b"
              ]
@@ -314,38 +324,38 @@ defmodule Web.TextEncodingTest do
     test "TextEncoderStream joins a code point that is divided between two chunks" do
       chunks = [<<"a", 0xC3>>, <<0xA9, 0xF0, 0x9F>>, <<0x8C, 0x8D, "z">>]
 
-      assert chunks |> through(TextEncoderStream.new()) |> Enum.map_join(&Uint8Array.to_binary/1) ==
+      assert chunks |> through(TextEncoderStream.new()) |> Enum.map_join(&to_string/1) ==
                "aé🌍z"
     end
 
     test "TextEncoderStream gives U+FFFD for bytes that are not valid, also at the end" do
       assert [<<"a", 0xFF, "b">>]
              |> through(TextEncoderStream.new())
-             |> Enum.map_join(&Uint8Array.to_binary/1) ==
+             |> Enum.map_join(&to_string/1) ==
                "a\uFFFDb"
 
       assert [<<"a", 0xF0, 0x9F>>]
              |> through(TextEncoderStream.new())
-             |> Enum.map_join(&Uint8Array.to_binary/1) ==
+             |> Enum.map_join(&to_string/1) ==
                "a\uFFFD"
     end
 
     test "TextEncoderStream keeps a byte order mark" do
       assert ["\uFEFFa"]
              |> through(TextEncoderStream.new())
-             |> Enum.map_join(&Uint8Array.to_binary/1) ==
+             |> Enum.map_join(&to_string/1) ==
                "\uFEFFa"
     end
 
     test "TextEncoder gives U+FFFD for bytes that are not valid" do
       encoded = TextEncoder.encode(TextEncoder.new(), <<"a", 0xFF, "b">>)
-      assert Uint8Array.to_binary(encoded) == "a\uFFFDb"
+      assert to_string(encoded) == "a\uFFFDb"
     end
 
     property "TextEncoderStream gives valid UTF-8 for each sequence of binaries" do
       check all(chunks <- list_of(binary(max_length: 8), max_length: 12), max_runs: 100) do
         output =
-          chunks |> through(TextEncoderStream.new()) |> Enum.map_join(&Uint8Array.to_binary/1)
+          chunks |> through(TextEncoderStream.new()) |> Enum.map_join(&to_string/1)
 
         assert String.valid?(output)
         assert output == chunks |> IO.iodata_to_binary() |> String.replace_invalid()
@@ -368,7 +378,7 @@ defmodule Web.TextEncodingTest do
                "\uFEFFa"
              ]
 
-      assert through([bom <> "a"], TextDecoderStream.new("utf-8", %{ignoreBOM: true})) == [
+      assert through([bom <> "a"], TextDecoderStream.new("utf-8", %{ignore_bom: true})) == [
                "\uFEFFa"
              ]
     end
@@ -485,7 +495,7 @@ defmodule Web.TextEncodingTest do
         assert {changed.byte_offset, changed.byte_length} == {offset, length}
         before = :binary.copy(<<filler>>, offset)
         rest = :binary.copy(<<filler>>, length + extra - offset - byte_size(written))
-        assert ArrayBuffer.data(changed.buffer) == before <> written <> rest
+        assert to_string(changed.buffer) == before <> written <> rest
       end
     end
 
@@ -512,7 +522,7 @@ defmodule Web.TextEncodingTest do
         assert result == %{read: units, written: byte_size(expected)}
         assert {changed.byte_offset, changed.byte_length} == {offset, length}
 
-        assert ArrayBuffer.data(changed.buffer) ==
+        assert to_string(changed.buffer) ==
                  :binary.copy(<<filler>>, offset) <>
                    expected <> :binary.copy(<<filler>>, length - byte_size(expected) + tail)
       end
@@ -523,7 +533,7 @@ defmodule Web.TextEncodingTest do
         TextEncoder.encode_into(TextEncoder.new(), <<"a", 0xFF, "b">>, view(0, 0, 6, 6))
 
       assert result == %{read: 3, written: 5}
-      assert Uint8Array.to_binary(changed) == <<"a\uFFFDb", 0>>
+      assert to_string(changed) == <<"a\uFFFDb", 0>>
     end
 
     test "writes no byte into a detached destination" do

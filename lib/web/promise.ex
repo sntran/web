@@ -1,12 +1,3 @@
-defmodule Web.Promise.AggregateError do
-  defexception [:errors]
-
-  @impl true
-  def message(%{errors: errors}) do
-    "All promises were rejected: #{inspect(errors)}"
-  end
-end
-
 defmodule Web.Promise do
   @moduledoc """
   A promise in the style of the ECMAScript `Promise`.
@@ -35,20 +26,20 @@ defmodule Web.Promise do
     * A pending promise is a small process. It stops when its owner stops.
       The work of its executor stops at the same time.
     * After a pending promise settles, it keeps its outcome until its first
-      delivery to an `await/1` or to a chained promise. Then it keeps the
+      delivery to a `Web.await/1` or to a chained promise. Then it keeps the
       outcome for the linger time, and stops.
-    * An `await/1` on a promise that stopped rejects with `Web.TypeError`.
+    * A `Web.await/1` on a promise that stopped rejects with
+      `Web.TypeError`.
 
   The default linger time is 5000 ms. Set `config :web, linger: ms`
   to change it. The value `:infinity` keeps each outcome until the owner
-  stops. The option `:linger` of `new/2` and `with_resolvers/1` sets the
-  time for one promise.
+  stops.
 
   Keep the awaited value, not the promise, when you need the value later.
   """
 
+  alias Web.AggregateError
   alias Web.AsyncContext.Snapshot
-  alias Web.Promise.AggregateError
   alias Web.TypeError
 
   defstruct [:pid, :state]
@@ -69,34 +60,40 @@ defmodule Web.Promise do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Makes a promise and runs `executor` in a new process.
+  Makes a promise and runs `executor` in a new process, as the constructor
+  `new Promise(executor)`.
 
   The executor gets the functions `resolve` and `reject`. If the executor
   raises, throws, or exits before it settles the promise, the promise rejects.
 
-  ## Options
-
-    * `:linger` - the time in milliseconds to keep the outcome after its first
-      delivery, or `:infinity`.
-    * `:detached` - if `true`, the executor continues to its end when the
-      owner stops. The default is `false`.
-
   ## Examples
 
       iex> promise = Web.Promise.new(fn resolve, _reject -> resolve.(:done) end)
-      iex> Web.Promise.await(promise)
+      iex> Web.await(promise)
       :done
-      iex> Web.Promise.await(promise)
+      iex> Web.await(promise)
       :done
   """
-  @spec new(executor(), keyword()) :: t()
-  def new(executor, opts \\ []) when is_function(executor, 2) and is_list(opts) do
+  @spec new(executor()) :: t()
+  def new(executor) when is_function(executor, 2), do: __new__(executor, [])
+
+  @doc false
+  # `new/1` with the options of the library:
+  #
+  #   * `:linger` - the time in milliseconds to keep the outcome after its
+  #     first delivery, or `:infinity`. The default is the setting
+  #     `config :web, linger: ms`.
+  #   * `:detached` - if `true`, the executor continues to its end when the
+  #     owner stops. The default is `false`.
+  @spec __new__(executor(), keyword()) :: t()
+  def __new__(executor, opts) when is_function(executor, 2) and is_list(opts) do
     {promise, _token} = start_cell(executor, opts)
     promise
   end
 
   @doc """
-  Returns a promise together with the functions that settle it.
+  Returns a promise together with the functions that settle it, as
+  `Promise.withResolvers()`.
 
   ## Examples
 
@@ -105,14 +102,19 @@ defmodule Web.Promise do
       iex> Web.await(promise)
       :hello
   """
-  @spec with_resolvers(keyword()) :: {t(), resolver(), resolver()}
-  def with_resolvers(opts \\ []) when is_list(opts) do
+  @spec with_resolvers() :: {t(), resolver(), resolver()}
+  def with_resolvers, do: __with_resolvers__([])
+
+  @doc false
+  # `with_resolvers/0` with the option `:linger` of `__new__/2`.
+  @spec __with_resolvers__(keyword()) :: {t(), resolver(), resolver()}
+  def __with_resolvers__(opts) when is_list(opts) do
     {%__MODULE__{pid: pid} = promise, token} = start_cell(nil, opts)
     {promise, settle_fun(pid, token, :fulfilled), settle_fun(pid, token, :rejected)}
   end
 
   @doc """
-  Returns a promise that is fulfilled with `value`.
+  Returns a promise that is fulfilled with `value`, as `Promise.resolve()`.
 
   If `value` is a promise, the function returns it without a change.
   """
@@ -121,7 +123,7 @@ defmodule Web.Promise do
   def resolve(value), do: %__MODULE__{state: {:fulfilled, value}}
 
   @doc """
-  Returns a promise that is rejected with `reason`.
+  Returns a promise that is rejected with `reason`, as `Promise.reject()`.
   """
   @spec reject(term()) :: t()
   def reject(reason), do: %__MODULE__{state: {:rejected, reason}}
@@ -130,19 +132,10 @@ defmodule Web.Promise do
   # Await
   # ---------------------------------------------------------------------------
 
-  @doc """
-  Waits for the promise and returns its value.
-
-  If the promise rejects, the calling process exits with the reason.
-
-  ## Examples
-
-      iex> Web.Promise.await(Web.Promise.resolve(1))
-      1
-
-      iex> catch_exit(Web.Promise.await(Web.Promise.reject(:boom)))
-      :boom
-  """
+  @doc false
+  # Waits for the promise and returns its value. If the promise rejects, the
+  # calling process exits with the reason. A caller of the library uses
+  # `Web.await/1`.
   @spec await(t()) :: term()
   def await(%__MODULE__{} = promise) do
     case wait(promise) do
@@ -151,17 +144,9 @@ defmodule Web.Promise do
     end
   end
 
-  @doc """
-  Waits for the promise and returns its outcome as data.
-
-  ## Examples
-
-      iex> Web.Promise.wait(Web.Promise.resolve(1))
-      {:fulfilled, 1}
-
-      iex> Web.Promise.wait(Web.Promise.reject(:boom))
-      {:rejected, :boom}
-  """
+  @doc false
+  # Waits for the promise and returns its outcome as data:
+  # `{:fulfilled, value}` or `{:rejected, reason}`.
   @spec wait(t()) :: outcome()
   def wait(%__MODULE__{state: {status, _} = outcome}) when status in [:fulfilled, :rejected] do
     outcome
@@ -181,7 +166,7 @@ defmodule Web.Promise do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Returns a promise for the result of `on_fulfilled`.
+  Returns a promise for the result of `on_fulfilled`, as `then()`.
 
   If the first promise rejects, the new promise rejects with the same reason.
   If the callback returns a promise, the new promise takes its outcome.
@@ -206,7 +191,8 @@ defmodule Web.Promise do
   defp on_fulfilled({:rejected, reason}, _callback, _resolve, reject), do: reject.(reason)
 
   @doc """
-  Returns a promise that recovers from a rejection with `on_rejected`.
+  Returns a promise that recovers from a rejection with `on_rejected`, as
+  `catch()`.
 
   If the first promise is fulfilled, the new promise has the same value.
   """
@@ -227,7 +213,8 @@ defmodule Web.Promise do
   defp on_rejected({:rejected, reason}, callback, resolve), do: resolve.(callback.(reason))
 
   @doc """
-  Runs `on_finally` when the promise settles, and keeps the outcome.
+  Runs `on_finally` when the promise settles, and keeps the outcome, as
+  `finally()`.
 
   If the callback raises, or returns a promise that rejects, the new promise
   rejects with that reason.
@@ -251,7 +238,7 @@ defmodule Web.Promise do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Returns a promise for the list of all values.
+  Returns a promise for the list of all values, as `Promise.all()`.
 
   The promise rejects when the first input promise rejects.
   """
@@ -276,7 +263,8 @@ defmodule Web.Promise do
   end
 
   @doc """
-  Returns a promise for the list of all outcomes. It does not reject.
+  Returns a promise for the list of all outcomes, as `Promise.allSettled()`.
+  It does not reject.
   """
   @spec all_settled(Enumerable.t()) :: t()
   def all_settled(enumerable) do
@@ -297,10 +285,11 @@ defmodule Web.Promise do
   defp outcome_record({:rejected, reason}), do: %{status: "rejected", reason: reason}
 
   @doc """
-  Returns a promise for the first value that is fulfilled.
+  Returns a promise for the first value that is fulfilled, as
+  `Promise.any()`.
 
   If all input promises reject, the promise rejects with
-  `Web.Promise.AggregateError`.
+  `Web.AggregateError`.
   """
   @spec any(Enumerable.t()) :: t()
   def any(enumerable) do
@@ -325,7 +314,7 @@ defmodule Web.Promise do
 
   @doc """
   Returns a promise that takes the outcome of the first input promise that
-  settles.
+  settles, as `Promise.race()`.
 
   The other input promises continue. An empty input gives a promise that
   stays pending.
@@ -347,7 +336,7 @@ defmodule Web.Promise do
   # Makes a promise for a command to a stream or a socket. The command
   # continues to its end when the owner stops.
   @spec detached(executor()) :: t()
-  def detached(executor) when is_function(executor, 2), do: new(executor, detached: true)
+  def detached(executor) when is_function(executor, 2), do: __new__(executor, detached: true)
 
   @doc false
   # Returns the process that owns the promises and the streams that the
@@ -492,7 +481,7 @@ defmodule Web.Promise do
     owner = owner()
     detached? = Keyword.get(opts, :detached, false)
     linger = Keyword.get_lazy(opts, :linger, &default_linger/0)
-    snapshot = Snapshot.take()
+    snapshot = Snapshot.new()
 
     # A cell has no supervisor: it monitors its owner, and it stops with its
     # rules. A supervisor is one process for all the cells, and each start
@@ -679,7 +668,7 @@ defmodule Web.Promise do
     %TypeError{
       message:
         "The promise is not available. Its owner stopped, or it released its outcome. " <>
-          "Keep the awaited value, or set the :linger option."
+          "Keep the awaited value, or set a longer time in `config :web, linger: ms`."
     }
   end
 end

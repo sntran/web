@@ -39,7 +39,8 @@ defmodule Web.TextDecoder do
   @moduledoc """
   A decoder from bytes to text, as `TextDecoder` of the Encoding Standard.
 
-  A decoder has the options `fatal` and `ignoreBOM`. With `stream: true`,
+  A decoder has the options `fatal` and `ignore_bom` (`ignoreBOM`). With
+  `stream: true`,
   `decode/3` keeps the bytes of a character that is not complete for the
   subsequent call.
 
@@ -101,8 +102,7 @@ defmodule Web.TextDecoder do
   @type options ::
           %{
             optional(:fatal) => boolean(),
-            optional(:ignore_bom) => boolean(),
-            optional(:ignoreBOM) => boolean()
+            optional(:ignore_bom) => boolean()
           }
           | keyword()
   @type decode_options :: %{optional(:stream) => boolean()}
@@ -110,7 +110,8 @@ defmodule Web.TextDecoder do
   @doc """
   Makes a decoder for the encoding of the label.
 
-  The options are `:fatal` and `:ignore_bom` (also `:ignoreBOM`). The field
+  The options are `:fatal` and `:ignore_bom`, the members of
+  `TextDecoderOptions`. The field
   `:encoding` of the result is the name of the encoding in lowercase.
 
   Raises `Web.RangeError` for a label that is not known, and for the
@@ -121,7 +122,7 @@ defmodule Web.TextDecoder do
     encoding = encoding!(label)
     options = Map.new(options)
     fatal = Map.get(options, :fatal, false) == true
-    ignore_bom = Map.get(options, :ignore_bom, Map.get(options, :ignoreBOM, false)) == true
+    ignore_bom = Map.get(options, :ignore_bom, false) == true
 
     {:ok, state_pid} = State.start(Web.Promise.owner(), initial_state())
     %__MODULE__{encoding: encoding, state_pid: state_pid, fatal: fatal, ignore_bom: ignore_bom}

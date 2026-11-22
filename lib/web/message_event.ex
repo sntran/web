@@ -33,8 +33,35 @@ defmodule Web.MessageEvent do
           ports: list()
         }
 
+  @doc """
+  Makes an event, as the constructor `new MessageEvent(type,
+  eventInitDict)`.
+
+  ## Options
+
+  The members of `MessageEventInit`:
+
+    * `:data` - the message. The default is `nil`;
+    * `:origin` and `:last_event_id` - the default is `""`;
+    * `:source` - the default is `nil`;
+    * `:ports` - a list of `Web.MessagePort`. The default is `[]`.
+
+  ## Examples
+
+      iex> event = Web.MessageEvent.new("message", data: [1, 2])
+      iex> {event.type, event.data, event.origin, event.ports}
+      {"message", [1, 2], "", []}
+  """
   @spec new(String.t() | atom(), keyword()) :: t()
-  def new(type \\ "message", opts \\ []) do
+  def new(type, opts \\ []) do
+    __new__(type, Keyword.take(opts, [:data, :origin, :last_event_id, :source, :ports]))
+  end
+
+  @doc false
+  # An event with the fields of a dispatch: the options of `new/2`, and
+  # `:target` and `:current_target` (the default is the target).
+  @spec __new__(String.t() | atom(), keyword()) :: t()
+  def __new__(type, opts) do
     target = Keyword.get(opts, :target)
 
     %__MODULE__{

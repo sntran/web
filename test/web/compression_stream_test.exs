@@ -646,7 +646,7 @@ defmodule Web.CompressionRuntimeLogTest do
 
   describe "Uint8Array and invalid chunk inputs" do
     test "runtime observation logs inherit async context metadata and console depth" do
-      user = AsyncContext.Variable.new("user")
+      user = AsyncContext.Variable.new(name: "user")
 
       log =
         capture_log(fn ->

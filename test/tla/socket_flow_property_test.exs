@@ -146,7 +146,7 @@ defmodule Web.TLA.SocketFlowPropertyTest do
 
       %{value: chunk} ->
         assert_flow(target)
-        read_all(reader, target, reads ++ [pause], [Web.Uint8Array.to_binary(chunk) | acc])
+        read_all(reader, target, reads ++ [pause], [to_string(chunk) | acc])
     end
   end
 

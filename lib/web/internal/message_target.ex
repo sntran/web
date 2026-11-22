@@ -165,7 +165,7 @@ defmodule Web.Internal.MessageTarget do
 
   @spec dispatch_event(handle(), Web.EventTarget.event()) :: boolean()
   def dispatch_event(handle, event) do
-    _reply = call(handle, {:dispatch, event, Snapshot.take()})
+    _reply = call(handle, {:dispatch, event, Snapshot.new()})
     true
   end
 end

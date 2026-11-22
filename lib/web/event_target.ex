@@ -30,9 +30,6 @@ defmodule Web.EventTarget do
   its listeners go away. A target of `new/0` is a small process. It stops
   when the process that made it stopped and it has no listener, after the
   linger time (`config :web, linger: ms`).
-
-  Evented structs may expose a direct `event_target_pid` so listener routing can
-  stay capability-local without any central registry lookup.
   """
 
   alias Web.AsyncContext.Snapshot
@@ -47,11 +44,17 @@ defmodule Web.EventTarget do
   @type event :: %{required(:type) => String.t() | atom()}
   @type callback :: (event() -> any()) | (-> any())
 
+  # The callbacks of a struct of the library that is an event target, with
+  # the field `event_target_pid`: see `__using__/1`. They are not a public
+  # API.
+  @doc false
   @callback handle_add_listener(struct(), String.t() | atom(), callback(), map()) ::
               :ok | {:ok, struct()}
+  @doc false
   @callback handle_dispatch(struct(), event()) :: :ok | {:ok, struct()}
   @optional_callbacks handle_add_listener: 4, handle_dispatch: 2
 
+  @doc false
   defmacro __using__(_opts) do
     # The macro runs when a module compiles, before the coverage tool starts.
     # coveralls-ignore-start
@@ -115,10 +118,6 @@ defmodule Web.EventTarget do
     Web.EventTarget.Protocol.add_event_listener(target, type, callback, flatten(options))
   end
 
-  def unquote(:addEventListener)(target, type, callback, options \\ %{}) do
-    add_event_listener(target, type, callback, options)
-  end
-
   @doc """
   Removes the listener with the type, the callback, and the capture of the
   options, as `removeEventListener(type, callback, options)`.
@@ -147,10 +146,6 @@ defmodule Web.EventTarget do
     Web.EventTarget.Protocol.remove_event_listener(target, type, callback)
   end
 
-  def unquote(:removeEventListener)(target, type, callback, options \\ %{}) do
-    remove_event_listener(target, type, callback, options)
-  end
-
   @doc """
   Dispatches an event to the target, as `dispatchEvent(event)`. Returns the
   target, and `false` when a listener canceled the event.
@@ -161,10 +156,6 @@ defmodule Web.EventTarget do
   @spec dispatch_event(target, event()) :: {target, boolean()} when target: var
   def dispatch_event(target, %{type: type} = event) when is_binary(type) or is_atom(type) do
     Web.EventTarget.Protocol.dispatch_event(target, event)
-  end
-
-  def unquote(:dispatchEvent)(target, event) do
-    dispatch_event(target, event)
   end
 
   # The steps "flatten more options": a boolean is the option `capture`.
@@ -266,7 +257,7 @@ defmodule Web.EventTarget do
   def __dispatch_event__(%{} = target, %{type: type} = event)
       when is_binary(type) or is_atom(type) do
     event_target_pid = event_target_pid!(target)
-    snapshot = Snapshot.take()
+    snapshot = Snapshot.new()
 
     dispatched? =
       if self() == event_target_pid do
@@ -281,6 +272,11 @@ defmodule Web.EventTarget do
 end
 
 defprotocol Web.EventTarget.Protocol do
+  @moduledoc false
+
+  # The functions of `Web.EventTarget` for each kind of event target of the
+  # library. Only the library implements this protocol.
+
   @spec add_event_listener(
           term(),
           String.t() | atom(),

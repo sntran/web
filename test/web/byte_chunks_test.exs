@@ -12,7 +12,7 @@ defmodule Web.ByteChunksTest do
 
   defp assert_bytes(chunks, expected) do
     assert Enum.all?(chunks, &match?(%Uint8Array{}, &1))
-    assert Enum.map_join(chunks, &Uint8Array.to_binary/1) == expected
+    assert Enum.map_join(chunks, &to_string/1) == expected
   end
 
   describe "Uint8Array.from/1" do
@@ -20,12 +20,12 @@ defmodule Web.ByteChunksTest do
       for bytes <- ["abc", [?a, "b", [?c]], ArrayBuffer.new("abc"), Uint8Array.from("abc")] do
         view = Uint8Array.from(bytes)
         assert %Uint8Array{byte_offset: 0, byte_length: 3} = view
-        assert Uint8Array.to_binary(view) == "abc"
+        assert to_string(view) == "abc"
       end
 
       # A view of a part of a buffer gives only that part.
       part = Uint8Array.new(ArrayBuffer.new("xabcx"), 1, 3)
-      assert Uint8Array.to_binary(Uint8Array.from(part)) == "abc"
+      assert to_string(Uint8Array.from(part)) == "abc"
       assert Uint8Array.from(part).buffer != part.buffer
     end
 
@@ -47,7 +47,7 @@ defmodule Web.ByteChunksTest do
         assert Bytes.to_binary(ArrayBuffer.new(binary)) == {:ok, binary}
         assert Bytes.to_binary([binary]) == {:ok, binary}
         assert Bytes.to_binary(:binary.bin_to_list(binary)) == {:ok, binary}
-        assert Uint8Array.to_binary(Bytes.chunk(binary)) == binary
+        assert to_string(Bytes.chunk(binary)) == binary
       end
     end
 
@@ -101,8 +101,8 @@ defmodule Web.ByteChunksTest do
 
         bytes =
           case result do
-            %Uint8Array{} = view -> Uint8Array.to_binary(view)
-            %ArrayBuffer{} = buffer -> ArrayBuffer.data(buffer)
+            %Uint8Array{} = view -> to_string(view)
+            %ArrayBuffer{} = buffer -> to_string(buffer)
             %Blob{} = blob -> Blob.to_binary(blob)
           end
 
@@ -149,7 +149,7 @@ defmodule Web.ByteChunksTest do
       assert %{value: %Uint8Array{} = first} = await(Reader.read(reader))
       assert %{value: %Uint8Array{} = second} = await(Reader.read(reader))
       assert %{done: true} = await(Reader.read(reader))
-      assert {Uint8Array.to_binary(first), Uint8Array.to_binary(second)} == {"ab", "cd"}
+      assert {to_string(first), to_string(second)} == {"ab", "cd"}
     end
 
     test "takes the buffer of a view that the source enqueues" do
@@ -174,7 +174,7 @@ defmodule Web.ByteChunksTest do
       assert %{value: value} =
                await(ReadableStreamBYOBReader.read(reader, Uint8Array.new(ArrayBuffer.new(2))))
 
-      assert Uint8Array.to_binary(value) == "ab"
+      assert to_string(value) == "ab"
     end
   end
 

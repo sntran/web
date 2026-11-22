@@ -763,7 +763,7 @@ defmodule Web.FormDataTest do
   end
 
   test "already locked upstream streams raise a type error" do
-    stream = ReadableStream.from("payload")
+    stream = ReadableStream.__from__("payload")
     reader = ReadableStream.get_reader(stream)
 
     assert_raise Web.TypeError, "ReadableStream is already locked", fn ->
@@ -774,7 +774,7 @@ defmodule Web.FormDataTest do
   end
 
   test "a body that a body function took raises a type error, with no crash report" do
-    stream = ReadableStream.from("payload")
+    stream = ReadableStream.__from__("payload")
     assert await(Web.Response.text(%Web.Response{body: stream})) == "payload"
 
     log =
@@ -1412,7 +1412,7 @@ defmodule Web.FormDataTest do
   end
 
   test "parser start_link returns an error when the owner helper crashes before replying" do
-    stream = ReadableStream.from("")
+    stream = ReadableStream.__from__("")
 
     capture_log(fn ->
       assert {:error, _reason} =
@@ -2029,8 +2029,11 @@ defmodule Web.FormDataTest do
       reader = ReadableStream.get_reader(file.stream)
       assert %{done: false} = await(ReadableStreamDefaultReader.read(reader))
 
+      # The abort comes to the coordinator, which errors the stream of the
+      # file in its own process. Thus a chunk that is in the queue can come
+      # first, but the reader gets the reason, not an end.
       send(form.coordinator, {:abort, :abort_token, :aborted})
-      assert :aborted = catch_exit(await(ReadableStreamDefaultReader.read(reader)))
+      assert read_to_error(reader) == :aborted
     end
 
     test "a kill of the parser gives a TypeError to the reader of the file, not an end" do
@@ -2325,6 +2328,17 @@ defmodule Web.FormDataTest do
 
   defp assert_eventually(_fun, 0) do
     flunk("condition was not satisfied in time")
+  end
+
+  # Reads until a read fails, and returns the reason. A read that gives the
+  # end fails the test.
+  defp read_to_error(reader) do
+    await(ReadableStreamDefaultReader.read(reader))
+  catch
+    :exit, reason -> reason
+  else
+    %{done: true} -> flunk("the reader got the end, not an error")
+    %{done: false} -> read_to_error(reader)
   end
 end
 

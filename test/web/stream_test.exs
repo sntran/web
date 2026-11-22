@@ -154,7 +154,7 @@ defmodule Web.StreamTest do
     test "start_task falls back to plain execution when async_context is not a snapshot" do
       parent = self()
 
-      data = %Web.Stream{async_context: :not_a_snapshot, timeout_ms: 50}
+      data = %Web.Stream{async_context: :not_a_snapshot}
 
       assert {:keep_state, next_data} =
                Web.Stream.readable(
@@ -985,33 +985,6 @@ defmodule Web.StreamTest do
       assert catch_exit(await(Web.ReadableStreamDefaultReader.read(right_reader)))
     end
 
-    test "timeout check transitions to errored with task timeout reason" do
-      {:ok, pid} =
-        WritableStream.start_link(
-          underlying_sink: %{
-            write: fn _chunk, _controller ->
-              # Longer than the time limit of the callback.
-              Process.sleep(60_000)
-              :ok
-            end
-          },
-          timeout_ms: 100
-        )
-
-      stream = %WritableStream{controller_pid: pid}
-      writer = WritableStream.get_writer(stream)
-
-      assert %TypeError{cause: {:task_timeout, :write}} =
-               catch_exit(await(WritableStreamDefaultWriter.write(writer, "slow")))
-
-      assert_wait(fn ->
-        slots = WritableStream.__get_slots__(stream.controller_pid)
-
-        slots.state == :errored and
-          match?(%TypeError{cause: {:task_timeout, :write}}, slots.error_reason)
-      end)
-    end
-
     test "transform callback uses the current two-argument signature" do
       parent = self()
 
@@ -1030,56 +1003,88 @@ defmodule Web.StreamTest do
       assert "X" == Enum.join(ts.readable, "")
       assert_receive {:transform_chunk, "x"}
     end
+  end
 
-    test "timeout check transitions to errored with task timeout reason for flush" do
-      {:ok, pid} =
-        WritableStream.start_link(
-          underlying_sink: %{
-            close: fn _controller ->
-              # Longer than the time limit of the callback.
-              Process.sleep(60_000)
-              :ok
-            end
-          },
-          timeout_ms: 100
-        )
+  # A callback has no time limit, as in the Streams Standard: the promise
+  # that it returns can stay pending. Each test waits for 100 ms, and then
+  # settles the promise. A time limit of less than 100 ms makes each test
+  # fail.
+  describe "a callback whose promise stays pending" do
+    test "keeps its write pending, and the stream writable" do
+      test = self()
 
-      stream = %WritableStream{controller_pid: pid}
+      stream =
+        WritableStream.new(%{
+          write: fn _chunk, _controller -> pending_promise(test) end
+        })
+
       writer = WritableStream.get_writer(stream)
+      write = WritableStreamDefaultWriter.write(writer, "a")
+      assert_receive {:resolve, resolve}
 
-      assert %TypeError{cause: {:task_timeout, :flush}} =
-               catch_exit(await(WritableStreamDefaultWriter.close(writer)))
+      wait_100_ms()
+      assert Web.Promise.peek(write) == :pending
+      assert WritableStream.__get_slots__(stream.controller_pid).state == :writable
 
-      assert_wait(fn ->
-        slots = WritableStream.__get_slots__(stream.controller_pid)
-
-        slots.state == :errored and
-          match?(%TypeError{cause: {:task_timeout, :flush}}, slots.error_reason)
-      end)
+      resolve.(:ok)
+      assert await(write) == :ok
     end
 
-    test "timeout check transitions to errored with task timeout reason for pull" do
-      {:ok, pid} =
-        ReadableStream.start_link(
-          source: %{
-            pull: fn _controller ->
-              # Longer than the time limit of the callback.
-              Process.sleep(60_000)
+    test "keeps its close pending" do
+      test = self()
+      stream = WritableStream.new(%{close: fn _controller -> pending_promise(test) end})
+      writer = WritableStream.get_writer(stream)
+      close = WritableStreamDefaultWriter.close(writer)
+      assert_receive {:resolve, resolve}
+
+      wait_100_ms()
+      assert Web.Promise.peek(close) == :pending
+      assert WritableStream.__get_slots__(stream.controller_pid).state == :closing
+
+      resolve.(:ok)
+      assert await(close) == :ok
+    end
+
+    test "keeps its read pending, and the stream readable" do
+      test = self()
+
+      stream =
+        ReadableStream.new(
+          %{
+            pull: fn controller ->
+              send(test, {:controller, controller})
+              pending_promise(test)
             end
           },
-          timeout_ms: 100
+          high_water_mark: 0
         )
 
-      _reader = ReadableStream.get_reader(pid)
-      _ = ReadableStream.read(pid)
+      reader = ReadableStream.get_reader(stream)
+      read = Web.ReadableStreamDefaultReader.read(reader)
+      assert_receive {:controller, controller}
+      assert_receive {:resolve, resolve}
 
-      assert_wait(fn ->
-        slots = ReadableStream.__get_slots__(pid)
+      wait_100_ms()
+      assert Web.Promise.peek(read) == :pending
+      assert ReadableStream.__get_slots__(stream.controller_pid).state == :readable
 
-        slots.state == :errored and
-          match?(%TypeError{cause: {:task_timeout, :pull}}, slots.error_reason)
-      end)
+      Web.ReadableStreamDefaultController.enqueue(controller, "a")
+      resolve.(:ok)
+      assert %{value: "a", done: false} = await(read)
     end
+  end
+
+  # A promise that the test settles: the callback sends its resolve function
+  # to the test.
+  defp pending_promise(test) do
+    {promise, resolve, _reject} = Web.Promise.with_resolvers()
+    send(test, {:resolve, resolve})
+    promise
+  end
+
+  defp wait_100_ms do
+    Process.send_after(self(), :waited, 100)
+    assert_receive :waited, 1_000
   end
 
   describe "Web.Stream callback rescue/catch paths" do

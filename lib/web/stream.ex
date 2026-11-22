@@ -100,7 +100,6 @@ defmodule Web.Stream do
     :impl_state,
     :active_task,
     :task_ref,
-    :task_timeout_ref,
     :active_operation,
     :async_context,
     # The callers that wait for the end of the function start: see
@@ -191,7 +190,6 @@ defmodule Web.Stream do
     enqueue_waiters: :queue.new(),
     backpressure: false,
     # Shared
-    timeout_ms: 30_000,
     error_reason: nil,
     cancel_on_reader_exit: false,
     # Lifetime
@@ -788,7 +786,6 @@ defmodule Web.Stream do
     Web.Promise.put_owner(self())
     hwm = Keyword.get(opts, :high_water_mark, 1)
     strategy = normalize_strategy(Keyword.get(opts, :strategy, %Web.CountQueuingStrategy{}))
-    timeout_ms = Keyword.get(opts, :timeout_ms, 30_000)
 
     started =
       case module.start(self(), opts) do
@@ -796,7 +793,7 @@ defmodule Web.Stream do
         {type, state, actions} -> {type, state, actions}
       end
 
-    init_data(started, module, {opts, internal}, snapshot, owner, hwm, strategy, timeout_ms)
+    init_data(started, module, {opts, internal}, snapshot, owner, hwm, strategy)
   end
 
   defp init_data(
@@ -806,8 +803,7 @@ defmodule Web.Stream do
          snapshot,
          owner,
          hwm,
-         strategy,
-         timeout_ms
+         strategy
        ) do
     {readable_hwm, writable_hwm} = init_capacities(type, hwm, strategy)
     {readable_size, writable_size} = init_sizes(type, opts, strategy)
@@ -830,7 +826,6 @@ defmodule Web.Stream do
       writable_size: writable_size,
       stream_type: Keyword.get(opts, :stream_type, :default),
       bytes: byte_controller(opts),
-      timeout_ms: timeout_ms,
       async_context: snapshot,
       owner_ref: Process.monitor(owner),
       linger: Keyword.get_lazy(opts, :linger, &Web.Promise.default_linger/0),
@@ -1739,12 +1734,10 @@ defmodule Web.Stream do
     do: {:keep_state_and_data, [{:reply, from, :ok}]}
 
   # The abort callback of the sink returned: the pipe can cancel its source.
-  # A pipe that has the reply of its abort gets no notice.
+  # The worker sends this message before the result of the callback, thus
+  # the abort has no reply yet.
   defp handle_common(:info, {:abort_callback_returned, from}, _state, data) do
-    if from in List.wrap(data.pending_abort_request) do
-      send_abort_notice(%{data | abort_notice: from})
-    end
-
+    send_abort_notice(%{data | abort_notice: from})
     :keep_state_and_data
   end
 
@@ -1938,27 +1931,6 @@ defmodule Web.Stream do
 
       true ->
         handle_task_result(result, state, data)
-    end
-  end
-
-  # Task timeout handling
-  defp handle_common(:info, {:task_timeout, ref}, state, data) do
-    if ref == data.task_ref and data.active_task do
-      operation = timeout_operation(data.active_operation)
-      kill_task(data.active_task)
-      error = task_timeout_error(operation, data)
-
-      if data.type == :consumer and operation != :abort do
-        # A callback of a sink that does not return fails with the timeout.
-        consumer_failure(error, state, data)
-      else
-        # The caller of an abort gets the timeout as its rejection reason.
-        abort_actions = abort_reply_actions(data, {:error, error})
-        data = clear_active_operation(%{data | pending_abort_request: nil})
-        fail_stream(error, data, abort_actions)
-      end
-    else
-      :keep_state_and_data
     end
   end
 
@@ -2198,13 +2170,6 @@ defmodule Web.Stream do
   defp controller_refusal(:closed, _data), do: :closed
   defp controller_refusal(_state, %{terminated: true}), do: :closed
   defp controller_refusal(_state, _data), do: nil
-
-  defp task_timeout_error(operation, data) do
-    Web.TypeError.exception(
-      message: "The #{operation} callback did not return in #{data.timeout_ms} ms.",
-      cause: {:task_timeout, operation}
-    )
-  end
 
   defp handle_ambient_abort(reason, state, data) do
     data = %{data | signal_subscription: nil}
@@ -2968,8 +2933,8 @@ defmodule Web.Stream do
   #     sends the two messages.
   #
   # The reply of the abort without a notice tells the pipe the same, and no
-  # notice comes after it. For example, the callback did not return in its
-  # time limit.
+  # notice comes after it. For example, the callback threw before it
+  # returned, or the destination is not writable.
   # ---------------------------------------------------------------------------
 
   defp send_abort_notice(%{abort_notice: nil} = data), do: data
@@ -3410,8 +3375,8 @@ defmodule Web.Stream do
 
   # TransformStreamDefaultSinkWriteAlgorithm: the write of the writable side
   # of a transform stream is in flight. With backpressure, it waits for the
-  # end of the backpressure. It has no task until then, thus no time limit:
-  # see `release_held_write/2`.
+  # end of the backpressure. It has no task until then: see
+  # `release_held_write/2`.
   defp start_write_task(%{transform: %{side: :writable, cell: cell}} = data, request) do
     if transform_hold?(cell) do
       {from, _pid, _chunk} = request
@@ -3428,8 +3393,8 @@ defmodule Web.Stream do
   # The default transform of a transform stream runs no code of the user.
   # Thus the writable side sends the enqueue to the readable side as a call,
   # with no worker, and gets the reply as the result of a callback. The
-  # write has no time limit: the readable side answers at once. When the
-  # readable side stopped, the enqueue fails, as an enqueue of a worker.
+  # readable side answers at once. When the readable side stopped, the
+  # enqueue fails, as an enqueue of a worker.
   defp run_write_task(%{transform: %{enqueue: true} = transform} = data, request) do
     {from, _pid, chunk} = request
     ref = make_ref()
@@ -4649,12 +4614,8 @@ defmodule Web.Stream do
   end
 
   defp clear_active_operation(data) do
-    if data.task_timeout_ref do
-      Process.cancel_timer(data.task_timeout_ref)
-    end
-
     data = reply_start_waiters(data)
-    %{data | active_task: nil, task_ref: nil, task_timeout_ref: nil, active_operation: nil}
+    %{data | active_task: nil, task_ref: nil, active_operation: nil}
   end
 
   # The start task is complete, or it stopped: each caller of
@@ -4842,14 +4803,6 @@ defmodule Web.Stream do
   defp strategy_size_algorithm(%Web.ByteLengthQueuingStrategy{}), do: :byte_length
   defp strategy_size_algorithm(_count), do: :count
 
-  defp timeout_operation(operation) do
-    case operation do
-      {:write, _from} -> :write
-      {:flush, _from} -> :flush
-      other -> other
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # The worker
   #
@@ -4955,14 +4908,13 @@ defmodule Web.Stream do
 
   defp resolve_if_promise(result, _fallback), do: result
 
+  # A callback has no time limit, as in the Streams Standard: a promise
+  # that it returns can stay pending.
   defp set_active_task(data, task, operation, updates \\ []) do
-    timeout_ref = Process.send_after(self(), {:task_timeout, task.ref}, data.timeout_ms)
-
     data =
       data
       |> Map.put(:active_task, task)
       |> Map.put(:task_ref, task.ref)
-      |> Map.put(:task_timeout_ref, timeout_ref)
       |> Map.put(:active_operation, operation)
 
     Enum.reduce(updates, data, fn {key, value}, acc -> Map.put(acc, key, value) end)

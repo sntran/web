@@ -154,14 +154,6 @@ defmodule Web.Test.QuickJS.WPT do
   # The rules, in their sequence: the first rule that gives a group wins.
   defp causes do
     [
-      # The library stops a callback of a source or a sink that does not
-      # return in 30000 ms, in real time. The first write of this test
-      # returns only after 1000 more calls of `write()`, and each call waits
-      # until the processes of the run are at rest. Alone, the file takes
-      # 14 s. In the full suite, the 1000 calls took more than 30 s in 1 run
-      # of 4. In a browser, the calls take no time.
-      {:test, "streams/writable-streams/write.any.js",
-       "a large queue of writes should be processed completely", @real_time},
       # The read of next() makes the stream pull again. In JavaScript the
       # pull runs before read() returns. In the runner, the call of that
       # pull is deferred, and does not hold the answer of the read: the

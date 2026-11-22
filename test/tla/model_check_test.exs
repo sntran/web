@@ -709,10 +709,6 @@ defmodule Web.TLA.ModelCheckTest do
       assert_violates(SpecModel.check("PipeAbort", bug("direct_notice")), "NoLateNotice")
     end
 
-    test "a notice after the reply at the time limit is found" do
-      assert_violates(SpecModel.check("PipeAbort", bug("relay_unchecked")), "NoLateNotice")
-    end
-
     test "a pipe that waits only for the notice is found" do
       assert_violates(SpecModel.check("PipeAbort", bug("keeps_waiting")), "Progress")
     end

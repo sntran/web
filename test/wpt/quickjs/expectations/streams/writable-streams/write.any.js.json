@@ -1,6 +1,0 @@
-{
-  "harness": "OK",
-  "failures": {
-    "a large queue of writes should be processed completely": "runner: a timer of the library runs in real time between two statements of JavaScript"
-  }
-}

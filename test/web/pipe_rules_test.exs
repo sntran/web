@@ -675,54 +675,6 @@ defmodule Web.PipeRulesTest do
       assert_receive {:cancel, :stop}
       assert rejection(pipe) == :stop
     end
-
-    test "an abort callback that does not return: the source gets its cancel after the time limit" do
-      test = self()
-      {source, _controller} = source(test)
-      sink = %{abort: fn _reason -> receive(do: (:never -> :ok)) end}
-      {:ok, dest} = WritableStream.start_link(underlying_sink: sink, timeout_ms: 50)
-
-      pipe = ReadableStream.pipe_to(source, dest, signal: AbortSignal.abort(:stop))
-      assert %TypeError{cause: {:task_timeout, :abort}} = rejection(pipe)
-      assert_received {:cancel, :stop}
-    end
-
-    test "an abort callback that returns after its time limit sends no notice to the pipe" do
-      test = self()
-
-      {source, _controller} =
-        source(test, %{
-          cancel: fn reason ->
-            send(test, {:cancel, self(), reason})
-            receive(do: (:return -> :ok))
-          end
-        })
-
-      {:ok, dest} = WritableStream.start_link(underlying_sink: waiting_abort(test))
-
-      pipe = ReadableStream.pipe_to(source, dest, signal: AbortSignal.abort(:stop))
-      pipe_pid = pipe_process(source)
-      assert_receive {:abort, worker, :stop}
-
-      # The time limit ends before the stream gets the return of the
-      # callback: the stream answers the pipe first. The test sends the
-      # message of the timer of the callback.
-      task_ref = WritableStream.__get_slots__(dest).task_ref
-      true = :erlang.suspend_process(dest)
-      send(dest, {:task_timeout, task_ref})
-      send(worker, :return)
-      in_mailbox(dest, &match?({:abort_callback_returned, _from}, &1))
-      true = :erlang.resume_process(dest)
-
-      # The pipe got the answer, and then cancelled the source. It has no
-      # message while it waits for the cancel.
-      assert_receive {:cancel, cancel_worker, :stop}
-      idle(pipe_pid)
-      assert {:messages, []} = Process.info(pipe_pid, :messages)
-
-      send(cancel_worker, :return)
-      assert %TypeError{cause: {:task_timeout, :abort}} = rejection(pipe)
-    end
   end
 
   describe "a stream that stops" do

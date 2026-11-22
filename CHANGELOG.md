@@ -494,6 +494,13 @@ All notable changes to this project are documented in this file.
   throws. It put the reason in an `AbortError` before.
 - **Breaking:** two `Web.Event` structs of the same type are not equal: each
   one has its own flags.
+- **Breaking:** a callback of a source, a sink, or a transformer has no
+  time limit, as in the Streams Standard. A callback that returns a promise
+  that stays pending keeps its read, write, close, or abort pending, and
+  the stream stays in its state. Before, the stream failed with a
+  `Web.TypeError` after 30 s. Use an `AbortSignal` (for example
+  `AbortSignal.timeout/1`) in the callback, or a time limit of your own,
+  to stop a callback that waits too long.
 - `Web.Blob` follows the File API: the type becomes ASCII lowercase, and a
   type with a character outside U+0020 to U+007E becomes `""`. The functions
   of `Web.Blob` accept a `Web.File`. `Web.Blob.stream/1` is a byte stream,
@@ -515,8 +522,8 @@ All notable changes to this project are documented in this file.
   gets its `cancel`. When the destination has a write or a close in flight,
   the cancel comes first, as in JavaScript. Before, the two callbacks ran
   at the same time, and on a busy machine the `cancel` could come first. A
-  pipe now waits for the sink `abort` before the cancel, at most for the
-  time limit of a callback. The priority messages of Erlang/OTP 28 cannot
+  pipe now waits until the sink `abort` returns before the cancel. The
+  priority messages of Erlang/OTP 28 cannot
   give this sequence: they change the sequence of the messages in one
   mailbox only, not the work of two processes.
 - `Web.WritableStream.abort/2` and `Web.WritableStreamDefaultWriter.abort/2`

@@ -277,8 +277,8 @@ defmodule Web.TransformStream do
     writable_hwm = QueuingStrategy.high_water_mark!(writable_hwm, 1)
     start_fn = Map.get(transformer, :start)
 
-    # The options of the engine for each side. Each other option, such as
-    # `:timeout_ms`, goes to the two sides.
+    # The options of the engine for each side. Each other option goes to
+    # the two sides.
     opts =
       opts
       |> Keyword.drop([:writable_strategy, :readable_strategy, :high_water_mark])

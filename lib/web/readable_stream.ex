@@ -1203,9 +1203,6 @@ defmodule Web.ReadableStream do
     end
   end
 
-  # The largest time that the VM accepts for a timer: about 49 days.
-  @no_callback_timeout 4_294_967_295
-
   # The two branches are usual streams of the type of the source. The tee
   # process reads the source for them: ReadableStreamDefaultTee, or
   # ReadableByteStreamTee for a byte stream.
@@ -1217,11 +1214,8 @@ defmodule Web.ReadableStream do
 
     with {:ok, tee} <- started do
       # The cancel callback of a branch waits until the two branches are
-      # cancelled, thus a branch has no time limit for its callbacks.
-      [branch1, branch2] =
-        for index <- [1, 2] do
-          new(tee_branch_source(tee_module, tee, index), timeout_ms: @no_callback_timeout)
-        end
+      # cancelled.
+      [branch1, branch2] = for index <- [1, 2], do: new(tee_branch_source(tee_module, tee, index))
 
       :ok =
         tee_module.attach(

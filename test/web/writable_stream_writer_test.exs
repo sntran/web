@@ -205,6 +205,37 @@ defmodule Web.WritableStreamWriterTest do
 
       send(worker, :continue)
     end
+
+    # The stop of the owner comes to its promise some time after the stop.
+    # The test suspends the promise, thus the promise stays alive after its
+    # owner stopped, as on a busy machine.
+    test "gives a promise with the same outcome while the old promise did not stop yet" do
+      test = self()
+      stream = WritableStream.new(gated_sink(test))
+
+      {pid, monitor} =
+        spawn_monitor(fn ->
+          writer = WritableStream.get_writer(stream)
+          _write = Writer.write(writer, :a)
+          ready = Writer.ready(writer)
+          :ok = Writer.release_lock(writer)
+          send(test, {:writer, writer, ready})
+          receive do: (:stop -> :ok)
+        end)
+
+      assert_receive {:writer, writer, old}
+      assert_receive {:write, worker, :a}
+      true = :erlang.suspend_process(old.pid)
+      send(pid, :stop)
+      assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+
+      promise = Writer.ready(writer)
+      assert promise.pid != old.pid
+      assert %TypeError{message: "This writer is no longer locked."} = rejection(promise)
+
+      true = :erlang.resume_process(old.pid)
+      send(worker, :continue)
+    end
   end
 
   describe "a release of the lock" do

@@ -3981,7 +3981,8 @@ defmodule Web.Stream do
   # [[closedPromise]]). The stream makes each promise at the first request,
   # thus a writer that does not ask for it costs no process. The process
   # that holds the lock owns the promise. An entry is
-  # `{:pending, promise, resolve, reject}` or `{:settled, promise, outcome}`.
+  # `{:pending, promise, resolve, reject, owner}` or
+  # `{:settled, promise, outcome, owner}`.
   #
   # After each event, the stream compares each entry with the state of the
   # stream (`sync_writer_promises/2`):
@@ -4044,32 +4045,41 @@ defmodule Web.Stream do
   end
 
   defp new_writer_entry(status, data) do
-    {promise, resolve, reject} =
-      Web.Promise.with_owner(data.writer_pid || self(), fn -> Web.Promise.with_resolvers() end)
-
-    settle_writer_entry({:pending, promise, resolve, reject}, status)
+    owner = data.writer_pid || self()
+    {promise, resolve, reject} = Web.Promise.with_owner(owner, &Web.Promise.with_resolvers/0)
+    settle_writer_entry({:pending, promise, resolve, reject, owner}, status)
   end
 
-  defp settle_writer_entry({:pending, promise, resolve, reject} = entry, status) do
+  defp settle_writer_entry({:pending, promise, resolve, reject, owner} = entry, status) do
     case status do
       :pending -> entry
-      {:fulfilled, value} -> settled_entry(promise, resolve, status, value)
-      {:rejected, reason} -> settled_entry(promise, reject, status, reason)
+      {:fulfilled, value} -> settled_entry(promise, resolve, status, value, owner)
+      {:rejected, reason} -> settled_entry(promise, reject, status, reason, owner)
     end
   end
 
-  defp settled_entry(promise, settle, outcome, value) do
+  defp settled_entry(promise, settle, outcome, value, owner) do
     settle.(value)
-    {:settled, promise, outcome}
+    {:settled, promise, outcome, owner}
   end
 
-  # A promise that settled stops after its linger time: then the request
-  # gets a promise with the same outcome.
-  defp entry_promise({:pending, promise, _resolve, _reject}), do: promise
+  # A promise that settled stops after its linger time, or when its owner
+  # stops: then the request gets a promise with the same outcome. The stop
+  # of the owner comes to the promise some time after the stop: a promise
+  # that is alive, of an owner that stopped, stops soon. Thus the stream
+  # also examines the owner.
+  defp entry_promise({:pending, promise, _resolve, _reject, _owner}), do: promise
 
-  defp entry_promise({:settled, promise, outcome}) do
-    if Process.alive?(promise.pid), do: promise, else: %Web.Promise{state: outcome}
+  defp entry_promise({:settled, promise, outcome, owner}) do
+    if local_alive?(owner) and Process.alive?(promise.pid),
+      do: promise,
+      else: %Web.Promise{state: outcome}
   end
+
+  # The stream cannot examine a process of a different node: the promise
+  # then tells.
+  defp local_alive?(pid) when node(pid) == node(), do: Process.alive?(pid)
+  defp local_alive?(_pid), do: true
 
   defp sync_writer_promises(_state, %{writer_ready: nil, writer_closed: nil} = data),
     do: {data, false}
@@ -4081,18 +4091,18 @@ defmodule Web.Stream do
     {%{data | writer_ready: ready, writer_closed: closed}, changed?}
   end
 
-  defp sync_ready({:pending, _promise, _resolve, _reject} = entry, status),
+  defp sync_ready({:pending, _promise, _resolve, _reject, _owner} = entry, status),
     do: settle_writer_entry(entry, status)
 
   # The backpressure is on again, or the stream is erroring: the next
   # request gets a new promise.
-  defp sync_ready({:settled, _promise, {:fulfilled, _value}}, status)
+  defp sync_ready({:settled, _promise, {:fulfilled, _value}, _owner}, status)
        when status == :pending or elem(status, 0) == :rejected,
        do: nil
 
   defp sync_ready(entry, _status), do: entry
 
-  defp sync_closed({:pending, _promise, _resolve, _reject} = entry, status),
+  defp sync_closed({:pending, _promise, _resolve, _reject, _owner} = entry, status),
     do: settle_writer_entry(entry, status)
 
   defp sync_closed(entry, _status), do: entry
@@ -4121,7 +4131,7 @@ defmodule Web.Stream do
 
   # A promise that settled before the release is replaced: the writer gets a
   # new rejected promise, thus the entry goes away.
-  defp reject_pending({:pending, _promise, _resolve, _reject} = entry, error),
+  defp reject_pending({:pending, _promise, _resolve, _reject, _owner} = entry, error),
     do: settle_writer_entry(entry, {:rejected, error})
 
   defp reject_pending(_entry, _error), do: nil

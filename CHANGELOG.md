@@ -6,6 +6,31 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- The members of the Standards that were missing:
+  - `for_each/2` of `Web.Headers`, `Web.URLSearchParams`, and
+    `Web.FormData`, and `keys/1`, `values/1`, and `entries/1` where they
+    were missing.
+  - The constructors `Web.ReadableStreamDefaultReader.new/1`,
+    `Web.ReadableStreamBYOBReader.new/1`, and
+    `Web.WritableStreamDefaultWriter.new/1`, and `Web.Request.url/1`.
+  - The default chunk `nil` of `enqueue/2` and `write/2`, as
+    `optional any chunk`.
+  - The option `:endings` of `Web.Blob.new/2` and `Web.File.new/3`
+    (`"transparent"` or `"native"`).
+  - `Web.Promise.then/3` with `onRejected`, and `Web.Promise.try/2`.
+  - `Web.AsyncContext.Snapshot.wrap/1` and the arguments of
+    `Snapshot.run/3` and `Variable.run/4`, as the proposal specifies.
+  - `Web.Governor.wrap_iterator/2`, as `wrapIterator(it)` of the proposal
+    for concurrency control.
+  - `Web.MessageEvent.init_message_event/9`, `Web.Performance.Mark.new/2`,
+    and `to_json/1` of the performance entries.
+  - The field `cause` of `Web.RangeError`, and `message` and `cause` of
+    `Web.AggregateError`.
+- `tla/SocketClose.tla`: the close, the half close, and the upgrade of a
+  socket, with a conformance test on a real TCP socket. Its `Bug` values
+  are the old behaviors.
+- The WPT files `fetch/data-urls/processing.any.js` and
+  `fetch/data-urls/base64.any.js` run in the runner: 154 more tests pass.
 - `Web.ReadableStream.values/2` and `Web.ReadableStreamAsyncIterator`, the
   async iterator of the Streams Standard: `next/1` and `return/2` return
   promises of `%{value: value, done: done}`. The option `prevent_cancel:`
@@ -612,6 +637,55 @@ All notable changes to this project are documented in this file.
       `local_address`.
     - The option `:ignoreBOM` of `Web.TextDecoder.new/2` is removed: use
       `:ignore_bom`.
+- **Breaking:** the results and the inputs of the public functions follow
+  the Standards. The changes:
+  - `Web.Blob.text/1`, `array_buffer/1`, and `bytes/1` (also of a
+    `Web.File`) return a promise, as the File API specifies. Change
+    `{:ok, text} = Blob.text(blob)` to `text = Web.await(Blob.text(blob))`.
+  - The option `:signal` of `Web.Request.new/2`, `Web.fetch/2`,
+    `pipe_to/3`, and `pipe_through/3`, and the signals of
+    `Web.AbortSignal.any/1`, accept only a `Web.AbortSignal` (or `nil` for
+    the option). Each other value gives a `Web.TypeError`.
+  - `Web.fetch/2` does "scheme fetch" of the Fetch Standard: `about:blank`
+    gives an empty HTML response, a `data:` URL goes through the "data: URL
+    processor", and `file:` and each scheme that the library does not know
+    give a network error. Before, such a URL went to the HTTP client. The
+    schemes of the library, `tcp:` and the form `remote:path`, stay.
+  - A setter that gets `nil` takes the string `"null"`, as Web IDL converts
+    `null`: `Web.URL.port(url, nil)` makes no change, and a name or a value
+    `nil` of `Web.URLSearchParams`, `Web.Headers`, or `Web.FormData` is
+    `"null"`. Use `""` to clear a part of a URL. `Web.URL.port/2` with a
+    number outside 0 to 65535 makes no change. `Web.FormData.append/4` and
+    `set/4` with a file name and a value that is not a blob raise
+    `Web.TypeError`.
+  - The sockets follow the draft of the WinterTC Sockets API:
+    - `Web.Socket.start_tls/1` returns the new socket at once, and its
+      `opened` fulfils after the handshake. Remove the `await`. The first
+      socket closes, and `Web.Socket.upgraded?/1` gives `true`. The field
+      `upgraded` is removed.
+    - `closed` and `Web.Socket.close/2` fulfil with `nil`. A failure
+      rejects with a `Web.TypeError` whose message starts with
+      "SocketError: ", and whose `cause` is the reason.
+    - `close(reason)` cancels the readable side and aborts the writable
+      side with the reason. The default reason is `nil`.
+    - A cancel of the readable side, and a close or an abort of the
+      writer, do not close the socket: a close of the writer sends a TCP
+      half close. Call `Web.Socket.close/2` to close the socket.
+    - The options `:allow_half_open`, `:sni`, and `:alpn` work. An option
+      that is not valid raises at `Web.connect/2`. When the process that
+      holds a socket stops, `closed` fulfils.
+  - `Web.MessageChannel.new/0` returns a struct with `port1` and `port2`.
+    Change `{port1, port2} = MessageChannel.new()` to
+    `%{port1: port1, port2: port2} = MessageChannel.new()`.
+  - A `Web.MessageEvent` is an `Event`, with the fields and the functions of
+    `Web.Event`. The events `message`, `messageerror`, and `close` of a port
+    or a channel are trusted, and a listener sees the phase AT_TARGET.
+  - The getters `Web.Event.default_prevented/1`, `cancel_bubble/1`, and
+    `return_value/1` are `default_prevented?/1`, `cancel_bubble?/1`, and
+    `return_value?/1`: they are boolean attributes.
+  - `Web.Performance.mark/2` and `measure/3` ignore an option that they do
+    not know. A number as a start or end mark is the name of a mark: give a
+    time with `:start` and `:end`.
 - `Web.Blob` follows the File API: the type becomes ASCII lowercase, and a
   type with a character outside U+0020 to U+007E becomes `""`. The functions
   of `Web.Blob` accept a `Web.File`. `Web.Blob.stream/1` is a byte stream,

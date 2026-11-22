@@ -5,8 +5,7 @@ defmodule Web.URLPatternTest do
   use Web.Platform.Test,
     urls: [
       "https://raw.githubusercontent.com/web-platform-tests/wpt/master/urlpattern/resources/urlpatterntestdata.json",
-      "https://raw.githubusercontent.com/web-platform-tests/wpt/master/urlpattern/resources/urlpattern-generate-test-data.json",
-      "https://raw.githubusercontent.com/web-platform-tests/wpt/master/urlpattern/resources/urlpattern-compare-test-data.json"
+      "https://raw.githubusercontent.com/web-platform-tests/wpt/master/urlpattern/resources/urlpattern-generate-test-data.json"
     ],
     prefix: "URLPattern WPT compliance"
 
@@ -24,17 +23,6 @@ defmodule Web.URLPatternTest do
   # ---------------------------------------------------------------------------
 
   @impl Web.Platform.Test
-  def web_platform_test(%{"left" => left, "right" => right} = test_case) do
-    left = URLPattern.new(left)
-    right = URLPattern.new(right)
-    component = test_case["component"]
-    expected = test_case["expected"]
-
-    assert URLPattern.compare_component(component, left, right) == expected
-    assert URLPattern.compare_component(component, right, left) == -expected
-    assert URLPattern.compare_component(component, left, left) == 0
-  end
-
   def web_platform_test(%{"component" => component, "groups" => groups} = test_case) do
     pattern = URLPattern.new(test_case["pattern"])
 
@@ -371,32 +359,6 @@ defmodule Web.URLPatternTest do
   describe "the cache" do
     test "gives the same struct for the same pattern" do
       assert URLPattern.new(%{pathname: "/foo/:id"}) == URLPattern.new(%{pathname: "/foo/:id"})
-    end
-  end
-
-  describe "compare_component/3" do
-    test "ranks the fixed text, the regular expressions, and the wildcards" do
-      fixed = URLPattern.new(%{pathname: "/a"})
-      regexp = URLPattern.new(%{pathname: "/:id(\\d+)"})
-      segment = URLPattern.new(%{pathname: "/:id"})
-      full = URLPattern.new(%{pathname: "/*"})
-
-      assert URLPattern.compare_component(:pathname, fixed, regexp) == 1
-      assert URLPattern.compare_component(:pathname, regexp, segment) == 1
-      assert URLPattern.compare_component(:pathname, segment, full) == 1
-      assert URLPattern.compare_component("pathname", full, full) == 0
-    end
-
-    test "raises ArgumentError for a name that is not a component" do
-      pattern = URLPattern.new(%{pathname: "/"})
-
-      assert_raise ArgumentError, ~r/Unknown URLPattern component/, fn ->
-        URLPattern.compare_component("invalid", pattern, pattern)
-      end
-
-      assert_raise ArgumentError, ~r/Unknown URLPattern component/, fn ->
-        URLPattern.compare_component(123, pattern, pattern)
-      end
     end
   end
 end

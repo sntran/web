@@ -683,7 +683,7 @@ defmodule Web.URL do
   end
 
   defp standard_path_for_href(%{pathname: pathname, protocol: protocol}) when pathname == "" do
-    if protocol == "file:" or Parser.special_scheme?(protocol) or protocol == "mock:" do
+    if protocol == "file:" or Parser.special_scheme?(protocol) do
       "/"
     else
       nil

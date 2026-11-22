@@ -50,7 +50,9 @@ defmodule SMTPClientExample do
     ReadableStreamDefaultReader.release_lock(reader)
     WritableStreamDefaultWriter.release_lock(writer)
 
-    socket = await(Socket.start_tls(socket))
+    # The TLS socket comes at once. Its promise `opened` fulfils after the
+    # handshake.
+    socket = Socket.start_tls(socket)
     await(socket.opened)
 
     reader = line_reader(socket)

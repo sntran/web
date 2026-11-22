@@ -106,12 +106,45 @@ defmodule Web.PerformanceTest do
       assert names(Performance.get_entries()) == ["with detail"]
     end
 
-    test "options that are not correct raise TypeError" do
-      assert_raise Web.TypeError, ~r/Unknown options: \[:start\]/, fn ->
-        Performance.mark("m", start: 1)
-      end
+    test "an option that is not a member of PerformanceMarkOptions has no effect" do
+      # A dictionary of Web IDL ignores a member that it does not know.
+      before = Performance.now()
+      mark = Performance.mark("m", start: 1, detail: :kept)
+      assert mark.start_time >= before
+      assert mark.detail == :kept
 
       assert_raise Web.TypeError, ~r/keyword list/, fn -> Performance.mark("m", [1, 2]) end
+    end
+
+    test "Mark.new/2 makes a mark that is not an entry, as new PerformanceMark()" do
+      mark = Mark.new("made", start_time: 4, detail: %{a: 1}, other: :ignored)
+      assert %Mark{name: "made", start_time: 4.0, duration: +0.0, detail: %{a: 1}} = mark
+      assert Performance.get_entries() == []
+
+      before = Performance.now()
+      assert Mark.new(:now).start_time >= before
+
+      assert_raise Web.TypeError, ~r/not below zero/, fn -> Mark.new("m", start_time: -1) end
+    end
+
+    test "to_json/1 gives the attributes of PerformanceEntry" do
+      mark = Performance.mark("json", start_time: 2, detail: :not_in_json)
+
+      assert Mark.to_json(mark) == %{
+               "name" => "json",
+               "entryType" => "mark",
+               "startTime" => 2.0,
+               "duration" => 0.0
+             }
+
+      measure = Performance.measure("span", start: 2, end: 5)
+
+      assert Measure.to_json(measure) == %{
+               "name" => "span",
+               "entryType" => "measure",
+               "startTime" => 2.0,
+               "duration" => 3.0
+             }
     end
   end
 
@@ -180,11 +213,17 @@ defmodule Web.PerformanceTest do
       assert names(Performance.get_entries()) == ["only a measure"]
     end
 
-    test "a time is a moment too" do
+    test "a number in the place of a mark is the name of a mark, as a DOMString" do
+      Performance.mark("4", start_time: 4)
+      Performance.mark("10.5", start_time: 10.5)
       measure = Performance.measure("times", 4, 10.5)
       assert {measure.start_time, measure.duration} == {4.0, 6.5}
 
-      assert_raise Web.TypeError, fn -> Performance.measure("negative", -1) end
+      exception = assert_raise DOMException, fn -> Performance.measure("negative", -1) end
+      assert exception.name == "SyntaxError"
+
+      exception = assert_raise DOMException, fn -> Performance.measure("end", "4", 7) end
+      assert exception.name == "SyntaxError"
     end
 
     test "with the options :start and :end" do
@@ -229,10 +268,6 @@ defmodule Web.PerformanceTest do
         apply(Performance, :measure, ["m", [start: 1], "end"])
       end
 
-      assert_raise Web.TypeError, ~r/Unknown options/, fn ->
-        Performance.measure("m", start: 1, finish: 2)
-      end
-
       assert_raise Web.TypeError, ~r/not below zero/, fn ->
         Performance.measure("m", start: 1, duration: -2)
       end
@@ -242,6 +277,25 @@ defmodule Web.PerformanceTest do
 
     test "an empty list of options is no options" do
       assert %Measure{start_time: +0.0} = Performance.measure("m", [])
+    end
+
+    test "an option that is not a member of PerformanceMeasureOptions has no effect" do
+      Performance.mark("b", start_time: 25.0)
+
+      # The member :finish is not known: the measure is from 1 to now.
+      before = Performance.now()
+      measure = Performance.measure("m", start: 1, finish: 2)
+      assert measure.start_time == 1.0
+      assert measure.start_time + measure.duration >= before
+
+      # Options with no member are no options: the end mark is permitted.
+      assert %Measure{start_time: +0.0, duration: 25.0} =
+               Performance.measure("to b", [finish: 2], "b")
+
+      before = Performance.now()
+      measure = Performance.measure("to now", other: 1)
+      assert measure.start_time == 0.0
+      assert measure.duration >= before
     end
   end
 

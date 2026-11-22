@@ -7,7 +7,7 @@ defmodule Web.MessagePort do
   `message`. The message is a structured clone: see
   `Web.structured_clone/2`.
 
-      {port1, port2} = Web.MessageChannel.new()
+      %{port1: port1, port2: port2} = Web.MessageChannel.new()
 
       Web.MessagePort.onmessage(port2, fn event ->
         # Answer on the port that got the message.
@@ -186,7 +186,7 @@ defmodule Web.MessagePort do
 
   ## Examples
 
-      iex> {port1, port2} = Web.MessageChannel.new()
+      iex> %{port1: port1, port2: port2} = Web.MessageChannel.new()
       iex> test = self()
       iex> Web.MessagePort.onmessage(port2, fn event -> send(test, event.data) end)
       iex> Web.MessagePort.post_message(port1, %{status: "ready"})
@@ -221,29 +221,37 @@ defmodule Web.MessageChannel do
   A channel with two connected ports, as `MessageChannel` of the HTML
   Standard.
 
-  See `Web.MessagePort`.
+  The fields `port1` and `port2` are the attributes of the Standard. See
+  `Web.MessagePort`.
   """
 
   alias Web.Internal.MessagePort, as: Engine
   alias Web.MessagePort
 
+  @enforce_keys [:port1, :port2]
+  defstruct [:port1, :port2]
+
+  @type t :: %__MODULE__{port1: MessagePort.t(), port2: MessagePort.t()}
+
   @doc """
-  Makes a channel and returns its two ports.
+  Makes a channel with two connected ports, as the constructor
+  `new MessageChannel()`.
 
   The process that calls this function is the holder of the two ports: the
   ports close when it stops.
 
   ## Examples
 
-      iex> {port1, port2} = Web.MessageChannel.new()
+      iex> %Web.MessageChannel{port1: port1, port2: port2} = Web.MessageChannel.new()
       iex> is_struct(port1, Web.MessagePort) and is_struct(port2, Web.MessagePort)
       true
       iex> Web.MessagePort.close(port1)
       :ok
   """
-  @spec new() :: {MessagePort.t(), MessagePort.t()}
+  @spec new() :: t()
   def new do
-    Engine.start_pair(self())
+    {port1, port2} = Engine.start_pair(self())
+    %__MODULE__{port1: port1, port2: port2}
   end
 end
 

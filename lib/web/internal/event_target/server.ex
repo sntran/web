@@ -28,8 +28,10 @@ defmodule Web.Internal.EventTarget.Server do
 
   alias Web.AbortSignal
   alias Web.AsyncContext.Snapshot
+  alias Web.Event
 
   @abort_message_prefix {Web.EventTarget, :abort_signal}
+  @at_target 2
 
   @type listener :: %{
           id: non_neg_integer(),
@@ -278,20 +280,44 @@ defmodule Web.Internal.EventTarget.Server do
     end
   end
 
+  # The listeners of the event, as the steps "inner invoke" of the DOM
+  # Standard for a target with no parent. During the calls, the event has
+  # its dispatch flag and the phase AT_TARGET: thus `Web.Event` gives the
+  # current target. A call of `Web.Event.stop_immediate_propagation/1`
+  # stops the calls.
   defp invoke_listeners(state, %{type: type} = event) do
     type = normalize_type(type)
     listeners = Map.get(state.listeners, type, [])
+    begin_dispatch(event)
 
-    Enum.reduce(listeners, state, fn listener, acc ->
-      invoke_listener(listener.callback, event, type, acc)
-
-      if listener.once do
-        remove_listener_by_id(acc, type, listener.id)
-      else
-        acc
-      end
-    end)
+    try do
+      Enum.reduce_while(listeners, state, fn listener, acc ->
+        invoke_listener(listener.callback, event, type, acc)
+        acc = if listener.once, do: remove_listener_by_id(acc, type, listener.id), else: acc
+        if Event.__flag__(event, :stop_immediate), do: {:halt, acc}, else: {:cont, acc}
+      end)
+    after
+      end_dispatch(event)
+    end
   end
+
+  defp begin_dispatch(%{flags: flags} = event) when flags != nil do
+    Event.__put_flag__(event, :dispatch, 1)
+    Event.__put_phase__(event, @at_target)
+  end
+
+  defp begin_dispatch(_event), do: :ok
+
+  defp end_dispatch(%{flags: flags} = event) when flags != nil do
+    Event.__put_phase__(event, 0)
+
+    for flag <- [:dispatch, :stop_propagation, :stop_immediate],
+        do: Event.__put_flag__(event, flag, 0)
+
+    :ok
+  end
+
+  defp end_dispatch(_event), do: :ok
 
   defp invoke_listener(:handler, event, type, state) do
     case state.handlers do

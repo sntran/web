@@ -163,8 +163,13 @@ defmodule Web.Internal.MessageTarget do
     :ok
   end
 
+  # The steps of `dispatchEvent(event)`: the event is not trusted. The
+  # listener process does the dispatch at a later time, thus the caller
+  # cannot see the end of a dispatch: the function does not refuse an event
+  # that is in a dispatch.
   @spec dispatch_event(handle(), Web.EventTarget.event()) :: boolean()
   def dispatch_event(handle, event) do
+    event = if Map.has_key?(event, :is_trusted), do: %{event | is_trusted: false}, else: event
     _reply = call(handle, {:dispatch, event, Snapshot.new()})
     true
   end

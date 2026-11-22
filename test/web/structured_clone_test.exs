@@ -336,7 +336,7 @@ defmodule Web.StructuredCloneTest do
     end
 
     test "a MessagePort that is not in the transfer list" do
-      {port1, port2} = MessageChannel.new()
+      %{port1: port1, port2: port2} = MessageChannel.new()
 
       assert data_clone_error(fn -> Web.structured_clone(%{"port" => port1}) end) ==
                "A MessagePort cannot be cloned. Put it in the transfer list."
@@ -399,7 +399,7 @@ defmodule Web.StructuredCloneTest do
 
     test "nothing is detached when the message cannot be cloned" do
       buffer = ArrayBuffer.new("hello")
-      {port1, port2} = MessageChannel.new()
+      %{port1: port1, port2: port2} = MessageChannel.new()
 
       data_clone_error(fn ->
         Web.structured_clone(%{"bad" => self()}, transfer: [buffer, port1])
@@ -413,7 +413,7 @@ defmodule Web.StructuredCloneTest do
     end
 
     test "a transferred MessagePort gives a new handle, and the first handle is detached" do
-      {port1, port2} = MessageChannel.new()
+      %{port1: port1, port2: port2} = MessageChannel.new()
       test = self()
 
       moved = Web.structured_clone(port1, transfer: [port1])
@@ -438,8 +438,8 @@ defmodule Web.StructuredCloneTest do
     end
 
     test "the record has the transferred ports in the sequence of the list" do
-      {port1, port2} = MessageChannel.new()
-      {port3, port4} = MessageChannel.new()
+      %{port1: port1, port2: port2} = MessageChannel.new()
+      %{port1: port3, port2: port4} = MessageChannel.new()
 
       record = StructuredData.serialize([port3], transfer: [port1, port3])
 

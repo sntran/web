@@ -11,7 +11,7 @@ defmodule Web.Promise do
     * Any process can await a promise, and can await it more than one time.
     * The executor can call `resolve` or `reject` at a later time, from any
       process.
-    * `then/2`, `catch/2`, and `finally/2` return a new promise immediately.
+    * `then/3`, `catch/2`, and `finally/2` return a new promise immediately.
       The callback runs in a different process, with the
       `Web.AsyncContext` values of the caller.
     * A rejection is a state. The value `{:error, reason}` is a usual value.
@@ -128,6 +128,27 @@ defmodule Web.Promise do
   @spec reject(term()) :: t()
   def reject(reason), do: %__MODULE__{state: {:rejected, reason}}
 
+  @doc """
+  Calls `fun` with the arguments `args` now, in the calling process, and
+  returns a promise of its result, as `Promise.try(callbackfn, ...args)`.
+
+  If `fun` raises, throws, or exits, the promise rejects with that value.
+  If `fun` returns a promise, the result is that promise.
+
+  ## Examples
+
+      iex> Web.await(Web.Promise.try(fn a, b -> a + b end, [1, 2]))
+      3
+      iex> catch_exit(Web.await(Web.Promise.try(fn -> throw(:no) end)))
+      :no
+  """
+  @spec unquote(:try)(function(), list()) :: t()
+  def unquote(:try)(fun, args \\ []) when is_function(fun, length(args)) do
+    resolve(apply(fun, args))
+  catch
+    _kind, reason -> reject(reason)
+  end
+
   # ---------------------------------------------------------------------------
   # Await
   # ---------------------------------------------------------------------------
@@ -165,61 +186,84 @@ defmodule Web.Promise do
   # Chaining
   # ---------------------------------------------------------------------------
 
-  @doc """
-  Returns a promise for the result of `on_fulfilled`, as `then()`.
+  @typedoc "A callback of `then/3`, or `nil` for `undefined`."
+  @type reaction :: (term() -> term()) | nil
 
-  If the first promise rejects, the new promise rejects with the same reason.
-  If the callback returns a promise, the new promise takes its outcome.
+  @doc """
+  Returns a promise for the result of a callback, as
+  `then(onFulfilled, onRejected)`.
+
+  `on_fulfilled` gets the value of a fulfilled promise, and `on_rejected`
+  gets the reason of a rejected promise. The callback that runs gives the
+  value of the new promise. If it returns a promise, the new promise takes
+  its outcome. If it raises, the new promise rejects.
+
+  Each callback can be `nil`, as `undefined` in ECMAScript. With no
+  `on_fulfilled`, the new promise fulfils with the value of the first
+  promise. With no `on_rejected`, it rejects with the same reason.
+
+  ## Examples
+
+      iex> Web.Promise.reject(:bad) |> Web.Promise.then(nil, fn reason -> {:recovered, reason} end) |> Web.await()
+      {:recovered, :bad}
   """
-  @spec then(t() | term(), (term() -> term())) :: t()
-  def then(promise, on_fulfilled) when is_function(on_fulfilled, 1) do
-    case resolve(promise) do
-      %__MODULE__{state: {:rejected, _}} = rejected ->
+  @spec then(t() | term(), reaction(), reaction()) :: t()
+  def then(promise, on_fulfilled, on_rejected \\ nil)
+      when (is_function(on_fulfilled, 1) or is_nil(on_fulfilled)) and
+             (is_function(on_rejected, 1) or is_nil(on_rejected)) do
+    case {resolve(promise), on_fulfilled, on_rejected} do
+      # A settled promise with no callback for its state: the new promise
+      # has the same outcome, and needs no process.
+      {%__MODULE__{state: {:rejected, _}} = rejected, _on_fulfilled, nil} ->
         rejected
 
-      upstream ->
+      {%__MODULE__{state: {:fulfilled, _}} = fulfilled, nil, _on_rejected} ->
+        fulfilled
+
+      {upstream, on_fulfilled, on_rejected} ->
         new(fn resolve, reject ->
-          upstream |> wait() |> on_fulfilled(on_fulfilled, resolve, reject)
+          upstream |> wait() |> react(on_fulfilled, on_rejected, resolve, reject)
         end)
     end
   end
 
-  defp on_fulfilled({:fulfilled, value}, callback, resolve, _reject) do
-    resolve.(callback.(value))
-  end
+  # The steps "PerformPromiseThen": a callback that is `undefined` passes
+  # the outcome on.
+  defp react({:fulfilled, value}, nil, _on_rejected, resolve, _reject), do: resolve.(value)
 
-  defp on_fulfilled({:rejected, reason}, _callback, _resolve, reject), do: reject.(reason)
+  defp react({:fulfilled, value}, on_fulfilled, _on_rejected, resolve, _reject),
+    do: resolve.(on_fulfilled.(value))
+
+  defp react({:rejected, reason}, _on_fulfilled, nil, _resolve, reject), do: reject.(reason)
+
+  defp react({:rejected, reason}, _on_fulfilled, on_rejected, resolve, _reject),
+    do: resolve.(on_rejected.(reason))
 
   @doc """
   Returns a promise that recovers from a rejection with `on_rejected`, as
-  `catch()`.
+  `catch()`. This is `then(promise, nil, on_rejected)`.
 
   If the first promise is fulfilled, the new promise has the same value.
+  `nil` is `undefined`: the new promise has the outcome of the first
+  promise.
   """
-  @spec unquote(:catch)(t() | term(), (term() -> term())) :: t()
-  def unquote(:catch)(promise, on_rejected) when is_function(on_rejected, 1) do
-    case resolve(promise) do
-      %__MODULE__{state: {:fulfilled, _}} = fulfilled ->
-        fulfilled
-
-      upstream ->
-        new(fn resolve, _reject ->
-          upstream |> wait() |> on_rejected(on_rejected, resolve)
-        end)
-    end
+  @spec unquote(:catch)(t() | term(), reaction()) :: t()
+  def unquote(:catch)(promise, on_rejected)
+      when is_function(on_rejected, 1) or is_nil(on_rejected) do
+    then(promise, nil, on_rejected)
   end
-
-  defp on_rejected({:fulfilled, value}, _callback, resolve), do: resolve.(value)
-  defp on_rejected({:rejected, reason}, callback, resolve), do: resolve.(callback.(reason))
 
   @doc """
   Runs `on_finally` when the promise settles, and keeps the outcome, as
   `finally()`.
 
   If the callback raises, or returns a promise that rejects, the new promise
-  rejects with that reason.
+  rejects with that reason. `nil` is `undefined`: the new promise has the
+  outcome of the first promise.
   """
-  @spec finally(t() | term(), (-> term())) :: t()
+  @spec finally(t() | term(), (-> term()) | nil) :: t()
+  def finally(promise, nil), do: then(promise, nil, nil)
+
   def finally(promise, on_finally) when is_function(on_finally, 0) do
     upstream = resolve(promise)
 

@@ -161,6 +161,7 @@ defmodule Web.BroadcastChannelTest do
 
       assert_receive {:first, %MessageEvent{} = event}
       assert event.type == "message"
+      assert event.is_trusted
       assert event.data == %{id: 7, state: :done}
       assert event.origin == "node://" <> Atom.to_string(node())
       assert event.ports == []
@@ -266,7 +267,13 @@ defmodule Web.BroadcastChannelTest do
       payload = %{record: record, origin: "node://other@host", snapshot: Snapshot.new()}
       send(receiver.address, {:broadcast_channel_message, payload})
 
-      assert_receive {:error, %MessageEvent{type: "messageerror", origin: "node://other@host"}}
+      assert_receive {:error,
+                      %MessageEvent{
+                        type: "messageerror",
+                        origin: "node://other@host",
+                        is_trusted: true
+                      }}
+
       refute_receive {:message, _event}, 30
       assert is_function(BroadcastChannel.onmessageerror(receiver), 1)
     end

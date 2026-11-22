@@ -49,6 +49,31 @@ defmodule Web.Performance do
             duration: float(),
             detail: term()
           }
+
+    @doc """
+    Makes a mark, as the constructor `new PerformanceMark(markName,
+    markOptions)`. The options are the options of `Web.Performance.mark/2`.
+
+    The mark is not an entry of the process: `Web.Performance.mark/2` makes
+    a mark and adds it.
+
+    ## Examples
+
+        iex> mark = Web.Performance.Mark.new("loaded", start_time: 2.5)
+        iex> {mark.name, mark.start_time}
+        {"loaded", 2.5}
+        iex> Web.Performance.get_entries_by_name("loaded")
+        []
+    """
+    @spec new(Web.Performance.name(), keyword()) :: t()
+    def new(name, options \\ []), do: Web.Performance.__mark__(name, options)
+
+    @doc """
+    Returns the data of `toJSON()`: a map with the attributes of
+    `PerformanceEntry`.
+    """
+    @spec to_json(t()) :: %{String.t() => term()}
+    def to_json(%__MODULE__{} = mark), do: Web.Performance.__entry_json__(mark)
   end
 
   defmodule Measure do
@@ -65,6 +90,13 @@ defmodule Web.Performance do
             duration: float(),
             detail: term()
           }
+
+    @doc """
+    Returns the data of `toJSON()`: a map with the attributes of
+    `PerformanceEntry`.
+    """
+    @spec to_json(t()) :: %{String.t() => term()}
+    def to_json(%__MODULE__{} = measure), do: Web.Performance.__entry_json__(measure)
   end
 
   @time_origin_key {__MODULE__, :time_origin}
@@ -75,8 +107,11 @@ defmodule Web.Performance do
   @typedoc "A name. An atom and a number become a string."
   @type name :: String.t() | atom() | number()
 
-  @typedoc "The name of a mark, or a time in milliseconds from the time origin."
-  @type moment :: name()
+  @typedoc """
+  The name of a mark, or a time in milliseconds from the time origin: the
+  type of the options `:start` and `:end` of `measure/3`.
+  """
+  @type moment :: String.t() | atom() | number()
 
   # ---------------------------------------------------------------------------
   # Time
@@ -151,6 +186,9 @@ defmodule Web.Performance do
     * `:detail` - data for the mark. The mark has a structured clone of it:
       see `Web.structured_clone/2`.
 
+  The options are the members of `PerformanceMarkOptions`. As a dictionary
+  of Web IDL, the function ignores each other option.
+
   Raises `Web.TypeError` for a time that is not a number, or that is below
   zero.
 
@@ -163,7 +201,13 @@ defmodule Web.Performance do
       :ok
   """
   @spec mark(name(), keyword()) :: Mark.t()
-  def mark(name, options \\ []) do
+  def mark(name, options \\ []), do: name |> __mark__(options) |> put_entry()
+
+  @doc false
+  # The steps of the constructor of `PerformanceMark`: the mark is not an
+  # entry of the process.
+  @spec __mark__(name(), keyword()) :: Mark.t()
+  def __mark__(name, options) do
     options = options!(options, [:start_time, :detail])
 
     start_time =
@@ -172,7 +216,19 @@ defmodule Web.Performance do
         :error -> now()
       end
 
-    put_entry(%Mark{name: text(name), start_time: start_time, detail: detail(options)})
+    %Mark{name: text(name), start_time: start_time, detail: detail(options)}
+  end
+
+  @doc false
+  # The default `toJSON()` of `PerformanceEntry`.
+  @spec __entry_json__(entry()) :: %{String.t() => term()}
+  def __entry_json__(entry) do
+    %{
+      "name" => entry.name,
+      "entryType" => entry.entry_type,
+      "startTime" => entry.start_time,
+      "duration" => entry.duration
+    }
   end
 
   @doc """
@@ -185,7 +241,9 @@ defmodule Web.Performance do
       measure(name, start_mark, end_mark)  # between two marks
       measure(name, options)
 
-  A mark is the name of the mark that was made last with that name.
+  A mark is the name of the mark that was made last with that name. An
+  atom and a number become the text of a name, as a `DOMString` of Web
+  IDL: a time is only an option.
 
   ## Options
 
@@ -196,7 +254,9 @@ defmodule Web.Performance do
     * `:detail` - data for the measure, as for `mark/2`.
 
   With no `:start`, the measure starts at the time origin. With no `:end`,
-  it ends now.
+  it ends now. The options are the members of `PerformanceMeasureOptions`:
+  the function ignores each other option. A list of options with no member
+  is no options.
 
   Raises `Web.DOMException` with the name `SyntaxError` for a mark that
   does not exist. Raises `Web.TypeError` for options that are not correct.
@@ -214,12 +274,25 @@ defmodule Web.Performance do
       iex> Web.Performance.clear_measures()
       :ok
   """
-  @spec measure(name(), moment() | keyword() | nil, moment() | nil) :: Measure.t()
+  @spec measure(name(), name() | keyword() | nil, name() | nil) :: Measure.t()
   def measure(name, start_or_options \\ nil, end_mark \\ nil)
 
-  def measure(name, options, end_mark) when is_list(options) and options != [] do
-    options = options!(options, [:start, :end, :duration, :detail])
+  def measure(name, options, end_mark) when is_list(options) do
+    case options!(options, [:start, :end, :duration, :detail]) do
+      # Step 1: the rules of the options apply when at least one member
+      # is there.
+      [] -> measure(name, nil, end_mark)
+      options -> measure_with_options(name, options, end_mark)
+    end
+  end
 
+  def measure(name, start_mark, end_mark) do
+    end_time = if end_mark == nil, do: now(), else: mark_time!(end_mark)
+    start_time = if start_mark == nil, do: 0.0, else: mark_time!(start_mark)
+    put_measure(name, start_time, end_time, nil)
+  end
+
+  defp measure_with_options(name, options, end_mark) do
     if end_mark != nil do
       raise TypeError, "A measure with options cannot have an end mark."
     end
@@ -231,13 +304,6 @@ defmodule Web.Performance do
     end_time = end_time(finish, start, duration)
     start_time = start_time(start, end_time, duration)
     put_measure(name, start_time, end_time, detail(options))
-  end
-
-  def measure(name, start_mark, end_mark) do
-    start_mark = if start_mark == [], do: nil, else: start_mark
-    end_time = if end_mark == nil, do: now(), else: moment!(end_mark)
-    start_time = if start_mark == nil, do: 0.0, else: moment!(start_mark)
-    put_measure(name, start_time, end_time, nil)
   end
 
   # The rules of the Standard for the options of a measure.
@@ -345,11 +411,13 @@ defmodule Web.Performance do
   # Arguments
   # ---------------------------------------------------------------------------
 
-  # The time of a moment: a number is a time, and each other value is the
-  # name of a mark.
+  # The steps "convert a mark to a timestamp" for a member of the options:
+  # a number is a time, and each other value is the name of a mark.
   defp moment!(moment) when is_number(moment), do: time!(moment)
+  defp moment!(mark), do: mark_time!(mark)
 
-  defp moment!(mark) do
+  # The same steps for a `DOMString`: a number is the text of a name.
+  defp mark_time!(mark) do
     name = text(mark)
 
     # The list has the last entry first.
@@ -368,15 +436,14 @@ defmodule Web.Performance do
     raise TypeError, "A time must be a number that is not below zero, got: #{inspect(time)}"
   end
 
-  defp options!(options, permitted) do
+  # A dictionary of Web IDL has only its members: each other option has no
+  # effect.
+  defp options!(options, members) do
     if not Keyword.keyword?(options) do
       raise TypeError, "The options must be a keyword list, got: #{inspect(options)}"
     end
 
-    case Keyword.keys(options) -- permitted do
-      [] -> options
-      unknown -> raise TypeError, "Unknown options: #{inspect(unknown)}"
-    end
+    Keyword.take(options, members)
   end
 
   # The Standard keeps a structured clone of the detail.

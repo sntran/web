@@ -151,17 +151,20 @@ defmodule Web.Internal.MessagePort do
   # Functions that make the events, in the listener process
   # ---------------------------------------------------------------------------
 
+  # The port fires each event, as "fire an event" of the DOM Standard: the
+  # event is trusted.
+
   @doc false
   def message_event(record, target) do
     {data, ports} = StructuredData.deserialize_with_ports(record)
-    MessageEvent.__new__("message", data: data, ports: ports, target: target)
+    MessageEvent.__create__("message", data: data, ports: ports, target: target)
   rescue
     # The Standard fires `messageerror` when the message cannot be made.
-    _exception -> MessageEvent.__new__("messageerror", target: target)
+    _exception -> MessageEvent.__create__("messageerror", target: target)
   end
 
   @doc false
-  def close_event(target), do: Web.Event.__new__("close", target: target)
+  def close_event(target), do: Web.Event.__create__("close", target: target)
 
   # ---------------------------------------------------------------------------
   # The server

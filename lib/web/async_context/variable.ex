@@ -3,7 +3,7 @@ defmodule Web.AsyncContext.Variable do
   A variable of the asynchronous context, as `AsyncContext.Variable` of the
   TC39 proposal "AsyncContext".
 
-  A variable has a value only in the callback of `run/3`, and in the work
+  A variable has a value only in the callback of `run/4`, and in the work
   that a `Web.AsyncContext.Snapshot` of that callback runs. A promise and a
   stream of this library take a snapshot, thus their callbacks see the
   value in a different process.
@@ -23,7 +23,7 @@ defmodule Web.AsyncContext.Variable do
       :blue
 
   `Web.AsyncContext.Snapshot.new/0` keeps the values of all the variables,
-  and `Web.AsyncContext.Snapshot.run/2` uses them again.
+  and `Web.AsyncContext.Snapshot.run/3` uses them again.
   """
 
   @registry_key {__MODULE__, :__registry__}
@@ -85,7 +85,8 @@ defmodule Web.AsyncContext.Variable do
   end
 
   @doc """
-  Runs `fun` with `value` as the value of the variable, as `run(value, fn)`.
+  Runs `fun` with `value` as the value of the variable, as
+  `run(value, fn, ...args)`. `fun` gets the arguments of the list `args`.
   Returns the result of `fun`.
 
   After `fun`, the variable has its value from before again, also when
@@ -101,13 +102,14 @@ defmodule Web.AsyncContext.Variable do
       ...> end)
       2
   """
-  @spec run(t(), term(), (-> result)) :: result when result: var
-  def run(%__MODULE__{key: key} = _var, value, fun) when is_function(fun, 0) do
+  @spec run(t(), term(), function(), list()) :: term()
+  def run(%__MODULE__{key: key} = _var, value, fun, args \\ [])
+      when is_function(fun, length(args)) do
     previous = Process.get(key, :__async_context_unset__)
     Process.put(key, value)
 
     try do
-      fun.()
+      apply(fun, args)
     after
       case previous do
         :__async_context_unset__ -> Process.delete(key)

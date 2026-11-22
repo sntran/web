@@ -10,8 +10,8 @@ defmodule SecureWorkerExample do
 
   def run do
     owner = self()
-    {controller_bootstrap, worker_bootstrap} = MessageChannel.new()
-    {client_port, service_port} = MessageChannel.new()
+    %{port1: controller_bootstrap, port2: worker_bootstrap} = MessageChannel.new()
+    %{port1: client_port, port2: service_port} = MessageChannel.new()
 
     worker_pid =
       spawn(fn ->

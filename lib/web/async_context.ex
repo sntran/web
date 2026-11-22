@@ -17,7 +17,7 @@ defmodule Web.AsyncContext do
 
   `Web.AsyncContext.Snapshot` captures those variable bindings along with
   logger metadata, `$callers`, and the current ambient abort signal so they can
-  be re-entered later with `Snapshot.run/2`.
+  be re-entered later with `Snapshot.run/3`.
 
   ## Example
 

@@ -99,16 +99,18 @@ defmodule Web.Internal.BroadcastChannel do
   # The function that makes the event, in the listener process
   # ---------------------------------------------------------------------------
 
+  # The channel fires each event, as "fire an event" of the DOM Standard:
+  # the event is trusted.
   @doc false
   def message_event(%{record: record, origin: origin}, target) do
-    MessageEvent.__new__("message",
+    MessageEvent.__create__("message",
       data: StructuredData.deserialize(record),
       origin: origin,
       target: target
     )
   rescue
     # The Standard fires `messageerror` when the message cannot be made.
-    _exception -> MessageEvent.__new__("messageerror", origin: origin, target: target)
+    _exception -> MessageEvent.__create__("messageerror", origin: origin, target: target)
   end
 
   # ---------------------------------------------------------------------------

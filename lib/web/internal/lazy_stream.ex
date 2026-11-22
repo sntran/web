@@ -176,10 +176,12 @@ defmodule Web.Internal.LazyStream do
 
   @doc false
   # The look of a claim: the cell, and then the stream process of the
-  # registry, or `nil`.
+  # registry, or `nil`. Only the cells "process" and "taken" need the
+  # registry: the step after the look does not use it for the other cells.
+  # Thus the claim of a body with no process has no look in the registry.
   def __look__(%__MODULE__{} = lazy) do
     current = :atomics.get(lazy.ref, 1)
-    {current, live_stream(lazy)}
+    {current, if(current in [@process, @taken], do: live_stream(lazy))}
   end
 
   @doc false

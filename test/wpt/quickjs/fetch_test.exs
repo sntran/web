@@ -33,6 +33,8 @@ defmodule Web.WPT.QuickJS.FetchTest do
   alias Web.Test.QuickJS.WPT
 
   @files [
+    "fetch/api/abort/general.any.js",
+    "fetch/api/abort/request.any.js",
     "fetch/api/request/forbidden-method.any.js",
     "fetch/api/request/request-bad-port.any.js",
     "fetch/api/request/request-cache-default-conditional.any.js",

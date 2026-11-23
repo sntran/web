@@ -106,11 +106,15 @@ defmodule Web.Dispatcher.RequestProcess do
     PromiseCell.start(context.owner)
     Web.Promise.put_owner(context.owner)
 
+    # The signal of the request has no process: the request subscribes to
+    # the process of its source. See `Web.AbortSignal`.
+    source = Web.AbortSignal.__source__(request.signal)
+
     subscription =
-      case Web.AbortSignal.subscribe(request.signal) do
+      case Web.AbortSignal.subscribe(source) do
         {:ok, subscription} ->
           context = Map.put(context, :subscription, subscription)
-          with_request_signal(request.signal, fn -> run.(request, context) end)
+          with_request_signal(source, fn -> run.(request, context) end)
           subscription
 
         {:error, :aborted} ->
@@ -125,8 +129,8 @@ defmodule Web.Dispatcher.RequestProcess do
   end
 
   # The response of the request, and the streams that a read of its body
-  # makes, get the signal of the request. Thus an abort puts the body in the
-  # errored state.
+  # makes, get the source of the signal of the request. Thus an abort puts
+  # the body in the errored state.
   defp with_request_signal(%Web.AbortSignal{} = signal, fun) do
     Web.AsyncContext.with_signal(signal, fun)
   end
@@ -206,9 +210,9 @@ defmodule Web.Dispatcher.RequestProcess do
   end
 
   # The messages of the subscription to the abort signal: see
-  # `Web.AbortSignal.receive_abort/3`. The signal of a request is a
-  # `Web.AbortSignal`: see `Web.Request.new/2`. A signal whose process
-  # stopped is an aborted signal.
+  # `Web.AbortSignal.receive_abort/3`. The source of the signal of a request
+  # is a `Web.AbortSignal` or `nil`: see `Web.Request.new/2`. A signal whose
+  # process stopped is an aborted signal.
   defp abort_event({:abort, ref, reason}, %{type: :abort_signal, ref: ref}), do: reason
 
   defp abort_event({:DOWN, monitor, :process, _pid, reason}, %{monitor_ref: monitor}) do

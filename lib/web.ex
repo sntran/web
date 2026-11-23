@@ -391,8 +391,7 @@ defmodule Web do
   # The Fetch Standard has two forms of rejection: the abort reason of the
   # signal, and `TypeError` for each other failure. The field `cause` of the
   # `TypeError` has the failure of the dispatcher.
-  # The signal of a request is a `Web.AbortSignal` or `nil`: see
-  # `Web.Request.new/2`.
+  # The signal of a request is a `Web.AbortSignal`: see `Web.Request.new/2`.
   defp fetch_error(:aborted, %Web.Request{signal: signal}) do
     Web.AbortSignal.reason(signal) || Web.AbortSignal.default_reason()
   end
@@ -426,14 +425,14 @@ defmodule Web do
 
   defp fetch_error_detail(_reason), do: ""
 
-  defp do_fetch_with_signal(%Web.Request{signal: %Web.AbortSignal{} = signal} = request) do
-    Web.AsyncContext.with_signal(signal, fn ->
-      do_fetch(request)
-    end)
-  end
-
-  defp do_fetch_with_signal(%Web.Request{} = request) do
-    do_fetch(request)
+  # The streams that the dispatcher makes get the source of the signal of the
+  # request as their ambient signal: an abort puts them in the errored
+  # state. A signal that no abort can reach changes nothing.
+  defp do_fetch_with_signal(%Web.Request{signal: signal} = request) do
+    case Web.AbortSignal.__source__(signal) do
+      nil -> do_fetch(request)
+      source -> Web.AsyncContext.with_signal(source, fn -> do_fetch(request) end)
+    end
   end
 
   # A different dispatcher in the internal field `dispatcher` of the

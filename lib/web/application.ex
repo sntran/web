@@ -19,8 +19,9 @@ defmodule Web.Application do
       Web.AbortSignal.Reasons,
       # The blob URL store of `Web.URL.create_object_url/1`.
       Web.Internal.BlobURLStore,
-      # The stream processes of the streams that started with no process:
-      # see `Web.Internal.LazyStream`.
+      # The stream processes of the streams that started with no process,
+      # and the processes of the lazy signals of the requests: see
+      # `Web.Internal.LazyStream` and `Web.AbortSignal`.
       {Registry,
        keys: :unique, name: LazyStream.registry(), partitions: System.schedulers_online()},
       Web.URLPattern.Cache,

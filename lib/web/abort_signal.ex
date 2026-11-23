@@ -85,6 +85,37 @@ defmodule Web.AbortSignal do
   `tla/AbortSteps.tla` (the steps of an abort), and `tla/AbortTimeouts.tla`
   (the sequence of the timeouts).
 
+  ## The signal of a request
+
+  `Web.Request.new/2` and `Web.Request.clone/1` give each request a new
+  signal that depends on the signal of the option `:signal`, or on the
+  signal of the input request, as the steps "create a dependent abort
+  signal" of the DOM Standard specify. That signal is lazy: it has no
+  process until an operation needs one. Thus `Web.Request.new/2` and
+  `Web.fetch/2` start no process for it.
+
+    * `aborted?/1`, `reason/1`, `throw_if_aborted/1`, and `onabort/1` read
+      the signal that it depends on, the source. `Web.fetch/2` and the
+      other operations that wait for an abort use the process of the
+      source.
+    * A listener, an event handler, and the option `:signal` of a listener
+      need a process. The first of these operations starts it. Each copy
+      of the struct is the same signal: all the copies use one process, and
+      a listener of one copy runs when the source aborts.
+    * The process stops as the other signals do: when its owner (the
+      process that started it) stopped and it has no use, or after its
+      abort.
+
+  The specification is `tla/LazySignal.tla`.
+
+      iex> controller = Web.AbortController.new()
+      iex> request = Web.Request.new("https://example.com", signal: controller.signal)
+      iex> {request.signal == controller.signal, request.signal.pid}
+      {false, nil}
+      iex> Web.AbortController.abort(controller, :stop)
+      iex> {Web.AbortSignal.aborted?(request.signal), Web.AbortSignal.reason(request.signal)}
+      {true, :stop}
+
   ## Examples
 
       iex> controller = Web.AbortController.new()
@@ -115,13 +146,24 @@ defmodule Web.AbortSignal do
   @handoff_linger 5_000
   @timeouts_key {__MODULE__, :timeouts}
 
-  defstruct aborted: false, reason: nil, pid: nil, ref: nil
+  # The processes of the lazy signals register themselves in the registry of
+  # the stream processes, with the key `{Web.AbortSignal, ref}`.
+  @registry Web.StreamRegistry
+
+  # The field `lazy` is `nil` for a signal with a process, or for an aborted
+  # signal with no process. For the lazy signal of a request, it is
+  # `{sequence, source}`: the source is the signal that this signal depends
+  # on (`nil` when no abort can reach the signal), and the sequence tells
+  # the time when the signal was made. The source keeps its dependent
+  # signals in that sequence.
+  defstruct aborted: false, reason: nil, pid: nil, ref: nil, lazy: nil
 
   @type t :: %__MODULE__{
           aborted: boolean(),
           reason: any(),
           pid: pid() | nil,
-          ref: reference() | nil
+          ref: reference() | nil,
+          lazy: nil | {integer(), t() | nil}
         }
 
   @typedoc false
@@ -250,19 +292,29 @@ defmodule Web.AbortSignal do
 
     sources =
       signals
-      |> Enum.filter(&is_pid(&1.pid))
       |> Enum.flat_map(&sources_of/1)
       |> Enum.uniq_by(& &1.pid)
 
     :ok = GenServer.call(result.pid, {:set_sources, sources}, :infinity)
-    Enum.each(sources, &add_dependent(&1, result))
+
+    Enum.each(sources, fn source ->
+      case add_dependent(source, {:add_dependent, result}) do
+        :ok -> :ok
+        {:aborted, reason} -> __signal_abort__(result, reason)
+      end
+    end)
+
     result
   end
 
   # A signal that depends on other signals gives its sources: the new
-  # signal depends on them, not on it.
-  defp sources_of(signal) do
-    case GenServer.call(signal.pid, :sources, :infinity) do
+  # signal depends on them, not on it. A lazy signal gives the sources of
+  # its source. A signal with no process that did not abort has no source.
+  defp sources_of(%__MODULE__{lazy: {_sequence, nil}}), do: []
+  defp sources_of(%__MODULE__{lazy: {_sequence, source}}), do: sources_of(source)
+
+  defp sources_of(%__MODULE__{pid: pid} = signal) when is_pid(pid) do
+    case GenServer.call(pid, :sources, :infinity) do
       {:ok, nil} -> [signal]
       {:ok, sources} -> sources
     end
@@ -270,16 +322,41 @@ defmodule Web.AbortSignal do
     :exit, _reason -> [signal]
   end
 
-  defp add_dependent(source, result) do
-    case GenServer.call(source.pid, {:add_dependent, result}, :infinity) do
-      :ok -> :ok
-      {:aborted, reason} -> __signal_abort__(result, reason)
-    end
+  defp sources_of(%__MODULE__{}), do: []
+
+  # Returns `:ok`, or `{:aborted, reason}` for a source that aborted.
+  defp add_dependent(source, request) do
+    GenServer.call(source.pid, request, :infinity)
   catch
     # The process of the source stopped: it aborted, or it had no use. A
     # signal whose process stopped is aborted.
-    :exit, _reason -> __signal_abort__(result, reason(source))
+    :exit, _reason -> {:aborted, reason(source)}
   end
+
+  @doc false
+  # The steps "create a dependent abort signal" for one signal, with no
+  # process: the signal of a `Web.Request`. The new signal is lazy: see
+  # "The signal of a request". `nil` gives a signal that no abort can
+  # reach. An aborted signal gives a new aborted signal with the same
+  # reason, as step 2 of the steps specifies. The source of a lazy signal is
+  # never a lazy signal: a lazy signal depends on the source of the lazy
+  # signal that it gets.
+  @spec __dependent__(t() | nil) :: t()
+  def __dependent__(%__MODULE__{aborted: true, reason: reason}), do: abort(reason)
+  def __dependent__(%__MODULE__{lazy: {_sequence, source}}), do: __dependent__(source)
+
+  def __dependent__(%__MODULE__{pid: pid} = source) when is_pid(pid) do
+    %__MODULE__{ref: make_ref(), lazy: {:erlang.unique_integer([:monotonic]), source}}
+  end
+
+  def __dependent__(_no_source), do: %__MODULE__{ref: make_ref(), lazy: {0, nil}}
+
+  @doc false
+  # The signal whose abort aborts this signal: the source of a lazy signal,
+  # or the signal itself. `nil` when no abort can reach the signal.
+  @spec __source__(t() | nil) :: t() | nil
+  def __source__(%__MODULE__{lazy: {_sequence, source}}), do: source
+  def __source__(signal), do: signal
 
   @doc false
   # Starts the process of a signal of `Web.AbortController.new/0`. The
@@ -294,6 +371,21 @@ defmodule Web.AbortSignal do
   end
 
   @doc false
+  # The start of the process of a lazy signal: see `keep_process/2`. The
+  # process registers itself with the key of the signal before this
+  # function runs. It adds itself to the dependent signals of its sources,
+  # and only then answers a request. A process that finds a source aborted
+  # stops at once: it has no listener yet, and its event has no effect.
+  def init({:lazy, %__MODULE__{lazy: {sequence, source}} = signal, owner}) do
+    {:ok, state} = init(%{ref: signal.ref, subscribers: %{}, owner: owner})
+    handle = %{signal | pid: self()}
+
+    case follow(source, {:add_dependent, handle, sequence}) do
+      {:ok, sources} -> {:ok, %{state | sources: sources}}
+      {:aborted, reason} -> {:stop, {:shutdown, {:aborted, reason}}}
+    end
+  end
+
   def init(%{owner: owner} = state) do
     state =
       state
@@ -307,11 +399,16 @@ defmodule Web.AbortSignal do
         listeners: Listeners.new(),
         algorithms: [],
         monitors: %{},
-        # The signals of `any/1` that depend on this signal, with a
-        # monitor, and the signals that this signal depends on.
+        # The signals that depend on this signal, in the sequence in which
+        # they were made, with a monitor and the sequence of each one, and
+        # the signals that this signal depends on.
         dependents: [],
         dependent_monitors: %{},
+        dependent_sequences: %{},
         sources: nil,
+        # The processes that keep the process of a lazy signal for an
+        # operation, with a monitor and a count: see `keep_process/2`.
+        keepers: %{},
         # `{:aborted, reason}` after the abort. The process stops when the
         # process that aborts it ran the listeners.
         aborted: nil,
@@ -321,15 +418,172 @@ defmodule Web.AbortSignal do
     {:ok, state}
   end
 
+  # The process of a lazy signal depends on the sources of its source. A
+  # source that is a signal of `any/1` also keeps the process of the lazy
+  # signal in its list: thus that source stays while the lazy signal has a
+  # process, and a read of the lazy signal finds it. The steps of an abort
+  # of the source do not use that list.
+  defp follow(nil, _request), do: {:ok, []}
+
+  defp follow(source, request) do
+    sources = sources_of(source)
+    kept = if Enum.any?(sources, &(&1.pid == source.pid)), do: [], else: [source]
+
+    Enum.reduce_while(sources ++ kept, {:ok, sources}, fn signal, ok ->
+      case add_dependent(signal, request) do
+        :ok -> {:cont, ok}
+        {:aborted, reason} -> {:halt, {:aborted, reason}}
+      end
+    end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # The process of a lazy signal
+  #
+  # The struct of a lazy signal is a value: each copy, in each process, is
+  # the same signal. The process registers itself in the registry with the
+  # key `{Web.AbortSignal, ref}`, as the stream process of a
+  # `Web.Internal.LazyStream` does. A copy:
+  #
+  #   1. looks in the registry. With no live process, it starts one. The new
+  #      process registers the key before its start continues: thus one
+  #      start wins, and each other start gets the process of the winner;
+  #   2. keeps the process for the operation. The process answers the keep
+  #      only after its start, and the lifetime rules do not stop a process
+  #      that a copy keeps. A process that stopped before the keep did not
+  #      get the operation: the copy looks again, while the signal is not
+  #      aborted;
+  #   3. does the operation, and then releases the process.
+  #
+  # The registry removes the key when the process stops, also when it is
+  # killed. A copy on a different node does these steps on the node of the
+  # reference of the signal. See `tla/LazySignal.tla`.
+  # ---------------------------------------------------------------------------
+
+  @doc false
+  # Runs `fun` with the pid of the process of a lazy signal, and starts the
+  # process if necessary. The process stays while `fun` runs. Returns
+  # `default` when the signal aborted before the process got the operation.
+  @spec __with_process__(t(), term(), (pid() -> term())) :: term()
+  def __with_process__(%__MODULE__{lazy: {_sequence, _source}} = signal, default, fun) do
+    case keep_process(signal, Web.Promise.owner()) do
+      {:ok, pid} ->
+        try do
+          fun.(pid)
+        after
+          GenServer.cast(pid, {:release, self()})
+        end
+
+      :aborted ->
+        default
+    end
+  end
+
+  # The steps 1 and 2 for the process `self()`, with `owner` as the owner of
+  # a new process.
+  defp keep_process(%__MODULE__{ref: ref} = signal, owner) do
+    if node(ref) == node() do
+      __keep__(signal, owner, self())
+    else
+      :erpc.call(node(ref), __MODULE__, :__keep__, [signal, owner, self()])
+    end
+  catch
+    # The node of the signal is not available: no process can keep the
+    # state of the signal.
+    :error, {:erpc, _reason} -> :aborted
+  end
+
+  @doc false
+  # The steps 1 and 2 on the node of the signal, for the process `keeper`. A
+  # start that stops found a source aborted: the operation has no effect.
+  @spec __keep__(t(), pid(), pid()) :: {:ok, pid()} | :aborted
+  def __keep__(signal, owner, keeper) do
+    case start_process(signal, owner) do
+      {:ok, pid} -> keep_or_again(signal, owner, keeper, pid)
+      :again -> __keep__(signal, owner, keeper)
+      :aborted -> :aborted
+    end
+  end
+
+  # A process that stopped before the keep did not get the operation.
+  defp keep_or_again(signal, owner, keeper, pid) do
+    case keep(pid, keeper) do
+      :ok -> {:ok, pid}
+      :gone -> if aborted?(signal), do: :aborted, else: __keep__(signal, owner, keeper)
+    end
+  end
+
+  defp keep(pid, keeper) do
+    GenServer.call(pid, {:keep, keeper}, :infinity)
+  catch
+    :exit, _reason -> :gone
+  end
+
+  # The look in the registry, and the start of a process when the registry
+  # has no live process: `GenServer.start/3` looks first. A different
+  # process can take the key between the look and the start: the start then
+  # gives that process. Returns `:aborted` for a start that stopped because
+  # it found a source aborted.
+  defp start_process(%__MODULE__{ref: ref} = signal, owner) do
+    name = {:via, Registry, {@registry, {__MODULE__, ref}}}
+
+    case GenServer.start(__MODULE__, {:lazy, signal, owner}, name: name) do
+      {:ok, pid} ->
+        {:ok, pid}
+
+      {:error, {:already_started, pid}} when is_pid(pid) ->
+        {:ok, pid}
+
+      {:error, {:shutdown, {:aborted, _reason}}} ->
+        :aborted
+
+      # The process with the key stopped after the look of the start. The
+      # look and the stop come at the same time: a test cannot make it at a
+      # known time.
+      # coveralls-ignore-start
+      {:error, {:already_started, _undefined}} ->
+        :again
+        # coveralls-ignore-stop
+    end
+  end
+
+  @doc false
+  # The live process of a lazy signal, or `nil`, with no start. For each
+  # other signal, its pid.
+  @spec __listener_pid__(t()) :: pid() | nil
+  def __listener_pid__(%__MODULE__{lazy: {_sequence, _source}, ref: ref} = signal) do
+    if node(ref) == node(),
+      do: live_process(signal),
+      else: :erpc.call(node(ref), __MODULE__, :__listener_pid__, [signal])
+  catch
+    :error, {:erpc, _reason} -> nil
+  end
+
+  def __listener_pid__(%__MODULE__{pid: pid}), do: pid
+
+  defp live_process(%__MODULE__{ref: ref}) do
+    case Registry.lookup(@registry, {__MODULE__, ref}) do
+      [{pid, _value}] -> if Process.alive?(pid), do: pid
+      [] -> nil
+    end
+  end
+
+  # The struct of a signal in an event: the process of a lazy signal has a
+  # struct with its pid, and the event has the struct of the copies.
+  defp event_target(%__MODULE__{lazy: {_sequence, _source}} = signal), do: %{signal | pid: nil}
+  defp event_target(signal), do: signal
+
   @doc """
   Returns the event handler of the event `abort`, as the attribute
   `onabort`, or `nil`.
   """
   @spec onabort(t()) :: Web.EventTarget.callback() | nil
-  def onabort(%__MODULE__{pid: pid}) when is_pid(pid),
-    do: Store.request(pid, {:get_handler, "abort"}, nil)
-
-  def onabort(%__MODULE__{}), do: nil
+  def onabort(%__MODULE__{} = signal) do
+    case __listener_pid__(signal) do
+      nil -> nil
+      pid -> Store.request(pid, {:get_handler, "abort"}, nil)
+    end
+  end
 
   @doc """
   Sets the event handler of the event `abort`, as the setter of the
@@ -337,30 +591,46 @@ defmodule Web.AbortSignal do
   fires no event again.
   """
   @spec onabort(t(), Web.EventTarget.callback() | nil) :: t()
-  def onabort(%__MODULE__{pid: pid} = signal, callback)
-      when is_pid(pid) and
-             (is_nil(callback) or is_function(callback, 0) or is_function(callback, 1)) do
-    _ok = Store.request(pid, {:set_handler, "abort", callback}, :ok)
+  def onabort(%__MODULE__{lazy: {_sequence, _source}} = signal, callback)
+      when is_function(callback, 0) or is_function(callback, 1) do
+    _ok = __with_process__(signal, :ok, &set_handler(&1, callback))
     signal
   end
 
   def onabort(%__MODULE__{} = signal, callback)
-      when is_nil(callback) or is_function(callback, 0) or is_function(callback, 1),
-      do: signal
+      when is_nil(callback) or is_function(callback, 0) or is_function(callback, 1) do
+    case __listener_pid__(signal) do
+      nil -> :ok
+      pid -> set_handler(pid, callback)
+    end
+
+    signal
+  end
+
+  defp set_handler(pid, callback), do: Store.request(pid, {:set_handler, "abort", callback}, :ok)
 
   @doc false
   # The steps "add an algorithm": the abort of the signal calls `apply/3`
   # with the module, the function, and the arguments. Returns `:aborted`
-  # for a signal that aborted: the algorithm does not run.
+  # for a signal that aborted: the algorithm does not run. A lazy signal
+  # starts its process: the algorithm runs after the listeners of the
+  # source, as the Standard specifies.
   @spec __add_algorithm__(t(), {module(), atom(), list()}) :: :ok | :aborted
+  def __add_algorithm__(%__MODULE__{lazy: {_sequence, _source}} = signal, algorithm) do
+    __with_process__(signal, :aborted, &add_algorithm(&1, algorithm))
+  end
+
   def __add_algorithm__(%__MODULE__{pid: pid}, {_module, _function, _args} = algorithm)
-      when is_pid(pid) do
+      when is_pid(pid),
+      do: add_algorithm(pid, algorithm)
+
+  def __add_algorithm__(%__MODULE__{}, _algorithm), do: :aborted
+
+  defp add_algorithm(pid, algorithm) do
     GenServer.call(pid, {:add_algorithm, algorithm}, :infinity)
   catch
     :exit, _reason -> :aborted
   end
-
-  def __add_algorithm__(%__MODULE__{}, _algorithm), do: :aborted
 
   @doc false
   # The steps "signal abort", in the calling process: the signal and the
@@ -431,7 +701,8 @@ defmodule Web.AbortSignal do
 
   defp run_abort_steps(signal, algorithms) do
     Enum.each(algorithms, fn {module, function, args} -> apply(module, function, args) end)
-    _result = Dispatch.dispatch(signal, Web.Event.__create__("abort"), signal.pid, trusted: true)
+    event = Web.Event.__create__("abort")
+    _result = Dispatch.dispatch(event_target(signal), event, signal.pid, trusted: true)
     :ok
   end
 
@@ -439,6 +710,13 @@ defmodule Web.AbortSignal do
   def subscribe(nil), do: {:ok, nil}
 
   def subscribe(%__MODULE__{aborted: true}), do: {:error, :aborted}
+
+  # A lazy signal gets its abort from its source. A signal that no abort can
+  # reach gives a subscription that never gets an abort.
+  def subscribe(%__MODULE__{lazy: {_sequence, nil}, ref: ref}),
+    do: {:ok, %{type: :token, token: ref}}
+
+  def subscribe(%__MODULE__{lazy: {_sequence, source}}), do: subscribe(source)
 
   def subscribe(%__MODULE__{pid: pid, ref: ref}) when is_pid(pid) and is_reference(ref) do
     case GenServer.call(pid, {:subscribe, self()}) do
@@ -480,6 +758,7 @@ defmodule Web.AbortSignal do
 
   @doc false
   def check!(nil), do: :ok
+  def check!(%__MODULE__{lazy: {_sequence, source}}), do: check!(source)
 
   def check!(signal) do
     case subscribe(signal) do
@@ -506,6 +785,7 @@ defmodule Web.AbortSignal do
   """
   def aborted?(nil), do: false
   def aborted?(%__MODULE__{aborted: true}), do: true
+  def aborted?(%__MODULE__{lazy: {_sequence, source}}), do: aborted?(source)
 
   def aborted?(%__MODULE__{pid: pid} = signal) when is_pid(pid) do
     case subscribe(signal) do
@@ -528,6 +808,7 @@ defmodule Web.AbortSignal do
   """
   def reason(nil), do: nil
   def reason(%__MODULE__{aborted: true, reason: reason}), do: reason
+  def reason(%__MODULE__{lazy: {_sequence, source}}), do: reason(source)
 
   def reason(%__MODULE__{pid: pid} = signal) when is_pid(pid) do
     case subscribe(signal) do
@@ -706,18 +987,45 @@ defmodule Web.AbortSignal do
     reply(:ok, monitor_owners(state))
   end
 
-  def handle_call({:add_dependent, _dependent}, _from, %{aborted: {:aborted, reason}} = state) do
+  # `any/1` adds each new signal one time: the list of its sources has no
+  # duplicate. Its signal is made at this time.
+  def handle_call({:add_dependent, dependent}, from, state),
+    do:
+      handle_call({:add_dependent, dependent, :erlang.unique_integer([:monotonic])}, from, state)
+
+  def handle_call(
+        {:add_dependent, _dependent, _sequence},
+        _from,
+        %{aborted: {:aborted, reason}} = state
+      ) do
     {:reply, {:aborted, reason}, state}
   end
 
-  # `any/1` adds each new signal one time: the list of its sources has no
-  # duplicate.
-  def handle_call({:add_dependent, %__MODULE__{pid: pid} = dependent}, _from, state) do
+  # The process of a lazy signal adds itself in its start, with the
+  # sequence of the time when the lazy signal was made. The list keeps the
+  # sequence in which the signals were made, as the Standard specifies.
+  def handle_call({:add_dependent, %__MODULE__{pid: pid} = dependent, sequence}, _from, state) do
+    sequences = Map.put(state.dependent_sequences, pid, sequence)
+    {earlier, later} = Enum.split_while(state.dependents, &(sequences[&1.pid] < sequence))
+
     reply(:ok, %{
       state
-      | dependents: state.dependents ++ [dependent],
-        dependent_monitors: Map.put(state.dependent_monitors, pid, Process.monitor(pid))
+      | dependents: earlier ++ [dependent | later],
+        dependent_monitors: Map.put(state.dependent_monitors, pid, Process.monitor(pid)),
+        dependent_sequences: sequences
     })
+  end
+
+  # A copy of a lazy signal keeps its process for an operation. A process can
+  # keep it more than one time: the count shows how many keeps it has.
+  def handle_call({:keep, keeper}, _from, state) do
+    entry =
+      case state.keepers do
+        %{^keeper => {monitor_ref, count}} -> {monitor_ref, count + 1}
+        _ -> {Process.monitor(keeper), 1}
+      end
+
+    reply(:ok, %{state | keepers: Map.put(state.keepers, keeper, entry)})
   end
 
   def handle_call(:sources, _from, %{aborted: {:aborted, _}} = state),
@@ -777,6 +1085,21 @@ defmodule Web.AbortSignal do
     noreply(%{state | subscribers: subscribers})
   end
 
+  # The operation of a copy of a lazy signal is complete.
+  def handle_cast({:release, keeper}, state) do
+    keepers =
+      case state.keepers do
+        %{^keeper => {monitor_ref, 1}} ->
+          Process.demonitor(monitor_ref, [:flush])
+          Map.delete(state.keepers, keeper)
+
+        %{^keeper => {monitor_ref, count}} ->
+          Map.put(state.keepers, keeper, {monitor_ref, count - 1})
+      end
+
+    noreply(%{state | keepers: keepers})
+  end
+
   # The process that aborted the signal ran its listeners.
   def handle_cast(:abort_done, %{aborted: {:aborted, reason}} = state) do
     {:stop, {:shutdown, {:aborted, reason}}, state}
@@ -818,6 +1141,9 @@ defmodule Web.AbortSignal do
       match?(%{^pid => {^ref, _count}}, state.subscribers) ->
         noreply(%{state | subscribers: Map.delete(state.subscribers, pid)})
 
+      match?(%{^pid => {^ref, _count}}, Map.get(state, :keepers, %{})) ->
+        noreply(%{state | keepers: Map.delete(state.keepers, pid)})
+
       Map.get(Map.get(state, :monitors, %{}), pid) == ref ->
         listeners = Listeners.remove_owner(state.listeners, pid)
         algorithms = Enum.reject(state.algorithms, &(elem(&1, 0) == pid))
@@ -827,7 +1153,8 @@ defmodule Web.AbortSignal do
         noreply(%{
           state
           | dependents: Enum.reject(state.dependents, &(&1.pid == pid)),
-            dependent_monitors: Map.delete(state.dependent_monitors, pid)
+            dependent_monitors: Map.delete(state.dependent_monitors, pid),
+            dependent_sequences: Map.delete(state.dependent_sequences, pid)
         })
 
       true ->
@@ -872,7 +1199,8 @@ defmodule Web.AbortSignal do
 
   defp unused?(state) do
     Map.get(state, :owner_down?, false) and map_size(state.subscribers) == 0 and
-      Map.get(state, :monitors, %{}) == %{} and Map.get(state, :dependents, []) == []
+      Map.get(state, :monitors, %{}) == %{} and Map.get(state, :dependents, []) == [] and
+      Map.get(state, :keepers, %{}) == %{}
   end
 
   defp unused_linger do
@@ -883,6 +1211,8 @@ defmodule Web.AbortSignal do
   end
 
   defp any_abort_result(%__MODULE__{aborted: true, reason: reason}), do: {:aborted, reason}
+  defp any_abort_result(%__MODULE__{lazy: {_sequence, nil}}), do: nil
+  defp any_abort_result(%__MODULE__{lazy: {_sequence, source}}), do: any_abort_result(source)
 
   defp any_abort_result(%__MODULE__{} = signal) do
     case subscribe(signal) do
@@ -904,17 +1234,42 @@ defmodule Web.AbortSignal do
 end
 
 defimpl Web.EventTarget.Protocol, for: Web.AbortSignal do
+  # A listener of a lazy signal starts its process: see "The signal of a
+  # request" in `Web.AbortSignal`. A remove and a dispatch use the process
+  # only when it exists: with no process, the signal has no listener.
+  def add_event_listener(
+        %Web.AbortSignal{lazy: {_sequence, _source}} = signal,
+        type,
+        callback,
+        options
+      ) do
+    :ok =
+      Web.AbortSignal.__with_process__(signal, :ok, fn pid ->
+        Web.EventTarget.__add__(pid, type, callback, options)
+      end)
+
+    signal
+  end
+
   def add_event_listener(signal, type, callback, options) do
     :ok = Web.EventTarget.__add__(signal.pid, type, callback, options)
     signal
   end
 
   def remove_event_listener(signal, type, callback, capture) do
-    :ok = Web.EventTarget.__remove__(signal.pid, type, callback, capture)
+    :ok =
+      Web.EventTarget.__remove__(
+        Web.AbortSignal.__listener_pid__(signal),
+        type,
+        callback,
+        capture
+      )
+
     signal
   end
 
   def dispatch_event(signal, event) do
-    {signal, Web.EventTarget.__dispatch__(signal, signal.pid, event)}
+    {signal,
+     Web.EventTarget.__dispatch__(signal, Web.AbortSignal.__listener_pid__(signal), event)}
   end
 end

@@ -162,7 +162,8 @@ defmodule Web.BodyStandardTest do
       assert Web.FormData.get(form, "b") == "2"
     end
 
-    test "rejects with the reason of an abort of the request signal" do
+    # The steps "consume body" do not use the signal of the request.
+    test "reads the body also after an abort of the request signal" do
       for body <- ["a=1", stream_of(["a=1"])] do
         controller = Web.AbortController.new()
 
@@ -170,16 +171,17 @@ defmodule Web.BodyStandardTest do
           Request.new("https://example.com/",
             method: "POST",
             body: body,
+            headers: [{"content-type", "application/x-www-form-urlencoded"}],
             duplex: "half",
             signal: controller.signal
           )
 
         Web.AbortController.abort(controller, :stop)
-        assert :stop = catch_exit(await(Request.form_data(request)))
+        assert Web.FormData.get(await(Request.form_data(request)), "a") == "1"
       end
     end
 
-    test "rejects a multipart form with the reason of an abort of the request signal" do
+    test "reads a multipart form also after an abort of the request signal" do
       controller = Web.AbortController.new()
       form = Web.FormData.new() |> Web.FormData.append("a", "1")
 
@@ -187,7 +189,7 @@ defmodule Web.BodyStandardTest do
         Request.new("https://example.com/", method: "POST", body: form, signal: controller.signal)
 
       Web.AbortController.abort(controller, :stop)
-      assert :stop = catch_exit(await(Request.form_data(request)))
+      assert Web.FormData.get(await(Request.form_data(request)), "a") == "1"
     end
 
     test "rejects for a body that an enumeration read, or that a cancel closed" do

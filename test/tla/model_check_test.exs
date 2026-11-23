@@ -314,6 +314,60 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "LazySignal" do
+    defp lazy_signal_bug(name, replace \\ []),
+      do: SpecModel.check("LazySignal", [bug(name) | replace])
+
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("LazySignal"))
+    end
+
+    test "a constructor that starts the process of the signal is found" do
+      assert_violates(lazy_signal_bug("eager"), "LazyStart")
+    end
+
+    test "copies that start their own processes, with no registry, are found" do
+      assert_violates(lazy_signal_bug("no_registry"), "OneProcess")
+    end
+
+    test "a copy that does not keep the process for its operation is found" do
+      assert_violates(lazy_signal_bug("no_keep"), "OpTakesEffect")
+    end
+
+    test "a process that stops while a copy keeps it is found" do
+      assert_violates(lazy_signal_bug("stop_with_keeper"), "OpTakesEffect")
+    end
+
+    test "a copy that does not look again after the stop of the process is found" do
+      assert_violates(lazy_signal_bug("no_retry"), "OpTakesEffect")
+    end
+
+    test "a copy that looks again after the abort is found" do
+      assert_violates(lazy_signal_bug("retry_when_aborted"), "AddEnds")
+    end
+
+    test "a process that does not stop when it finds the source aborted is found" do
+      assert_violates(lazy_signal_bug("init_ignores_aborted"), "RunningIsDependent")
+
+      assert_violates(
+        lazy_signal_bug("init_ignores_aborted", [{" RunningIsDependent", ""}]),
+        "AbortedStops"
+      )
+    end
+
+    test "a process that stops before its event is found" do
+      assert_violates(lazy_signal_bug("stop_at_mark"), "FiresBeforeStop")
+    end
+
+    test "a process with no lifetime rule is found" do
+      assert_violates(lazy_signal_bug("no_expire"), "NoOrphan")
+    end
+
+    test "dependent signals in the sequence of the starts of their processes are found" do
+      assert_violates(lazy_signal_bug("order_by_start"), "EventOrder")
+    end
+  end
+
   describe "AbortSteps" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("AbortSteps"))

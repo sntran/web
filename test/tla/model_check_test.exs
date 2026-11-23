@@ -670,6 +670,29 @@ defmodule Web.TLA.ModelCheckTest do
       )
     end
 
+    test "a write that only the server does, which a read of the same process does not see, is found" do
+      assert_violates(
+        SpecModel.check("PerformanceObserver", observer_bug("write_by_cast")),
+        "ReadYourWrites"
+      )
+    end
+
+    test "a write of the callback that the copy of the global object does not see is found" do
+      assert_violates(
+        SpecModel.check("PerformanceObserver", observer_bug("no_counter")),
+        "CopyIsCurrent"
+      )
+    end
+
+    # A buffered observe of the callback, while an entry of the global
+    # object is on its way to the server: two calls of observe.
+    test "a buffered observe that copies an entry before its queue step is found" do
+      assert_violates(
+        SpecModel.check("PerformanceObserver", bug("buffered_not_queued")),
+        "OneDeliveryPath"
+      )
+    end
+
     test "a server that adds an entry of a type that the observer does not observe is found" do
       assert_violates(
         SpecModel.check("PerformanceObserver", observer_bug("no_filter")),

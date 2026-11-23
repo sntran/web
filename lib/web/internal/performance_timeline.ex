@@ -17,21 +17,47 @@ defmodule Web.Internal.PerformanceTimeline do
   # its observers get the entry. The callback runs in a different process,
   # and a process cannot change the process dictionary of a different
   # process. Thus the first observer of a global object moves the buffer of
-  # the global object to a server, the timeline server. From then on, each
-  # process that acts for the global object uses the server: the process of
-  # the global object, and the callback process. The process dictionary of
-  # such a process has the pid of the server.
+  # the global object to an ETS table of a server, the timeline server. From
+  # then on, each process that acts for the global object writes its
+  # entries to the table: the process of the global object, and the
+  # callback process.
+  #
+  # ## The table and the reads
+  #
+  # The table is an `ordered_set`: a row is `{key, entry, writer}`. The key
+  # comes from `:erlang.unique_integer([:monotonic])`, thus the rows are in
+  # the sequence in which the processes made the entries. A process writes
+  # the table itself, and no read or write waits for a message.
+  #
+  #   * The process of the global object also keeps its buffer in its
+  #     process dictionary, as a process with no observer does. Its reads
+  #     use that copy. A write of a different process to the table adds one
+  #     to a counter (`:atomics`). The process reads the table again when
+  #     the counter is not the counter of its copy: it reads the counter
+  #     first, then the table.
+  #   * A different process that acts for the global object reads the
+  #     table.
+  #
+  # Thus a read sees each earlier write of the same process.
   #
   # ## The server
   #
-  # The server keeps the performance entry buffer, the list of registered
-  # performance observers, and the state of each observer of the global
-  # object: its callback, its observer buffer, its observer type, and its
-  # flag "requires dropped entries". It never runs the code of a user, thus
-  # it always answers. A write (a mark, a measure, a clear) is a message
-  # that does not wait. A read is a call. The messages from one process
-  # arrive in their sequence, thus a read sees each earlier write of the
-  # same process.
+  # The server owns the table. It keeps the list of registered performance
+  # observers, and the state of each observer of the global object: its
+  # callback, its observer buffer, its observer type, and its flag
+  # "requires dropped entries". It never runs the code of a user, thus it
+  # always answers.
+  #
+  # A process that adds an entry to the table sends it to the server, and
+  # does not wait. The server does the observer part of "queue a
+  # PerformanceEntry": the interested observers get the entry. The server
+  # keeps the key of the last entry that it got from each process: an entry
+  # of a process with a larger key is on its way. A buffered
+  # `observe(options)` copies only the entries that the server got. Thus an
+  # entry gets to an observer one time: from the buffer, or from the queue,
+  # not from the two. The messages from one process arrive in their
+  # sequence: a call of the observer (for example `take_records/1`) comes
+  # after the earlier entries of the same process.
   #
   # ## The task
   #
@@ -50,8 +76,10 @@ defmodule Web.Internal.PerformanceTimeline do
   # ## The lifetime
   #
   # The server monitors its global object, and stops when it stops. The
-  # callback process then drops the task that it did not start. A callback
-  # that runs completes, but its calls of the server have no effect.
+  # table goes away with the server: a later read gives no entry, and a
+  # later write has no effect. The callback process then drops the task that
+  # it did not start. A callback that runs completes, but its calls of the
+  # server have no effect.
 
   use GenServer, restart: :temporary
 
@@ -66,13 +94,24 @@ defmodule Web.Internal.PerformanceTimeline do
   # that the library makes, in alphabetical order.
   @supported_entry_types ["mark", "measure"]
 
-  # The server of the global object for which the process acts.
+  # The timeline of the global object for which the process acts, and the
+  # role of the process: `:own` for the process of the global object,
+  # `:other` for a different process.
   @server_key {__MODULE__, :server}
-  # The performance entry buffer of a process with no server, with the last
-  # entry first.
+  # The performance entry buffer of a process with no server, or the copy
+  # of the process of the global object, with the last entry first.
   @entries_key {__MODULE__, :entries}
+  # The counter of the writes of the other processes when the process of
+  # the global object made its copy.
+  @version_key {__MODULE__, :version}
 
   @type entry :: Web.Performance.entry()
+
+  @typedoc """
+  The server, the table, and the counter of the writes of the other
+  processes, of a global object with an observer.
+  """
+  @type timeline :: {pid(), :ets.table(), :atomics.atomics_ref()}
 
   @spec supported_entry_types() :: [String.t()]
   def supported_entry_types, do: @supported_entry_types
@@ -91,11 +130,15 @@ defmodule Web.Internal.PerformanceTimeline do
   def put(entry) do
     case Process.get(@server_key) do
       nil ->
-        _previous = Process.put(@entries_key, [entry | Process.get(@entries_key, [])])
-        :ok
+        push(entry)
 
-      server ->
-        GenServer.cast(server, {:put, entry})
+      {timeline, :own} ->
+        write(timeline, entry)
+        push(entry)
+
+      {timeline, :other} ->
+        write(timeline, entry)
+        changed(timeline)
     end
   end
 
@@ -104,7 +147,8 @@ defmodule Web.Internal.PerformanceTimeline do
   def entries do
     case Process.get(@server_key) do
       nil -> @entries_key |> Process.get([]) |> Enum.reverse()
-      server -> call(server, :entries, [])
+      {timeline, :own} -> timeline |> own_copy() |> Enum.reverse()
+      {{_server, table, _counter}, :other} -> select(table, [{{:_, :"$1", :_}, [], [:"$1"]}])
     end
   end
 
@@ -116,11 +160,15 @@ defmodule Web.Internal.PerformanceTimeline do
   def clear(type, name) do
     case Process.get(@server_key) do
       nil ->
-        _previous = Process.put(@entries_key, remove(Process.get(@entries_key, []), type, name))
-        :ok
+        remove_own(type, name)
 
-      server ->
-        GenServer.cast(server, {:clear, type, name})
+      {{_server, table, _counter}, :own} ->
+        delete(table, type, name)
+        remove_own(type, name)
+
+      {{_server, table, _counter} = timeline, :other} ->
+        delete(table, type, name)
+        changed(timeline)
     end
   end
 
@@ -132,7 +180,79 @@ defmodule Web.Internal.PerformanceTimeline do
   def last_mark(name) do
     case Process.get(@server_key) do
       nil -> find_mark(Process.get(@entries_key, []), name)
-      server -> call(server, {:last_mark, name}, nil)
+      {timeline, :own} -> timeline |> own_copy() |> find_mark(name)
+      {{_server, table, _counter}, :other} -> last_mark_in(table, name)
+    end
+  end
+
+  defp push(entry) do
+    _previous = Process.put(@entries_key, [entry | Process.get(@entries_key, [])])
+    :ok
+  end
+
+  defp remove_own(type, name) do
+    _previous = Process.put(@entries_key, remove(Process.get(@entries_key, []), type, name))
+    :ok
+  end
+
+  # The copy of the process of the global object. A write of a different
+  # process changed the counter: the process reads the counter, then the
+  # table. A later write then changes the counter again.
+  defp own_copy({_server, table, counter}) do
+    version = :atomics.get(counter, 1)
+
+    if Process.get(@version_key) == version do
+      Process.get(@entries_key, [])
+    else
+      entries = table |> select([{{:_, :"$1", :_}, [], [:"$1"]}]) |> Enum.reverse()
+      _previous = Process.put(@entries_key, entries)
+      _previous = Process.put(@version_key, version)
+      entries
+    end
+  end
+
+  # The entry goes to the table, then to the server, which does the steps
+  # for the observers.
+  defp write({server, table, _counter}, entry) do
+    key = :erlang.unique_integer([:monotonic])
+    true = :ets.insert(table, {key, entry, self()})
+    GenServer.cast(server, {:queue, self(), key, entry})
+  rescue
+    # The table went away with its server.
+    ArgumentError -> :ok
+  end
+
+  # A different process changed the table.
+  defp changed({_server, _table, counter}), do: :atomics.add(counter, 1, 1)
+
+  defp select(table, spec) do
+    :ets.select(table, spec)
+  rescue
+    ArgumentError -> []
+  end
+
+  defp delete(table, type, name) do
+    pattern = if name == nil, do: %{entry_type: type}, else: %{entry_type: type, name: name}
+    _count = :ets.select_delete(table, [{{:_, pattern, :_}, [], [true]}])
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # The table is in the sequence of the entries: the search starts at the
+  # end.
+  defp last_mark_in(table, name) do
+    previous_mark(table, :ets.last(table), name)
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp previous_mark(_table, :"$end_of_table", _name), do: nil
+
+  defp previous_mark(table, key, name) do
+    case :ets.lookup(table, key) do
+      [{_key, %Web.Performance.Mark{name: ^name, start_time: start_time}, _writer}] -> start_time
+      _other -> previous_mark(table, :ets.prev(table, key), name)
     end
   end
 
@@ -153,32 +273,36 @@ defmodule Web.Internal.PerformanceTimeline do
   # ---------------------------------------------------------------------------
 
   @doc """
-  The server of the global object of the calling process. The function
-  starts it when the global object has none: the buffer of the process
-  moves to the server.
+  The timeline of the global object of the calling process. The function
+  starts the server when the global object has none: the buffer of the
+  process goes to the table of the server, and stays as the copy of the
+  process.
   """
-  @spec share() :: pid()
+  @spec share() :: timeline()
   def share do
     case Process.get(@server_key) do
       nil ->
-        entries = Process.delete(@entries_key) || []
-        {:ok, server} = GenServer.start(__MODULE__, {self(), entries})
-        _previous = Process.put(@server_key, server)
-        server
+        # The buffer of the process stays as its copy.
+        entries = Process.get(@entries_key, [])
+        {:ok, server} = GenServer.start(__MODULE__, {self(), Enum.reverse(entries)})
+        timeline = GenServer.call(server, :timeline)
+        _previous = Process.put(@version_key, 0)
+        _previous = Process.put(@server_key, {timeline, :own})
+        timeline
 
-      server ->
-        server
+      {timeline, _role} ->
+        timeline
     end
   end
 
   @doc """
-  The calling process acts for the global object of `server` from now on:
+  The calling process acts for the global object of `timeline` from now on:
   the callback process of the global object, or a process of a test that
   plays the role of one page of JavaScript.
   """
-  @spec enter(pid()) :: :ok
-  def enter(server) when is_pid(server) do
-    _previous = Process.put(@server_key, server)
+  @spec enter(timeline()) :: :ok
+  def enter({server, _table, _counter} = timeline) when is_pid(server) do
+    _previous = Process.put(@server_key, {timeline, :other})
     :ok
   end
 
@@ -189,7 +313,7 @@ defmodule Web.Internal.PerformanceTimeline do
   """
   @spec new_observer(PerformanceObserver.callback()) :: PerformanceObserver.t()
   def new_observer(callback) do
-    server = share()
+    {server, _table, _counter} = share()
     token = make_ref()
     _reply = call(server, {:new_observer, token, callback}, :closed)
     %PerformanceObserver{address: server, token: token}
@@ -209,8 +333,8 @@ defmodule Web.Internal.PerformanceTimeline do
   @doc false
   # The task of "queue the PerformanceObserver task", in the callback
   # process. The task gives no event to the runner.
-  def run_task(server) do
-    :ok = enter(server)
+  def run_task({server, _table, _counter} = timeline) do
+    :ok = enter(timeline)
 
     # Steps 1 and 2: the server sets the flag down, and gives a copy of the
     # list of registered performance observers.
@@ -263,12 +387,21 @@ defmodule Web.Internal.PerformanceTimeline do
     gate = :atomics.new(1, signed: false)
     {:ok, runner} = Runner.start_link(gate)
 
+    # The performance entry buffer. The earlier entries of the process had
+    # their steps "queue a PerformanceEntry": they have no writer.
+    table = :ets.new(__MODULE__, [:ordered_set, :public])
+
+    for entry <- entries,
+        do: :ets.insert(table, {:erlang.unique_integer([:monotonic]), entry, nil})
+
     {:ok,
      %{
        global: global,
        monitor: Process.monitor(global),
-       # The performance entry buffer, with the last entry first.
-       entries: entries,
+       table: table,
+       counter: :atomics.new(1, signed: false),
+       # The key of the last entry that the server got from each process.
+       queued: %{},
        # The state of each observer, by its token.
        observers: %{},
        # The list of registered performance observers: the token and the
@@ -284,18 +417,13 @@ defmodule Web.Internal.PerformanceTimeline do
   end
 
   @impl true
-  def handle_cast({:put, entry}, state), do: {:noreply, queue_entry(state, entry)}
-
-  def handle_cast({:clear, type, name}, state) do
-    {:noreply, %{state | entries: remove(state.entries, type, name)}}
+  def handle_cast({:queue, writer, key, entry}, state) do
+    state = queue_entry(state, entry)
+    {:noreply, %{state | queued: Map.put(state.queued, writer, key)}}
   end
 
   @impl true
-  def handle_call(:entries, _from, state), do: {:reply, Enum.reverse(state.entries), state}
-
-  def handle_call({:last_mark, name}, _from, state) do
-    {:reply, find_mark(state.entries, name), state}
-  end
+  def handle_call(:timeline, _from, state), do: {:reply, timeline(state), state}
 
   def handle_call({:new_observer, token, callback}, _from, state) do
     observer = %{
@@ -348,12 +476,11 @@ defmodule Web.Internal.PerformanceTimeline do
   # The steps of the Standard
   # ---------------------------------------------------------------------------
 
-  # The steps "queue a PerformanceEntry": each registered observer whose
-  # options list has the type of the entry gets it, then the entry goes to
-  # the performance entry buffer. The registry gives "mark" and "measure"
-  # no buffer limit, and the steps "should add entry" return true. A task
-  # with no entry in a buffer does nothing, thus only an interested
-  # observer queues the task.
+  # The steps "queue a PerformanceEntry" for the observers: each registered
+  # observer whose options list has the type of the entry gets it. The
+  # entry is in the table already. The steps "should add entry" return true
+  # for a mark and a measure. A task with no entry in a buffer does
+  # nothing, thus only an interested observer queues the task.
   defp queue_entry(state, entry) do
     interested =
       for {token, options} <- state.registered,
@@ -365,7 +492,7 @@ defmodule Web.Internal.PerformanceTimeline do
         Map.update!(observers, token, &%{&1 | buffer: [entry | &1.buffer]})
       end)
 
-    state = %{state | observers: observers, entries: [entry | state.entries]}
+    state = %{state | observers: observers}
     if interested == [], do: state, else: queue_task(state)
   end
 
@@ -381,7 +508,7 @@ defmodule Web.Internal.PerformanceTimeline do
   # callbacks of an observer.
   defp send_task(%{task_queued: true, task_running: false} = state) do
     Runner.run_task(state.runner, %{
-      build: {__MODULE__, :run_task, [self()]},
+      build: {__MODULE__, :run_task, [timeline(state)]},
       snapshot: %Snapshot{},
       target: nil,
       store: nil
@@ -485,14 +612,36 @@ defmodule Web.Internal.PerformanceTimeline do
 
   # Step 7.4: the entries of the type in the performance entry buffer go
   # to the observer buffer, in their sequence, and the task is queued. The
-  # steps "should add entry" return true for a mark and a measure.
+  # steps "should add entry" return true for a mark and a measure. An entry
+  # that the server did not get yet gets to the observer from its queue
+  # step.
   defp add_buffered(state, token, type) do
-    buffered = for entry <- state.entries, entry.entry_type == type, do: entry
+    buffered =
+      for {key, entry, writer} <- :ets.tab2list(state.table),
+          entry.entry_type == type,
+          queued?(state, writer, key),
+          do: entry
+
+    buffered = Enum.reverse(buffered)
 
     observers =
       Map.update!(state.observers, token, &%{&1 | buffer: buffered ++ &1.buffer})
 
     queue_task(%{state | observers: observers})
+  end
+
+  defp timeline(state), do: {self(), state.table, state.counter}
+
+  # The server got the entry, or the entry came before the first observer.
+  # The keys of one process grow, and its messages arrive in their
+  # sequence.
+  defp queued?(_state, nil, _key), do: true
+
+  defp queued?(state, writer, key) do
+    case state.queued do
+      %{^writer => last} -> key <= last
+      _none -> false
+    end
   end
 
   # The registered performance observer of the observer: a new one goes to

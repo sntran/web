@@ -681,9 +681,19 @@ defmodule Web.PerformanceObserverTest do
           :continue -> :ok
         end
 
-        # The timeline stopped with its global object: no effect.
+        # The timeline stopped with its global object: no effect, and a read
+        # gives no entry.
         Performance.mark("too late")
-        send(test, {:entries, Performance.get_entries()})
+        :ok = Performance.clear_marks("last")
+
+        measure =
+          try do
+            Performance.measure("too late", "last")
+          rescue
+            error in DOMException -> error.name
+          end
+
+        send(test, {:entries, Performance.get_entries(), measure})
       end
 
       global =
@@ -704,7 +714,7 @@ defmodule Web.PerformanceObserverTest do
       wait_for_stop(observer.address)
 
       send(runner, :continue)
-      assert_receive {:entries, []}, 5_000
+      assert_receive {:entries, [], "SyntaxError"}, 5_000
       wait_for_stop(runner)
     end
 
@@ -842,6 +852,45 @@ defmodule Web.PerformanceObserverTest do
       send(runner, :continue)
       assert_receive {:waiting, ^runner, ["b"], _options}, 5_000
       send(runner, :continue)
+    end
+
+    test "the reads and the writes of the timeline need no answer of the server" do
+      observer = observer()
+      true = :erlang.suspend_process(observer.address)
+
+      try do
+        Performance.mark("start", start_time: 1.0)
+        assert Performance.measure("from start", "start").start_time == 1.0
+        assert names(Performance.get_entries()) == ["start", "from start"]
+        assert names(Performance.get_entries_by_name("start", "mark")) == ["start"]
+        assert :ok = Performance.clear_marks("start")
+        assert names(Performance.get_entries_by_type("mark")) == []
+      after
+        true = :erlang.resume_process(observer.address)
+      end
+    end
+
+    test "an entry gets to an observer one time, also when observe comes before its queue step" do
+      observer = observer()
+      %{table: table, runner: runner} = :sys.get_state(observer.address)
+      true = :erlang.suspend_process(runner)
+
+      # A different process wrote the entry to the table. Its message to
+      # the server is on its way.
+      writer = spawn(fn -> :ok end)
+      mark = Performance.Mark.new("on its way", start_time: 1.0)
+      key = :erlang.unique_integer([:monotonic])
+      true = :ets.insert(table, {key, mark, writer})
+
+      # The buffered entries are the entries after their queue step.
+      PerformanceObserver.observe(observer, type: "mark", buffered: true)
+      assert PerformanceObserver.take_records(observer) == []
+
+      # The queue step gives the entry to the observer.
+      GenServer.cast(observer.address, {:queue, writer, key, mark})
+      assert PerformanceObserver.take_records(observer) == [mark]
+      assert %{queued: %{^writer => ^key}} = :sys.get_state(observer.address)
+      true = :erlang.resume_process(runner)
     end
 
     test "the first observer keeps the earlier entries of the process" do

@@ -47,11 +47,14 @@ defmodule Web.Performance do
   ## Observers
 
   A `Web.PerformanceObserver` gets the later entries of its global object.
-  A process with no observer keeps its entries in its process dictionary:
-  `mark/2` and `measure/3` then send no message. The first observer of a
-  process moves the entries to a server of the global object. After that,
-  `mark/2` and `measure/3` send the entry to the server, and do not wait
-  for it. A measure from the name of a mark asks the server for the mark.
+  A process keeps its entries in its process dictionary. The first observer
+  of a process also puts the entries in an ETS table of a server of the
+  global object, because the callback runs in a different process. Each
+  process of the global object writes its entries to the table itself,
+  and the process of the global object reads its own copy until the
+  callback changes the table. Thus no function of this module waits for a
+  message, and a read sees each earlier write of the same process. A new
+  entry also goes to the server, which gives it to the observers.
   """
 
   alias Web.DOMException

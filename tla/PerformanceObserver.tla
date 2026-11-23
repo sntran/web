@@ -2,16 +2,25 @@
 (* The timeline of one global object of Web.Performance, one observer of    *)
 (* that global object, and its callback process.                            *)
 (*                                                                          *)
-(* A process is a global object. The first observer of a global object      *)
-(* moves its performance entry buffer to a server, the timeline server.     *)
-(* Two processes act for the global object: the process of the global       *)
-(* object, and the callback process, which runs the callbacks with the      *)
-(* global object of the observer. Each of them sends its entries to the     *)
-(* server, and does not wait ("queue a PerformanceEntry"). The server adds  *)
-(* the entry to the timeline, and a copy to the observer buffer when the    *)
-(* options of the observer have its type. Then it queues the task: it sets *)
-(* the flag "task queued" of the global object, and sends the task to the   *)
-(* callback process when that process has no task.                          *)
+(* A process is a global object. The first observer of a global object puts *)
+(* its performance entry buffer in an ETS table of a server, the timeline   *)
+(* server. Two processes act for the global object: the process of the      *)
+(* global object, and the callback process, which runs the callbacks with   *)
+(* the global object of the observer. Each of them writes its entries to    *)
+(* the table with no message to the server. The callback process reads the  *)
+(* table. The process of the global object keeps a copy of the timeline,    *)
+(* and reads the copy: a write of the callback process adds one to a        *)
+(* counter, and the process reads the table again when the counter changed. *)
+(*                                                                          *)
+(* A process that wrote an entry sends it to the server, and does not wait. *)
+(* The server does the observer part of "queue a PerformanceEntry": a copy  *)
+(* goes to the observer buffer when the options of the observer have its    *)
+(* type, and the row gets the flag queued. (The server keeps the key of the *)
+(* last entry of each process: the flag is a comparison with that key.) A   *)
+(* buffered observe copies only the rows with the flag. Then the server     *)
+(* queues the task: it sets the flag "task queued" of the global object,    *)
+(* and sends the task to the callback process when that process has no      *)
+(* task.                                                                    *)
 (*                                                                          *)
 (* The task sets the flag down when it starts, and takes a copy of the list *)
 (* of the registered observers. Then it takes the observer buffer, and the  *)
@@ -23,7 +32,8 @@
 (* and before the end of a task.                                            *)
 (*                                                                          *)
 (* The server monitors the global object, and stops when it stops. The      *)
-(* callback process then drops the task that it did not start.              *)
+(* table goes away with it. The callback process then drops the task that   *)
+(* it did not start.                                                        *)
 (*                                                                          *)
 (* Each entry that the server adds to the observer buffer is a copy. A copy *)
 (* goes to a callback, to take_records, or a disconnect or the stop of the  *)
@@ -32,6 +42,11 @@
 (* The constant Bug is "none" for the design. Each other value removes one  *)
 (* rule of the design. The value "callback_own_timeline" is the first       *)
 (* design: a mark of the callback was an entry of the callback process.     *)
+(* The value "write_by_cast" is the second design: the server wrote each    *)
+(* entry, and each read was a call of the server.                           *)
+(*                                                                          *)
+(* The module has no clear of the entries: Performance.tla has the clears   *)
+(* of one timeline.                                                         *)
 EXTENDS Naturals, Sequences
 
 CONSTANTS
@@ -45,11 +60,19 @@ Procs == {"global", "callback"}
 
 VARIABLES
     alive,       \* TRUE while the process of the global object runs
-    timeline,    \* the performance entry buffer in the server
+    timeline,    \* the performance entry buffer: the rows of the table
     own,         \* the entries that the callback process keeps in its own
                  \* timeline. The design has none
     wire,        \* wire[p] is the sequence of the entries of process p on
                  \* their way to the server
+    copy,        \* the numbers of the entries in the copy of the
+                 \* process of the global object, in their sequence
+    counter,     \* the number of the writes of the callback process
+    seen,        \* the counter when the process of the global object
+                 \* made its copy
+    fromBuffer,  \* the entries that a buffered observe copied
+    again,       \* TRUE when the queue step copied an entry that a
+                 \* buffered observe copied
     made,        \* the number of entries that the processes made
     server,      \* TRUE while the server runs
     registered,  \* the set of the types of the options list of the
@@ -75,11 +98,13 @@ VARIABLES
     last         \* the name of the last step when a property examines
                  \* it, else "other"
 
-vars == <<alive, timeline, own, wire, made, server, registered, buffer,
-          pending, queued, running, tasks, phase, notify, requires, since,
-          observes, copies, called, taken, dropped, last>>
+vars == <<alive, timeline, own, wire, copy, counter, seen, fromBuffer, again, made, server,
+          registered, buffer, pending, queued, running, tasks, phase, notify,
+          requires, since, observes, copies, called, taken, dropped, last>>
 
-Entry(p, n, t) == [proc |-> p, n |-> n, type |-> t]
+\* The flag queued of a row is TRUE after the queue step of its entry.
+Entry(p, n, t) == [proc |-> p, n |-> n, type |-> t, queued |-> FALSE]
+Queued(e) == [proc |-> e.proc, n |-> e.n, type |-> e.type, queued |-> TRUE]
 
 \* The flag observed of a copy is TRUE when the options of the observer had
 \* the type of the entry when the server made the copy.
@@ -90,6 +115,11 @@ Init ==
     /\ timeline = <<>>
     /\ own = <<>>
     /\ wire = [p \in Procs |-> <<>>]
+    /\ copy = <<>>
+    /\ counter = 0
+    /\ seen = 0
+    /\ fromBuffer = {}
+    /\ again = FALSE
     /\ made = 0
     /\ server = TRUE
     /\ registered = {}
@@ -144,25 +174,56 @@ Ready(p) == Runs(p) /\ wire[p] = <<>>
 -----------------------------------------------------------------------------
 \* The calls of the processes
 
-\* Process p makes an entry of type t: a mark or a measure. The entry goes
-\* to the server. With the Bug "callback_own_timeline", an entry of the
-\* callback goes to the timeline of the callback process.
+\* Process p makes an entry of type t: a mark or a measure. The process
+\* writes the entry to the table, and sends it to the server. The process
+\* of the global object adds it to its copy. A write of the callback
+\* process adds one to the counter. A table that went away with its server
+\* takes no entry. With the Bug "callback_own_timeline", an entry of the
+\* callback goes to the timeline of the callback process. With the Bug
+\* "write_by_cast", only the server writes the entry to the table. With the
+\* Bug "no_counter", a write of the callback does not change the counter.
 Make(p, t) ==
     /\ Runs(p) /\ t \in Types /\ made < MaxEntries
     /\ made' = made + 1
-    /\ IF p = "callback" /\ Bug = "callback_own_timeline"
-       THEN /\ own' = Append(own, Entry(p, made + 1, t))
-            /\ UNCHANGED wire
-       ELSE /\ wire' = [wire EXCEPT ![p] = Append(@, Entry(p, made + 1, t))]
-            /\ UNCHANGED own
+    /\ LET e == Entry(p, made + 1, t)
+       IN  IF p = "callback" /\ Bug = "callback_own_timeline"
+           THEN /\ own' = Append(own, e)
+                /\ UNCHANGED <<timeline, wire, copy, counter>>
+           ELSE IF ~server
+           THEN UNCHANGED <<own, timeline, wire, copy, counter>>
+           ELSE /\ timeline' = IF Bug = "write_by_cast" THEN timeline ELSE Append(timeline, e)
+                /\ wire' = [wire EXCEPT ![p] = Append(@, e)]
+                /\ copy' = IF p = "global" /\ Bug # "write_by_cast"
+                           THEN Append(copy, e.n) ELSE copy
+                /\ counter' = IF p = "callback" /\ Bug # "no_counter"
+                              THEN counter + 1 ELSE counter
+                /\ UNCHANGED own
     /\ last' = "other"
-    /\ UNCHANGED <<alive, timeline, server, registered, buffer, pending,
-                   queued, running, tasks, phase, notify, requires, since,
-                   observes, copies, called, taken, dropped>>
+    /\ UNCHANGED <<alive, seen, fromBuffer, again, server, registered, buffer,
+                   pending, queued, running, tasks, phase, notify, requires,
+                   since, observes, copies, called, taken, dropped>>
 
-\* The entries of the timeline with type t.
+\* The numbers of the entries of a sequence.
+Numbers(s) == [i \in 1..Len(s) |-> s[i].n]
+
+\* The process of the global object reads its timeline. When the counter
+\* changed, it reads the counter, then the table, and its copy is new.
+Read ==
+    /\ alive /\ server /\ counter # seen
+    /\ copy' = Numbers(timeline)
+    /\ seen' = counter
+    /\ last' = "other"
+    /\ UNCHANGED <<alive, timeline, own, wire, counter, fromBuffer, again,
+                   made, server, registered, buffer, pending, queued, running,
+                   tasks, phase, notify, requires, since, observes, copies,
+                   called, taken, dropped>>
+
+\* The rows of the timeline with type t and the flag queued. With the Bug
+\* "buffered_not_queued", also the rows with no flag.
+BufferedRows(t) ==
+    SelectSeq(timeline, LAMBDA e : e.type = t /\ (e.queued \/ Bug = "buffered_not_queued"))
 Buffered(t) ==
-    LET old == SelectSeq(timeline, LAMBDA e : e.type = t)
+    LET old == BufferedRows(t)
     IN  [i \in 1..Len(old) |-> Copy(old[i], TRUE)]
 
 \* Process p calls observe with the type t, and with the flag buffered b.
@@ -177,11 +238,12 @@ Observe(p, t, b) ==
     /\ requires' = TRUE
     /\ since' = TRUE
     /\ IF b
-       THEN Store(Buffered(t)) /\ QueueTask
-       ELSE UNCHANGED <<buffer, pending, copies, queued, running, tasks>>
+       THEN /\ Store(Buffered(t)) /\ QueueTask
+            /\ fromBuffer' = fromBuffer \cup {BufferedRows(t)[i].n : i \in 1..Len(BufferedRows(t))}
+       ELSE UNCHANGED <<buffer, pending, copies, queued, running, tasks, fromBuffer>>
     /\ last' = "other"
-    /\ UNCHANGED <<alive, timeline, own, wire, made, server, phase, notify,
-                   called, taken, dropped>>
+    /\ UNCHANGED <<copy, counter, seen, alive, timeline, own, wire, again, made, server, phase,
+                   notify, called, taken, dropped>>
 
 \* take_records returns the buffer, and empties it.
 TakeRecords(p) ==
@@ -189,7 +251,7 @@ TakeRecords(p) ==
     /\ buffer' = IF Bug = "take_keeps_buffer" THEN buffer ELSE <<>>
     /\ taken' = taken + Len(buffer)
     /\ last' = "take"
-    /\ UNCHANGED <<alive, timeline, own, wire, made, server, registered,
+    /\ UNCHANGED <<copy, counter, seen, fromBuffer, again, alive, timeline, own, wire, made, server, registered,
                    pending, queued, running, tasks, phase, notify, requires,
                    since, observes, copies, called, dropped>>
 
@@ -203,7 +265,7 @@ Disconnect(p) ==
        ELSE /\ buffer' = <<>>
             /\ dropped' = dropped + Len(buffer)
     /\ last' = "disconnect"
-    /\ UNCHANGED <<alive, timeline, own, wire, made, server, pending, queued,
+    /\ UNCHANGED <<copy, counter, seen, fromBuffer, again, alive, timeline, own, wire, made, server, pending, queued,
                    running, tasks, phase, notify, requires, since, observes,
                    copies, called, taken>>
 
@@ -213,44 +275,53 @@ Stop ==
     /\ alive
     /\ alive' = FALSE
     /\ last' = "other"
-    /\ UNCHANGED <<timeline, own, wire, made, server, registered, buffer,
+    /\ UNCHANGED <<copy, counter, seen, fromBuffer, again, timeline, own, wire, made, server, registered, buffer,
                    pending, queued, running, tasks, phase, notify, requires,
                    since, observes, copies, called, taken, dropped>>
 
 -----------------------------------------------------------------------------
 \* The server
 
-\* The server gets the next entry of process p. The entry goes to the
-\* timeline, and a copy to the buffer when the options of the observer
-\* have its type. A server that stopped gets nothing.
+\* The server gets the next entry of process p. The row of the entry gets
+\* the flag queued, and a copy goes to the buffer when the options of the
+\* observer have the type of the entry. A server that stopped gets nothing.
+\* With the Bug "write_by_cast", the server writes the row here.
 Receive(p) ==
     /\ wire[p] # <<>>
     /\ wire' = [wire EXCEPT ![p] = Tail(@)]
     /\ LET e == Head(wire[p])
            observed == e.type \in registered
+           copied == observed \/ Bug = "no_filter"
        IN  IF server
-           THEN /\ timeline' = Append(timeline, e)
-                /\ IF observed \/ Bug = "no_filter"
+           THEN /\ timeline' = IF Bug = "write_by_cast"
+                               THEN Append(timeline, Queued(e))
+                               ELSE [i \in 1..Len(timeline) |->
+                                       IF timeline[i].n = e.n THEN Queued(timeline[i])
+                                       ELSE timeline[i]]
+                /\ again' = (again \/ (copied /\ e.n \in fromBuffer))
+                /\ IF copied
                    THEN Store(<<Copy(e, observed)>>) /\ QueueTask
                    ELSE UNCHANGED <<buffer, pending, copies, queued, running,
                                     tasks>>
-           ELSE UNCHANGED <<timeline, buffer, pending, copies, queued,
+           ELSE UNCHANGED <<timeline, again, buffer, pending, copies, queued,
                             running, tasks>>
     /\ last' = "other"
-    /\ UNCHANGED <<alive, own, made, server, registered, phase, notify,
-                   requires, since, observes, called, taken, dropped>>
+    /\ UNCHANGED <<copy, counter, seen, alive, own, fromBuffer, made, server, registered, phase,
+                   notify, requires, since, observes, called, taken, dropped>>
 
 \* The monitor of the server tells it that the global object stopped,
-\* after the entries of that process. The server stops. The buffer is lost.
+\* after the entries of that process. The server stops. The buffer and the
+\* table are lost.
 ServerStop ==
     /\ ~alive /\ wire["global"] = <<>> /\ server /\ Bug # "no_monitor"
     /\ server' = FALSE
+    /\ timeline' = <<>>
     /\ registered' = {}
     /\ buffer' = <<>>
     /\ dropped' = dropped + Len(buffer)
     /\ queued' = FALSE
     /\ last' = "stop"
-    /\ UNCHANGED <<alive, timeline, own, wire, made, pending, running, tasks,
+    /\ UNCHANGED <<copy, counter, seen, alive, own, fromBuffer, again, wire, made, pending, running, tasks,
                    phase, notify, requires, since, observes, copies, called,
                    taken>>
 
@@ -270,7 +341,7 @@ Begin ==
             /\ phase' = "begun"
        ELSE UNCHANGED <<queued, notify, phase>>
     /\ last' = "other"
-    /\ UNCHANGED <<alive, timeline, own, wire, made, server, registered,
+    /\ UNCHANGED <<copy, counter, seen, fromBuffer, again, alive, timeline, own, wire, made, server, registered,
                    buffer, pending, running, requires, since, observes,
                    copies, called, taken, dropped>>
 
@@ -293,7 +364,7 @@ Take ==
                 /\ phase' = "end"
                 /\ last' = "other"
                 /\ UNCHANGED <<buffer, pending, called, since>>
-    /\ UNCHANGED <<alive, timeline, own, wire, made, server, registered,
+    /\ UNCHANGED <<copy, counter, seen, fromBuffer, again, alive, timeline, own, wire, made, server, registered,
                    queued, running, tasks, notify, observes, copies, taken,
                    dropped>>
 
@@ -302,7 +373,7 @@ Return ==
     /\ phase = "callback"
     /\ phase' = "end"
     /\ last' = "other"
-    /\ UNCHANGED <<alive, timeline, own, wire, made, server, registered,
+    /\ UNCHANGED <<copy, counter, seen, fromBuffer, again, alive, timeline, own, wire, made, server, registered,
                    buffer, pending, queued, running, tasks, notify, requires,
                    since, observes, copies, called, taken, dropped>>
 
@@ -321,7 +392,7 @@ Done ==
                  /\ UNCHANGED tasks
        ELSE UNCHANGED <<running, queued, tasks>>
     /\ last' = "other"
-    /\ UNCHANGED <<alive, timeline, own, wire, made, server, registered,
+    /\ UNCHANGED <<copy, counter, seen, fromBuffer, again, alive, timeline, own, wire, made, server, registered,
                    buffer, pending, notify, requires, since, observes, copies,
                    called, taken, dropped>>
 
@@ -331,7 +402,7 @@ Next ==
     \/ \E p \in Procs : \E t \in Types : Make(p, t)
     \/ \E p \in Procs : \E t \in Types : \E b \in BOOLEAN : Observe(p, t, b)
     \/ \E p \in Procs : TakeRecords(p) \/ Disconnect(p) \/ Receive(p)
-    \/ Stop \/ ServerStop \/ Begin \/ Take \/ Return \/ Done
+    \/ Stop \/ ServerStop \/ Read \/ Begin \/ Take \/ Return \/ Done
     \* The system can stay as it is: no step is necessary.
     \/ UNCHANGED vars
 
@@ -346,7 +417,7 @@ Spec == Init /\ [][Next]_vars /\ Fairness
 \* Properties
 
 TypeOK ==
-    /\ alive \in BOOLEAN /\ server \in BOOLEAN
+    /\ alive \in BOOLEAN /\ server \in BOOLEAN /\ again \in BOOLEAN
     /\ registered \in SUBSET Types
     /\ made \in 0..MaxEntries
     /\ queued \in BOOLEAN /\ running \in BOOLEAN
@@ -354,10 +425,28 @@ TypeOK ==
     /\ phase \in {"idle", "begun", "callback", "end"}
     /\ observes \in 0..MaxObserves
 
+InTimeline(n) == \E i \in 1..Len(timeline) : timeline[i].n = n
+
+\* The entries of process p on their way to the server that are not in the
+\* table.
+NotWritten(p) == SelectSeq(wire[p], LAMBDA e : ~InTimeline(e.n))
+
 \* The timeline of the global object has each entry that the processes of
 \* the global object made: also the entries of the callback.
 OneTimeline ==
-    server => Len(timeline) + Len(wire["global"]) + Len(wire["callback"]) = made
+    server => Len(timeline) + Len(NotWritten("global")) + Len(NotWritten("callback")) = made
+
+\* A read of a process sees each earlier write of that process: an entry on
+\* its way to the server is in the table.
+ReadYourWrites == server => \A p \in Procs : NotWritten(p) = <<>>
+
+\* An entry gets to the observer from a buffered observe or from its queue
+\* step, not from the two.
+OneDeliveryPath == ~again
+
+\* The process of the global object reads its copy only when the copy is
+\* the timeline: a write of the callback process changed the counter.
+CopyIsCurrent == (server /\ counter = seen) => copy = Numbers(timeline)
 
 \* Each copy is in one place: the buffer, a task, a callback, the result
 \* of take_records, or the dropped copies.

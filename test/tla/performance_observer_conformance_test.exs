@@ -23,6 +23,7 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
+  alias Web.Internal.PerformanceTimeline, as: Timeline
   alias Web.Performance
   alias Web.PerformanceObserver
   alias Web.Test.SpecModel
@@ -50,6 +51,7 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
 
     frequency([
       {12, tuple({constant(:make), proc, member_of(@types)})},
+      {4, tuple({constant(:read), proc})},
       {6, tuple({constant(:observe), proc, member_of(@types), boolean()})},
       {10, constant(:run)},
       {4, constant(:return)},
@@ -221,13 +223,48 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
   defp runs?(model, :global), do: SpecModel.get(model, "alive")
   defp runs?(model, :callback), do: SpecModel.get(model, "phase") == "callback"
 
+  # The process makes the entry and reads its timeline while the server
+  # is suspended: the read sees the entry with no message to the server.
+  # Then the server gets the entry.
   defp run({:make, proc, type}, model, system) do
     if SpecModel.enabled?(model, "Make", [to_string(proc), type]) do
-      name = "#{proc}-#{SpecModel.get(model, "made") + 1}"
-      call_in(proc, system, fn -> make(type, name, system.server) end)
-      {SpecModel.step!(model, "Make", [to_string(proc), type]), system}
+      n = SpecModel.get(model, "made") + 1
+      name = "#{proc}-#{n}"
+      model = SpecModel.step!(model, "Make", [to_string(proc), type])
+      suspended = suspend(system.server)
+      seen = call_in(proc, system, fn -> make(type, name) end)
+      if suspended, do: :erlang.resume_process(system.server)
+      call_in(proc, system, fn -> sync(system.server) end)
+
+      assert seen == in_timeline?(model, n),
+             "the read after #{inspect(name)} saw #{inspect(seen)}"
+
+      # The read of the global object can make a new copy.
+      {read(model, proc), system}
     else
       # The process does not run, or the specification has no more entries.
+      {model, system}
+    end
+  end
+
+  # A read of the timeline: the copy of the global object, or the table
+  # for the callback. The read gives the buffer in its sequence: the
+  # functions of `Web.Performance` sort it by the start times.
+  defp run({:read, proc}, model, system) do
+    if runs?(model, proc) do
+      names = call_in(proc, system, fn -> Enum.map(Timeline.entries(), & &1.name) end)
+      model = read(model, proc)
+
+      expected =
+        if SpecModel.get(model, "server"),
+          do: model |> SpecModel.get("timeline") |> rows_of() |> Enum.map(&elem(&1, 1)),
+          else: []
+
+      assert Enum.map(names, &(&1 |> String.split("-") |> List.last() |> String.to_integer())) ==
+               expected
+
+      {model, system}
+    else
       {model, system}
     end
   end
@@ -329,6 +366,22 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
     end
   end
 
+  # A read of the global object makes a new copy when the counter changed.
+  # The callback process reads the table: the specification has no step.
+  defp read(model, :global), do: step_if_enabled(model, "Read", [])
+  defp read(model, :callback), do: model
+
+  defp suspend(server) do
+    :erlang.suspend_process(server)
+  catch
+    # The server stopped.
+    :error, :badarg -> false
+  end
+
+  defp in_timeline?(model, n) do
+    model |> SpecModel.get("timeline") |> rows_of() |> Enum.any?(&(elem(&1, 1) == n))
+  end
+
   # The callback runs: it got the copies, and the option of the dropped
   # entries count when the flag "requires dropped entries" was set.
   defp assert_callback(system, expected, requires) do
@@ -366,14 +419,15 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
     end
   end
 
-  defp make("mark", name, server) do
+  # Makes the entry, and tells if a read of the timeline after it has it.
+  defp make("mark", name) do
     Performance.mark(name)
-    sync(server)
+    Enum.any?(Performance.get_entries_by_name(name))
   end
 
-  defp make("measure", name, server) do
+  defp make("measure", name) do
     Performance.measure(name)
-    sync(server)
+    Enum.any?(Performance.get_entries_by_name(name))
   end
 
   defp observe(system, proc, type, buffered) do
@@ -411,6 +465,21 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
     state = SpecModel.to_map(model)
     assert Process.alive?(system.server) == state["server"], "after #{inspect(command)}"
 
+    # The copy of the process of the global object, and the counter of the
+    # writes of the callback process.
+    if state["alive"] do
+      {copy, version} = global_copy(system.global)
+      assert copy == numbers(state["copy"]), "after #{inspect(command)}: the copy"
+      assert version == state["seen"], "after #{inspect(command)}: the counter of the copy"
+    end
+
+    if state["server"] do
+      %{counter: counter} = :sys.get_state(system.server)
+
+      assert :atomics.get(counter, 1) == state["counter"],
+             "after #{inspect(command)}: the counter"
+    end
+
     # The callback process keeps no entries of its own: its entries go to
     # the timeline of the global object.
     assert entries(own_entries(system.runner)) == copies(state["own"]),
@@ -420,7 +489,7 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
       real = :sys.get_state(system.server)
       observer = real.observers[system.observer.token]
 
-      assert entries(Enum.reverse(real.entries)) == copies(state["timeline"]),
+      assert rows(real) == rows_of(state["timeline"]),
              "after #{inspect(command)}: the timeline"
 
       assert entries(Enum.reverse(observer.buffer)) == copies(state["buffer"]),
@@ -433,6 +502,42 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
       assert registered(real, system) == state["registered"], "after #{inspect(command)}"
     end
   end
+
+  # The rows of the table: each entry, and if the server got it.
+  defp rows(real) do
+    for {key, entry, writer} <- :ets.tab2list(real.table) do
+      [{proc, n, type}] = entries([entry])
+      {proc, n, type, queued?(real, writer, key)}
+    end
+  end
+
+  defp queued?(_real, nil, _key), do: true
+  defp queued?(real, writer, key), do: Map.get(real.queued, writer, key - 1) >= key
+
+  defp rows_of(timeline) when is_map(timeline),
+    do: timeline |> Enum.sort() |> Enum.map(&elem(&1, 1)) |> rows_of()
+
+  defp rows_of(timeline), do: Enum.map(timeline, &{&1["proc"], &1["n"], &1["type"], &1["queued"]})
+
+  defp global_copy({pid, _monitor}) do
+    {:dictionary, dictionary} = Process.info(pid, :dictionary)
+    entries = value(dictionary, :entries, [])
+    version = value(dictionary, :version, 0)
+    {entries |> Enum.reverse() |> entries() |> Enum.map(&elem(&1, 1)), version}
+  end
+
+  defp value(dictionary, name, default) do
+    case List.keyfind(dictionary, {Web.Internal.PerformanceTimeline, name}, 0) do
+      {_key, value} -> value
+      nil -> default
+    end
+  end
+
+  # The checker can give a sequence as a map from its positions.
+  defp numbers(sequence) when is_map(sequence),
+    do: sequence |> Enum.sort() |> Enum.map(&elem(&1, 1))
+
+  defp numbers(sequence), do: sequence
 
   defp own_entries(runner) do
     case Process.info(runner, :dictionary) do

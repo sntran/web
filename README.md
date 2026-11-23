@@ -254,12 +254,101 @@ gets the value and its counter. An error of a callback rejects, and closes
 the source with `return/1`.
 
 Concurrent calls of `next/1` on a helper run at the same time, and get
-their results in their sequence. The concurrency argument of the TC39
-proposal "concurrency control" (a governor, or an integer for a
-`CountingGovernor` of that capacity) lets `to_array`, `for_each`, `some`,
-`every`, `find`, and `reduce` read many values at the same time, with the
-same result. `limit/2` gives an iterator that reads its source only with a
-token of a governor. `return/1` comes after the calls of `next/1` before it.
+their results in their sequence. `flat_map` reads its inner iterator once
+for each call, at the same time, and reads its source again only after the
+end of the inner iterator, as the champion of the proposal specifies. The
+concurrency argument of the TC39 proposal "concurrency control" (a
+governor, or an integer for a `CountingGovernor` of that capacity) lets
+`to_array`, `for_each`, `some`, `every`, `find`, and `reduce` read many
+values at the same time, with the same result. `limit/2` gives an iterator
+that reads its source only with a token of a governor. `return/1` comes
+after the calls of `next/1` before it.
+
+`buffered(iterator, limit, prepopulate \\ false)` reads ahead for you: a
+loop that takes one value at a time then gets the concurrency of the
+helpers before it. `limit` is a governor or an integer. The iterator starts
+its reads at the first `next/1` (or at once with `prepopulate`), and keeps
+`limit` reads ahead. A promise of `next/1` that is not settled counts
+towards the buffer, thus the loop below runs the mapper for 5 values at the
+same time, not 6.
+
+```elixir
+use Web
+
+1..100
+|> AsyncIterator.from()
+|> AsyncIterator.map(fn id -> fetch("https://example.com/items/#{id}") end)
+|> AsyncIterator.buffered(5)
+|> Enum.each(fn response -> IO.puts(response.status) end)
+
+# Two calls of next at the same time read the inner list at the same time.
+iterator = AsyncIterator.flat_map(AsyncIterator.from([1, 2]), &[&1, &1 * 10])
+[first, second] = [AsyncIterator.next(iterator), AsyncIterator.next(iterator)]
+{await(first), await(second)}
+# => {%{value: 1, done: false}, %{value: 10, done: false}}
+```
+
+### 🔂 Iterator Helpers
+
+`Web.Iterator` has the iterator helpers of ECMAScript 2025: `from/1`,
+`next/1`, `return/1`, and the methods `map`, `filter`, `take`, `drop`,
+`flat_map`, `reduce`, `to_array`, `for_each`, `some`, `every`, and `find`.
+`to_async/1` gives a `Web.AsyncIterator`, as `toAsync()` of the proposal
+"async iterator helpers". An iterator keeps its state in a process that
+belongs to the process that made it: each `next/1` gives the next value.
+
+```elixir
+use Web
+
+iterator = Iterator.from(["a", "b", "c", "d"])
+Iterator.next(iterator)
+# => %{value: "a", done: false}
+
+iterator
+|> Iterator.map(fn letter, index -> {index, letter} end)
+|> Iterator.filter(fn {index, _letter} -> index > 1 end)
+|> Iterator.to_array()
+# => [{2, "d"}] (the first next/1 took "a")
+
+Stream.iterate(1, &(&1 + 1))
+|> Iterator.from()
+|> Iterator.drop(2)
+|> Iterator.take(3)
+|> Enum.to_list()
+# => [3, 4, 5]
+
+[[1, 2], [3]] |> Iterator.from() |> Iterator.flat_map(& &1) |> Iterator.reduce(&+/2)
+# => 6
+
+Iterator.from(1..5) |> Iterator.reduce(fn acc, value -> acc + value end, 100)
+# => 115
+
+Iterator.from(1..5) |> Iterator.for_each(&IO.puts/1)
+# => :ok (after it prints 1 to 5)
+
+numbers = fn -> Iterator.from(1..5) end
+{Iterator.some(numbers.(), &(&1 > 4)), Iterator.every(numbers.(), &(&1 > 4)),
+ Iterator.find(numbers.(), &(&1 > 2))}
+# => {true, false, 3}
+
+# return/1 closes the iterator: an enumerable runs its code for the end.
+counter = Stream.resource(fn -> 1 end, &{[&1], &1 + 1}, fn _n -> IO.puts("closed") end)
+counter = Iterator.from(counter)
+Iterator.next(counter)
+# => %{value: 1, done: false}
+Iterator.return(counter)
+# => %{value: nil, done: true} (after it prints "closed")
+
+# toAsync(): the async helpers take a sync iterator.
+Iterator.from([1, 2]) |> Iterator.to_async() |> AsyncIterator.to_array() |> await()
+# => [1, 2]
+```
+
+An error of a callback raises in the caller of `next/1`, after the helper
+closes its source. As in ECMAScript 2025, a callback that is not a function
+or a limit that is not valid closes the iterator, and then raises. A
+`Web.Iterator` is an `Enumerable`: a halt of the enumeration closes the
+iterator.
 
 ### 🌊 Zero-Buffer Streaming
 
@@ -947,6 +1036,9 @@ easy to make and hard to find with an example test:
 | `PerformanceObserver.tla` | The timeline of a global object and its observer: the entries of the callback in the same timeline, one task at a time, `take_records`, `disconnect`, and the stop of the global object. |
 | `AsyncIteratorHelper.tla` | A helper such as `map` of an async iterator: the results of concurrent calls of `next` in their sequence, the end and the errors, the close of the source, and the permits of `limit`. |
 | `AsyncIteratorConsumer.tla` | A method that consumes an async iterator, such as `find`, with a concurrency argument: the first result, the reads in their sequence, and one close before the promise settles. |
+| `AsyncFlatMap.tla`   | Concurrent calls of `next` on `flat_map`: the reads of the inner iterator at the same time, the results of a sequential run, and the read of the source only after the end of the inner iterator. |
+| `AsyncBuffered.tla`  | `buffered`: the reads ahead, the promises of the calls in the buffer, the reads for the calls with no read, and each permit back. |
+| `SyncIterator.tla`   | The calls of a `Web.Iterator`: one step at a time, and a call of an iterator that runs in its own chain fails and does not wait for itself. |
 
 `mix test` examines each specification with the checker of
 [`accord`](https://github.com/sntran/accord), which is written in Elixir and

@@ -1,7 +1,8 @@
 defmodule Web.Internal.AsyncFromSyncIterator do
   @moduledoc false
 
-  # The async iterator of an enumerable, for `Web.AsyncIterator.from/1`:
+  # The async iterator of an enumerable, for `Web.AsyncIterator.from/1`, and
+  # of a `Web.Iterator`, for `Web.Iterator.to_async/1`:
   # CreateAsyncFromSyncIterator of ECMAScript, for an enumerable as a sync
   # iterator.
   #
@@ -22,24 +23,37 @@ defmodule Web.Internal.AsyncFromSyncIterator do
   # The code of the enumerable runs in this process. Thus a resource that
   # the enumerable opens, for example a file, belongs to this process
   # during the whole iteration.
+  #
+  # A `Web.Iterator` has its own process. `next()` and `return()` call
+  # `next()` and `return()` of that iterator, also a `return()` before the
+  # first `next()` (%AsyncFromSyncIteratorPrototype%). The process does not
+  # close the iterator when its owner stops: the iterator has its own
+  # owner.
 
   alias Web.AsyncContext.Snapshot
   alias Web.Internal.AsyncStep
   alias Web.Promise
 
-  @doc "Starts the iterator of `enumerable`."
-  @spec start(Enumerable.t()) :: Web.AsyncIterator.t()
-  def start(enumerable) do
+  @doc "Starts the async iterator of an enumerable or of a `Web.Iterator`."
+  @spec start(Enumerable.t() | Web.Iterator.t()) :: Web.AsyncIterator.t()
+  def start(source) do
     owner = Promise.owner()
     snapshot = Snapshot.new()
-    pid = spawn(fn -> init(enumerable, owner, snapshot) end)
+    pid = spawn(fn -> init(source, owner, snapshot) end)
     %Web.AsyncIterator{pid: pid}
   end
 
-  defp init(enumerable, owner, snapshot) do
+  defp init(source, owner, snapshot) do
     Promise.put_owner(owner)
     Snapshot.restore(snapshot)
-    loop(%{enumerable: {:initial, enumerable}, owner: Process.monitor(owner)})
+
+    enumerable =
+      case source do
+        %Web.Iterator{} = iterator -> {:iterator, iterator}
+        enumerable -> {:initial, enumerable}
+      end
+
+    loop(%{enumerable: enumerable, owner: Process.monitor(owner)})
   end
 
   defp loop(state) do
@@ -56,7 +70,7 @@ defmodule Web.Internal.AsyncFromSyncIterator do
         end
 
       {:DOWN, monitor, :process, _owner, _reason} when monitor == state.owner ->
-        halt(state.enumerable)
+        owner_down(state.enumerable)
 
       _other ->
         loop(state)
@@ -93,6 +107,16 @@ defmodule Web.Internal.AsyncFromSyncIterator do
         AsyncStep.reply(target, {:rejected, reason})
         %{state | enumerable: :done}
     end
+  end
+
+  # IteratorNext of a `Web.Iterator`: its result, or its error.
+  defp step({:iterator, iterator} = source) do
+    case Web.Iterator.next(iterator) do
+      %{done: true} -> :done
+      %{value: value} -> {:value, value, source}
+    end
+  catch
+    kind, reason -> {:error, Exception.normalize(kind, reason, __STACKTRACE__)}
   end
 
   # The accumulator of the reduction holds the element. The value `:none`
@@ -132,5 +156,15 @@ defmodule Web.Internal.AsyncFromSyncIterator do
     kind, reason -> {:error, Exception.normalize(kind, reason, __STACKTRACE__)}
   end
 
+  defp halt({:iterator, iterator}) do
+    _result = Web.Iterator.return(iterator)
+    :ok
+  catch
+    kind, reason -> {:error, Exception.normalize(kind, reason, __STACKTRACE__)}
+  end
+
   defp halt(_initial_or_done), do: :ok
+
+  defp owner_down({:iterator, _iterator}), do: :ok
+  defp owner_down(enumerable), do: halt(enumerable)
 end

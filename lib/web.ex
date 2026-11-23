@@ -72,6 +72,7 @@ defmodule Web do
       alias Web.FormData
       alias Web.Governor
       alias Web.Headers
+      alias Web.Iterator
       alias Web.MessageChannel
       alias Web.MessageEvent
       alias Web.MessagePort

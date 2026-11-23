@@ -782,20 +782,165 @@ defmodule Web.AsyncIteratorTest do
       assert Enum.to_list(iterator) == [0, 1, 2, :last]
     end
 
-    test "reads the inner iterator before the source, one call at a time" do
-      source = Script.new()
-      iterator = AsyncIterator.flat_map(source, fn value -> [value, value] end)
-      first = AsyncIterator.next(iterator)
-      second = AsyncIterator.next(iterator)
-      third = AsyncIterator.next(iterator)
+    property "concurrent calls get the results of sequential calls" do
+      check all(
+              lists <- list_of(list_of(integer(), max_length: 3), max_length: 5),
+              batches <- list_of(integer(1..4), min_length: 1, max_length: 6)
+            ) do
+        iterator = lists |> AsyncIterator.from() |> AsyncIterator.flat_map(& &1)
+        expected = Enum.concat(lists)
+        count = Enum.sum(batches)
 
-      Script.give(Script.assert_next(), :a)
-      assert await(first) == value(:a)
-      assert await(second) == value(:a)
-      Script.give(Script.assert_next(), :b)
-      assert await(third) == value(:b)
+        results =
+          Enum.flat_map(batches, fn size ->
+            calls = for _call <- 1..size, do: AsyncIterator.next(iterator)
+            Enum.map(calls, &await/1)
+          end)
+
+        assert results ==
+                 Enum.map(Enum.take(expected, count), &value/1) ++
+                   List.duplicate(done(), max(count - length(expected), 0))
+      end
+    end
+
+    test "reads its inner iterator once for each call, and its source after the end" do
+      [source, inner, second] = Enum.map([:source, :inner, :second], &Script.new/1)
+      iterator = AsyncIterator.flat_map(source, &%{a: inner, b: second}[&1])
+      calls = for _call <- 1..3, do: AsyncIterator.next(iterator)
+
+      # One read of the source for the three calls, and then three reads of
+      # the inner iterator at the same time.
+      Script.give(Script.assert_read(:source), :a)
+      [first, middle, last] = for _read <- 1..3, do: Script.assert_read(:inner)
+      Script.settle([iterator.pid, source.pid, inner.pid])
+      refute_received {:scripted, _tag, _step, _target}
+
+      # An end before the values of the reads before it starts the read of
+      # the source at once.
+      Script.finish(last)
+      Script.give(Script.assert_read(:source), :b)
+      Script.give(Script.assert_read(:second), :c)
+      Script.give(middle, :y)
+      Script.settle([iterator.pid | Enum.map(calls, & &1.pid)])
+      assert Enum.map(calls, &peek/1) == [:pending, :pending, :pending]
+
+      Script.give(first, :x)
+      assert Enum.map(calls, &await/1) == [value(:x), value(:y), value(:c)]
+      Enum.each([source, inner, second], &Script.stop/1)
+    end
+
+    test "an end removes the later reads of its inner iterator: their calls get later values" do
+      [source, inner, second] = Enum.map([:source, :inner, :second], &Script.new/1)
+      iterator = AsyncIterator.flat_map(source, &%{a: inner, b: second}[&1])
+      calls = for _call <- 1..2, do: AsyncIterator.next(iterator)
+      Script.give(Script.assert_read(:source), :a)
+      [first, late] = for _read <- 1..2, do: Script.assert_read(:inner)
+
+      Script.finish(first)
+      Script.give(Script.assert_read(:source), :b)
+      Script.give(late, :late)
+      for value <- [:x, :y], do: Script.give(Script.assert_read(:second), value)
+      assert Enum.map(calls, &await/1) == [value(:x), value(:y)]
+      Enum.each([source, inner, second], &Script.stop/1)
+    end
+
+    test "an end of an earlier inner iterator gives its calls reads of the current one" do
+      [source, inner, second] = Enum.map([:source, :inner, :second], &Script.new/1)
+      iterator = AsyncIterator.flat_map(source, &%{a: inner, b: second}[&1])
+      calls = for _call <- 1..2, do: AsyncIterator.next(iterator)
+      Script.give(Script.assert_read(:source), :a)
+      [first, last] = for _read <- 1..2, do: Script.assert_read(:inner)
+      Script.finish(last)
+      Script.give(Script.assert_read(:source), :b)
+      for_second = Script.assert_read(:second)
+
+      Script.finish(first)
+      for_first = Script.assert_read(:second)
+      Script.give(for_first, :y)
+      Script.give(for_second, :x)
+      assert Enum.map(calls, &await/1) == [value(:x), value(:y)]
+      Enum.each([source, inner, second], &Script.stop/1)
+    end
+
+    test "an error waits for a read before it that can give the end, and no read starts" do
+      [source, inner, second] = Enum.map([:source, :inner, :second], &Script.new/1)
+      iterator = AsyncIterator.flat_map(source, &%{a: inner, b: second}[&1])
+      calls = for _call <- 1..2, do: AsyncIterator.next(iterator)
+      Script.give(Script.assert_read(:source), :a)
+      [first, failing] = for _read <- 1..2, do: Script.assert_read(:inner)
+
+      Script.fail(failing, :inner_error)
       Script.settle([iterator.pid])
-      Script.refute_step()
+      calls = calls ++ [AsyncIterator.next(iterator)]
+      Script.settle([iterator.pid, source.pid, inner.pid | Enum.map(calls, & &1.pid)])
+      refute_received {:scripted, _tag, _step, _target}
+      assert Enum.map(calls, &peek/1) == [:pending, :pending, :pending]
+
+      # The end removes the error: the calls get the values of the next inner
+      # iterator.
+      Script.finish(first)
+      Script.give(Script.assert_read(:source), :b)
+      for value <- [:x, :y, :z], do: Script.give(Script.assert_read(:second), value)
+      assert Enum.map(calls, &await/1) == [value(:x), value(:y), value(:z)]
+      Enum.each([source, inner, second], &Script.stop/1)
+    end
+
+    test "an error stays when the reads before it give values, and closes the source" do
+      [source, inner] = Enum.map([:source, :inner], &Script.new/1)
+      iterator = AsyncIterator.flat_map(source, fn :a -> inner end)
+      calls = for _call <- 1..3, do: AsyncIterator.next(iterator)
+      Script.give(Script.assert_read(:source), :a)
+      [first, failing, _last] = for _read <- 1..3, do: Script.assert_read(:inner)
+
+      Script.fail(failing, :inner_error)
+      Script.give(first, :x)
+      Script.finish(Script.assert_close(:source))
+      [first, second, third] = calls
+      assert await(first) == value(:x)
+      assert catch_exit(await(second)) == :inner_error
+      assert await(third) == done()
+      Script.settle([iterator.pid, inner.pid])
+      refute_received {:scripted, :inner, {:return, _value}, _target}
+      Enum.each([source, inner], &Script.stop/1)
+    end
+
+    test "an error of an earlier inner iterator waits, and the current one stays open" do
+      [source, inner, second] = Enum.map([:source, :inner, :second], &Script.new/1)
+      iterator = AsyncIterator.flat_map(source, &%{a: inner, b: second}[&1])
+      calls = for _call <- 1..3, do: AsyncIterator.next(iterator)
+      Script.give(Script.assert_read(:source), :a)
+      [first, failing, last] = for _read <- 1..3, do: Script.assert_read(:inner)
+      Script.finish(last)
+      Script.give(Script.assert_read(:source), :b)
+      _for_last = Script.assert_read(:second)
+
+      Script.fail(failing, :inner_error)
+      Script.give(first, :x)
+      Script.finish(Script.assert_close(:source))
+
+      assert Enum.map(calls, &(&1 |> Promise.wait() |> elem(0))) == [
+               :fulfilled,
+               :rejected,
+               :fulfilled
+             ]
+
+      assert await(List.last(calls)) == done()
+      Enum.each([source, inner, second], &Script.stop/1)
+    end
+
+    test "return/1 after concurrent calls closes the inner iterator of the last value" do
+      [source, inner] = Enum.map([:source, :inner], &Script.new/1)
+      iterator = AsyncIterator.flat_map(source, fn :a -> inner end)
+      calls = for _call <- 1..2, do: AsyncIterator.next(iterator)
+      returned = AsyncIterator.return(iterator)
+      Script.give(Script.assert_read(:source), :a)
+      for value <- [:x, :y], do: Script.give(Script.assert_read(:inner), value)
+
+      Script.finish(Script.assert_close(:inner))
+      Script.finish(Script.assert_close(:source))
+      assert Enum.map(calls, &await/1) == [value(:x), value(:y)]
+      assert await(returned) == done()
+      Enum.each([source, inner], &Script.stop/1)
     end
 
     test "a string, an error of the mapper, and an error of the inner iterator close the source" do
@@ -850,6 +995,261 @@ defmodule Web.AsyncIteratorTest do
                catch_exit(await(AsyncIterator.return(iterator)))
 
       assert_received :closed
+    end
+  end
+
+  describe "buffered/3" do
+    property "gives the values of its source in their sequence" do
+      check all(
+              values <- list_of(term(), max_length: 8),
+              limit <- integer(0..4),
+              prepopulate <- boolean(),
+              batch <- integer(1..3)
+            ) do
+        iterator = values |> AsyncIterator.from() |> AsyncIterator.buffered(limit, prepopulate)
+
+        results =
+          Stream.repeatedly(fn ->
+            calls = for _call <- 1..batch, do: AsyncIterator.next(iterator)
+            Enum.map(calls, &await/1)
+          end)
+          |> Enum.take(div(length(values), batch) + 2)
+          |> Enum.concat()
+
+        expected = Enum.map(values, &value/1)
+        assert Enum.take(results, length(values)) == expected
+        assert Enum.drop(results, length(values)) |> Enum.uniq() == [done()]
+      end
+    end
+
+    test "is lazy: it starts its reads at the first next, and fills its buffer" do
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, 2)
+      Script.settle([iterator.pid])
+      Script.refute_step()
+
+      promise = AsyncIterator.next(iterator)
+      [first, second] = for _read <- 1..2, do: Script.assert_next()
+      Script.settle([iterator.pid])
+      Script.refute_step()
+
+      Script.give(second, :b)
+      Script.give(first, :a)
+      assert await(promise) == value(:a)
+      assert await(AsyncIterator.next(iterator)) == value(:b)
+    end
+
+    test "prepopulate starts the reads at once" do
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, 2, true)
+      reads = for _read <- 1..2, do: Script.assert_next()
+      Enum.each(reads, &Script.give(&1, :value))
+      Script.settle([iterator.pid])
+      Script.refute_step()
+      assert next(iterator) == value(:value)
+    end
+
+    test "a promise that a call has, and that is not settled, counts towards the buffer" do
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, 2)
+      promise = AsyncIterator.next(iterator)
+      [first, second] = for _read <- 1..2, do: Script.assert_next()
+
+      # The read of the call settles, and its value goes to the call: then
+      # the buffer reads again.
+      Script.give(second, :b)
+      Script.settle([iterator.pid])
+      Script.refute_step()
+      Script.give(first, :a)
+      assert await(promise) == value(:a)
+      third = Script.assert_next()
+
+      assert next(iterator) == value(:b)
+      Script.give(third, :c)
+      assert next(iterator) == value(:c)
+    end
+
+    test "map |> buffered(5) calls the mapper five times at the same time, not six" do
+      iterator =
+        1..10
+        |> AsyncIterator.from()
+        |> AsyncIterator.map(blocking(:map))
+        |> AsyncIterator.buffered(5)
+
+      promise = AsyncIterator.next(iterator)
+      [{1, 0, first} | _rest] = assert_calls(:map, 5)
+      Script.settle([iterator.pid])
+      refute_received {:map, _value, _counter, _pid}
+
+      send(first, {:go, :one})
+      assert await(promise) == value(:one)
+      assert {6, 5, _pid} = assert_called(:map)
+    end
+
+    test "a call with no read in the buffer gets a read at once, with no permit" do
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, 1)
+      calls = for _call <- 1..3, do: AsyncIterator.next(iterator)
+      reads = for _read <- 1..3, do: Script.assert_next()
+      Script.settle([iterator.pid])
+      Script.refute_step()
+
+      reads
+      |> Enum.reverse()
+      |> Enum.zip([:c, :b, :a])
+      |> Enum.each(fn {r, v} -> Script.give(r, v) end)
+
+      assert Enum.map(calls, &await/1) == [value(:a), value(:b), value(:c)]
+      # The permit of the first read goes back with its value: one read ahead.
+      Script.give(Script.assert_next(), :d)
+      assert next(iterator) == value(:d)
+    end
+
+    test "buffered(0) reads only for the calls" do
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, 0, true)
+      Script.settle([iterator.pid])
+      Script.refute_step()
+      promise = AsyncIterator.next(iterator)
+      Script.give(Script.assert_next(), :a)
+      assert await(promise) == value(:a)
+      Script.settle([iterator.pid])
+      Script.refute_step()
+    end
+
+    test "after the end, the calls get the values of the reads before the end" do
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, 3)
+      promise = AsyncIterator.next(iterator)
+      [first, second, third] = for _read <- 1..3, do: Script.assert_next()
+      Script.finish(third)
+      Script.give(second, :b)
+      Script.give(first, :a)
+      assert await(promise) == value(:a)
+
+      monitor = Process.monitor(iterator.pid)
+      assert next(iterator) == value(:b)
+      assert next(iterator) == done()
+      assert_receive {:DOWN, ^monitor, :process, _pid, :normal}
+      assert next(iterator) == done()
+    end
+
+    test "an error of a read ahead goes to the call of its position, and ends the others" do
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, 2, true)
+      [first, second] = for _read <- 1..2, do: Script.assert_next()
+      Script.fail(second, :source_error)
+      Script.give(first, :a)
+      Script.settle([iterator.pid])
+      Script.refute_step()
+
+      assert next(iterator) == value(:a)
+      assert catch_exit(next(iterator)) == :source_error
+      assert next(iterator) == done()
+    end
+
+    test "return/1 closes the source, and drops the values that no call took" do
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, 2)
+      promise = AsyncIterator.next(iterator)
+      [first, second] = for _read <- 1..2, do: Script.assert_next()
+      Script.give(first, :a)
+      Script.give(second, :b)
+      assert await(promise) == value(:a)
+      _third = Script.assert_next()
+
+      returned = AsyncIterator.return(iterator)
+      Script.finish(Script.assert_return())
+      assert await(returned) == done()
+      assert next(iterator) == done()
+    end
+
+    test "return/1 after the end gives done, closes nothing, and drops the values" do
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, 2, true)
+      [first, second] = for _read <- 1..2, do: Script.assert_next()
+      Script.give(first, :a)
+      Script.finish(second)
+      Script.settle([iterator.pid])
+
+      assert await(AsyncIterator.return(iterator)) == done()
+      assert next(iterator) == done()
+      Script.settle([iterator.pid])
+      Script.refute_step()
+    end
+
+    test "a governor gives the permits, and gets each token back after the value goes to a call" do
+      governor = %ManualGovernor{test: self()}
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, governor)
+
+      # The call does not wait for a token: it gets a read with no permit.
+      promise = AsyncIterator.next(iterator)
+      forwarded = Script.assert_next()
+      assert_receive {:acquire, resolve, _reject}
+      token = token(governor)
+      resolve.(token)
+      ahead = Script.assert_next()
+      assert_receive {:acquire, _resolve, _reject}
+
+      Script.give(forwarded, :a)
+      assert await(promise) == value(:a)
+      Script.give(ahead, :b)
+      Script.settle([iterator.pid])
+      refute_received {:released, _ref}
+
+      assert next(iterator) == value(:b)
+      assert_receive {:released, ref} when ref == token.ref
+    end
+
+    test "a read ahead that return/1 drops gives its token back when it settles" do
+      governor = %ManualGovernor{test: self()}
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, governor, true)
+      assert_receive {:acquire, resolve, _reject}
+      token = token(governor)
+      resolve.(token)
+      ahead = Script.assert_next()
+      assert_receive {:acquire, late, _reject}
+
+      returned = AsyncIterator.return(iterator)
+      Script.finish(Script.assert_return())
+      assert await(returned) == done()
+      refute_received {:released, _ref}
+
+      Script.give(ahead, :dropped)
+      assert_receive {:released, ref} when ref == token.ref
+
+      # The acquisition after the close gives its token back at once.
+      late_token = token(governor)
+      late.(late_token)
+      assert_receive {:released, ref} when ref == late_token.ref
+    end
+
+    test "a governor that rejects gives its error to the next call, and closes the source" do
+      governor = %ManualGovernor{test: self()}
+      source = Script.new()
+      iterator = AsyncIterator.buffered(source, governor, true)
+      assert_receive {:acquire, _resolve, reject}
+      reject.(:no_token)
+      Script.settle([iterator.pid])
+      Script.refute_step()
+
+      # The error has the position of the next call: the close comes before
+      # the error goes to that call.
+      promise = AsyncIterator.next(iterator)
+      Script.finish(Script.assert_return())
+      assert catch_exit(await(promise)) == :no_token
+      assert next(iterator) == done()
+    end
+
+    test "raises for an iterator or a limit that is not valid" do
+      assert_raise TypeError, fn -> AsyncIterator.buffered(:none, 1) end
+      assert_raise RangeError, fn -> AsyncIterator.buffered(AsyncIterator.from([]), -1) end
+
+      for limit <- [nil, 1.5, :governor] do
+        assert_raise TypeError, fn -> AsyncIterator.buffered(AsyncIterator.from([]), limit) end
+      end
     end
   end
 

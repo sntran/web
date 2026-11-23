@@ -19,7 +19,7 @@
 * **Structured Data**: `structured_clone/2` of the HTML Standard, with transferable `ArrayBuffer`s and message ports.
 * **Messaging**: `MessageChannel` and `MessagePort` of the HTML Standard, with the port message queue and transferable ports.
 * **Cluster Coordination**: `BroadcastChannel` to the channels of all the connected BEAM nodes.
-* **Developer Tools**: `Console` for `Logger`, and `Performance` for times, marks, and measures.
+* **Developer Tools**: `Console` for `Logger`, `Performance` for times, marks, and measures, and `PerformanceObserver` to get the entries when a process makes them.
 * **Capability Sockets**: WINTERCG-style `Socket` handles with readable/writable streams and `STARTTLS` upgrades.
 * **Resource Disposal**: `Symbol.dispose` and a `using` macro with the rules of ECMAScript.
 * **Zero-Buffer Performance**: Native streaming with backpressure-aware engines.
@@ -649,6 +649,37 @@ Console.group_end()
 The groups, the timers, the counters, and the entries are the state of the
 process that calls the functions.
 
+A `PerformanceObserver` gets the marks and the measures of a process when
+the process makes them, as the Performance Timeline Standard specifies.
+`observe/2` observes the process that calls it. The callback runs later, in
+a process of the observer, and gets the entries that came before it ran:
+
+```elixir
+use Web
+
+observer =
+  PerformanceObserver.new(fn list, _observer, _options ->
+    for entry <- PerformanceObserverEntryList.get_entries(list) do
+      Console.log(["%s took %f ms", entry.name, entry.duration])
+    end
+  end)
+
+PerformanceObserver.observe(observer, entry_types: ["measure"])
+
+Performance.mark("start")
+import_rows()
+Performance.measure("import", "start")
+# => import took 3.305 ms (from the process of the observer)
+
+# Takes the entries that no callback got. No callback gets them after this.
+PerformanceObserver.take_records(observer)
+PerformanceObserver.disconnect(observer)
+```
+
+With `type: "mark", buffered: true`, the observer also gets the marks that
+the process made before the call. The process that calls `new/1` owns the
+observer: the observer stops when that process stops.
+
 Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rclone-style URL support.
 
 ```elixir
@@ -839,6 +870,7 @@ easy to make and hard to find with an example test:
 | `Disposal.tla`       | The blocks of `using`: each resource is released one time. |
 | `Console.tla`        | The groups, the timers, and the counters of the console.   |
 | `Performance.tla`    | The marks and the measures of a process.                   |
+| `PerformanceObserver.tla` | The entries that go to an observer, its task, `take_records`, `disconnect`, and the stop of the owner or of an observed process. |
 
 `mix test` examines each specification with the checker of
 [`accord`](https://github.com/sntran/accord), which is written in Elixir and

@@ -30,9 +30,16 @@ defmodule Web.Performance do
   process has its own entries, and the entries of a process go away with
   the process. The list has no limit, as in a browser: a process that
   runs for a long time must call `clear_marks/1` and `clear_measures/1`.
+
+  ## Observers
+
+  A `Web.PerformanceObserver` gets the later entries of each process that
+  calls `Web.PerformanceObserver.observe/2`. `mark/2` and `measure/3` send
+  the entry to the observers of the process, and do not wait for them.
   """
 
   alias Web.DOMException
+  alias Web.Internal.PerformanceObserver, as: Observers
   alias Web.TypeError
 
   defmodule Mark do
@@ -344,24 +351,14 @@ defmodule Web.Performance do
   Returns the entries of the process, in the sequence of their start times.
   """
   @spec get_entries() :: [entry()]
-  def get_entries do
-    # The list has the last entry first. The sort keeps the sequence of
-    # two entries with the same start time.
-    @entries_key
-    |> Process.get([])
-    |> Enum.reverse()
-    |> Enum.sort_by(& &1.start_time)
-  end
+  def get_entries, do: __filter__(__entries__(), nil, nil)
 
   @doc """
   Returns the entries of the process with the given type: `"mark"` or
   `"measure"`.
   """
   @spec get_entries_by_type(name()) :: [entry()]
-  def get_entries_by_type(type) do
-    type = text(type)
-    Enum.filter(get_entries(), &(&1.entry_type == type))
-  end
+  def get_entries_by_type(type), do: __filter__(__entries__(), nil, text(type))
 
   @doc """
   Returns the entries of the process with the given name, and with the
@@ -369,12 +366,24 @@ defmodule Web.Performance do
   """
   @spec get_entries_by_name(name(), name() | nil) :: [entry()]
   def get_entries_by_name(name, type \\ nil) do
-    name = text(name)
-    type = type && text(type)
+    __filter__(__entries__(), text(name), type && text(type))
+  end
 
-    Enum.filter(get_entries(), fn entry ->
-      entry.name == name and (type == nil or entry.entry_type == type)
-    end)
+  @doc false
+  # The performance entry buffer of the process, in the sequence in which
+  # the process made the entries.
+  @spec __entries__() :: [entry()]
+  def __entries__, do: @entries_key |> Process.get([]) |> Enum.reverse()
+
+  @doc false
+  # The steps "filter buffer by name and type" of the Performance Timeline:
+  # `name` and `type` are strings, or `nil` for null. The sort keeps the
+  # sequence of two entries with the same start time.
+  @spec __filter__([entry()], String.t() | nil, String.t() | nil) :: [entry()]
+  def __filter__(buffer, name, type) do
+    buffer
+    |> Enum.filter(&((type == nil or &1.entry_type == type) and (name == nil or &1.name == name)))
+    |> Enum.sort_by(& &1.start_time)
   end
 
   @doc """
@@ -390,7 +399,11 @@ defmodule Web.Performance do
   @spec clear_measures(name() | nil) :: :ok
   def clear_measures(name \\ nil), do: clear_entries("measure", name)
 
+  # The steps "queue a PerformanceEntry": the observers of the process get
+  # the entry (see `Web.PerformanceObserver`), and the entry goes to the
+  # performance entry buffer of the process.
   defp put_entry(entry) do
+    :ok = Observers.queue_entry(entry)
     Process.put(@entries_key, [entry | Process.get(@entries_key, [])])
     entry
   end
@@ -453,6 +466,11 @@ defmodule Web.Performance do
       detail -> Web.structured_clone(detail)
     end
   end
+
+  @doc false
+  # The conversion of a `DOMString`: an atom and a number become a string.
+  @spec __text__(term()) :: String.t()
+  def __text__(value), do: text(value)
 
   defp text(value) when is_binary(value), do: value
   defp text(value) when is_atom(value) or is_number(value), do: to_string(value)

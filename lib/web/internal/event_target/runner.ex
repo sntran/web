@@ -29,14 +29,15 @@ defmodule Web.Internal.EventTarget.Runner do
   A task makes its event in this process, immediately before the dispatch.
   `build` is a module, a function, and its arguments. The function returns
   the event, or `nil` for no event. `target` gets the event, and `store`
-  has its listeners. `reply_to` gets `{:event_done, tag}` after the
-  dispatch, or `{:event_returned, tag}` when the gate was closed.
+  has its listeners. A task that gives no event can have no store.
+  `reply_to` gets `{:event_done, tag}` after the dispatch, or
+  `{:event_returned, tag}` when the gate was closed.
   """
   @type task :: %{
           required(:build) => {module(), atom(), list()},
           required(:snapshot) => Snapshot.t(),
           required(:target) => term(),
-          required(:store) => pid(),
+          required(:store) => pid() | nil,
           optional(:reply_to) => {pid(), term()}
         }
 

@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Test PerformanceObserver's takeRecords()": "runner: the library runs the task of an observer before the call that queued it returns"
+  }
+}

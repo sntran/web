@@ -26,20 +26,36 @@ defmodule Web.Performance do
   attributes of the Standard as fields, in snake_case: `name`,
   `entry_type`, `start_time`, `duration`, and `detail`.
 
-  The entries are the state of the process that makes them. A different
-  process has its own entries, and the entries of a process go away with
-  the process. The list has no limit, as in a browser: a process that
-  runs for a long time must call `clear_marks/1` and `clear_measures/1`.
+  The list has no limit, as the registry of the entry types specifies for
+  "mark" and "measure": a process that runs for a long time must call
+  `clear_marks/1` and `clear_measures/1`.
+
+  ## The global object
+
+  Each process is a global object of the Standards: it has its own
+  performance entry buffer, and the entries of a process go away with the
+  process. The functions act on the timeline of the global object of the
+  calling process: for a usual process, the process itself. The time
+  origin is the same for each global object.
+
+  The callback of a `Web.PerformanceObserver` runs in a different process,
+  but with the global object of its observer, as the Standard specifies:
+  in the callback, the functions of this module act on the timeline of
+  that global object, and its observers get the entries that the callback
+  makes.
 
   ## Observers
 
-  A `Web.PerformanceObserver` gets the later entries of each process that
-  calls `Web.PerformanceObserver.observe/2`. `mark/2` and `measure/3` send
-  the entry to the observers of the process, and do not wait for them.
+  A `Web.PerformanceObserver` gets the later entries of its global object.
+  A process with no observer keeps its entries in its process dictionary:
+  `mark/2` and `measure/3` then send no message. The first observer of a
+  process moves the entries to a server of the global object. After that,
+  `mark/2` and `measure/3` send the entry to the server, and do not wait
+  for it. A measure from the name of a mark asks the server for the mark.
   """
 
   alias Web.DOMException
-  alias Web.Internal.PerformanceObserver, as: Observers
+  alias Web.Internal.PerformanceTimeline, as: Timeline
   alias Web.TypeError
 
   defmodule Mark do
@@ -61,8 +77,8 @@ defmodule Web.Performance do
     Makes a mark, as the constructor `new PerformanceMark(markName,
     markOptions)`. The options are the options of `Web.Performance.mark/2`.
 
-    The mark is not an entry of the process: `Web.Performance.mark/2` makes
-    a mark and adds it.
+    The mark is not an entry of a global object: `Web.Performance.mark/2`
+    makes a mark and adds it.
 
     ## Examples
 
@@ -107,7 +123,6 @@ defmodule Web.Performance do
   end
 
   @time_origin_key {__MODULE__, :time_origin}
-  @entries_key {__MODULE__, :entries}
 
   @type entry :: Mark.t() | Measure.t()
 
@@ -184,7 +199,8 @@ defmodule Web.Performance do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Makes a mark, adds it to the entries of the process, and returns it.
+  Makes a mark, adds it to the entries of the global object of the
+  process, and returns it.
 
   ## Options
 
@@ -212,7 +228,7 @@ defmodule Web.Performance do
 
   @doc false
   # The steps of the constructor of `PerformanceMark`: the mark is not an
-  # entry of the process.
+  # entry of a global object.
   @spec __mark__(name(), keyword()) :: Mark.t()
   def __mark__(name, options) do
     options = options!(options, [:start_time, :detail])
@@ -239,7 +255,8 @@ defmodule Web.Performance do
   end
 
   @doc """
-  Makes a measure, adds it to the entries of the process, and returns it.
+  Makes a measure, adds it to the entries of the global object of the
+  process, and returns it.
 
   The three forms are:
 
@@ -348,32 +365,27 @@ defmodule Web.Performance do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Returns the entries of the process, in the sequence of their start times.
+  Returns the entries of the global object of the process, in the
+  sequence of their start times.
   """
   @spec get_entries() :: [entry()]
-  def get_entries, do: __filter__(__entries__(), nil, nil)
+  def get_entries, do: __filter__(Timeline.entries(), nil, nil)
 
   @doc """
-  Returns the entries of the process with the given type: `"mark"` or
-  `"measure"`.
+  Returns the entries of the global object of the process with the given
+  type: `"mark"` or `"measure"`.
   """
   @spec get_entries_by_type(name()) :: [entry()]
-  def get_entries_by_type(type), do: __filter__(__entries__(), nil, text(type))
+  def get_entries_by_type(type), do: __filter__(Timeline.entries(), nil, text(type))
 
   @doc """
-  Returns the entries of the process with the given name, and with the
-  given type when there is one.
+  Returns the entries of the global object of the process with the given
+  name, and with the given type when there is one.
   """
   @spec get_entries_by_name(name(), name() | nil) :: [entry()]
   def get_entries_by_name(name, type \\ nil) do
-    __filter__(__entries__(), text(name), type && text(type))
+    __filter__(Timeline.entries(), text(name), type && text(type))
   end
-
-  @doc false
-  # The performance entry buffer of the process, in the sequence in which
-  # the process made the entries.
-  @spec __entries__() :: [entry()]
-  def __entries__, do: @entries_key |> Process.get([]) |> Enum.reverse()
 
   @doc false
   # The steps "filter buffer by name and type" of the Performance Timeline:
@@ -387,38 +399,27 @@ defmodule Web.Performance do
   end
 
   @doc """
-  Removes the marks of the process with the given name, or all its marks.
+  Removes the marks of the global object of the process with the given
+  name, or all its marks.
   """
   @spec clear_marks(name() | nil) :: :ok
   def clear_marks(name \\ nil), do: clear_entries("mark", name)
 
   @doc """
-  Removes the measures of the process with the given name, or all its
-  measures.
+  Removes the measures of the global object of the process with the given
+  name, or all its measures.
   """
   @spec clear_measures(name() | nil) :: :ok
   def clear_measures(name \\ nil), do: clear_entries("measure", name)
 
-  # The steps "queue a PerformanceEntry": the observers of the process get
-  # the entry (see `Web.PerformanceObserver`), and the entry goes to the
-  # performance entry buffer of the process.
+  # The steps "queue a PerformanceEntry" and "add entry to the performance
+  # entry buffer", on the timeline of the global object of the process.
   defp put_entry(entry) do
-    :ok = Observers.queue_entry(entry)
-    Process.put(@entries_key, [entry | Process.get(@entries_key, [])])
+    :ok = Timeline.put(entry)
     entry
   end
 
-  defp clear_entries(type, name) do
-    name = name && text(name)
-
-    entries =
-      Enum.reject(Process.get(@entries_key, []), fn entry ->
-        entry.entry_type == type and (name == nil or entry.name == name)
-      end)
-
-    Process.put(@entries_key, entries)
-    :ok
-  end
+  defp clear_entries(type, name), do: Timeline.clear(type, name && text(name))
 
   # ---------------------------------------------------------------------------
   # Arguments
@@ -429,17 +430,17 @@ defmodule Web.Performance do
   defp moment!(moment) when is_number(moment), do: time!(moment)
   defp moment!(mark), do: mark_time!(mark)
 
-  # The same steps for a `DOMString`: a number is the text of a name.
+  # The same steps for a `DOMString`: a number is the text of a name. The
+  # mark is the mark that the global object made last with the name.
   defp mark_time!(mark) do
     name = text(mark)
 
-    # The list has the last entry first.
-    case Enum.find(Process.get(@entries_key, []), &match?(%Mark{name: ^name}, &1)) do
-      %Mark{start_time: start_time} ->
-        start_time
-
+    case Timeline.last_mark(name) do
       nil ->
         raise DOMException, name: "SyntaxError", message: "The mark '#{name}' does not exist."
+
+      start_time ->
+        start_time
     end
   end
 

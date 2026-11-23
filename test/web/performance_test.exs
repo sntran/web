@@ -6,6 +6,7 @@ defmodule Web.PerformanceTest do
   alias Web.Performance
   alias Web.Performance.Mark
   alias Web.Performance.Measure
+  alias Web.PerformanceObserver
 
   doctest Web.Performance
 
@@ -358,6 +359,98 @@ defmodule Web.PerformanceTest do
 
       assert Task.await(Task.async(fn -> Performance.get_entries() end)) == []
       assert names(Performance.get_entries()) == ["mine"]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # The global object
+  # ---------------------------------------------------------------------------
+
+  # An operation of the timeline. The times do not come from the clock, thus
+  # two runs of the same operations give the same entries.
+  defp operation do
+    name = member_of(["a", "b"])
+    moment = one_of([member_of(["a", "b"]), integer(0..10)])
+
+    one_of([
+      tuple({constant(:mark), name, integer(0..10)}),
+      tuple({constant(:measure), name, moment, moment}),
+      tuple({constant(:clear_marks), member_of([nil, "a", "b"])}),
+      tuple({constant(:clear_measures), member_of([nil, "a", "b"])})
+    ])
+  end
+
+  # Does the operations, and returns the result of each and the entries.
+  defp run_all(operations) do
+    results = Enum.map(operations, &run_operation/1)
+    {results, Performance.get_entries()}
+  end
+
+  defp run_operation({:mark, name, time}), do: Performance.mark(name, start_time: time)
+
+  defp run_operation({:measure, name, from, to}) do
+    Performance.measure(name, start: from, end: to)
+  rescue
+    error in DOMException -> {:error, error.name}
+  end
+
+  defp run_operation({:clear_marks, name}), do: Performance.clear_marks(name)
+  defp run_operation({:clear_measures, name}), do: Performance.clear_measures(name)
+
+  defp in_process(fun), do: fun |> Task.async() |> Task.await()
+
+  describe "the global object" do
+    property "an observer and its callback keep the entries as a process with no observer" do
+      check all(operations <- list_of(operation(), max_length: 15), max_runs: 50) do
+        alone = in_process(fn -> run_all(operations) end)
+
+        # The global object has a server, and an observer of each type.
+        observed =
+          in_process(fn ->
+            observer = PerformanceObserver.new(fn -> :ok end)
+            PerformanceObserver.observe(observer, entry_types: ["mark", "measure"])
+            run_all(operations)
+          end)
+
+        # The callback acts on the timeline of the global object: the global
+        # object has the entries of the callback.
+        in_callback =
+          in_process(fn ->
+            test = self()
+
+            observer =
+              PerformanceObserver.new(fn _list, observer ->
+                PerformanceObserver.disconnect(observer)
+                Performance.clear_marks("start")
+                send(test, {:done, run_all(operations)})
+              end)
+
+            PerformanceObserver.observe(observer, type: "mark")
+            Performance.mark("start")
+
+            receive do
+              {:done, {results, entries}} ->
+                assert Performance.get_entries() == entries
+                {results, entries}
+            end
+          end)
+
+        assert observed == alone
+        assert in_callback == alone
+      end
+    end
+
+    test "a process does not see the entries of a different process" do
+      Performance.mark("test process")
+
+      in_process(fn ->
+        observer = PerformanceObserver.new(fn -> :ok end)
+        PerformanceObserver.observe(observer, type: "mark")
+        Performance.mark("other process")
+        assert names(Performance.get_entries()) == ["other process"]
+      end)
+
+      assert names(Performance.get_entries()) == ["test process"]
     end
   end
 

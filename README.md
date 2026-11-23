@@ -690,13 +690,15 @@ Performance.measure("import", "start").duration
 Console.group_end()
 ```
 
-The groups, the timers, the counters, and the entries are the state of the
-process that calls the functions.
+The groups, the timers, and the counters are the state of the process that
+calls the functions. Each process is also a global object of the Standards:
+it has its own timeline of marks and measures.
 
-A `PerformanceObserver` gets the marks and the measures of a process when
-the process makes them, as the Performance Timeline Standard specifies.
-`observe/2` observes the process that calls it. The callback runs later, in
-a process of the observer, and gets the entries that came before it ran:
+A `PerformanceObserver` gets the marks and the measures of its global object
+when they are made, as the Performance Timeline Standard specifies. The
+observer belongs to the global object of the process that calls `new/1`.
+The callback runs later, in a process of the observer, and gets the entries
+that came before it ran:
 
 ```elixir
 use Web
@@ -706,6 +708,10 @@ observer =
     for entry <- PerformanceObserverEntryList.get_entries(list) do
       Console.log(["%s took %f ms", entry.name, entry.duration])
     end
+
+    # The callback runs with the global object of the observer: this mark
+    # is an entry of the process that made the observer.
+    Performance.mark("reported")
   end)
 
 PerformanceObserver.observe(observer, entry_types: ["measure"])
@@ -720,9 +726,22 @@ PerformanceObserver.take_records(observer)
 PerformanceObserver.disconnect(observer)
 ```
 
-With `type: "mark", buffered: true`, the observer also gets the marks that
-the process made before the call. The process that calls `new/1` owns the
-observer: the observer stops when that process stops.
+In the callback, `Performance.mark/2`, `measure/3`, the functions
+`get_entries*` and `clear_*`, and `now/0` act on the global object of the
+observer: its timeline, and its time origin, which is the same for each
+process. The observers of that global object get the entries that the
+callback makes. With `type: "mark", buffered: true`, the observer also gets the marks
+that its global object made before the call. `observe/2` from a different
+process registers the observer in its own global object, not in the calling
+process. The observer stops when its global object stops.
+
+A process with no observer keeps its entries in its process dictionary:
+`mark/2` and `measure/3` send no message. The first observer moves the
+timeline to a server of the global object, because the callback runs in a
+different process. After that, `mark/2` sends the entry to the server and
+does not wait, and `measure/3` with the name of a mark asks the server for
+the mark. The registry of the entry types gives "mark" and "measure" no
+buffer limit: no entry is dropped, and `dropped_entries_count` is always 0.
 
 Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rclone-style URL support.
 
@@ -816,8 +835,9 @@ systems, and examine its SHA-256 hash.
 | `Request`, `Response`, the body, and `data:` URLs | 930 | 709 | 163 | 6 | 2 | 50 |
 | `Blob`, `File`, and `FormData` | 527 | 402 | 51 | 3 | 0 | 71 |
 | `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 71 | 5 | 0 | 0 | 0 |
+| `performance`, its marks and measures, and `PerformanceObserver` | 124 | 99 | 20 | 5 | 0 | 0 |
 
-19767 of 20638 tests pass. The tests that are not in the scope of the library
+19866 of 20762 tests pass. The tests that are not in the scope of the library
 use `XMLHttpRequest` or `FileReader`, the guard of the forbidden headers of a
 browser, the shared memory of JavaScript, or the conversion of JavaScript of
 a value to a string. The library will not have them: `Web.fetch/2` and the
@@ -841,14 +861,24 @@ use the signal or the body of the request (30 tests of `fetch/api/abort/`). A
 string of Elixir is UTF-8, thus a lone surrogate of JavaScript cannot come to
 the library. The runner answers a call when the library is at rest. Thus the
 library can do a step before the call returns, where JavaScript does it in a
-later microtask (53 stream tests). A timer of the library runs in real time,
+later microtask (53 stream tests), and the task of a `PerformanceObserver`
+runs before the call that made the entry returns, where a browser runs it
+after the script (4 tests). The layer calls a callback with no `this` value,
+and makes a new array at each read of a `FrozenArray`. The detail `nil` of an
+entry is `undefined` in JavaScript, where the Standard gives `null`, and a
+JavaScript object goes to the library as a reference, which the library
+cannot clone. The executors of a run act for one global object, as the code
+of one page. A timer of the library runs in real time,
 also while JavaScript runs: the result of a test of `AbortSignal.timeout()`
-can change from run to run. The differences of the library are:
+can change from run to run, as the result of a test that allows 20 ms
+between two calls. The differences of the library are:
 
 * A body accepts a binary of Elixir as a chunk of bytes. The Standard
   accepts only a `Uint8Array` (5 tests).
 * A `Request` does not keep the blob of a blob URL: a revoke before the
   fetch makes the fetch fail (2 tests).
+* The library has no Resource Timing: a fetch makes no "resource" entry,
+  and `performance` has no `setResourceTimingBufferSize()` (5 tests).
 * A view of a byte stream is a `Web.Uint8Array`: the library has no other
   typed array and no `DataView` (15 tests).
 * `TextEncoderStream` converts a chunk with `String.Chars`, not with the
@@ -914,7 +944,7 @@ easy to make and hard to find with an example test:
 | `Disposal.tla`       | The blocks of `using`: each resource is released one time. |
 | `Console.tla`        | The groups, the timers, and the counters of the console.   |
 | `Performance.tla`    | The marks and the measures of a process.                   |
-| `PerformanceObserver.tla` | The entries that go to an observer, its task, `take_records`, `disconnect`, and the stop of the owner or of an observed process. |
+| `PerformanceObserver.tla` | The timeline of a global object and its observer: the entries of the callback in the same timeline, one task at a time, `take_records`, `disconnect`, and the stop of the global object. |
 | `AsyncIteratorHelper.tla` | A helper such as `map` of an async iterator: the results of concurrent calls of `next` in their sequence, the end and the errors, the close of the source, and the permits of `limit`. |
 | `AsyncIteratorConsumer.tla` | A method that consumes an async iterator, such as `find`, with a concurrency argument: the first result, the reads in their sequence, and one close before the promise settles. |
 

@@ -90,7 +90,32 @@
         value: cls, writable: true, configurable: true, enumerable: false,
       });
     }
+    installGlobalAttributes();
     return dispatch;
+  }
+
+  // An attribute of the global object whose type is an interface of the
+  // run, such as `performance` of `WindowOrWorkerGlobalScope`: the library
+  // gives the object at the first read. The attribute is [Replaceable]: the
+  // global object then keeps the object, and an assignment replaces it.
+  function installGlobalAttributes() {
+    const scope = definitions.get("WindowOrWorkerGlobalScope");
+    for (const m of scope ? scope.members : []) {
+      if (m.type !== "attribute" || !classes.has(resolve(m.idlType).idlType)) continue;
+      const keep = (value) => Object.defineProperty(globalThis, m.name, {
+        value, writable: true, configurable: true, enumerable: true,
+      });
+      Object.defineProperty(globalThis, m.name, {
+        get() {
+          const value = fromLibrary(m.idlType, call({ i: "WindowOrWorkerGlobalScope", k: "getter", m: m.name, self: null }));
+          keep(value);
+          return value;
+        },
+        set: keep,
+        configurable: true,
+        enumerable: true,
+      });
+    }
   }
 
   // ---------------------------------------------------------------------

@@ -14,7 +14,7 @@ defmodule Web.PerformanceObserverTest do
   doctest Web.PerformanceObserver
   doctest Web.PerformanceObserverEntryList
 
-  # The entries are the state of the test process.
+  # The test process is a global object: the entries are its state.
   setup do
     Performance.clear_marks()
     Performance.clear_measures()
@@ -50,6 +50,15 @@ defmodule Web.PerformanceObserverTest do
 
   defp names(entries), do: Enum.map(entries, & &1.name)
 
+  # The first message of the mailbox, with no pattern.
+  defp next_message do
+    receive do
+      message -> message
+    after
+      5_000 -> flunk("no message")
+    end
+  end
+
   defp next_callback do
     assert_receive {:callback, _observer, names, options}, 5_000
     {names, options}
@@ -75,6 +84,12 @@ defmodule Web.PerformanceObserverTest do
   defp in_process(fun) do
     task = Task.async(fun)
     Task.await(task)
+  end
+
+  # The options list of the registered performance observer of an observer.
+  defp options(%PerformanceObserver{address: server, token: token}) do
+    {^token, options} = List.keyfind(:sys.get_state(server).registered, token, 0)
+    options
   end
 
   # ---------------------------------------------------------------------------
@@ -140,6 +155,24 @@ defmodule Web.PerformanceObserverTest do
       assert_receive {:callback_process, pid}, 5_000
       assert pid != self()
       assert pid == :sys.get_state(observer.address).runner
+    end
+
+    test "the dropped entries count is 0: mark and measure have no buffer limit" do
+      # The registry gives other types a limit of 150 or 250 entries.
+      for i <- 1..1_000, do: Performance.mark("before #{i}", start_time: i * 1.0)
+      observer = observer()
+      for i <- 1..1_000, do: Performance.measure("after #{i}", start: 0, end: i)
+
+      # One task takes the entries of the two calls.
+      %{runner: runner} = :sys.get_state(observer.address)
+      true = :erlang.suspend_process(runner)
+      PerformanceObserver.observe(observer, type: "mark", buffered: true)
+      PerformanceObserver.observe(observer, type: "measure", buffered: true)
+      true = :erlang.resume_process(runner)
+
+      assert {names, %{dropped_entries_count: 0}} = next_callback()
+      assert length(names) == 2_000
+      assert length(Performance.get_entries()) == 2_000
     end
 
     test "only the first callback after observe has the dropped entries count" do
@@ -246,7 +279,7 @@ defmodule Web.PerformanceObserverTest do
         PerformanceObserver.new(fn list, observer ->
           case names(PerformanceObserverEntryList.get_entries(list)) do
             ["from test"] ->
-              # The callback process is a new observed process.
+              # The callback acts for the global object of the observer.
               PerformanceObserver.observe(observer, type: "measure")
               Performance.measure("from callback")
               send(test, {:records, PerformanceObserver.take_records(observer)})
@@ -386,8 +419,7 @@ defmodule Web.PerformanceObserverTest do
 
       assert {["early"], _options} = next_callback()
 
-      %{registrations: registrations} = :sys.get_state(observer.address)
-      assert [%{type: "mark", buffered: true}] = registrations[self()].options
+      assert [%{type: "mark", buffered: true}] = options(observer)
     end
 
     test "with buffered gets the entries before the call, and later entries" do
@@ -440,7 +472,7 @@ defmodule Web.PerformanceObserverTest do
         log = capture_log(fn -> assert :ok = PerformanceObserver.observe(observer, options) end)
         assert log =~ "does not observe"
 
-        assert :sys.get_state(observer.address).registrations == %{}
+        assert :sys.get_state(observer.address).registered == []
       end
     end
 
@@ -455,101 +487,34 @@ defmodule Web.PerformanceObserverTest do
       end
     end
 
-    test "observes the process that calls it" do
+    test "from a different process registers the observer in its global object" do
+      # The mark goes to the server with the observer: no message from the
+      # test process can come after the call of the other process.
+      Performance.mark("before", start_time: 1.0)
       observer = observer()
-      test = self()
 
-      pid =
-        spawn(fn ->
-          PerformanceObserver.observe(observer, type: "mark")
-          send(test, :observed)
+      # The other process is a different global object. The buffered
+      # entries are the entries of the global object of the observer.
+      in_process(fn ->
+        Performance.mark("other process", start_time: 2.0)
+        PerformanceObserver.observe(observer, type: "mark", buffered: true)
+        Performance.mark("other process again")
+      end)
 
-          receive do
-            :mark -> Performance.mark("other process")
-          end
-
-          receive do
-            :stop -> :ok
-          end
-        end)
-
-      assert_receive :observed, 5_000
-
-      # The entry of the test process does not go to the observer.
-      Performance.mark("test process")
-      send(pid, :mark)
-      assert {["other process"], _options} = next_callback()
+      assert {["before"], _options} = next_callback()
+      Performance.mark("after")
+      assert {["after"], _options} = next_callback()
       settle(observer)
       refute_received {:callback, _observer, _names, _options}
-      send(pid, :stop)
     end
 
-    test "an observer can observe two processes" do
+    test "observes only its global object" do
       observer = observer()
-      test = self()
+      PerformanceObserver.observe(observer, type: "mark")
+      in_process(fn -> Performance.mark("other process") end)
+      Performance.mark("test process")
 
-      pids =
-        for name <- ["first", "second"] do
-          spawn(fn ->
-            PerformanceObserver.observe(observer, type: "mark")
-            send(test, {:observed, self()})
-
-            receive do
-              :mark -> Performance.mark(name)
-            end
-
-            send(test, {:marked, self()})
-          end)
-        end
-
-      for pid <- pids, do: assert_receive({:observed, ^pid}, 5_000)
-      for pid <- pids, do: send(pid, :mark)
-      for pid <- pids, do: assert_receive({:marked, ^pid}, 5_000)
-
-      names =
-        Stream.repeatedly(&next_callback/0)
-        |> Stream.flat_map(&elem(&1, 0))
-        |> Enum.take(2)
-
-      assert Enum.sort(names) == ["first", "second"]
-    end
-
-    test "a process lists an observer one time, and forgets an observer that stopped" do
-      first = in_process(fn -> observer() end)
-      wait_for_stop(first.address)
-      second = observer()
-
-      Process.put({Web.Internal.PerformanceObserver, :observers}, [
-        {first.address, first.token}
-      ])
-
-      PerformanceObserver.observe(second, type: "mark")
-      PerformanceObserver.observe(second, type: "measure")
-
-      assert Process.get({Web.Internal.PerformanceObserver, :observers}) == [
-               {second.address, second.token}
-             ]
-    end
-  end
-
-  # A pid of a node that is not connected.
-  defp remote_pid do
-    name = "remote@host"
-    :erlang.binary_to_term(<<131, 88, 119, byte_size(name), name::binary, 1::32, 0::32, 1::32>>)
-  end
-
-  describe "an observer of a different node" do
-    test "stays in the list of the process" do
-      remote = {remote_pid(), make_ref()}
-      Process.put({Web.Internal.PerformanceObserver, :observers}, [remote])
-      local = observer()
-
-      assert :ok = PerformanceObserver.observe(local, type: "mark")
-
-      assert Process.get({Web.Internal.PerformanceObserver, :observers}) == [
-               remote,
-               {local.address, local.token}
-             ]
+      assert {["test process"], _options} = next_callback()
     end
   end
 
@@ -635,18 +600,16 @@ defmodule Web.PerformanceObserverTest do
       assert {["b"], _options} = next_callback()
     end
 
-    test "from a different process stops the entries of each process" do
+    test "from a different process stops the observation" do
       observer = observer()
       PerformanceObserver.observe(observer, type: "mark")
       in_process(fn -> PerformanceObserver.disconnect(observer) end)
 
-      # The test process still lists the observer. The server drops the
-      # entry, because the process has no options.
-      assert [{_pid, _token}] = Process.get({Web.Internal.PerformanceObserver, :observers})
       Performance.mark("a")
       settle(observer)
       refute_received {:callback, _observer, _names, _options}
       assert PerformanceObserver.take_records(observer) == []
+      assert :sys.get_state(observer.address).registered == []
     end
   end
 
@@ -655,7 +618,7 @@ defmodule Web.PerformanceObserverTest do
   # ---------------------------------------------------------------------------
 
   describe "lifetime" do
-    test "the observer stops with its owner" do
+    test "the observer stops with its global object" do
       {observer, runner} =
         in_process(fn ->
           observer = observer()
@@ -672,12 +635,20 @@ defmodule Web.PerformanceObserverTest do
       Performance.mark("a")
     end
 
-    test "a task that did not start does not run after the stop of the owner" do
+    test "a task that did not start does not run after the stop of the global object" do
       test = self()
 
-      owner =
+      global =
         spawn(fn ->
-          send(test, {:observer, PerformanceObserver.new(fn -> send(test, :ran) end)})
+          observer = PerformanceObserver.new(fn -> send(test, :ran) end)
+          PerformanceObserver.observe(observer, type: "mark")
+          send(test, {:observer, observer})
+
+          receive do
+            :mark -> Performance.mark("a")
+          end
+
+          send(test, :marked)
 
           receive do
             :stop -> :ok
@@ -686,42 +657,55 @@ defmodule Web.PerformanceObserverTest do
 
       assert_receive {:observer, observer}, 5_000
       %{runner: runner} = :sys.get_state(observer.address)
-      PerformanceObserver.observe(observer, type: "mark")
       true = :erlang.suspend_process(runner)
 
       # The task waits in the mailbox of the callback process.
-      Performance.mark("a")
+      send(global, :mark)
+      assert_receive :marked, 5_000
       assert %{task_queued: true} = :sys.get_state(observer.address)
 
-      send(owner, :stop)
+      send(global, :stop)
       wait_for_stop(observer.address)
       true = :erlang.resume_process(runner)
       wait_for_stop(runner)
       refute_received :ran
     end
 
-    test "the entries of an observed process that stopped stay" do
-      observer = waiting_observer()
+    test "a callback that runs after the stop of its global object completes" do
+      test = self()
 
-      in_process(fn ->
-        PerformanceObserver.observe(observer, type: "mark")
-        Performance.mark("first")
-      end)
+      callback = fn list, _observer ->
+        send(test, {:waiting, self(), names(PerformanceObserverEntryList.get_entries(list))})
 
-      assert_receive {:waiting, runner, ["first"], _options}, 5_000
+        receive do
+          :continue -> :ok
+        end
 
-      pid =
+        # The timeline stopped with its global object: no effect.
+        Performance.mark("too late")
+        send(test, {:entries, Performance.get_entries()})
+      end
+
+      global =
         spawn(fn ->
+          observer = PerformanceObserver.new(callback)
           PerformanceObserver.observe(observer, type: "mark")
-          Performance.mark("last words")
+          Performance.mark("last")
+          send(test, {:observer, observer})
+
+          receive do
+            :stop -> :ok
+          end
         end)
 
-      wait_for_stop(pid)
-      wait_until(fn -> not Map.has_key?(:sys.get_state(observer.address).registrations, pid) end)
+      assert_receive {:observer, observer}, 5_000
+      assert_receive {:waiting, runner, ["last"]}, 5_000
+      send(global, :stop)
+      wait_for_stop(observer.address)
 
       send(runner, :continue)
-      assert_receive {:waiting, runner, ["last words"], _options}, 5_000
-      send(runner, :continue)
+      assert_receive {:entries, []}, 5_000
+      wait_for_stop(runner)
     end
 
     test "a handle with a token that is not correct has no effect" do
@@ -733,28 +717,143 @@ defmodule Web.PerformanceObserverTest do
       assert PerformanceObserver.take_records(forged) == []
       assert :ok = PerformanceObserver.disconnect(forged)
 
-      # An entry with the wrong token, and a message with no meaning.
-      send(observer.address, {:queue_entry, make_ref(), self(), Performance.Mark.new("x")})
+      # A message with no meaning.
       send(observer.address, :unknown)
 
       Performance.mark("a")
       assert {["a"], _options} = next_callback()
-      assert [%{type: "mark"}] = :sys.get_state(observer.address).registrations[self()].options
+      assert [%{type: "mark"}] = options(observer)
     end
   end
 
-  # Examines a condition of a different process until it is true.
-  defp wait_until(condition, attempts \\ 500) do
-    cond do
-      condition.() ->
-        :ok
+  # ---------------------------------------------------------------------------
+  # The global object
+  # ---------------------------------------------------------------------------
 
-      attempts > 0 ->
-        Process.sleep(1)
-        wait_until(condition, attempts - 1)
+  describe "the global object" do
+    test "a mark of the callback is an entry of the global object of the observer" do
+      test = self()
 
-      true ->
-        flunk("the condition did not become true")
+      observer =
+        PerformanceObserver.new(fn list ->
+          names = names(PerformanceObserverEntryList.get_entries(list))
+          send(test, {:names, names})
+          if names == ["from test"], do: Performance.mark("from callback")
+        end)
+
+      PerformanceObserver.observe(observer, type: "mark")
+      Performance.mark("from test")
+
+      # The observer gets the entry of the callback, and the test process
+      # has it.
+      assert_receive {:names, ["from test"]}, 5_000
+      assert_receive {:names, ["from callback"]}, 5_000
+      assert names(Performance.get_entries()) == ["from test", "from callback"]
+    end
+
+    test "the functions of Performance in the callback act on the timeline of the global object" do
+      test = self()
+
+      observer =
+        PerformanceObserver.new(fn ->
+          before = names(Performance.get_entries())
+          measure = Performance.measure("in callback", "start")
+          Performance.clear_marks("start")
+
+          send(test, {
+            :callback,
+            before,
+            measure.start_time,
+            names(Performance.get_entries_by_type("mark")),
+            names(Performance.get_entries_by_name("in callback", "measure")),
+            Performance.now()
+          })
+        end)
+
+      Performance.mark("start", start_time: 5.0)
+      PerformanceObserver.observe(observer, type: "mark")
+      Performance.mark("other", start_time: 6.0)
+
+      assert_receive {:callback, ["start", "other"], 5.0, ["other"], ["in callback"], now},
+                     5_000
+
+      # The time origin is the same for each global object.
+      assert now <= Performance.now()
+      assert names(Performance.get_entries()) == ["in callback", "other"]
+    end
+
+    test "an observer that the callback makes belongs to the global object" do
+      test = self()
+
+      first =
+        PerformanceObserver.new(fn list, first ->
+          names = names(PerformanceObserverEntryList.get_entries(list))
+
+          if names == ["foo"] do
+            second = PerformanceObserver.new(fn list -> send(test, {:second, list}) end)
+            PerformanceObserver.observe(second, type: "mark", buffered: true)
+            PerformanceObserver.disconnect(first)
+          end
+        end)
+
+      PerformanceObserver.observe(first, entry_types: ["mark"])
+      Performance.mark("foo")
+      assert_receive {:second, list}, 5_000
+      assert names(PerformanceObserverEntryList.get_entries(list)) == ["foo"]
+
+      Performance.mark("bar")
+      assert_receive {:second, list}, 5_000
+      assert names(PerformanceObserverEntryList.get_entries(list)) == ["bar"]
+    end
+
+    test "the callbacks of a task run in the sequence of the registrations" do
+      test = self()
+
+      [first, second] =
+        for name <- [:first, :second] do
+          PerformanceObserver.new(fn list ->
+            send(test, {name, names(PerformanceObserverEntryList.get_entries(list))})
+          end)
+        end
+
+      PerformanceObserver.observe(second, type: "mark")
+      PerformanceObserver.observe(first, type: "mark")
+      %{runner: runner} = :sys.get_state(first.address)
+      true = :erlang.suspend_process(runner)
+      Performance.mark("a")
+      true = :erlang.resume_process(runner)
+
+      # The callbacks run in the same process: their messages come in the
+      # sequence of the callbacks.
+      assert [next_message(), next_message()] == [{:second, ["a"]}, {:first, ["a"]}]
+    end
+
+    test "the callback process has no task in its mailbox while a callback runs" do
+      observer = waiting_observer()
+      PerformanceObserver.observe(observer, type: "mark")
+      Performance.mark("a")
+      assert_receive {:waiting, runner, ["a"], _options}, 5_000
+
+      # The flag goes up, and the task waits in the server.
+      Performance.mark("b")
+      assert %{task_queued: true, task_running: true} = :sys.get_state(observer.address)
+      assert Process.info(runner, :message_queue_len) == {:message_queue_len, 0}
+
+      send(runner, :continue)
+      assert_receive {:waiting, ^runner, ["b"], _options}, 5_000
+      send(runner, :continue)
+    end
+
+    test "the first observer keeps the earlier entries of the process" do
+      Performance.mark("early", start_time: 1.0)
+      Performance.measure("measure", start: 0.5, end: 1.5)
+
+      observer = observer()
+      assert names(Performance.get_entries()) == ["measure", "early"]
+      assert Performance.measure("from early", "early").start_time == 1.0
+
+      PerformanceObserver.observe(observer, type: "mark", buffered: true)
+      assert {["early"], _options} = next_callback()
     end
   end
 
@@ -879,7 +978,9 @@ defmodule Web.PerformanceObserverTest do
             capture_log(fn -> assert :ok = PerformanceObserver.observe(observer, options) end)
         end
 
-        assert :sys.get_state(observer.address).observer_type == observer_type
+        assert :sys.get_state(observer.address).observers[observer.token].observer_type ==
+                 observer_type
+
         observer_type
       end)
     end

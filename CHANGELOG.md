@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.Iterator`, the Iterator helpers of ES2025: `from/1`, `next/1`,
+  `return/1`, the lazy helpers `map/2`, `filter/2`, `take/2`, `drop/2`, and
+  `flat_map/2`, and `reduce/2,3`, `to_array/1`, `for_each/2`, `some/2`,
+  `every/2`, and `find/2`. `to_async/1` gives a `Web.AsyncIterator`, as
+  `toAsync()` of the proposal for async iterator helpers. An iterator keeps
+  its state in a process of its owner, and `Web.Iterator` implements
+  `Enumerable`. `Web.AsyncIterator.from/1` takes a `Web.Iterator`.
+  `tla/SyncIterator.tla` gives the rules of the calls.
+- `Web.AsyncIterator.buffered/2,3`, as `buffered(limit, prepopulate)` of the
+  proposal for concurrency control. The proposal has no spec text: the
+  rules come from the notes of the champions (the iterator starts at the
+  first call, unless `prepopulate` is true, and a read that no call took
+  yet counts in the limit). `tla/AsyncBuffered.tla` gives the rules.
+- The WPT files of `performance-timeline/` and `user-timing/` run in the
+  runner.
+- `use Web` aliases `Web.Iterator`.
 - `Web.AsyncIterator`, the async iterator helpers of TC39: `from/1`,
   `next/1`, `return/1`, the lazy helpers `map/2`, `filter/2`, `take/2`,
   `drop/2`, and `flat_map/2`, and the methods `reduce/2,3,4`, `to_array/1,2`,
@@ -720,6 +736,23 @@ All notable changes to this project are documented in this file.
   - `Web.Performance.mark/2` and `measure/3` ignore an option that they do
     not know. A number as a start or end mark is the name of a mark: give a
     time with `:start` and `:end`.
+- **Breaking:** the callback of a `Web.PerformanceObserver` runs with the
+  global object of the observer, as the Performance Timeline specifies. The
+  global object is the process that makes the observer. In the callback,
+  `Web.Performance.mark/2`, `measure/3`, `get_entries/0` and the other
+  functions act on the timeline of that process, and its observers get the
+  entries of the callback. `observe/2` registers the observer in its global
+  object, also when a different process calls it: make the observer in the
+  process that you want to observe. The callbacks of the observers of one
+  global object run one at a time, in the sequence of registration. The
+  count `dropped_entries_count` is 0: the Performance Timeline gives
+  "mark" and "measure" no buffer limit.
+- Concurrent calls of `next/1` on `Web.AsyncIterator.flat_map/2` read the
+  inner iterator at the same time, and give the results of a sequential
+  run. The helper reads its source only after the end of the inner
+  iterator. `tla/AsyncFlatMap.tla` gives the rules. The result of the
+  mapper becomes an iterator in the process of the helper: a stream from
+  the mapper keeps its lock.
 - **Breaking:** `Web.Governor.wrap_iterator/2` gives a `Web.AsyncIterator`,
   as the proposal for concurrency control says: use
   `Web.AsyncIterator.next/1` and `Web.AsyncIterator.return/1`. Its

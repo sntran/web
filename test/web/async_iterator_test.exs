@@ -892,7 +892,10 @@ defmodule Web.AsyncIteratorTest do
       Script.give(Script.assert_read(:source), :a)
       [first, failing, _last] = for _read <- 1..3, do: Script.assert_read(:inner)
 
+      # The error comes before the value of the read before it: thus it waits
+      # for that read. (Each read has its own job process.)
       Script.fail(failing, :inner_error)
+      Script.settle([iterator.pid])
       Script.give(first, :x)
       Script.finish(Script.assert_close(:source))
       [first, second, third] = calls
@@ -914,7 +917,10 @@ defmodule Web.AsyncIteratorTest do
       Script.give(Script.assert_read(:source), :b)
       _for_last = Script.assert_read(:second)
 
+      # The error comes before the value of the read before it, when the
+      # current inner iterator is a different one.
       Script.fail(failing, :inner_error)
+      Script.settle([iterator.pid])
       Script.give(first, :x)
       Script.finish(Script.assert_close(:source))
 

@@ -10,6 +10,7 @@ defmodule Web.FormDataTest do
   alias Web.ReadableStream
   alias Web.ReadableStreamDefaultReader
   alias Web.Test.StreamEngine
+  alias Web.TestSupport.CrashReport
 
   defmodule ShutdownCallMachine do
     @behaviour :gen_statem
@@ -1413,7 +1414,7 @@ defmodule Web.FormDataTest do
 
   test "parser start_link returns an error when the owner helper crashes before replying" do
     stream = ReadableStream.__from__("")
-    handler = Web.TestSupport.CrashReport.attach(self())
+    handler = CrashReport.attach(self())
 
     try do
       capture_log(fn ->
@@ -1425,7 +1426,7 @@ defmodule Web.FormDataTest do
         assert_receive {:crash_report, %{level: :error}}, 5_000
       end)
     after
-      Web.TestSupport.CrashReport.detach(handler)
+      CrashReport.detach(handler)
     end
   end
 

@@ -56,6 +56,7 @@ defmodule Web do
       alias Web.AbortSignal
       alias Web.ArrayBuffer
       alias Web.AsyncContext
+      alias Web.AsyncIterator
       alias Web.Blob
       alias Web.BroadcastChannel
       alias Web.ByteLengthQueuingStrategy

@@ -76,8 +76,9 @@ defmodule Web.TLA.AbortSignalConformanceTest do
       Enum.reduce(commands, {SpecModel.start("AbortSignal"), system}, fn command,
                                                                          {model, system} ->
         {model, system} = run(command, model, system)
-        model = follow_timers(model, system)
-        assert_same_state(model, system)
+        observed = observe(system)
+        model = follow_timers(model, observed)
+        assert_same_state(model, system, observed)
         {model, system}
       end)
     after
@@ -374,19 +375,30 @@ defmodule Web.TLA.AbortSignalConformanceTest do
     assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, 2_000, message
   end
 
-  # The linger time can be complete at this moment, and the store can remove
-  # a reason at this moment. The specification permits those steps at each
-  # time when they are possible. Thus the model does them when the real
-  # system did them.
-  defp follow_timers(model, system) do
+  # The facts that a timer can change: the linger time of a signal can end,
+  # and the store can remove a reason, at each moment. The test reads each
+  # of them one time after a command, and uses the same values for the steps
+  # of the timers and for the comparison: a second read could see a change
+  # that the first read did not see.
+  defp observe(system) do
+    %{
+      signal_alive: Process.alive?(system.signal.pid),
+      dep_alive: system.dep != nil and Process.alive?(system.dep.pid),
+      stored: stored?(system)
+    }
+  end
+
+  # The specification permits the steps of the timers at each time when
+  # they are possible. Thus the model does them when the real system did
+  # them.
+  defp follow_timers(model, observed) do
     model
-    |> follow(not Process.alive?(system.signal.pid) and SpecModel.get(model, "running"), "Expire")
+    |> follow(not observed.signal_alive and SpecModel.get(model, "running"), "Expire")
     |> follow(
-      system.dep != nil and not Process.alive?(system.dep.pid) and
-        SpecModel.get(model, "dep") == "running",
+      not observed.dep_alive and SpecModel.get(model, "dep") == "running",
       "DepExpire"
     )
-    |> follow(not stored?(system) and SpecModel.get(model, "stored"), "Sweep")
+    |> follow(not observed.stored and SpecModel.get(model, "stored"), "Sweep")
   end
 
   defp follow(model, true, action) do
@@ -401,20 +413,20 @@ defmodule Web.TLA.AbortSignalConformanceTest do
   # The comparison of the two states
   # ---------------------------------------------------------------------------
 
-  defp assert_same_state(model, system) do
+  defp assert_same_state(model, system, observed) do
     state = SpecModel.to_map(model)
     pid = system.signal.pid
 
-    assert Process.alive?(pid) == state["running"],
-           "the signal is #{if Process.alive?(pid), do: "alive", else: "stopped"}, " <>
+    assert observed.signal_alive == state["running"],
+           "the signal is #{if observed.signal_alive, do: "alive", else: "stopped"}, " <>
              "but the specification has #{inspect(state)}"
 
-    assert stored?(system) == state["stored"],
-           "the store #{if stored?(system), do: "has", else: "does not have"} the reason, " <>
+    assert observed.stored == state["stored"],
+           "the store #{if observed.stored, do: "has", else: "does not have"} the reason, " <>
              "but the specification has #{inspect(state)}"
 
     if system.dep do
-      assert Process.alive?(system.dep.pid) == state["dep"] in ["running", "aborted"]
+      assert observed.dep_alive == state["dep"] in ["running", "aborted"]
     end
 
     if state["running"] do

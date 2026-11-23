@@ -75,6 +75,8 @@ defmodule Web do
       alias Web.MessageEvent
       alias Web.MessagePort
       alias Web.Performance
+      alias Web.PerformanceObserver
+      alias Web.PerformanceObserverEntryList
       alias Web.Promise
       alias Web.ReadableByteStreamController
       alias Web.ReadableStream

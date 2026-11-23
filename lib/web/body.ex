@@ -349,8 +349,9 @@ defmodule Web.Body do
   end
 
   # The clone of a request gets a new signal that depends on the signal of
-  # the request, as `clone()` of the Fetch Standard specifies.
-  defp clone_signal(%Web.Request{signal: signal, options: options} = request) do
+  # the request, as `clone()` of the Fetch Standard specifies. The match
+  # has no struct pattern: `Web.Request` uses this module at compile time.
+  defp clone_signal(%{__struct__: Web.Request, signal: signal, options: options} = request) do
     clone = Web.AbortSignal.__dependent__(signal)
     %{request | signal: clone, options: Keyword.put(options || [], :signal, clone)}
   end

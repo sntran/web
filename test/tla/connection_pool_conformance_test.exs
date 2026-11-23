@@ -81,12 +81,20 @@ defmodule Web.TLA.ConnectionPoolConformanceTest do
     server_loop(acceptor, %{})
   end
 
+  # The listener closes when the test kills the server at its end. The
+  # acceptor can see that close before it gets the exit signal of its link:
+  # then it stops normally, with no crash report.
   defp accept(listener, server) do
-    {:ok, socket} = :gen_tcp.accept(listener)
-    :ok = :gen_tcp.controlling_process(socket, server)
-    {:ok, {_address, port}} = :inet.peername(socket)
-    send(server, {:accepted, port, socket})
-    accept(listener, server)
+    case :gen_tcp.accept(listener) do
+      {:ok, socket} ->
+        :ok = :gen_tcp.controlling_process(socket, server)
+        {:ok, {_address, port}} = :inet.peername(socket)
+        send(server, {:accepted, port, socket})
+        accept(listener, server)
+
+      {:error, :closed} ->
+        :ok
+    end
   end
 
   defp server_loop(acceptor, sockets) do

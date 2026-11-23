@@ -504,8 +504,8 @@ defmodule Web.GovernorTest do
   end
 
   describe "Governor.wrap_iterator/2" do
+    alias Web.AsyncIterator, as: Iterator
     alias Web.ReadableStream
-    alias Web.ReadableStreamAsyncIterator, as: Iterator
 
     # An enumerable that tells the test about each step, with the token
     # count of the governor at that time.
@@ -606,7 +606,8 @@ defmodule Web.GovernorTest do
       iterator = Governor.wrap_iterator(governor, ReadableStream.values(source))
 
       assert await(Iterator.next(iterator)) == %{value: 1, done: false}
-      assert await(Iterator.return(iterator, :enough)) == %{value: :enough, done: true}
+      # The method return() of the iterator has no argument.
+      assert await(Iterator.return(iterator, :enough)) == %{value: nil, done: true}
 
       # The return of the source releases its lock.
       eventually(fn -> not ReadableStream.locked?(source) end)
@@ -634,7 +635,7 @@ defmodule Web.GovernorTest do
     end
 
     test "raises TypeError for a value that is not an iterator" do
-      assert_raise Web.TypeError, ~r/not an iterator/, fn ->
+      assert_raise Web.TypeError, ~r/not an async iterator or an iterable/, fn ->
         Governor.wrap_iterator(CountingGovernor.new(1), :not_an_iterator)
       end
     end

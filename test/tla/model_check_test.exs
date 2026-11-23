@@ -1101,4 +1101,120 @@ defmodule Web.TLA.ModelCheckTest do
       )
     end
   end
+
+  describe "AsyncIteratorHelper" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("AsyncIteratorHelper"))
+    end
+
+    test "the design of map, with a job for each call, has all its properties" do
+      assert_holds(SpecModel.check("AsyncIteratorHelper", {"Capacity = 2", "Capacity = 3"}))
+    end
+
+    test "a value that comes before the results of the calls before it is found" do
+      assert_violates(SpecModel.check("AsyncIteratorHelper", bug("unordered")), "InOrder")
+    end
+
+    test "a return that closes the source during the reads of the calls before it is found" do
+      assert_violates(
+        SpecModel.check("AsyncIteratorHelper", bug("return_not_queued")),
+        "CloseSafe"
+      )
+    end
+
+    test "an error of the mapper that closes the source before its entry is the first is found" do
+      assert_violates(SpecModel.check("AsyncIteratorHelper", bug("close_at_error")), "CloseSafe")
+    end
+
+    test "an error that does not end the calls after it is found" do
+      assert_violates(
+        SpecModel.check("AsyncIteratorHelper", bug("error_keeps_later")),
+        "CloseSafe"
+      )
+    end
+
+    # The defect that a test found: a killed job gave its permit back before
+    # its failure, and a new read started after the failure.
+    test "a killed job that gives its permit back before its failure is found" do
+      assert_violates(
+        SpecModel.check("AsyncIteratorHelper", bug("release_before_failure")),
+        "NoReadAfterEnd"
+      )
+    end
+
+    test "a helper that stops while its jobs run is found" do
+      assert_violates(
+        SpecModel.check("AsyncIteratorHelper", bug("stop_with_jobs")),
+        "StopsWithJobs"
+      )
+    end
+
+    test "an end of the source that does not end the calls after it is found" do
+      assert_violates(
+        SpecModel.check("AsyncIteratorHelper", bug("end_keeps_later")),
+        "AllAnswered"
+      )
+    end
+  end
+
+  describe "AsyncIteratorConsumer" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("AsyncIteratorConsumer"))
+    end
+
+    test "the design with one permit has all its properties" do
+      assert_holds(SpecModel.check("AsyncIteratorConsumer", {"Capacity = 2", "Capacity = 1"}))
+    end
+
+    test "a result that does not wait for the decisions before it is found" do
+      assert_violates(SpecModel.check("AsyncIteratorConsumer", bug("unordered")), "FirstFound")
+    end
+
+    test "a promise that settles before the close is found" do
+      assert_violates(
+        SpecModel.check("AsyncIteratorConsumer", bug("settle_before_close")),
+        "SettleAfterClose"
+      )
+    end
+
+    test "a read after the decision is found" do
+      assert_violates(
+        SpecModel.check("AsyncIteratorConsumer", bug("read_after_decision")),
+        "NoReadAfterDecision"
+      )
+    end
+
+    test "a process that stops its work while its jobs run is found" do
+      assert_violates(
+        SpecModel.check("AsyncIteratorConsumer", bug("stop_with_jobs")),
+        "StopsWithJobs"
+      )
+    end
+
+    # The defect that the conformance test found: a read after the end of
+    # the source, while a decision before the end waited.
+    test "a read after the end of the source is found" do
+      assert_violates(
+        SpecModel.check("AsyncIteratorConsumer", bug("read_after_end")),
+        "NoReadAfterEnd"
+      )
+    end
+
+    test "an end of the source with no decision is found" do
+      assert_violates(SpecModel.check("AsyncIteratorConsumer", bug("no_end_decision")), "Settles")
+    end
+
+    # The defect that a test found: with one permit, a killed job gave its
+    # permit back before its failure, and a new read started before the
+    # decision on it.
+    test "a killed job that gives its permit back before its failure is found" do
+      result =
+        SpecModel.check("AsyncIteratorConsumer", [
+          bug("release_before_failure"),
+          {"Capacity = 2", "Capacity = 1"}
+        ])
+
+      assert_violates(result, "SequentialReads")
+    end
+  end
 end

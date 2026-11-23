@@ -21,7 +21,9 @@ defmodule Web.ReadableStreamAsyncIterator do
   with the error again.
 
   An `Enum` function on the stream is the usual way to read all its chunks
-  in Elixir: see `Web.ReadableStream`.
+  in Elixir: see `Web.ReadableStream`. The async iterator helpers of
+  `Web.AsyncIterator`, for example `Web.AsyncIterator.map/2`, take the
+  iterator as their source.
   """
 
   alias Web.Promise

@@ -15,12 +15,10 @@ defmodule Web.Governor do
       :done
   """
 
+  alias Web.AsyncIterator
   alias Web.GovernorToken
   alias Web.Internal.Arity
   alias Web.Promise
-  alias Web.ReadableStream
-  alias Web.ReadableStreamAsyncIterator
-  alias Web.TypeError
 
   @type t :: struct()
 
@@ -77,13 +75,14 @@ defmodule Web.Governor do
   `wrapIterator(it)`. Each step of `iterator` holds a token of the
   governor: the governor limits the steps that run at the same time.
 
-  `iterator` is an enumerable, as an `Iterator`, or a
-  `Web.ReadableStreamAsyncIterator`, as an `AsyncIterator`. The result is a
-  `Web.ReadableStreamAsyncIterator`: `Web.ReadableStreamAsyncIterator.next/1`
-  acquires a token, takes the next value of `iterator`, releases the
-  token, and gives the value. A step that raises releases the token, and
-  `next/1` rejects with the error. `Web.ReadableStreamAsyncIterator.return/2`
-  stops `iterator`.
+  `iterator` is an enumerable, as an `Iterator`, or an async iterator of
+  this library, as an `AsyncIterator`: see `Web.AsyncIterator.from/1`. The
+  result is a `Web.AsyncIterator`, as the proposal specifies. It is
+  `Web.AsyncIterator.limit/2` of the iterator: each call of
+  `Web.AsyncIterator.next/1` acquires a token, takes the next value of
+  `iterator`, and releases the token when the step settles. A step that
+  raises releases the token, and `next/1` rejects with the error.
+  `Web.AsyncIterator.return/1` stops `iterator`.
 
   Raises `Web.TypeError` for a value that is not an iterator.
 
@@ -91,74 +90,16 @@ defmodule Web.Governor do
 
       iex> governor = Web.CountingGovernor.new(1)
       iex> iterator = Web.Governor.wrap_iterator(governor, [:a, :b])
-      iex> Web.await(Web.ReadableStreamAsyncIterator.next(iterator))
+      iex> Web.await(Web.AsyncIterator.next(iterator))
       %{value: :a, done: false}
-      iex> Web.await(Web.ReadableStreamAsyncIterator.next(iterator))
+      iex> Web.await(Web.AsyncIterator.next(iterator))
       %{value: :b, done: false}
-      iex> Web.await(Web.ReadableStreamAsyncIterator.next(iterator))
+      iex> Web.await(Web.AsyncIterator.next(iterator))
       %{value: nil, done: true}
   """
-  @spec wrap_iterator(t(), Enumerable.t() | ReadableStreamAsyncIterator.t()) ::
-          ReadableStreamAsyncIterator.t()
+  @spec wrap_iterator(t(), Enumerable.t() | AsyncIterator.async_iterator()) :: AsyncIterator.t()
   def wrap_iterator(%_{} = governor, iterator) do
-    iterator
-    |> values()
-    |> governed(governor)
-    |> ReadableStream.from()
-    |> ReadableStream.values()
-  end
-
-  # The values of an async iterator: each step awaits `next()`. A stop
-  # before the end calls `return()`.
-  defp values(%ReadableStreamAsyncIterator{} = iterator) do
-    Stream.resource(
-      fn -> {:open, iterator} end,
-      fn {:open, iterator} ->
-        case Promise.await(ReadableStreamAsyncIterator.next(iterator)) do
-          %{done: true} -> {:halt, {:done, iterator}}
-          %{value: value} -> {[value], {:open, iterator}}
-        end
-      end,
-      fn
-        {:open, iterator} -> ReadableStreamAsyncIterator.return(iterator)
-        {:done, _iterator} -> :ok
-      end
-    )
-  end
-
-  defp values(iterator) do
-    if Enumerable.impl_for(iterator) do
-      iterator
-    else
-      raise TypeError, "The value is not an iterator: #{inspect(iterator)}"
-    end
-  end
-
-  # An enumerable that takes each value of `enumerable` while it holds a
-  # token. The enumerable suspends after each value: the next step runs
-  # only for the next value.
-  defp governed(enumerable, governor) do
-    Stream.resource(
-      fn -> &Enumerable.reduce(enumerable, &1, fn value, _acc -> {:suspend, value} end) end,
-      fn continuation -> governed_step(continuation, governor) end,
-      fn
-        :done -> :ok
-        continuation -> continuation.({:halt, nil})
-      end
-    )
-  end
-
-  defp governed_step(continuation, governor) do
-    token = Promise.await(acquire(governor))
-
-    try do
-      case continuation.({:cont, nil}) do
-        {:suspended, value, continuation} -> {[value], continuation}
-        {_done_or_halted, _acc} -> {:halt, :done}
-      end
-    after
-      GovernorToken.release(token)
-    end
+    iterator |> AsyncIterator.from() |> AsyncIterator.limit(governor)
   end
 
   defp await_settled(%Promise{} = promise) do

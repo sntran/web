@@ -133,8 +133,9 @@ responses = await(Promise.all(requests))
 ```
 
 `Governor.wrap/2` gives a function that holds a token for each call, and
-`Governor.wrap_iterator/2` gives an async iterator that holds a token for
-each step of an enumerable, as `wrapIterator(it)`.
+`Governor.wrap_iterator/2` gives a `Web.AsyncIterator` that holds a token
+for each step of an iterator, as `wrapIterator(it)`: see "Async Iterator
+Helpers".
 
 A token belongs to the process that acquired it. When that process stops,
 also with a failure, the governor takes the token back. Thus the capacity
@@ -216,6 +217,49 @@ end)
 
 `AsyncContext.Snapshot.wrap/1` takes the context now, and gives a function
 that runs in that context at a later time, also in a different process.
+
+### 🔁 Async Iterator Helpers
+
+`Web.AsyncIterator` has the helpers of the TC39 proposal "async iterator
+helpers": `from/1`, and the methods `map`, `filter`, `take`, `drop`,
+`flat_map`, `reduce`, `to_array`, `for_each`, `some`, `every`, and `find`.
+The methods take each async iterator of the library: a `Web.AsyncIterator`,
+the iterator of `ReadableStream.values/2`, and the iterator of
+`Governor.wrap_iterator/2`. `from/1` also takes an enumerable.
+
+```elixir
+use Web
+
+urls = ["https://a.com", "https://b.com", "https://c.com"]
+
+# Two fetches at the same time. The list has the sequence of the URLs.
+statuses =
+  urls
+  |> AsyncIterator.from()
+  |> AsyncIterator.map(fn url -> Promise.then(fetch(url), & &1.status) end)
+  |> AsyncIterator.to_array(2)
+  |> await()
+
+# A stream is a source, and an async iterator is an enumerable.
+ReadableStream.from(["a", "b", "c"])
+|> ReadableStream.values()
+|> AsyncIterator.filter(&(&1 != "b"))
+|> Enum.to_list()
+# => ["a", "c"]
+```
+
+A method that gives an iterator is lazy: it reads its source only at the
+first `next/1`. A method that gives a value returns a promise. A callback
+gets the value and its counter. An error of a callback rejects, and closes
+the source with `return/1`.
+
+Concurrent calls of `next/1` on a helper run at the same time, and get
+their results in their sequence. The concurrency argument of the TC39
+proposal "concurrency control" (a governor, or an integer for a
+`CountingGovernor` of that capacity) lets `to_array`, `for_each`, `some`,
+`every`, `find`, and `reduce` read many values at the same time, with the
+same result. `limit/2` gives an iterator that reads its source only with a
+token of a governor. `return/1` comes after the calls of `next/1` before it.
 
 ### 🌊 Zero-Buffer Streaming
 

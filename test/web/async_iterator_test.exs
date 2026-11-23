@@ -1190,8 +1190,10 @@ defmodule Web.AsyncIteratorTest do
       held = await(Web.Governor.acquire(governor))
       promise = AsyncIterator.to_array(Script.new(), governor)
       read = Script.assert_next()
-      Script.settle([promise.pid, governor.pid])
-      assert map_size(:sys.get_state(governor.pid).waiting) == 1
+      # The method acquires its next permit through a promise of
+      # `Web.Governor.acquire/1`, a process that is not linked to the method:
+      # the test waits until the governor has the acquisition.
+      eventually(fn -> map_size(:sys.get_state(governor.pid).waiting) == 1 end)
 
       Script.finish(read)
       assert await(promise) == []

@@ -42,7 +42,13 @@ defmodule Web.AsyncIteratorTest do
     def acquire_abortable(%__MODULE__{test: test}) do
       {promise, resolve, reject} = Promise.with_resolvers()
       send(test, {:acquire, resolve, reject})
-      %{promise: promise, abort: fn -> send(test, {:aborted, reject}) && :ok end}
+
+      abort = fn ->
+        send(test, {:aborted, reject})
+        :ok
+      end
+
+      %{promise: promise, abort: abort}
     end
 
     def release_token(%__MODULE__{test: test}, ref) do

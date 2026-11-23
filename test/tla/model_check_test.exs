@@ -1157,6 +1157,125 @@ defmodule Web.TLA.ModelCheckTest do
     end
   end
 
+  describe "AsyncFlatMap" do
+    # The bugs that need a third call of next() during a deferred error use
+    # three calls and one inner iterator: a model with three calls and two
+    # inner iterators takes minutes.
+    @three_calls [
+      {~s(Calls = {"c1", "c2"}), ~s(Calls = {"c1", "c2", "c3"})},
+      {"Inners = 2", "Inners = 1"},
+      {"MaxJobs = 7", "MaxJobs = 6"}
+    ]
+
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("AsyncFlatMap"))
+    end
+
+    # The behavior before this design: one read at a time.
+    test "a helper that reads its inner iterator one call at a time is found" do
+      assert_violates(SpecModel.check("AsyncFlatMap", bug("one_at_a_time")), "Eager")
+    end
+
+    test "an end that keeps the later reads of its inner iterator is found" do
+      assert_violates(SpecModel.check("AsyncFlatMap", bug("no_discard")), "RaceFree")
+    end
+
+    test "an error that ends the calls before an earlier read can give the end is found" do
+      assert_violates(SpecModel.check("AsyncFlatMap", bug("error_at_once")), "RaceFree")
+    end
+
+    test "a read of the source after an error of the inner iterator is found" do
+      result = SpecModel.check("AsyncFlatMap", [bug("read_on_error") | @three_calls])
+      assert_violates(result, "SourceLazy")
+    end
+
+    test "a read of an inner iterator after its deferred error is found" do
+      result = SpecModel.check("AsyncFlatMap", [bug("pull_after_error") | @three_calls])
+      assert_violates(result, "NoReadAfterError")
+    end
+
+    test "a return that closes only the source is found" do
+      assert_violates(SpecModel.check("AsyncFlatMap", bug("close_source_only")), "CloseRight")
+    end
+  end
+
+  describe "AsyncBuffered" do
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("AsyncBuffered"))
+    end
+
+    test "the design with prepopulate has all its properties" do
+      assert_holds(
+        SpecModel.check("AsyncBuffered", {"Prepopulate = FALSE", "Prepopulate = TRUE"})
+      )
+    end
+
+    test "the design with a limit of 0 has all its properties" do
+      assert_holds(SpecModel.check("AsyncBuffered", {"Capacity = 2", "Capacity = 0"}))
+    end
+
+    test "a promise of a call that does not count towards the buffer is found" do
+      assert_violates(SpecModel.check("AsyncBuffered", bug("vended_not_counted")), "Buffer")
+    end
+
+    test "a buffer that does not fill again is found" do
+      assert_violates(SpecModel.check("AsyncBuffered", bug("no_refill")), "Full")
+    end
+
+    test "a call that waits for a permit is found" do
+      result =
+        SpecModel.check("AsyncBuffered", [bug("no_forward"), {"Capacity = 2", "Capacity = 1"}])
+
+      assert_violates(result, "Forward")
+    end
+
+    test "a read before the first next is found" do
+      assert_violates(SpecModel.check("AsyncBuffered", bug("eager")), "Lazy")
+    end
+
+    test "a dropped read that gives its permit back before it settles is found" do
+      assert_violates(
+        SpecModel.check("AsyncBuffered", bug("release_dropped_at_once")),
+        "HeldWhileRunning"
+      )
+    end
+
+    # The defect that the model check found: an error of a read ahead after
+    # return() stayed in the buffer with its permit, and the process stopped.
+    test "a return that keeps the reads ahead is found" do
+      assert_violates(SpecModel.check("AsyncBuffered", bug("return_keeps_buffer")), "ReleasesAll")
+    end
+
+    test "an end that drops the values before it is found" do
+      assert_violates(SpecModel.check("AsyncBuffered", bug("end_drops_buffer")), "RaceFree")
+    end
+  end
+
+  describe "SyncIterator" do
+    @two_users [{"Users = {11}", "Users = {11, 12}"}, {"Acyclic = FALSE", "Acyclic = TRUE"}]
+
+    test "the design has all its properties" do
+      assert_holds(SpecModel.check("SyncIterator"))
+    end
+
+    test "the design with two users and no cycle has all its properties" do
+      assert_holds(SpecModel.check("SyncIterator", @two_users))
+    end
+
+    test "a call that waits for an iterator of its own chain is found" do
+      assert_violates(SpecModel.check("SyncIterator", bug("no_chain")), "AllAnswered")
+    end
+
+    test "a step that does not give its chain to its calls is found" do
+      assert_violates(SpecModel.check("SyncIterator", bug("no_propagation")), "AllAnswered")
+    end
+
+    test "a TypeError for a call of an iterator that runs for a different user is found" do
+      result = SpecModel.check("SyncIterator", [bug("error_on_busy") | @two_users])
+      assert_violates(result, "NoFalseError")
+    end
+  end
+
   describe "AsyncIteratorConsumer" do
     test "the design has all its properties" do
       assert_holds(SpecModel.check("AsyncIteratorConsumer"))

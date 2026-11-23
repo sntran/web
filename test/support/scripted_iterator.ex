@@ -20,6 +20,45 @@ defmodule Web.Test.ScriptedIterator do
   @doc "An iterator that the calling process serves."
   def new, do: %Web.AsyncIterator{pid: self()}
 
+  @doc """
+  An iterator that the calling process serves, with the name `tag`: a
+  process gives each step to the caller as `{:scripted, tag, step,
+  target}`. Thus a test serves many iterators, and knows the iterator of
+  each step. Stop the process with `stop/1`.
+  """
+  def new(tag) do
+    test = self()
+    %Web.AsyncIterator{pid: spawn(fn -> forward(test, tag) end)}
+  end
+
+  defp forward(test, tag) do
+    receive do
+      {:"$web_async_iterator", step, target} ->
+        send(test, {:scripted, tag, step, target})
+        forward(test, tag)
+    end
+  end
+
+  @doc "Stops the process of an iterator of `new/1`."
+  def stop(%Web.AsyncIterator{pid: pid}) do
+    monitor = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}
+    :ok
+  end
+
+  @doc "Waits for a read of the iterator `tag` of `new/1`."
+  def assert_read(tag, timeout \\ 1_000) do
+    assert_receive {:scripted, ^tag, :next, target}, timeout
+    target
+  end
+
+  @doc "Waits for a close of the iterator `tag` of `new/1`."
+  def assert_close(tag, timeout \\ 1_000) do
+    assert_receive {:scripted, ^tag, {:return, _value}, target}, timeout
+    target
+  end
+
   @doc "Waits for a read of the iterator. Returns the target of the reply."
   def assert_next(timeout \\ 1_000) do
     assert_receive {:"$web_async_iterator", :next, target}, timeout

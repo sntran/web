@@ -21,9 +21,10 @@ defmodule Web.AsyncIterator do
 
   ## The methods
 
-    * `map/2`, `filter/2`, `take/2`, `drop/2`, `flat_map/2`, and `limit/2`
-      give a new async iterator. The new iterator is lazy: it reads the
-      first value of its source only at the first `next/1`.
+    * `map/2`, `filter/2`, `take/2`, `drop/2`, `flat_map/2`, `buffered/3`,
+      and `limit/2` give a new async iterator. The new iterator is lazy: it
+      reads the first value of its source only at the first `next/1`.
+      Only `buffered/3` with `prepopulate` starts its reads at once.
     * `reduce/2`, `to_array/1`, `for_each/2`, `some/2`, `every/2`, and
       `find/2` read the iterator and give a `Web.Promise` of the result.
     * `next/1` and `return/1` are the methods of each async iterator. The
@@ -53,9 +54,10 @@ defmodule Web.AsyncIterator do
   Each call of `next/1` on a helper starts its own step. Thus the mapper of
   `map/2` can run for many values at the same time. The calls get their
   results in their sequence, with the values that they get one after the
-  other. `flat_map/2` reads all the values of an inner iterator before it
-  reads its source again. A call of `return/1` comes after the calls of
-  `next/1` before it.
+  other. `flat_map/2` reads its inner iterator once for each call, at the
+  same time, and reads its source again only after the end of its inner
+  iterator. `buffered/3` makes the calls for you: it reads ahead. A call of
+  `return/1` comes after the calls of `next/1` before it.
 
   The methods that consume an iterator take a concurrency argument: a
   governor, for example a `Web.CountingGovernor`, or a non-negative
@@ -71,7 +73,8 @@ defmodule Web.AsyncIterator do
       [1, 4, 9, 16, 25]
 
   `limit/2` gives an iterator that reads its source only with a token of
-  the governor.
+  the governor. `buffered/3` takes a governor or an integer as its limit
+  of the reads ahead.
 
   ## Elixir glue
 
@@ -133,6 +136,8 @@ defmodule Web.AsyncIterator do
       as `[Symbol.asyncIterator]()` of the stream. The iterator takes the
       lock of the stream.
     * A string: its code points, as the iterator of a `String`.
+    * A `Web.Iterator`: its async iterator, as `Web.Iterator.to_async/1`
+      (CreateAsyncFromSyncIterator).
     * An enumerable, as an iterable: the iterator gives its elements, as
       CreateAsyncFromSyncIterator. An element that is a `Web.Promise` gives
       the value of the promise. The iterator takes the first element only at
@@ -310,10 +315,23 @@ defmodule Web.AsyncIterator do
   `flatMap(mapper)`.
 
   `mapper` gets the value and its counter. Its result is an async iterator,
-  a `Web.ReadableStream`, or an enumerable, as for `from/1`. A string is
-  not an iterable here: it rejects with `Web.TypeError`. The helper reads
-  all the values of an inner iterator before it reads its source again,
-  and `return/1` closes the inner iterator and then the source.
+  a `Web.ReadableStream`, a `Web.Iterator`, or an enumerable, as for
+  `from/1`. A string is not an iterable here: it rejects with
+  `Web.TypeError`. `return/1` closes the inner iterator and then the
+  source.
+
+  Concurrent calls of `next/1` read the inner iterator at the same time,
+  one read for each call. The helper reads its source again only after a
+  read of the inner iterator gives `done: true`, and then for one value:
+  the mapper gives the next inner iterator. The calls that come during
+  that read wait for that inner iterator. The proposal has no text for
+  these steps. They are the steps of its champion ("drain the first
+  callback before pulling from the underlying iterator again", issue #22
+  of the proposal, and the meeting of TC39 of July 2026). An end can come
+  before the values of the reads before it: the read of the source then
+  starts at once. Each call gets the result of a sequential run, also
+  when an inner iterator gives `done: true` and then a value: the reads
+  after its first end give no result.
 
   Raises `Web.TypeError` when `iterator` is not an async iterator, or
   `mapper` is not a function of arity 0 to 2.
@@ -325,11 +343,79 @@ defmodule Web.AsyncIterator do
       ...> |> Web.AsyncIterator.flat_map(fn value -> [value, value * 10] end)
       ...> |> Enum.to_list()
       [1, 10, 2, 20]
+
+      iex> iterator =
+      ...>   [1, 2]
+      ...>   |> Web.AsyncIterator.from()
+      ...>   |> Web.AsyncIterator.flat_map(fn value -> [value, value * 10] end)
+      iex> calls = for _call <- 1..5, do: Web.AsyncIterator.next(iterator)
+      iex> Enum.map(calls, &Web.await/1)
+      [
+        %{value: 1, done: false},
+        %{value: 10, done: false},
+        %{value: 2, done: false},
+        %{value: 20, done: false},
+        %{value: nil, done: true}
+      ]
   """
   @spec flat_map(async_iterator(), function()) :: t()
   def flat_map(iterator, mapper) do
     iterator = iterator!(iterator)
     AsyncIteratorHelper.start(iterator, {:flat_map, AsyncStep.callback!(mapper, 2, "flatMap")})
+  end
+
+  @doc """
+  Gives an iterator that reads its source ahead of the calls, as
+  `buffered(limit, prepopulate = false)` of the proposals "async iterator
+  helpers" and "concurrency control".
+
+  The iterator gives the values of `iterator` in their sequence, as
+  `iterator` gives them. It reads ahead, thus a loop that takes one value
+  at a time gets concurrency from the helpers before it, for example from
+  the mapper of `map/2`.
+
+  `limit` is a governor, or a non-negative integer, as a
+  `Web.CountingGovernor` of that capacity. Each read ahead holds a permit
+  of `limit`. The proposals have no text for this method. The steps come
+  from the champions of the proposals:
+
+    * The iterator starts its reads at the first `next/1`, and then keeps
+      its buffer full (the meetings of TC39 of September 2023 and June
+      2024). With `prepopulate` (a value that is not `false` or `nil`, as
+      ToBoolean), it starts at once ("an opt-in parameter to start filling
+      the buffer eagerly").
+    * A promise that `next/1` gave, and that is not settled, counts towards
+      the buffer: its read keeps its permit until the read settles and its
+      value goes to the call ("promises which have been vended by
+      buffered but not yet settled will count towards the buffer", June
+      2024). Thus `iterator |> map(fun) |> buffered(5)` in a loop calls
+      `fun` 5 times at the same time, not 6.
+    * A call of `next/1` when the buffer has no read gets a read of
+      `iterator` at once, with no permit: "buffered(N) allows pulling more
+      than N times". The method is not a limit: see `limit/2` for a limit.
+    * After the end of `iterator`, the calls still get the values of the
+      reads before the end. `return/1` comes after the calls before it,
+      closes `iterator`, and drops the values that no call took.
+
+  Raises `Web.TypeError` when `iterator` is not an async iterator, or
+  `limit` is not a governor or an integer, and `Web.RangeError` for a
+  negative integer.
+
+  ## Examples
+
+      iex> iterator =
+      ...>   1..4
+      ...>   |> Web.AsyncIterator.from()
+      ...>   |> Web.AsyncIterator.map(fn value -> value * 10 end)
+      ...>   |> Web.AsyncIterator.buffered(2)
+      iex> Enum.to_list(iterator)
+      [10, 20, 30, 40]
+  """
+  @spec buffered(async_iterator(), concurrency(), term()) :: t()
+  def buffered(iterator, limit, prepopulate \\ false) do
+    iterator = iterator!(iterator)
+    permit = AsyncPermit.new!(limit)
+    AsyncIteratorHelper.start(iterator, {:buffered, {permit, AsyncStep.truthy?(prepopulate)}})
   end
 
   @doc """

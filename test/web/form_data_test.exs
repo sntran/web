@@ -1413,16 +1413,20 @@ defmodule Web.FormDataTest do
 
   test "parser start_link returns an error when the owner helper crashes before replying" do
     stream = ReadableStream.__from__("")
+    handler = Web.TestSupport.CrashReport.attach(self())
 
-    capture_log(fn ->
-      assert {:error, _reason} =
-               Web.FormData.Parser.start_link(stream, "owner-crash-boundary", owner: 123)
+    try do
+      capture_log(fn ->
+        assert {:error, _reason} =
+                 Web.FormData.Parser.start_link(stream, "owner-crash-boundary", owner: 123)
 
-      # The helper fails on purpose. The emulator gives its report to the
-      # process `logger_proxy`, which logs it later: the report comes in
-      # this capture when that process handled the messages that it has now.
-      _state = :sys.get_state(:logger_proxy)
-    end)
+        # The helper fails on purpose. The emulator gives its report to the
+        # logger later: the test waits for the report in this capture.
+        assert_receive {:crash_report, %{level: :error}}, 5_000
+      end)
+    after
+      Web.TestSupport.CrashReport.detach(handler)
+    end
   end
 
   test "parser terminate normalizes normal and custom stop reasons" do

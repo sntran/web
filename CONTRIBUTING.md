@@ -213,9 +213,11 @@ process). Such a crash can fail no test, for example at the end of a test
 when the processes stop in a different sequence. It is a defect: find its
 sequence, and write a test that makes that sequence. A test that makes a
 process fail on purpose captures the report with `capture_log/1`, and waits
-in the capture until the logger has it: the emulator gives the report of a
-plain process to `logger_proxy`, which logs it later
-(`:sys.get_state(:logger_proxy)`).
+in the capture until the logger has it. The emulator keeps the report of a
+plain process in its own queue, and gives it to the logger later: a call to
+`logger_proxy` does not tell when it comes. Attach
+`Web.TestSupport.CrashReport` before the capture, and wait for the message
+`{:crash_report, event}` in it.
 
 ## Benchmarks
 

@@ -7,15 +7,19 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
   # server, and the specification, do their work. Then it compares the
   # states.
   #
-  # The test controls the callback process: it suspends the process, and
-  # resumes it only for the command `:run`. Thus a task waits in the
-  # mailbox of the callback process until the test runs it, and the
-  # commands between can take the entries of the task.
+  # The global object is a helper process of the test: it makes the
+  # observer. The callback of the observer tells the test that it runs, and
+  # then does the functions that the test gives it, until the test tells it
+  # to return. Thus the commands of the callback process (a mark, observe,
+  # take_records, disconnect) run in the callback, with the global object
+  # of the observer.
   #
-  # The observed processes and the owner are helper processes of the test.
-  # A helper that makes an entry asks the server for its state after the
-  # entry: the messages of one process arrive in their sequence, thus the
-  # server has the entry when the helper continues.
+  # The test controls the callback process with the system messages of
+  # `:sys`. The process is suspended between the tasks: a task waits in its
+  # mailbox until the command `:run`. The command sends "resume" and
+  # "suspend" together, thus the process does one task and suspends again.
+  # The end of a task is a call of the server: when the process takes the
+  # message "suspend", the server has sent the next task.
   use ExUnit.Case, async: true
   use ExUnitProperties
 
@@ -23,42 +27,40 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
   alias Web.PerformanceObserver
   alias Web.Test.SpecModel
 
-  @procs [:p1, :p2]
   @types ["mark", "measure"]
+  @entries_key {Web.Internal.PerformanceTimeline, :entries}
 
   @constants [
-    {"Procs = {p1}", "Procs = {p1, p2}"},
     {~s(Types = {"mark"}), ~s(Types = {"mark", "measure"})},
     {"MaxEntries = 2", "MaxEntries = 8"},
     {"MaxObserves = 2", "MaxObserves = 8"}
   ]
 
-  # The steps that the server does with no command. The command `:run`
-  # does the step of the callback process.
+  # The steps that the server does with no command.
   @internal [
-    {"Receive", [:p1]},
-    {"Receive", [:p2]},
-    {"Down", [:p1]},
-    {"Down", [:p2]},
+    {"Receive", ["global"]},
+    {"Receive", ["callback"]},
     {"ServerStop", []}
   ]
 
+  # A command of the callback process has an effect only while a callback
+  # runs: such commands come more often.
   defp command do
-    proc = member_of(@procs)
+    proc = frequency([{1, constant(:global)}, {2, constant(:callback)}])
 
     frequency([
-      {6, tuple({constant(:make), proc, member_of(@types)})},
-      {3, tuple({constant(:observe), proc, member_of(@types), boolean()})},
-      {4, constant(:run)},
-      {2, tuple({constant(:take_records), proc})},
-      {1, tuple({constant(:disconnect), proc})},
-      {1, tuple({constant(:stop), proc})},
-      {1, constant(:stop_owner)}
+      {12, tuple({constant(:make), proc, member_of(@types)})},
+      {6, tuple({constant(:observe), proc, member_of(@types), boolean()})},
+      {10, constant(:run)},
+      {4, constant(:return)},
+      {4, tuple({constant(:take_records), proc})},
+      {2, tuple({constant(:disconnect), proc})},
+      {1, constant(:stop)}
     ])
   end
 
   property "the observer does each step as the specification permits" do
-    check all(commands <- list_of(command(), max_length: 25), max_runs: 100) do
+    check all(commands <- list_of(command(), max_length: 40), max_runs: 150) do
       system = start_system()
 
       try do
@@ -66,7 +68,6 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
           command, {model, system} ->
             {model, system} = run(command, model, system)
             model = SpecModel.settle(model, @internal)
-            system = settle(system, model)
             assert_same_state(model, system, command)
             {model, system}
         end)
@@ -83,19 +84,19 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
   defp start_system do
     test = self()
     run = make_ref()
-
-    owner = start_helper()
+    global = start_helper()
 
     observer =
-      call(owner, fn ->
+      call(global, fn ->
         PerformanceObserver.new(fn list, _observer, options ->
-          send(test, {run, :callback, list.entries, options})
+          send(test, {run, :callback, self(), list.entries, options})
+          callback_loop(run)
         end)
       end)
 
     server = observer.address
     %{runner: runner} = :sys.get_state(server)
-    true = :erlang.suspend_process(runner)
+    :ok = :sys.suspend(runner)
 
     %{
       run: run,
@@ -103,17 +104,62 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
       server: server,
       server_monitor: Process.monitor(server),
       runner: runner,
-      owner: owner,
-      procs: Map.new(@procs, &{&1, start_helper()})
+      runner_monitor: Process.monitor(runner),
+      global: global,
+      # The callback that runs, and the reference of the message "suspend"
+      # that the callback process takes at the end of the task.
+      callback: nil,
+      suspend: nil
     }
   end
 
-  defp stop_system(system) do
-    resume(system.runner)
+  # The callback does the functions of the test until the test tells it to
+  # return.
+  defp callback_loop(run) do
+    receive do
+      {^run, :do, ref, fun, test} ->
+        send(test, {ref, fun.()})
+        callback_loop(run)
 
-    for {pid, _monitor} = helper <- [system.owner | Map.values(system.procs)],
-        Process.alive?(pid),
-        do: stop_helper(helper)
+      {^run, :return} ->
+        :ok
+    end
+  end
+
+  # The callback process stops after the server: a callback that waits
+  # returns, and the process drops the tasks that it did not start. The
+  # system of the test is the system at the start: the callback runs in the
+  # callback process.
+  defp stop_system(system) do
+    send(system.runner, {system.run, :return})
+
+    {pid, _monitor} = system.global
+    if Process.alive?(pid), do: stop_helper(system.global)
+    wait_for_down(system.server, system.server_monitor)
+
+    try do
+      :sys.resume(system.runner)
+    catch
+      # The process stopped.
+      :exit, _reason -> :ok
+    end
+
+    if Process.alive?(system.runner), do: wait_for_down(system.runner, system.runner_monitor)
+  end
+
+  defp wait_for_down(pid, monitor) do
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+    after
+      # The test got the message before.
+      0 -> if Process.alive?(pid), do: wait_for_down_now(pid, monitor), else: :ok
+    end
+  end
+
+  defp wait_for_down_now(pid, monitor) do
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+    end
   end
 
   # A helper process does the functions that the test gives it.
@@ -151,34 +197,48 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
     end
   end
 
-  # A process that made an entry waits until the server has it.
+  # Does `fun` in the process of `proc`: the global object, or the callback
+  # that runs now.
+  defp call_in(:global, system, fun), do: call(system.global, fun)
+
+  defp call_in(:callback, system, fun) do
+    ref = make_ref()
+    send(system.callback, {system.run, :do, ref, fun, self()})
+
+    receive do
+      {^ref, result} -> result
+    end
+  end
+
+  # A process that made an entry waits until the server has it: the
+  # messages of one process arrive in their sequence.
   defp sync(server) do
     :sys.get_state(server)
   catch
     :exit, _reason -> nil
   end
 
+  defp runs?(model, :global), do: SpecModel.get(model, "alive")
+  defp runs?(model, :callback), do: SpecModel.get(model, "phase") == "callback"
+
   defp run({:make, proc, type}, model, system) do
-    if SpecModel.enabled?(model, "Make", [proc, type]) do
-      n = length(SpecModel.get(model, "timeline")[to_string(proc)]) + 1
-      name = "#{proc}-#{n}"
-
-      call(system.procs[proc], fn -> make(type, name, system.server) end)
-
-      {SpecModel.step!(model, "Make", [proc, type]), system}
+    if SpecModel.enabled?(model, "Make", [to_string(proc), type]) do
+      name = "#{proc}-#{SpecModel.get(model, "made") + 1}"
+      call_in(proc, system, fn -> make(type, name, system.server) end)
+      {SpecModel.step!(model, "Make", [to_string(proc), type]), system}
     else
-      # The process stopped, or the specification has no more entries.
+      # The process does not run, or the specification has no more entries.
       {model, system}
     end
   end
 
   defp run({:observe, proc, type, buffered}, model, system) do
     cond do
-      SpecModel.enabled?(model, "Observe", [proc, type, buffered]) ->
+      SpecModel.enabled?(model, "Observe", [to_string(proc), type, buffered]) ->
         :ok = observe(system, proc, type, buffered)
-        {SpecModel.step!(model, "Observe", [proc, type, buffered]), system}
+        {SpecModel.step!(model, "Observe", [to_string(proc), type, buffered]), system}
 
-      alive?(model, proc) and not SpecModel.get(model, "server") ->
+      runs?(model, proc) and not SpecModel.get(model, "server") ->
         # The observer stopped: the call has no effect.
         :ok = observe(system, proc, type, buffered)
         {model, system}
@@ -190,20 +250,18 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
 
   defp run({:take_records, proc}, model, system) do
     cond do
-      SpecModel.enabled?(model, "TakeRecords", [proc]) ->
+      SpecModel.enabled?(model, "TakeRecords", [to_string(proc)]) ->
         expected = SpecModel.get(model, "buffer")
 
         records =
-          call(system.procs[proc], fn -> PerformanceObserver.take_records(system.observer) end)
+          call_in(proc, system, fn -> PerformanceObserver.take_records(system.observer) end)
 
         assert entries(records) == copies(expected), "take_records returned #{inspect(records)}"
-        {SpecModel.step!(model, "TakeRecords", [proc]), system}
+        {SpecModel.step!(model, "TakeRecords", [to_string(proc)]), system}
 
-      alive?(model, proc) ->
+      runs?(model, proc) ->
         # The observer stopped.
-        assert call(system.procs[proc], fn ->
-                 PerformanceObserver.take_records(system.observer)
-               end) ==
+        assert call_in(proc, system, fn -> PerformanceObserver.take_records(system.observer) end) ==
                  []
 
         {model, system}
@@ -214,25 +272,16 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
   end
 
   defp run({:disconnect, proc}, model, system) do
-    if alive?(model, proc) do
-      :ok = call(system.procs[proc], fn -> PerformanceObserver.disconnect(system.observer) end)
+    if runs?(model, proc) do
+      :ok = call_in(proc, system, fn -> PerformanceObserver.disconnect(system.observer) end)
     end
 
-    {step_if_enabled(model, "Disconnect", [proc]), system}
+    {step_if_enabled(model, "Disconnect", [to_string(proc)]), system}
   end
 
-  defp run({:stop, proc}, model, system) do
-    if alive?(model, proc) do
-      stop_helper(system.procs[proc])
-      {SpecModel.step!(model, "Stop", [proc]), system}
-    else
-      {model, system}
-    end
-  end
-
-  defp run(:stop_owner, model, system) do
-    if SpecModel.enabled?(model, "StopOwner") do
-      stop_helper(system.owner)
+  defp run(:stop, model, system) do
+    if SpecModel.enabled?(model, "Stop") do
+      stop_helper(system.global)
       monitor = system.server_monitor
       server = system.server
 
@@ -240,29 +289,81 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
         {:DOWN, ^monitor, :process, ^server, _reason} -> :ok
       end
 
-      {SpecModel.step!(model, "StopOwner"), system}
+      {SpecModel.step!(model, "Stop"), system}
     else
       {model, system}
     end
   end
 
-  # The callback process takes its task, and the test suspends it again.
+  # The callback process does one task. It suspends again at the end of the
+  # task. A callback of the task tells the test that it runs, and waits.
   defp run(:run, model, system) do
-    expected =
-      if SpecModel.get(model, "server") and SpecModel.get(model, "tasks") > 0 and
-           copies(SpecModel.get(model, "buffer")) != [] do
-        count = if SpecModel.get(model, "requires"), do: %{dropped_entries_count: 0}, else: %{}
-        [{copies(SpecModel.get(model, "buffer")), count}]
+    if SpecModel.enabled?(model, "Begin") do
+      model = SpecModel.step!(model, "Begin")
+      expected = SpecModel.get(model, "buffer")
+      requires = SpecModel.get(model, "requires")
+      model = step_if_enabled(model, "Take", [])
+      suspend = resume_for_one_task(system.runner)
+
+      if SpecModel.get(model, "phase") == "callback" do
+        pid = assert_callback(system, copies(expected), requires)
+        {model, %{system | callback: pid, suspend: suspend}}
       else
-        []
+        wait_for_suspend(system, suspend)
+        {step_if_enabled(model, "Done", []), system}
       end
+    else
+      {model, system}
+    end
+  end
 
-    resume(system.runner)
-    sync(system.runner)
-    if Process.alive?(system.runner), do: true = :erlang.suspend_process(system.runner)
+  # The callback returns, and the task ends.
+  defp run(:return, model, system) do
+    if SpecModel.get(model, "phase") == "callback" do
+      send(system.callback, {system.run, :return})
+      wait_for_suspend(system, system.suspend)
+      model = model |> SpecModel.step!("Return") |> SpecModel.step!("Done")
+      {model, %{system | callback: nil, suspend: nil}}
+    else
+      {model, system}
+    end
+  end
 
-    assert callbacks(system.run) == expected
-    {step_if_enabled(model, "Task", []), system}
+  # The callback runs: it got the copies, and the option of the dropped
+  # entries count when the flag "requires dropped entries" was set.
+  defp assert_callback(system, expected, requires) do
+    run = system.run
+    assert_receive {^run, :callback, pid, received, options}, 5_000
+    assert entries(received) == expected, "the callback got #{inspect(received)}"
+    assert options == if(requires, do: %{dropped_entries_count: 0}, else: %{})
+    pid
+  end
+
+  # The callback process takes "resume" first, as a system message. Then
+  # it takes its messages in their sequence: the task, then "suspend".
+  defp resume_for_one_task(runner) do
+    resume = make_ref()
+    suspend = make_ref()
+    true = :erlang.suspend_process(runner)
+    send(runner, {:system, {self(), resume}, :resume})
+    send(runner, {:system, {self(), suspend}, :suspend})
+    true = :erlang.resume_process(runner)
+    suspend
+  catch
+    # The callback process stopped after the server.
+    :error, :badarg -> nil
+  end
+
+  # The end of the task, or the stop of the callback process: a process
+  # whose server stopped drops the task, and stops.
+  defp wait_for_suspend(system, suspend) do
+    runner = system.runner
+    monitor = system.runner_monitor
+
+    receive do
+      {^suspend, :ok} -> :ok
+      {:DOWN, ^monitor, :process, ^runner, _reason} -> :ok
+    end
   end
 
   defp make("mark", name, server) do
@@ -276,7 +377,7 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
   end
 
   defp observe(system, proc, type, buffered) do
-    call(system.procs[proc], fn ->
+    call_in(proc, system, fn ->
       PerformanceObserver.observe(system.observer, type: type, buffered: buffered)
     end)
   end
@@ -285,53 +386,6 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
     if SpecModel.enabled?(model, action, args),
       do: SpecModel.step!(model, action, args),
       else: model
-  end
-
-  defp alive?(model, proc), do: SpecModel.get(model, "alive")[to_string(proc)]
-
-  defp resume(runner) do
-    :erlang.resume_process(runner)
-  catch
-    # The process stopped, or it does not wait.
-    :error, :badarg -> true
-  end
-
-  defp callbacks(run) do
-    receive do
-      {^run, :callback, entries, options} -> [{entries(entries), options} | callbacks(run)]
-    after
-      0 -> []
-    end
-  end
-
-  # The server removes the options of a process that stopped, when its
-  # monitor tells it. The test waits for that step, as the specification
-  # does it with no command.
-  defp settle(system, model) do
-    if SpecModel.get(model, "server") do
-      wait_for_down(system, 500)
-    end
-
-    system
-  end
-
-  defp wait_for_down(system, attempts) do
-    stopped =
-      for {proc, {pid, _monitor}} <- system.procs, not Process.alive?(pid), do: {proc, pid}
-
-    %{registrations: registrations} = :sys.get_state(system.server)
-
-    cond do
-      not Enum.any?(stopped, fn {_proc, pid} -> Map.has_key?(registrations, pid) end) ->
-        :ok
-
-      attempts > 0 ->
-        Process.sleep(1)
-        wait_for_down(system, attempts - 1)
-
-      true ->
-        flunk("the server did not remove the options of #{inspect(stopped)}")
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -357,50 +411,50 @@ defmodule Web.TLA.PerformanceObserverConformanceTest do
     state = SpecModel.to_map(model)
     assert Process.alive?(system.server) == state["server"], "after #{inspect(command)}"
 
-    for proc <- @procs, state["alive"][to_string(proc)] do
-      {pid, _monitor} = system.procs[proc]
-      {:dictionary, dictionary} = Process.info(pid, :dictionary)
-
-      observers =
-        case List.keyfind(dictionary, {Web.Internal.PerformanceObserver, :observers}, 0) do
-          {_key, observers} -> observers
-          nil -> []
-        end
-
-      listed = List.keymember?(observers, system.server, 0)
-
-      assert listed == state["listed"][to_string(proc)],
-             "after #{inspect(command)}: #{proc} lists"
-    end
+    # The callback process keeps no entries of its own: its entries go to
+    # the timeline of the global object.
+    assert entries(own_entries(system.runner)) == copies(state["own"]),
+           "after #{inspect(command)}: the entries of the callback process"
 
     if state["server"] do
       real = :sys.get_state(system.server)
+      observer = real.observers[system.observer.token]
 
-      assert entries(Enum.reverse(real.buffer)) == copies(state["buffer"]),
+      assert entries(Enum.reverse(real.entries)) == copies(state["timeline"]),
+             "after #{inspect(command)}: the timeline"
+
+      assert entries(Enum.reverse(observer.buffer)) == copies(state["buffer"]),
              "after #{inspect(command)}: the buffer"
 
       assert real.task_queued == state["queued"], "after #{inspect(command)}: the flag"
-      assert real.requires_dropped_entries == state["requires"], "after #{inspect(command)}"
-
-      {:message_queue_len, tasks} = Process.info(system.runner, :message_queue_len)
-      assert tasks == state["tasks"], "after #{inspect(command)}: the tasks"
-
+      assert real.task_running == state["running"], "after #{inspect(command)}: the task"
+      assert observer.requires_dropped_entries == state["requires"], "after #{inspect(command)}"
+      assert tasks(system.runner) == state["tasks"], "after #{inspect(command)}: the tasks"
       assert registered(real, system) == state["registered"], "after #{inspect(command)}"
     end
   end
 
-  # The types of the options of each process.
+  defp own_entries(runner) do
+    case Process.info(runner, :dictionary) do
+      {:dictionary, dictionary} -> dictionary |> List.keyfind(@entries_key, 0) |> own_list()
+      nil -> []
+    end
+  end
+
+  defp own_list({_key, entries}), do: Enum.reverse(entries)
+  defp own_list(nil), do: []
+
+  # The tasks in the mailbox of the callback process.
+  defp tasks(runner) do
+    {:messages, messages} = Process.info(runner, :messages)
+    Enum.count(messages, &match?({:"$gen_cast", {:task, _task}}, &1))
+  end
+
+  # The types of the options of the observer.
   defp registered(real, system) do
-    Map.new(@procs, fn proc ->
-      {pid, _monitor} = system.procs[proc]
-
-      types =
-        case real.registrations do
-          %{^pid => %{options: options}} -> MapSet.new(options, & &1.type)
-          _none -> MapSet.new()
-        end
-
-      {to_string(proc), types}
-    end)
+    case List.keyfind(real.registered, system.observer.token, 0) do
+      {_token, options} -> MapSet.new(options, & &1.type)
+      nil -> MapSet.new()
+    end
   end
 end

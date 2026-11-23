@@ -16,20 +16,25 @@ defmodule Web.PerformanceObserver do
       Web.Performance.measure("query", "start")
       # Prints "query: 0.012 ms" after the call.
 
-  ## The observed process
+  ## The global object
 
-  The entries of `Web.Performance` are the state of the process that makes
-  them. `observe/2` observes the process that calls it: a later mark or
-  measure of that process goes to the observer. An observer can observe
-  more than one process, when each of the processes calls `observe/2`.
-  `disconnect/1` stops the observation of each process.
+  Each process is a global object of the Standards: it has its own
+  performance entry buffer (see `Web.Performance`). An observer belongs to
+  the global object of the process that calls `new/1`, as the relevant
+  global object of the Standard. It observes that global object only:
+  `observe/2`, `disconnect/1`, and `take_records/1` act on the same
+  observer from each process, and `observe/2` registers the observer in
+  its global object, not in the calling process.
 
   ## The callback
 
-  The callback runs in a process of the observer, after the call that
+  The callback runs in a process of the global object, after the call that
   made the entry, not in the call of `Web.Performance.mark/2` or
   `Web.Performance.measure/3`. One callback gets each entry that came
-  before it runs, and the callbacks of an observer run one at a time.
+  before it runs. The callbacks of the observers of a global object run one
+  at a time, in the sequence of their registration, as one task of the
+  Standard. A disconnect and a new call of `observe/2` put an observer at
+  the end.
 
   The callback gets three arguments, as the `PerformanceObserverCallback`
   of the Standard. A function with fewer arguments gets the first ones:
@@ -38,26 +43,30 @@ defmodule Web.PerformanceObserver do
     * the observer;
     * the options of the callback: `%{dropped_entries_count: 0}` in the
       first callback after a call to `observe/2`, and `%{}` in the other
-      callbacks. The buffers of the marks and the measures have no limit,
-      thus the count is 0.
+      callbacks. The registry of the entry types gives "mark" and "measure"
+      no buffer limit: no entry is dropped, thus the count is always 0.
 
-  The callback can call each function of this module. A mark or a measure
-  that the callback makes is an entry of the process of the callback. A
-  value that the callback throws goes to the log, and the observer
-  continues. The callback runs in the empty context of
-  `Web.AsyncContext`, as the proposal specifies for the callback of an
-  observer.
+  The callback runs with the global object of the observer. Thus
+  `Web.Performance.mark/2`, `Web.Performance.measure/3`, the functions
+  `get_entries*` and `clear_*` of `Web.Performance`, and
+  `Web.Performance.now/0` in the callback act on that global object: its
+  timeline, and its time origin, which is the same for each process. The
+  observers of that global object get the entries that the callback
+  makes. A new observer of the callback belongs to the same global object.
+  The callback can call each function of this module. A value that the
+  callback throws goes to the log, and the observer continues. The
+  callback runs in the empty context of `Web.AsyncContext`, as the
+  proposal specifies for the callback of an observer.
 
   ## Lifetime
 
-  The process that calls `new/1` is the owner of the observer. The
-  observer stops when its owner stops: a callback that did not start does
-  not run. After that, `observe/2` and `disconnect/1` have no effect, and
-  `take_records/1` returns `[]`. The entries that an observed process made
-  before it stopped stay in the observer.
+  The observer stops when its global object stops: a callback that did
+  not start does not run. After that, `observe/2` and `disconnect/1` have
+  no effect, and `take_records/1` returns `[]`.
   """
 
   alias Web.Internal.PerformanceObserver, as: Engine
+  alias Web.Internal.PerformanceTimeline
   alias Web.PerformanceObserverEntryList
 
   @enforce_keys [:address, :token]
@@ -84,18 +93,42 @@ defmodule Web.PerformanceObserver do
   @doc """
   Makes an observer, as the constructor `new PerformanceObserver(callback)`.
 
-  The calling process is the owner of the observer: the observer stops
-  when the process stops. The observer observes nothing until a process
-  calls `observe/2`.
+  The observer belongs to the global object of the calling process, and
+  stops when that global object stops. It observes nothing until a
+  process calls `observe/2`.
 
   Raises `Web.TypeError` when the callback is not a function with 0 to 3
   arguments.
+
+  ## Examples
+
+  The callback sees the entries of the global object of the observer, and
+  a mark of the callback is an entry of that global object:
+
+      iex> test = self()
+      iex> observer =
+      ...>   Web.PerformanceObserver.new(fn _list ->
+      ...>     Web.Performance.mark("from the callback")
+      ...>     send(test, {:seen, Enum.map(Web.Performance.get_entries(), & &1.name)})
+      ...>   end)
+      iex> Web.PerformanceObserver.observe(observer, type: "measure")
+      :ok
+      iex> _measure = Web.Performance.measure("query")
+      iex> receive do
+      ...>   {:seen, names} -> names
+      ...> end
+      ["query", "from the callback"]
+      iex> Enum.map(Web.Performance.get_entries_by_type("mark"), & &1.name)
+      ["from the callback"]
+      iex> Web.Performance.clear_marks()
+      iex> Web.Performance.clear_measures()
+      :ok
   """
   @spec new(callback()) :: t()
   def new(callback)
       when is_function(callback, 0) or is_function(callback, 1) or is_function(callback, 2) or
              is_function(callback, 3) do
-    Engine.start(callback, self())
+    PerformanceTimeline.new_observer(callback)
   end
 
   def new(callback) do
@@ -104,7 +137,9 @@ defmodule Web.PerformanceObserver do
   end
 
   @doc """
-  Observes the entries of the calling process, as `observe(options)`.
+  Observes the entries of the global object of the observer, as
+  `observe(options)`. The calling process can be a different process: the
+  observer observes its own global object, not the calling process.
 
   ## Options
 
@@ -117,7 +152,8 @@ defmodule Web.PerformanceObserver do
     * `:type` - one entry type. Each call adds its type, and the options
       of a call with the same type take the place of the old options;
     * `:buffered` - with `:type`. When it is `true`, the observer also gets
-      the entries of that type that the process made before the call.
+      the entries of that type that its global object made before the
+      call.
 
   An observer observes with `:entry_types` or with `:type`, not with the
   two. The observer ignores an entry type that is not in
@@ -146,7 +182,8 @@ defmodule Web.PerformanceObserver do
   def observe(%__MODULE__{} = observer, options \\ []), do: Engine.observe(observer, options)
 
   @doc """
-  Stops the observation of each process, as `disconnect()`.
+  Stops the observation, as `disconnect()`. The observer leaves the list
+  of the observers of its global object.
 
   The observer drops the entries that no callback got. A later call to
   `observe/2` starts the observation again.
@@ -187,5 +224,5 @@ defmodule Web.PerformanceObserver do
       ["mark", "measure"]
   """
   @spec supported_entry_types() :: [String.t()]
-  def supported_entry_types, do: Engine.supported_entry_types()
+  def supported_entry_types, do: PerformanceTimeline.supported_entry_types()
 end

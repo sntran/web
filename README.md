@@ -690,13 +690,15 @@ Performance.measure("import", "start").duration
 Console.group_end()
 ```
 
-The groups, the timers, the counters, and the entries are the state of the
-process that calls the functions.
+The groups, the timers, and the counters are the state of the process that
+calls the functions. Each process is also a global object of the Standards:
+it has its own timeline of marks and measures.
 
-A `PerformanceObserver` gets the marks and the measures of a process when
-the process makes them, as the Performance Timeline Standard specifies.
-`observe/2` observes the process that calls it. The callback runs later, in
-a process of the observer, and gets the entries that came before it ran:
+A `PerformanceObserver` gets the marks and the measures of its global object
+when they are made, as the Performance Timeline Standard specifies. The
+observer belongs to the global object of the process that calls `new/1`.
+The callback runs later, in a process of the observer, and gets the entries
+that came before it ran:
 
 ```elixir
 use Web
@@ -706,6 +708,10 @@ observer =
     for entry <- PerformanceObserverEntryList.get_entries(list) do
       Console.log(["%s took %f ms", entry.name, entry.duration])
     end
+
+    # The callback runs with the global object of the observer: this mark
+    # is an entry of the process that made the observer.
+    Performance.mark("reported")
   end)
 
 PerformanceObserver.observe(observer, entry_types: ["measure"])
@@ -720,9 +726,22 @@ PerformanceObserver.take_records(observer)
 PerformanceObserver.disconnect(observer)
 ```
 
-With `type: "mark", buffered: true`, the observer also gets the marks that
-the process made before the call. The process that calls `new/1` owns the
-observer: the observer stops when that process stops.
+In the callback, `Performance.mark/2`, `measure/3`, the functions
+`get_entries*` and `clear_*`, and `now/0` act on the global object of the
+observer: its timeline, and its time origin, which is the same for each
+process. The observers of that global object get the entries that the
+callback makes. With `type: "mark", buffered: true`, the observer also gets the marks
+that its global object made before the call. `observe/2` from a different
+process registers the observer in its own global object, not in the calling
+process. The observer stops when its global object stops.
+
+A process with no observer keeps its entries in its process dictionary:
+`mark/2` and `measure/3` send no message. The first observer moves the
+timeline to a server of the global object, because the callback runs in a
+different process. After that, `mark/2` sends the entry to the server and
+does not wait, and `measure/3` with the name of a mark asks the server for
+the mark. The registry of the entry types gives "mark" and "measure" no
+buffer limit: no entry is dropped, and `dropped_entries_count` is always 0.
 
 Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rclone-style URL support.
 
@@ -914,7 +933,7 @@ easy to make and hard to find with an example test:
 | `Disposal.tla`       | The blocks of `using`: each resource is released one time. |
 | `Console.tla`        | The groups, the timers, and the counters of the console.   |
 | `Performance.tla`    | The marks and the measures of a process.                   |
-| `PerformanceObserver.tla` | The entries that go to an observer, its task, `take_records`, `disconnect`, and the stop of the owner or of an observed process. |
+| `PerformanceObserver.tla` | The timeline of a global object and its observer: the entries of the callback in the same timeline, one task at a time, `take_records`, `disconnect`, and the stop of the global object. |
 | `AsyncIteratorHelper.tla` | A helper such as `map` of an async iterator: the results of concurrent calls of `next` in their sequence, the end and the errors, the close of the source, and the permits of `limit`. |
 | `AsyncIteratorConsumer.tla` | A method that consumes an async iterator, such as `find`, with a concurrency argument: the first result, the reads in their sequence, and one close before the promise settles. |
 

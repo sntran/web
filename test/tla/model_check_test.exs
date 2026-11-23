@@ -656,84 +656,88 @@ defmodule Web.TLA.ModelCheckTest do
   end
 
   describe "PerformanceObserver" do
+    # One call of observe: the check of each Bug value stays fast.
+    defp observer_bug(name), do: [bug(name), {"MaxObserves = 2", "MaxObserves = 1"}]
+
     test "the design has all its properties" do
       assert_holds(SpecModel.check("PerformanceObserver"))
     end
 
-    # One entry for each process, thus the check stays fast.
-    test "the design has all its properties with two observed processes" do
-      two = [{"Procs = {p1}", "Procs = {p1, p2}"}, {"MaxEntries = 2", "MaxEntries = 1"}]
-      assert_holds(SpecModel.check("PerformanceObserver", two))
+    test "a mark of the callback in the timeline of the callback process is found" do
+      assert_violates(
+        SpecModel.check("PerformanceObserver", observer_bug("callback_own_timeline")),
+        "OneTimeline"
+      )
     end
 
-    test "a server that adds an entry of a type that the process does not observe is found" do
+    test "a server that adds an entry of a type that the observer does not observe is found" do
       assert_violates(
-        SpecModel.check("PerformanceObserver", bug("no_filter")),
+        SpecModel.check("PerformanceObserver", observer_bug("no_filter")),
         "OnlyObservedEntries"
       )
     end
 
     test "a take_records that does not empty the buffer is found" do
       assert_violates(
-        SpecModel.check("PerformanceObserver", bug("take_keeps_buffer")),
+        SpecModel.check("PerformanceObserver", observer_bug("take_keeps_buffer")),
         "EachCopyOnce"
       )
     end
 
     test "a callback with no entries is found" do
       assert_violates(
-        SpecModel.check("PerformanceObserver", bug("empty_callback")),
+        SpecModel.check("PerformanceObserver", observer_bug("empty_callback")),
         "CallbackHasEntries"
       )
     end
 
     test "a task with no entries that clears the flag of the dropped entries count is found" do
       assert_violates(
-        SpecModel.check("PerformanceObserver", bug("empty_task_clears_count")),
+        SpecModel.check("PerformanceObserver", observer_bug("empty_task_clears_count")),
         "CountAfterObserve"
       )
     end
 
-    test "a task for each entry, with no flag, is found" do
-      assert_violates(SpecModel.check("PerformanceObserver", bug("no_flag")), "OneTask")
+    test "a server that sends a task while the callback process has one is found" do
+      assert_violates(
+        SpecModel.check("PerformanceObserver", observer_bug("push_task")),
+        "OneTask"
+      )
+    end
+
+    test "a flag that does not keep a task for the end of the running task is found" do
+      assert_violates(SpecModel.check("PerformanceObserver", observer_bug("no_flag")), "Drains")
     end
 
     test "a task that takes the entries when the server sends it is found" do
       assert_violates(
-        SpecModel.check("PerformanceObserver", bug("take_at_queue")),
+        SpecModel.check("PerformanceObserver", observer_bug("take_at_queue")),
         "TakeRecordsTakesAll"
       )
     end
 
     test "a disconnect that does not empty the buffer is found" do
       assert_violates(
-        SpecModel.check("PerformanceObserver", bug("disconnect_keeps_buffer")),
+        SpecModel.check("PerformanceObserver", observer_bug("disconnect_keeps_buffer")),
         "NothingAfterDisconnect"
       )
     end
 
-    test "a server that drops the entries of an observed process that stopped is found" do
+    test "a task that sets the flag down at its end is found" do
       assert_violates(
-        SpecModel.check("PerformanceObserver", bug("down_drops_entries")),
-        "DropReason"
+        SpecModel.check("PerformanceObserver", observer_bug("flag_at_end")),
+        "Drains"
       )
     end
 
     test "a task that does not set the flag down is found" do
-      assert_violates(SpecModel.check("PerformanceObserver", bug("flag_stays")), "Drains")
+      assert_violates(SpecModel.check("PerformanceObserver", observer_bug("flag_stays")), "Rests")
     end
 
-    test "a server that does not monitor the observed processes is found" do
+    test "a server that does not stop with its global object is found" do
       assert_violates(
-        SpecModel.check("PerformanceObserver", bug("no_monitor")),
-        "ForgetsStoppedProcess"
-      )
-    end
-
-    test "a server that does not stop with its owner is found" do
-      assert_violates(
-        SpecModel.check("PerformanceObserver", bug("no_owner_monitor")),
-        "StopsWithOwner"
+        SpecModel.check("PerformanceObserver", observer_bug("no_monitor")),
+        "StopsWithGlobal"
       )
     end
   end

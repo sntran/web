@@ -7,6 +7,7 @@ defmodule Web.Test.SpecModel do
 
   alias Accord.Spec.Value
   alias Accord.TLA.Checker
+  alias Accord.TLA.Checker.Eval
   alias Accord.TLA.Checker.Machine
 
   @directory Path.expand("../../tla", __DIR__)
@@ -42,8 +43,30 @@ defmodule Web.Test.SpecModel do
   @doc """
   Loads the specification `name` and goes to its initial state. `replace`
   changes lines of the configuration, as for `check/3`.
+
+  A property test starts the model again for each run, and a load takes 20
+  to 30 ms. Thus the process keeps the model of its first load, and a later
+  start gives that model again: the model is a value, thus a new run starts
+  from the initial state. The checker keeps the data of a load in the
+  dictionary of the process, thus each process loads its models itself. A
+  start clears the cache of the checker, as a load does.
   """
   def start(name, replace \\ nil) do
+    key = {__MODULE__, name, replace}
+
+    case Process.get(key) do
+      nil ->
+        model = load(name, replace)
+        Process.put(key, model)
+        model
+
+      model ->
+        Eval.reset_cache()
+        model
+    end
+  end
+
+  defp load(name, replace) do
     {:ok, machine} = Machine.load(path(name), config: config(name, replace))
     {:ok, [state]} = Machine.init_states(machine)
     %__MODULE__{machine: machine, state: state, model_values: Machine.model_values(machine)}

@@ -915,6 +915,8 @@ easy to make and hard to find with an example test:
 | `Console.tla`        | The groups, the timers, and the counters of the console.   |
 | `Performance.tla`    | The marks and the measures of a process.                   |
 | `PerformanceObserver.tla` | The entries that go to an observer, its task, `take_records`, `disconnect`, and the stop of the owner or of an observed process. |
+| `AsyncIteratorHelper.tla` | A helper such as `map` of an async iterator: the results of concurrent calls of `next` in their sequence, the end and the errors, the close of the source, and the permits of `limit`. |
+| `AsyncIteratorConsumer.tla` | A method that consumes an async iterator, such as `find`, with a concurrency argument: the first result, the reads in their sequence, and one close before the promise settles. |
 
 `mix test` examines each specification with the checker of
 [`accord`](https://github.com/sntran/accord), which is written in Elixir and

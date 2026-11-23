@@ -6,6 +6,29 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `Web.AsyncIterator`, the async iterator helpers of TC39: `from/1`,
+  `next/1`, `return/1`, the lazy helpers `map/2`, `filter/2`, `take/2`,
+  `drop/2`, and `flat_map/2`, and the methods `reduce/2,3,4`, `to_array/1,2`,
+  `for_each/2,3`, `some/2,3`, `every/2,3`, and `find/2,3`, which return a
+  promise. The methods take the concurrency argument of the proposal for
+  concurrency control (a governor or a number), and `limit/2` limits an
+  iterator with a governor. Concurrent calls of `next/1` on a helper run at
+  the same time, and give their results in their sequence. The helpers
+  take each async iterator of the library, also the iterator of
+  `Web.ReadableStream.values/2`, and `from/1` takes an enumerable.
+  `Web.AsyncIterator` implements `Enumerable`. `tla/AsyncIteratorHelper.tla`
+  and `tla/AsyncIteratorConsumer.tla` give the rules, with conformance
+  tests.
+- `Web.PerformanceObserver` (`new/1`, `observe/2`, `disconnect/1`,
+  `take_records/1`, and `supported_entry_types/0`) and
+  `Web.PerformanceObserverEntryList` (`get_entries/1`,
+  `get_entries_by_type/2`, and `get_entries_by_name/3`), as the Performance
+  Timeline specifies. An observer gets the marks and the measures of the
+  process that calls `observe/2`, and its callback runs later, in a process
+  of the observer. `tla/PerformanceObserver.tla` gives the rules, with a
+  conformance test.
+- `use Web` aliases `Web.AsyncIterator`, `Web.PerformanceObserver`, and
+  `Web.PerformanceObserverEntryList`.
 - The constants of the Standards, as functions with no argument:
   `Web.Event.none/0`, `capturing_phase/0`, `at_target/0`, and
   `bubbling_phase/0`, the 25 legacy codes of `Web.DOMException`
@@ -697,6 +720,10 @@ All notable changes to this project are documented in this file.
   - `Web.Performance.mark/2` and `measure/3` ignore an option that they do
     not know. A number as a start or end mark is the name of a mark: give a
     time with `:start` and `:end`.
+- **Breaking:** `Web.Governor.wrap_iterator/2` gives a `Web.AsyncIterator`,
+  as the proposal for concurrency control says: use
+  `Web.AsyncIterator.next/1` and `Web.AsyncIterator.return/1`. Its
+  `return/1` gives `%{value: nil, done: true}`.
 - **Breaking:** each `Web.Request` has its own `Web.AbortSignal`, as the
   Fetch Standard specifies: a new signal that depends on the option
   `:signal` or on the signal of the input request, and a new dependent

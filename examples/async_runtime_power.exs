@@ -1,8 +1,8 @@
 defmodule AsyncRuntimePowerExample do
   @moduledoc """
   Demonstrates invisible async context propagation across multipart parsing,
-  file streaming, compression tasks, logger metadata, console grouping, and
-  ambient abort signals.
+  file streaming, compression tasks, logger metadata, and console grouping,
+  and an abort signal that stops the source of an upload.
 
   Usage:
     mix run examples/async_runtime_power.exs
@@ -33,7 +33,7 @@ defmodule AsyncRuntimePowerExample do
           Request.new("https://example.com/upload",
             method: "POST",
             headers: %{"content-type" => "multipart/form-data; boundary=#{boundary}"},
-            body: upload_stream(boundary),
+            body: upload_stream(boundary, controller.signal),
             duplex: "half",
             signal: controller.signal
           )
@@ -130,7 +130,10 @@ defmodule AsyncRuntimePowerExample do
     end)
   end
 
-  defp upload_stream(boundary) do
+  # The signal of a request does not stop a read of its body, as the Fetch
+  # Standard specifies. Thus the source of the upload stops itself when the
+  # signal aborts: the stream goes to the errored state with the reason.
+  defp upload_stream(boundary, signal) do
     payload =
       multipart_payload(boundary, [
         %{name: "meta", value: "confidential"},
@@ -146,6 +149,12 @@ defmodule AsyncRuntimePowerExample do
     {:ok, cursor} = Agent.start_link(fn -> chunks end)
 
     ReadableStream.new(%{
+      start: fn controller ->
+        EventTarget.add_event_listener(signal, "abort", fn ->
+          Console.warn("upload source stopped: #{inspect(AbortSignal.reason(signal))}")
+          ReadableStreamDefaultController.error(controller, AbortSignal.reason(signal))
+        end)
+      end,
       pull: fn controller ->
         Process.sleep(15)
 

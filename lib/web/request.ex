@@ -23,6 +23,28 @@ defmodule Web.Request do
 
   The function `body_used?/1` is the attribute `bodyUsed`.
 
+  ## The signal
+
+  The field `signal` is the attribute `signal`: each request has its own
+  `Web.AbortSignal`. The constructor and `clone/1` make it as the Fetch
+  Standard specifies: a new signal that depends on the signal of the option
+  `:signal`, or else on the signal of the input request. Thus an abort of
+  that signal aborts the signal of the request. A request with no such
+  signal gets a signal that no abort can reach.
+
+  The signal of a request has no process until an operation needs one,
+  such as a listener: see "The signal of a request" in `Web.AbortSignal`.
+  Thus a request and `Web.fetch/2` start no process for it.
+
+      iex> controller = Web.AbortController.new()
+      iex> request = Web.Request.new("https://example.com", signal: controller.signal)
+      iex> {copy, clone} = Web.Request.clone(request)
+      iex> {copy.signal == request.signal, clone.signal == request.signal}
+      {true, false}
+      iex> Web.AbortController.abort(controller, :stop)
+      iex> Web.AbortSignal.reason(clone.signal)
+      :stop
+
   ## The body
 
   The methods of the body mixin of the Fetch Standard read the body, as
@@ -138,10 +160,15 @@ defmodule Web.Request do
   changed to uppercase. Each other method keeps its case, thus `"patch"`
   stays `"patch"`. A method that is an atom is always changed to uppercase.
 
+  The new request gets a new signal that depends on the signal of the
+  option `:signal`, or else on the signal of the input request: see "The
+  signal". A `nil` signal is a member that is not given.
+
   ## Examples
       iex> req = Web.Request.new("http://example.com")
-      iex> Web.Request.new(req, []) == req
-      true
+      iex> copy = Web.Request.new(req, [])
+      iex> {copy.url == req.url, copy.signal == req.signal}
+      {true, false}
       iex> {req.mode, req.credentials, req.cache, req.referrer, req.duplex}
       {"cors", "same-origin", "default", "about:client", "half"}
 
@@ -157,8 +184,10 @@ defmodule Web.Request do
   """
   def new(input, init \\ [])
 
-  # A request with no body and no init: the new request has the same values.
-  def new(%__MODULE__{body: nil} = request, []), do: request
+  # A request with no body and no init: the new request has the same values,
+  # and a new signal.
+  def new(%__MODULE__{body: nil} = request, []),
+    do: put_signal(request, Web.AbortSignal.__dependent__(request.signal))
 
   def new(%__MODULE__{} = request, init) when is_list(init) do
     construct(request, init, request, nil)
@@ -574,23 +603,26 @@ defmodule Web.Request do
 
   defp take_input_body(request, _input), do: request
 
+  # The steps of the signal: "If init["signal"] exists, then set signal to
+  # it", and "Set this's signal to the result of creating a dependent abort
+  # signal from signals". The signal of a URL input is the ambient signal,
+  # for example the signal of the `fetch` that makes the request.
   defp finish(request, headers, init) do
     snapshot = request.snapshot || AsyncContext.Snapshot.new()
-    signal = Keyword.get(init, :signal) || request.signal || snapshot.ambient_signal
+    followed = Keyword.get(init, :signal) || request.signal || snapshot.ambient_signal
+    signal = Web.AbortSignal.__dependent__(followed)
 
     options =
       request.options
       |> Keyword.merge(Keyword.drop(init, [:method, :headers, :body]))
       |> Keyword.put(:redirect, request.redirect)
-      |> Keyword.put(:signal, signal)
 
-    %{
-      request
-      | headers: headers,
-        signal: signal,
-        snapshot: snapshot,
-        options: options
-    }
+    put_signal(%{request | headers: headers, snapshot: snapshot, options: options}, signal)
+  end
+
+  # The field `signal`, and the option of the request for a redirect.
+  defp put_signal(request, signal) do
+    %{request | signal: signal, options: Keyword.put(request.options || [], :signal, signal)}
   end
 
   # A body that is a stream has no source: it can be read only one time.

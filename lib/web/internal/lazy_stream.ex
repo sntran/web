@@ -115,8 +115,9 @@ defmodule Web.Internal.LazyStream do
   end
 
   # A request can have a signal in a different form, which cannot abort a
-  # body.
-  defp abort_signal(%AbortSignal{} = signal), do: signal
+  # body. The signal of a request has no process: the stream uses its
+  # source.
+  defp abort_signal(%AbortSignal{} = signal), do: AbortSignal.__source__(signal)
   defp abort_signal(_other), do: nil
 
   defp ambient_signal, do: Snapshot.new().ambient_signal

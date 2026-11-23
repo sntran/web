@@ -134,8 +134,20 @@ defmodule Web.Test.QuickJS.Bridge do
   # global has one: two calls of the library for each test. Thus only the
   # tests that use these interfaces get them.
   @scoped %{
-    "AbortController" => ["streams/", "dom/", "fetch/api/request", "fetch/api/response"],
-    "AbortSignal" => ["streams/", "dom/", "fetch/api/request", "fetch/api/response"]
+    "AbortController" => [
+      "streams/",
+      "dom/",
+      "fetch/api/abort",
+      "fetch/api/request",
+      "fetch/api/response"
+    ],
+    "AbortSignal" => [
+      "streams/",
+      "dom/",
+      "fetch/api/abort",
+      "fetch/api/request",
+      "fetch/api/response"
+    ]
   }
 
   @classes Map.new(Map.merge(@interfaces, @iterators), fn {name, module} -> {module, name} end)

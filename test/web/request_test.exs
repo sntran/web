@@ -28,9 +28,11 @@ defmodule Web.RequestTest do
           assert req.body == nil
           assert req.dispatcher == nil
           assert req.redirect == "follow"
-          assert req.signal == nil
+          # A request with no signal gets a signal that no abort can reach.
+          assert %Web.AbortSignal{pid: nil, lazy: {_sequence, nil}} = req.signal
+          refute Web.AbortSignal.aborted?(req.signal)
           assert req.options[:redirect] == "follow"
-          assert req.options[:signal] == nil
+          assert req.options[:signal] == req.signal
       end
     end
   end
@@ -63,10 +65,12 @@ defmodule Web.RequestTest do
     # A key that `RequestInit` does not have changes no field.
     assert req.dispatcher == nil
     assert req.redirect == "manual"
-    assert req.signal == signal
+    # An aborted signal gives a new aborted signal with the same reason.
+    assert %Web.AbortSignal{aborted: true, reason: :stop, pid: nil} = req.signal
+    assert req.signal != signal
     assert req.options[:extra_option] == true
     assert req.options[:redirect] == "manual"
-    assert req.options[:signal] == signal
+    assert req.options[:signal] == req.signal
   end
 
   test "url/1 gives the attribute url: the serialized URL, with its fragment" do
@@ -95,12 +99,15 @@ defmodule Web.RequestTest do
       refute Web.ReadableStream.disturbed?(input.body)
     end
 
-    # A `nil` signal is a member that is not given: the signal of the input
-    # request stays.
-    signal = Web.AbortSignal.abort(:stop)
-    request = Request.new("http://example.com", signal: signal)
-    assert Request.new(request, signal: nil).signal == signal
-    assert Request.new("http://example.com", signal: nil).signal == nil
+    # A `nil` signal is a member that is not given: the new signal depends
+    # on the signal of the input request.
+    controller = Web.AbortController.new()
+    request = Request.new("http://example.com", signal: controller.signal)
+    copy = Request.new(request, signal: nil)
+    assert copy.signal.lazy == {elem(copy.signal.lazy, 0), controller.signal}
+    assert Request.new("http://example.com", signal: nil).signal.lazy == {0, nil}
+    Web.AbortController.abort(controller, :stop)
+    assert Web.AbortSignal.reason(copy.signal) == :stop
   end
 
   test "new/2 normalizes tuple-list headers into Web.Headers" do
@@ -347,10 +354,16 @@ defmodule Web.RequestTest do
   end
 
   describe "new/2 with a request as its input" do
-    test "gives the same request when init is empty and the input has no body" do
-      request = Request.new("https://example.com", method: "PUT")
-      assert Request.new(request) == request
-      assert Request.new(request, []) == request
+    test "gives the same values and a new signal when init is empty and the input has no body" do
+      controller = Web.AbortController.new()
+      request = Request.new("https://example.com", method: "PUT", signal: controller.signal)
+
+      for copy <- [Request.new(request), Request.new(request, [])] do
+        assert %{copy | signal: request.signal, options: request.options} == request
+        assert copy.signal != request.signal
+        assert copy.options[:signal] == copy.signal
+        assert Web.AbortSignal.__source__(copy.signal) == controller.signal
+      end
     end
 
     test "takes the body of the input, which is then disturbed and locked" do
@@ -391,8 +404,8 @@ defmodule Web.RequestTest do
       assert Web.Headers.get(second.headers, "x-two") == "2"
       refute Web.Headers.has(second.headers, "x-one")
       assert second.redirect == "manual"
-      assert second.signal == controller.signal
-      assert second.options[:signal] == controller.signal
+      assert Web.AbortSignal.__source__(second.signal) == controller.signal
+      assert second.options[:signal] == second.signal
       assert await(Request.text(second)) == "first"
     end
 

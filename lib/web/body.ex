@@ -255,12 +255,13 @@ defmodule Web.Body do
   # other body is read in full first, as "consume body" of the Fetch
   # Standard specifies: thus an error of the stream comes before the
   # `TypeError` of a type that is not a form.
+  # The signal of a request does not stop the read of its body, as the steps
+  # "consume body" specify: only the ambient signal of the time when the
+  # struct was made does, for example the signal of a `fetch` response.
   def form_data(%{body: body} = struct) do
     owner = self()
-    explicit_signal = Map.get(struct, :signal)
     struct_snapshot = Map.get(struct, :snapshot)
-    # Derive the signal: explicit field takes priority, then creation-time ambient.
-    signal = explicit_signal || (struct_snapshot && struct_snapshot.ambient_signal)
+    signal = struct_snapshot && struct_snapshot.ambient_signal
     content_type = content_type(struct)
 
     case form_type(content_type) do
@@ -339,13 +340,22 @@ defmodule Web.Body do
   @doc false
   # The steps of `clone()`: a tee of the body, with a structured clone of
   # each chunk for the second branch.
-  def clone(%{body: nil} = struct), do: {struct, struct}
+  def clone(%{body: nil} = struct), do: {struct, clone_signal(struct)}
 
   def clone(%{body: body} = struct) do
     :ok = ensure_usable!(body)
     [branch_a, branch_b] = Web.ReadableStream.__tee__(body, true)
-    {%{struct | body: branch_a}, %{struct | body: branch_b}}
+    {%{struct | body: branch_a}, clone_signal(%{struct | body: branch_b})}
   end
+
+  # The clone of a request gets a new signal that depends on the signal of
+  # the request, as `clone()` of the Fetch Standard specifies.
+  defp clone_signal(%Web.Request{signal: signal, options: options} = request) do
+    clone = Web.AbortSignal.__dependent__(signal)
+    %{request | signal: clone, options: Keyword.put(options || [], :signal, clone)}
+  end
+
+  defp clone_signal(response), do: response
 
   @doc false
   # The body is used when it is not `nil` and a process read from it.

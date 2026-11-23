@@ -6,6 +6,7 @@ defmodule Web.AbortSignalLifetimeTest do
   use Web
 
   alias Web.AbortSignal.Reasons
+  alias Web.EventTarget
 
   @linger 100
   @count 200
@@ -276,6 +277,117 @@ defmodule Web.AbortSignalLifetimeTest do
       # their last step at this time. The signal removes each stream that
       # stops.
       assert wait_for_no_subscribers(controller.signal) == %{}
+    end
+  end
+
+  describe "the process of the signal of a request" do
+    defp request_signal(source),
+      do: Web.Request.new("https://example.com/", signal: source).signal
+
+    defp start_copy(signal, listener) do
+      parent = self()
+
+      copy =
+        spawn(fn ->
+          EventTarget.add_event_listener(signal, "abort", listener)
+          send(parent, {:added, self()})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:added, ^copy}
+      copy
+    end
+
+    test "stays while a listener of a process that is alive is on it" do
+      controller = AbortController.new()
+      signal = request_signal(controller.signal)
+      copy = start_copy(signal, fn -> :ok end)
+      pid = AbortSignal.__listener_pid__(signal)
+
+      # The owner is the copy: the process stays while the copy is alive.
+      refute_down(pid, 4 * @linger)
+
+      Process.exit(copy, :kill)
+      assert_down(pid)
+      assert AbortSignal.__listener_pid__(signal) == nil
+      assert eventually(fn -> :sys.get_state(controller.signal.pid).dependents == [] end)
+    end
+
+    test "stops after the linger time when its owner stops and it has no listener" do
+      controller = AbortController.new()
+      signal = request_signal(controller.signal)
+      listener = fn -> :ok end
+
+      in_short_process(fn ->
+        EventTarget.add_event_listener(signal, "abort", listener)
+        EventTarget.remove_event_listener(signal, "abort", listener)
+      end)
+
+      pid = AbortSignal.__listener_pid__(signal)
+      assert is_pid(pid)
+      assert_down(pid)
+      refute AbortSignal.aborted?(signal)
+
+      # The next listener starts a new process.
+      test = self()
+      EventTarget.add_event_listener(signal, "abort", fn -> send(test, :fired) end)
+      :ok = AbortController.abort(controller)
+      assert_received :fired
+    end
+
+    test "stays while a copy keeps it, also when its owner stopped" do
+      controller = AbortController.new()
+      signal = request_signal(controller.signal)
+      in_short_process(fn -> EventTarget.add_event_listener(signal, "x", fn -> :ok end) end)
+      pid = AbortSignal.__listener_pid__(signal)
+      test = self()
+
+      keeper =
+        spawn(fn ->
+          AbortSignal.__with_process__(signal, :ok, fn _pid ->
+            send(test, :kept)
+
+            receive do
+              :release -> :ok
+            end
+          end)
+        end)
+
+      assert_receive :kept
+      refute_down(pid, 4 * @linger)
+      send(keeper, :release)
+      assert_down(pid)
+    end
+
+    test "keeps a source of any/1 that has no other use" do
+      controller = AbortController.new()
+      any = in_short_process(fn -> AbortSignal.any([controller.signal]) end)
+      signal = request_signal(any)
+      test = self()
+      copy = start_copy(signal, fn -> send(test, {:fired, AbortSignal.reason(signal)}) end)
+
+      # The owner of the signal of any/1 stopped: the process of the signal of
+      # the request keeps it.
+      refute_down(any.pid, 4 * @linger)
+
+      :ok = AbortController.abort(controller, :why)
+      assert_receive {:fired, :why}
+      Process.exit(copy, :kill)
+    end
+
+    test "stops with the source of any/1 when the copies stop" do
+      controller = AbortController.new()
+      any = in_short_process(fn -> AbortSignal.any([controller.signal]) end)
+      signal = request_signal(any)
+      copy = start_copy(signal, fn -> :ok end)
+      pid = AbortSignal.__listener_pid__(signal)
+
+      Process.exit(copy, :kill)
+      assert_down(pid)
+      assert_down(any.pid)
+
+      # A signal whose process stopped is aborted.
+      assert AbortSignal.aborted?(signal)
     end
   end
 end

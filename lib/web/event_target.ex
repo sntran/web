@@ -133,11 +133,11 @@ defmodule Web.EventTarget do
 
   def remove_event_listener(target, _type, nil, _options), do: target
 
-  def remove_event_listener(%struct{pid: pid} = target, type, callback, options)
+  def remove_event_listener(%struct{} = target, type, callback, options)
       when struct in [__MODULE__, Web.AbortSignal] and
              (is_function(callback, 0) or is_function(callback, 1)) do
     capture = Map.get(flatten(options), :capture, false) == true
-    :ok = __remove__(pid, type, callback, capture)
+    :ok = __remove__(listener_pid(target), type, callback, capture)
     target
   end
 
@@ -157,6 +157,11 @@ defmodule Web.EventTarget do
   def dispatch_event(target, %{type: type} = event) when is_binary(type) or is_atom(type) do
     Web.EventTarget.Protocol.dispatch_event(target, event)
   end
+
+  # The process with the listeners. A lazy signal has it only after its
+  # first listener: see `Web.AbortSignal`.
+  defp listener_pid(%Web.AbortSignal{} = signal), do: Web.AbortSignal.__listener_pid__(signal)
+  defp listener_pid(%__MODULE__{pid: pid}), do: pid
 
   # The steps "flatten more options": a boolean is the option `capture`.
   defp flatten(capture) when is_boolean(capture), do: %{capture: capture}

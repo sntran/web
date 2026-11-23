@@ -275,6 +275,14 @@ the server closed, and a request that an HTTP/2 server did not process,
 go again on a new connection. A request with a body from a stream does not
 go again.
 
+Each request has its own signal, as the Fetch Standard specifies:
+`Request.new/2` and `Request.clone/1` make a new `AbortSignal` that depends
+on the signal of the option `:signal`, or on the signal of the input
+request. An abort of that signal aborts the signal of the request. The
+signal of a request has no process until an operation needs one, such as
+a listener: `Request.new/2` and `fetch` start no process for it, and a
+read such as `AbortSignal.aborted?/1` reads the signal that it depends on.
+
 The field `status_text` of a response follows the HTTP version of its
 connection. An HTTP/2 response has no reason phrase, thus its status text
 is `""`, as the Fetch Standard specifies. For HTTP/1.1, the text is the
@@ -726,11 +734,11 @@ systems, and examine its SHA-256 hash.
 | `URLPattern` | 373 | 373 | 0 | 0 | 0 | 0 |
 | The streams, the readers, the writers, and the strategies | 1157 | 1030 | 109 | 1 | 0 | 17 |
 | `CompressionStream` and `DecompressionStream` | 318 | 309 | 1 | 0 | 0 | 8 |
-| `Request`, `Response`, the body, and `data:` URLs | 851 | 675 | 118 | 6 | 2 | 50 |
+| `Request`, `Response`, the body, and `data:` URLs | 930 | 709 | 163 | 6 | 2 | 50 |
 | `Blob`, `File`, and `FormData` | 527 | 402 | 51 | 3 | 0 | 71 |
 | `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 71 | 5 | 0 | 0 | 0 |
 
-19733 of 20559 tests pass. The tests that are not in the scope of the library
+19767 of 20638 tests pass. The tests that are not in the scope of the library
 use `XMLHttpRequest` or `FileReader`, the guard of the forbidden headers of a
 browser, the shared memory of JavaScript, or the conversion of JavaScript of
 a value to a string. The library will not have them: `Web.fetch/2` and the
@@ -748,7 +756,9 @@ as a browser gives the base URL of a document.
 
 A test that the runner cannot run needs a feature that the runner does not
 have yet: the server of WPT, the conversion to an async sequence of
-`ReadableStream.from()`, `MessageChannel`, `crypto`, or `structuredClone`. A
+`ReadableStream.from()`, `MessageChannel`, `crypto`, or `structuredClone`.
+The `fetch` of the runner reads a file of WPT next to the test: it does not
+use the signal or the body of the request (30 tests of `fetch/api/abort/`). A
 string of Elixir is UTF-8, thus a lone surrogate of JavaScript cannot come to
 the library. The runner answers a call when the library is at rest. Thus the
 library can do a step before the call returns, where JavaScript does it in a
@@ -804,6 +814,7 @@ easy to make and hard to find with an example test:
 | `EventTarget.tla`    | The listeners of a target, a dispatch, and the lifetime of the target. |
 | `FormDataParser.tla` | The live parser of a multipart form: each call gets an answer, and a file part ends. |
 | `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
+| `LazySignal.tla`     | The signal of a request: no process until a listener needs one, one process for all the copies, and the listener of each copy runs at the abort. |
 | `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |
 | `ConnectionPool.tla` | The connections of an origin, and the slots of a counting governor: the limit, the queue, and the stops. |
 | `SocketFlow.tla`     | A request reads its socket one message at a time, at the limit. |

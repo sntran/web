@@ -425,7 +425,8 @@ defmodule Web.BodyTest do
              catch_exit(await(Response.form_data(response)))
   end
 
-  test "Request.form_data/1 rejects immediately when the request signal is already aborted" do
+  # The steps "consume body" do not use the signal of the request.
+  test "Request.form_data/1 reads the body also when the request signal is already aborted" do
     controller = Web.AbortController.new()
     :ok = Web.AbortController.abort(controller, :user_cancelled)
 
@@ -437,6 +438,6 @@ defmodule Web.BodyTest do
         signal: controller.signal
       )
 
-    assert :user_cancelled = catch_exit(await(Request.form_data(request)))
+    assert Web.FormData.get(await(Request.form_data(request)), "a") == "1"
   end
 end

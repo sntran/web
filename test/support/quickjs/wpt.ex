@@ -179,7 +179,26 @@ defmodule Web.Test.QuickJS.WPT do
       {:test, "streams/readable-byte-streams/patched-global.any.js",
        "Patched then() sees byobRequest after filling all pending pull-into descriptors",
        @no_view_type}
-    ] ++ microtask_causes() ++ file_api_dom_causes() ++ base_causes()
+    ] ++ microtask_causes() ++ file_api_dom_causes() ++ fetch_abort_causes() ++ base_causes()
+  end
+
+  # The rules of the files of `fetch/api/abort/`. The `fetch` of the runner
+  # reads a file of WPT next to the test, and makes a response with the
+  # `Response` constructor: it does not use the signal or the body of the
+  # request. Thus the steps of `fetch` for an aborted signal, and the
+  # disturb of the body of the request, are not in these tests. The other
+  # tests of the files examine the signal of a request.
+  defp fetch_abort_causes do
+    runner_fetch =
+      "runner: the fetch of the runner does not use the signal or the body of a request"
+
+    [
+      {:test, "fetch/api/abort/general.any.js",
+       ~r/^(Aborting rejects with (AbortError|abort reason)( when aborted after fetch\(\) called)?|Signal on request object.*|Signal retained after unrelated properties are overridden by fetch|Already aborted signal rejects immediately|Request is still 'used' if signal is aborted before fetching|response\.\w+\(\) rejects (with abort reason )?if already aborted|Call text\(\) twice on aborted response|Readable stream synchronously cancels with AbortError if aborted before reading)$/,
+       runner_fetch},
+      {:test, "fetch/api/abort/request.any.js", ~r/on an aborted consumed nonempty request$/,
+       runner_fetch}
+    ]
   end
 
   # The rules of the File API, of `FormData`, and of the DOM Standard.

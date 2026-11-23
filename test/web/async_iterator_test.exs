@@ -1123,6 +1123,10 @@ defmodule Web.AsyncIteratorTest do
       promise = AsyncIterator.next(iterator)
       [first, second, third] = for _read <- 1..3, do: Script.assert_next()
       Script.finish(third)
+      # Each read has its own job process. Thus the helper must have the end
+      # before the first value: else the permit of the first value starts a
+      # fourth read, as the helper does not yet know the end.
+      Script.settle([iterator.pid])
       Script.give(second, :b)
       Script.give(first, :a)
       assert await(promise) == value(:a)

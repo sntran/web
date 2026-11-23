@@ -8,6 +8,11 @@ defmodule Web.Platform.Test do
   alias Web.Platform.Test, as: PlatformTest
   alias Web.Platform.Test.JSHarvester
 
+  # The commit of web-platform-tests/wpt that the test suite uses. The URLs in
+  # the test modules refer to `master`. The loader replaces `master` with this
+  # commit, thus a change upstream cannot change the test results. To update
+  # the fixtures, change this value and correct the new failures.
+  @wpt_revision "61ad038e419a0bfacee26801e584b5057c3fbd60"
   @cache_dir Path.expand("tmp/wpt_cache", Elixir.File.cwd!())
   # The infrastructure uses an AsyncContext.Variable (referenced via
   # @context_key) to store the URL of the remote spec being processed.
@@ -95,19 +100,63 @@ defmodule Web.Platform.Test do
     end
   end
 
+  @doc """
+  The local path of a file of WPT at the pinned commit, for example
+  `"resources/testharness.js"`. The file is in a tree of directories under
+  the cache: the QuickJS runner loads a test with its helper files, and many
+  files of WPT have the same name in different directories. A file at a
+  pinned commit does not change, thus a file in the cache is correct.
+  """
+  def tree_file!(path) when is_binary(path) do
+    target = Path.join([@cache_dir, "tree", @wpt_revision, path])
+
+    if Elixir.File.exists?(target) do
+      target
+    else
+      url = "https://raw.githubusercontent.com/web-platform-tests/wpt/#{@wpt_revision}/#{path}"
+      started_at = System.monotonic_time(:millisecond)
+      bytes = governed_fetch(url, fn -> fetch_tree_file(url, started_at) end)
+
+      # A write to a temporary file, then a rename: a different test that
+      # reads the file at the same time sees all of it, or nothing.
+      Elixir.File.mkdir_p!(Path.dirname(target))
+      part = target <> ".#{System.unique_integer([:positive])}.part"
+      Elixir.File.write!(part, bytes)
+      Elixir.File.rename!(part, target)
+      target
+    end
+  end
+
+  defp fetch_tree_file(url, started_at) do
+    response = fetch_with_retry([], url, started_at)
+
+    case response.status do
+      200 -> Web.await(Web.Response.bytes(response)) |> Web.Uint8Array.to_binary()
+      status -> raise "The WPT file #{url} gave the status #{status}."
+    end
+  end
+
   def load_json!(url) when is_binary(url) do
     Elixir.File.mkdir_p!(@cache_dir)
 
     {cache_path, meta_path} = cache_paths(url)
-    meta = read_meta(meta_path)
     fetch_url = normalize_fetch_url(url)
+    meta = meta_path |> read_meta() |> discard_other_revision(fetch_url, cache_path, meta_path)
     started_at = System.monotonic_time(:millisecond)
 
-    Variable.run(fetch_context_variable(), url, fn ->
-      fetch_governor()
-      |> Governor.with(fn ->
+    if cached_revision?(meta, fetch_url, cache_path) do
+      read_cached_json!(cache_path, url)
+    else
+      governed_fetch(url, fn ->
         fetch_json_with_cache(fetch_url, cache_path, meta_path, meta, started_at)
       end)
+    end
+  end
+
+  defp governed_fetch(url, fetch) do
+    Variable.run(fetch_context_variable(), url, fn ->
+      fetch_governor()
+      |> Governor.with(fetch)
       |> Web.await()
     end)
   end
@@ -123,17 +172,42 @@ defmodule Web.Platform.Test do
     Elixir.File.mkdir_p!(@cache_dir)
 
     {cache_path, meta_path} = cache_paths(url)
-    meta = read_meta(meta_path)
     fetch_url = normalize_fetch_url(url)
+    meta = meta_path |> read_meta() |> discard_other_revision(fetch_url, cache_path, meta_path)
     started_at = System.monotonic_time(:millisecond)
 
-    Variable.run(fetch_context_variable(), url, fn ->
-      fetch_governor()
-      |> Governor.with(fn ->
+    if cached_revision?(meta, fetch_url, cache_path) do
+      read_cached_source!(cache_path, url)
+    else
+      governed_fetch(url, fn ->
         fetch_source_with_cache(fetch_url, cache_path, meta_path, meta, started_at)
       end)
-      |> Web.await()
-    end)
+    end
+  end
+
+  # A fixture at a pinned commit does not change. Thus a cache entry for the
+  # same URL is correct, and no request is necessary.
+  defp cached_revision?(meta, fetch_url, cache_path) do
+    pinned?(fetch_url) and meta["url"] == fetch_url and Elixir.File.exists?(cache_path)
+  end
+
+  # A cache entry of a pinned fixture is correct only for the same commit.
+  # An entry for a different commit must not be used as a fallback.
+  defp discard_other_revision(meta, fetch_url, cache_path, meta_path) do
+    if pinned?(fetch_url) and meta["url"] != fetch_url do
+      _ = Elixir.File.rm(cache_path)
+      _ = Elixir.File.rm(meta_path)
+      %{}
+    else
+      meta
+    end
+  end
+
+  defp pinned?(fetch_url) do
+    String.starts_with?(
+      fetch_url,
+      "https://raw.githubusercontent.com/web-platform-tests/wpt/" <> @wpt_revision <> "/"
+    )
   end
 
   defp fetch_source_with_cache(url, cache_path, meta_path, meta, started_at) do
@@ -222,7 +296,7 @@ defmodule Web.Platform.Test do
   defp handle_fetch_source_response(response, url, cache_path, meta_path) do
     case response.status do
       200 ->
-        persist_fresh_source(response, cache_path, meta_path)
+        persist_fresh_source(response, url, cache_path, meta_path)
 
       304 ->
         read_cached_source!(cache_path, url)
@@ -253,7 +327,7 @@ defmodule Web.Platform.Test do
   defp handle_fetch_json_response(response, url, cache_path, meta_path) do
     case response.status do
       200 ->
-        persist_fresh_json(response, cache_path, meta_path)
+        persist_fresh_json(response, url, cache_path, meta_path)
 
       304 ->
         read_cached_json!(cache_path, url)
@@ -372,6 +446,16 @@ defmodule Web.Platform.Test do
     status in [403, 408, 425, 429] or status >= 500
   end
 
+  # A fetch that fails rejects with a TypeError. Its cause is the failure of
+  # the dispatcher.
+  defp retryable_fetch_error?(%Web.TypeError{cause: cause}) when not is_nil(cause) do
+    retryable_fetch_error?(cause)
+  end
+
+  defp retryable_fetch_error?(%Web.DOMException{name: name})
+       when name in ["AbortError", "TimeoutError"],
+       do: true
+
   defp retryable_fetch_error?(%Mint.TransportError{reason: reason}) do
     transient_network_error?(reason)
   end
@@ -414,21 +498,22 @@ defmodule Web.Platform.Test do
       :ok
   end
 
-  defp persist_fresh_source(response, cache_path, meta_path) do
+  defp persist_fresh_source(response, url, cache_path, meta_path) do
     raw = Web.await(Web.Response.text(response))
 
     Elixir.File.write!(cache_path, raw)
 
     meta = %{
+      url: url,
       etag: Web.Headers.get(response.headers, "etag"),
       last_modified: Web.Headers.get(response.headers, "last-modified")
     }
 
-    Elixir.File.write!(meta_path, Jason.encode!(meta))
+    Elixir.File.write!(meta_path, JSON.encode!(meta))
     raw
   end
 
-  defp persist_fresh_json(response, cache_path, meta_path) do
+  defp persist_fresh_json(response, url, cache_path, meta_path) do
     {json_response, text_response} = Web.Response.clone(response)
     raw = Web.await(Web.Response.text(text_response))
     decoded = decode_payload(json_response, raw)
@@ -436,11 +521,12 @@ defmodule Web.Platform.Test do
     Elixir.File.write!(cache_path, raw)
 
     meta = %{
+      url: url,
       etag: Web.Headers.get(response.headers, "etag"),
       last_modified: Web.Headers.get(response.headers, "last-modified")
     }
 
-    Elixir.File.write!(meta_path, Jason.encode!(meta))
+    Elixir.File.write!(meta_path, JSON.encode!(meta))
     decoded
   end
 
@@ -457,7 +543,7 @@ defmodule Web.Platform.Test do
   defp decode_fallback_payload(raw) do
     raw
     |> repair_surrogates()
-    |> Jason.decode!()
+    |> JSON.decode!()
   end
 
   defp fallback_to_cache_source_or_raise(cache_path, url, reason) do
@@ -484,7 +570,7 @@ defmodule Web.Platform.Test do
     cache_path
     |> Elixir.File.read!()
     |> repair_surrogates()
-    |> Jason.decode!()
+    |> JSON.decode!()
   end
 
   defp conditional_headers(meta) do
@@ -506,7 +592,7 @@ defmodule Web.Platform.Test do
     if Elixir.File.exists?(path) do
       path
       |> Elixir.File.read!()
-      |> Jason.decode!()
+      |> JSON.decode!()
     else
       %{}
     end
@@ -517,7 +603,7 @@ defmodule Web.Platform.Test do
   defp fetch_context_variable do
     case :persistent_term.get(@context_key, nil) do
       nil ->
-        variable = Variable.new("wpt_url")
+        variable = Variable.new(name: "wpt_url")
         :persistent_term.put(@context_key, variable)
         variable
 
@@ -549,7 +635,11 @@ defmodule Web.Platform.Test do
   end
 
   defp new_fetch_governor do
-    governor = CountingGovernor.new(governor_capacity())
+    # All the test processes use this governor, thus it has no owner and no
+    # link.
+    {:ok, pid} = CountingGovernor.start_link(capacity: governor_capacity())
+    true = Process.unlink(pid)
+    governor = CountingGovernor.get(pid)
     :persistent_term.put(@governor_key, governor)
     governor
   end
@@ -581,12 +671,18 @@ defmodule Web.Platform.Test do
         host: "github.com",
         path: "/web-platform-tests/wpt/raw/refs/heads/" <> rest
       } ->
-        "https://raw.githubusercontent.com/web-platform-tests/wpt/" <> rest
+        pin_revision("https://raw.githubusercontent.com/web-platform-tests/wpt/" <> rest)
 
       _ ->
-        url
+        pin_revision(url)
     end
   end
+
+  defp pin_revision("https://raw.githubusercontent.com/web-platform-tests/wpt/master/" <> rest) do
+    "https://raw.githubusercontent.com/web-platform-tests/wpt/" <> @wpt_revision <> "/" <> rest
+  end
+
+  defp pin_revision(url), do: url
 
   defp runtime_option(key, default) do
     :web
@@ -637,19 +733,16 @@ defmodule Web.Platform.Test do
 
   defp normalize_cases(url, payload) when is_binary(url) and is_map(payload), do: [payload]
 
+  # The JSON decoder decodes a correct surrogate pair, but fails on a surrogate that is
+  # alone. A browser changes such a surrogate to U+FFFD when it reads the
+  # string, thus do the same here. Do not change a correct pair.
   defp repair_surrogates(text) do
     Regex.replace(
       ~r/\\u([Dd][89AaBb][0-9A-Fa-f]{2})\\u([Dd][C-Fc-f][0-9A-Fa-f]{2})|\\u([Dd][89A-Fa-f][0-9A-Fa-f]{2})/,
       text,
       fn
-        _, high, low, "" ->
-          h = String.to_integer(high, 16)
-          l = String.to_integer(low, 16)
-          cp = 0x10000 + (h - 0xD800) * 0x400 + (l - 0xDC00)
-          cp |> List.wrap() |> List.to_string() |> Jason.encode!() |> String.slice(1..-2//1)
-
-        _, "", "", _lone ->
-          "\\uFFFD"
+        _match, "", "", _lone -> "\\uFFFD"
+        pair, _high, _low, "" -> pair
       end
     )
   end

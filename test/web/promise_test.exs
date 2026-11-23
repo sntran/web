@@ -1,417 +1,795 @@
 defmodule Web.PromiseTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   import Web, only: [await: 1]
 
+  alias Web.AsyncContext.Variable
   alias Web.Promise
+  alias Web.TypeError
 
-  # ---------------------------------------------------------------------------
-  # AggregateError
-  # ---------------------------------------------------------------------------
+  doctest Web.Promise
 
-  test "AggregateError message formats the errors list" do
-    err = %Promise.AggregateError{errors: [:a, :b]}
-    assert Exception.message(err) =~ "All promises were rejected"
-    assert Exception.message(err) =~ ":a"
-  end
-
-  # ---------------------------------------------------------------------------
-  # resolve/1 variants
-  # ---------------------------------------------------------------------------
-
-  test "resolve/1 wraps a Task directly" do
-    task = Task.async(fn -> 42 end)
-    promise = Promise.resolve(task)
-    assert is_struct(promise, Promise)
-    assert await(promise) == 42
-  end
-
-  test "resolve/1 wraps a raw value" do
-    promise = Promise.resolve(:hello)
-    assert await(promise) == :hello
-  end
-
-  test "resolve/1 is idempotent for an existing promise" do
-    original = Promise.resolve(99)
-    assert Promise.resolve(original) == original
-  end
-
-  test "with_resolvers/0 resolves with the external resolver" do
-    {promise, resolve, _reject} = Promise.with_resolvers()
-
-    assert :ok == resolve.(:hello)
-    assert :hello == await(promise)
-  end
-
-  test "with_resolvers/0 rejects with the external rejector" do
-    {promise, _resolve, reject} = Promise.with_resolvers()
-
-    assert :ok == reject.(:boom)
-    assert :boom == catch_exit(await(promise))
-  end
-
-  test "with_resolvers/0 settles asynchronously" do
-    {promise, resolve, _reject} = Promise.with_resolvers()
-
-    Task.start(fn ->
-      Process.sleep(10)
-      resolve.(:later)
+  # Returns a promise that is fulfilled with `value` after `ms` milliseconds.
+  defp later(value, ms) do
+    Promise.new(fn resolve, _reject ->
+      Process.sleep(ms)
+      resolve.(value)
     end)
-
-    assert :later == await(promise)
   end
 
-  test "with_resolvers/0 ignores later settlement attempts" do
-    {promise, resolve, reject} = Promise.with_resolvers()
-
-    assert :ok == resolve.(:first)
-    assert :ok == reject.(:second)
-    assert :first == await(promise)
+  # Returns a promise that is rejected with `reason` after `ms` milliseconds.
+  defp later_rejection(reason, ms) do
+    Promise.new(fn _resolve, reject ->
+      Process.sleep(ms)
+      reject.(reason)
+    end)
   end
 
-  test "with_resolvers/0 exits the promise task when the creator dies before settlement" do
-    parent = self()
+  defp assert_down(pid) do
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
+  end
 
-    creator_pid =
+  describe "AggregateError" do
+    test "the message contains the list of errors" do
+      error = %Web.AggregateError{errors: [:a, :b]}
+      assert Exception.message(error) =~ "All promises were rejected"
+      assert Exception.message(error) =~ ":a"
+    end
+  end
+
+  describe "resolve/1 and reject/1" do
+    test "resolve/1 gives a fulfilled promise without a process" do
+      promise = Promise.resolve(:hello)
+      assert promise.pid == nil
+      assert await(promise) == :hello
+    end
+
+    test "resolve/1 returns an input promise without a change" do
+      original = Promise.resolve(99)
+      assert Promise.resolve(original) == original
+    end
+
+    test "reject/1 gives a rejected promise without a process" do
+      promise = Promise.reject(:bad)
+      assert promise.pid == nil
+      assert catch_exit(await(promise)) == :bad
+    end
+
+    test "the value {:error, reason} is a usual value" do
+      assert await(Promise.resolve({:error, :not_a_rejection})) == {:error, :not_a_rejection}
+    end
+  end
+
+  describe "new/2" do
+    test "the executor can resolve immediately" do
+      assert await(Promise.new(fn resolve, _reject -> resolve.(1) end)) == 1
+    end
+
+    test "the executor can reject immediately" do
+      promise = Promise.new(fn _resolve, reject -> reject.(:no) end)
+      assert catch_exit(await(promise)) == :no
+    end
+
+    test "a different process can resolve the promise after the executor returns" do
+      promise =
+        Promise.new(fn resolve, _reject ->
+          executor = self()
+
+          # The other process resolves the promise after the executor stopped.
+          spawn(fn ->
+            monitor = Process.monitor(executor)
+
+            receive do
+              {:DOWN, ^monitor, :process, ^executor, _reason} -> resolve.(:late)
+            end
+          end)
+        end)
+
+      assert await(promise) == :late
+    end
+
+    test "the promise stays pending when the executor returns and does not settle it" do
+      parent = self()
+      promise = Promise.new(fn _resolve, _reject -> send(parent, {:executor, self()}) end)
+
+      # The executor stopped before the peek.
+      assert_receive {:executor, executor}
+      assert_down(executor)
+      assert Promise.peek(promise) == :pending
+    end
+
+    test "only the first settlement has an effect" do
+      promise =
+        Promise.new(fn resolve, reject ->
+          resolve.(:first)
+          reject.(:second)
+          resolve.(:third)
+        end)
+
+      assert await(promise) == :first
+    end
+
+    test "an executor that raises rejects the promise with the exception" do
+      promise = Promise.new(fn _resolve, _reject -> raise "executor failure" end)
+      assert %RuntimeError{message: "executor failure"} = catch_exit(await(promise))
+    end
+
+    test "an executor that throws rejects the promise with the thrown value" do
+      promise = Promise.new(fn _resolve, _reject -> throw(:thrown) end)
+      assert catch_exit(await(promise)) == :thrown
+    end
+
+    test "an executor that exits rejects the promise with the exit reason" do
+      promise = Promise.new(fn _resolve, _reject -> exit(:stopped) end)
+      assert catch_exit(await(promise)) == :stopped
+    end
+
+    test "an executor that is killed rejects the promise" do
+      parent = self()
+
+      promise =
+        Promise.new(fn _resolve, _reject ->
+          send(parent, {:executor, self()})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:executor, executor}
+      Process.exit(executor, :kill)
+      assert catch_exit(await(promise)) == :killed
+    end
+
+    test "an error after the settlement does not change the outcome" do
+      promise =
+        Promise.new(fn resolve, _reject ->
+          resolve.(:kept)
+          raise "too late"
+        end)
+
+      assert await(promise) == :kept
+    end
+
+    test "a resolve with a fulfilled promise takes its value" do
+      promise = Promise.new(fn resolve, _reject -> resolve.(Promise.resolve(:inner)) end)
+      assert await(promise) == :inner
+    end
+
+    test "a resolve with a rejected promise takes its reason" do
+      promise = Promise.new(fn resolve, _reject -> resolve.(Promise.reject(:inner_fail)) end)
+      assert catch_exit(await(promise)) == :inner_fail
+    end
+
+    test "a resolve with a pending promise takes its later outcome" do
+      promise = Promise.new(fn resolve, _reject -> resolve.(later(:inner_later, 20)) end)
+      assert await(promise) == :inner_later
+    end
+
+    test "a promise that resolves to itself rejects with TypeError" do
+      {promise, resolve, _reject} = Promise.with_resolvers()
+      resolve.(promise)
+
+      assert %TypeError{message: "A promise cannot resolve to itself."} =
+               catch_exit(await(promise))
+    end
+
+    test "the executor gets the AsyncContext values of the caller" do
+      variable = Variable.new(name: "promise_new_context")
+
+      promise =
+        Variable.run(variable, :from_caller, fn ->
+          Promise.new(fn resolve, _reject -> resolve.(Variable.get(variable)) end)
+        end)
+
+      assert await(promise) == :from_caller
+    end
+  end
+
+  describe "with_resolvers/1" do
+    test "the resolve function fulfills the promise" do
+      {promise, resolve, _reject} = Promise.with_resolvers()
+      assert resolve.(:hello) == :ok
+      assert await(promise) == :hello
+    end
+
+    test "the reject function rejects the promise" do
+      {promise, _resolve, reject} = Promise.with_resolvers()
+      assert reject.(:boom) == :ok
+      assert catch_exit(await(promise)) == :boom
+    end
+
+    test "a different process can settle the promise at a later time" do
+      {promise, resolve, _reject} = Promise.with_resolvers()
+
+      # The sleep is part of the scenario: the settle comes after the start
+      # of the await.
       spawn(fn ->
-        {promise, _resolve, _reject} = Promise.with_resolvers()
-        send(parent, {:with_resolvers_task, promise.task.pid})
-
-        receive do
-          :stop -> :ok
-        end
+        Process.sleep(10)
+        resolve.(:later)
       end)
 
-    assert_receive {:with_resolvers_task, task_pid}, 1_000
+      assert await(promise) == :later
+    end
 
-    task_monitor = Process.monitor(task_pid)
-    Process.exit(creator_pid, :kill)
-
-    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :normal}, 1_000
+    test "only the first settlement has an effect" do
+      {promise, resolve, reject} = Promise.with_resolvers()
+      resolve.(:first)
+      reject.(:second)
+      assert await(promise) == :first
+    end
   end
 
-  # ---------------------------------------------------------------------------
-  # then/2 — catch clause (rejected upstream)
-  # ---------------------------------------------------------------------------
+  describe "await/1 and wait/1" do
+    test "a process can await a promise more than one time" do
+      promise = later(:again, 10)
+      assert await(promise) == :again
+      assert await(promise) == :again
+      assert await(promise) == :again
+    end
 
-  test "then/2 transforms a fulfilled promise" do
-    promise =
-      Promise.resolve(2)
-      |> Promise.then(fn value -> value * 3 end)
+    test "a different process can await a promise" do
+      promise = later(:shared, 10)
+      tasks = for _ <- 1..3, do: Task.async(fn -> await(promise) end)
+      assert Task.await_many(tasks) == [:shared, :shared, :shared]
+      assert await(promise) == :shared
+    end
 
-    assert 6 == await(promise)
+    test "await/1 of Web returns a value that is not a promise" do
+      assert await(:not_a_promise) == :not_a_promise
+    end
+
+    test "wait/1 returns the outcome as data" do
+      assert Promise.wait(Promise.resolve(1)) == {:fulfilled, 1}
+      assert Promise.wait(Promise.reject(:no)) == {:rejected, :no}
+      assert Promise.wait(later(2, 5)) == {:fulfilled, 2}
+      assert Promise.wait(later_rejection(:late_no, 5)) == {:rejected, :late_no}
+    end
   end
 
-  test "then/2 propagates rejection when upstream rejects" do
-    promise =
-      Promise.reject(:bad)
-      |> Promise.then(fn value -> value end)
+  describe "then/2" do
+    test "it changes the value of a fulfilled promise" do
+      assert await(Promise.then(Promise.resolve(2), &(&1 * 3))) == 6
+    end
 
-    assert :bad == catch_exit(await(promise))
+    test "it accepts a value that is not a promise" do
+      assert await(Promise.then(2, &(&1 + 1))) == 3
+    end
+
+    test "it returns before a pending promise settles" do
+      # The promise settles only when the test resolves it.
+      {promise, resolve, _reject} = Promise.with_resolvers()
+      {microseconds, chained} = :timer.tc(fn -> Promise.then(promise, &(&1 + 1)) end)
+
+      assert microseconds < 100_000
+      assert Promise.peek(chained) == :pending
+      resolve.(1)
+      assert await(chained) == 2
+    end
+
+    test "a rejection goes through and the callback does not run" do
+      parent = self()
+
+      promise =
+        later_rejection(:bad, 5)
+        |> Promise.then(fn value ->
+          send(parent, :callback_ran)
+          value
+        end)
+
+      assert catch_exit(await(promise)) == :bad
+      refute_received :callback_ran
+    end
+
+    test "a settled rejection is returned without a new process" do
+      rejected = Promise.reject(:bad)
+      assert Promise.then(rejected, & &1) == rejected
+    end
+
+    test "a callback that returns a promise gives the outcome of that promise" do
+      promise = Promise.then(Promise.resolve("a"), fn value -> later(value <> "b", 5) end)
+      assert await(promise) == "ab"
+    end
+
+    test "a callback that raises rejects the new promise" do
+      promise = Promise.then(Promise.resolve(1), fn _value -> raise "callback failure" end)
+      assert %RuntimeError{message: "callback failure"} = catch_exit(await(promise))
+    end
+
+    test "many callbacks can use the same promise" do
+      promise = later(10, 10)
+      first = Promise.then(promise, &(&1 + 1))
+      second = Promise.then(promise, &(&1 + 2))
+      assert await(first) == 11
+      assert await(second) == 12
+    end
+
+    test "the callback runs in a different process with the context of the caller" do
+      variable = Variable.new(name: "promise_then_context")
+      caller = self()
+
+      promise =
+        Variable.run(variable, :from_caller, fn ->
+          Promise.then(Promise.resolve(:ok), fn _value -> {self(), Variable.get(variable)} end)
+        end)
+
+      assert {pid, :from_caller} = await(promise)
+      assert pid != caller
+    end
   end
 
-  test "then/2 handles callbacks that return another promise" do
-    promise =
-      Promise.resolve("a")
-      |> Promise.then(fn value -> Promise.resolve(value <> "b") end)
+  describe "then/3" do
+    # A settled or a pending promise with the outcome.
+    defp promise_of({:fulfilled, value}, false), do: Promise.resolve(value)
+    defp promise_of({:rejected, reason}, false), do: Promise.reject(reason)
+    defp promise_of({:fulfilled, value}, true), do: later(value, 1)
+    defp promise_of({:rejected, reason}, true), do: later_rejection(reason, 1)
 
-    assert "ab" == await(promise)
+    property "the callback of the state runs, and nil passes the outcome on" do
+      check all(
+              outcome <-
+                one_of([
+                  tuple({constant(:fulfilled), term()}),
+                  tuple({constant(:rejected), term()})
+                ]),
+              pending? <- boolean(),
+              on_fulfilled? <- boolean(),
+              on_rejected? <- boolean(),
+              max_runs: 40
+            ) do
+        on_fulfilled = if on_fulfilled?, do: &{:fulfilled_with, &1}
+        on_rejected = if on_rejected?, do: &{:rejected_with, &1}
+        promise = Promise.then(promise_of(outcome, pending?), on_fulfilled, on_rejected)
+
+        expected =
+          case {outcome, on_fulfilled?, on_rejected?} do
+            {{:fulfilled, value}, true, _} -> {:fulfilled, {:fulfilled_with, value}}
+            {{:rejected, reason}, _, true} -> {:fulfilled, {:rejected_with, reason}}
+            {outcome, _, _} -> outcome
+          end
+
+        assert Promise.wait(promise) == expected
+      end
+    end
+
+    test "on_rejected does not run for a fulfilled promise, and on_fulfilled not for a rejection" do
+      parent = self()
+      on_fulfilled = fn value -> send(parent, {:on_fulfilled, value}) end
+      on_rejected = fn reason -> send(parent, {:on_rejected, reason}) end
+
+      assert await(Promise.then(later(:value, 1), on_fulfilled, on_rejected)) ==
+               {:on_fulfilled, :value}
+
+      assert await(Promise.then(later_rejection(:bad, 1), on_fulfilled, on_rejected)) ==
+               {:on_rejected, :bad}
+
+      assert_received {:on_fulfilled, :value}
+      assert_received {:on_rejected, :bad}
+      refute_received _other
+    end
+
+    test "an on_rejected that raises rejects the new promise" do
+      promise =
+        Promise.then(Promise.reject(:err), nil, fn _reason -> raise "callback failure" end)
+
+      assert %RuntimeError{message: "callback failure"} = catch_exit(await(promise))
+    end
+
+    test "a settled promise with no callback for its state is returned without a new process" do
+      fulfilled = Promise.resolve(:value)
+      assert Promise.then(fulfilled, nil, fn _reason -> :fallback end) == fulfilled
+      assert Promise.then(fulfilled, nil, nil) == fulfilled
+    end
   end
 
-  # ---------------------------------------------------------------------------
-  # catch/2
-  # ---------------------------------------------------------------------------
+  describe "try/2" do
+    test "it calls the function now, in the calling process, with the arguments" do
+      parent = self()
+      promise = Promise.try(fn a, b -> send(parent, {:called, self(), a + b}) end, [1, 2])
 
-  test "catch/2 recovers from a rejected promise" do
-    promise =
-      Promise.reject(:boom)
-      |> Promise.catch(fn reason -> {:recovered, reason} end)
+      assert_received {:called, ^parent, 3}
+      assert promise == Promise.resolve({:called, parent, 3})
+    end
 
-    assert {:recovered, :boom} == await(promise)
+    test "a raise, a throw, and an exit reject the promise with their value" do
+      assert %RuntimeError{message: "bad"} = catch_exit(await(Promise.try(fn -> raise "bad" end)))
+      assert catch_exit(await(Promise.try(fn -> throw(:thrown) end))) == :thrown
+      assert catch_exit(await(Promise.try(fn -> exit(:exited) end))) == :exited
+    end
+
+    test "a promise of the function is the result" do
+      pending = later(:later, 1)
+      assert Promise.try(fn -> pending end) == pending
+      assert await(Promise.try(fn -> pending end)) == :later
+    end
   end
 
-  test "catch/2 passes through a fulfilled promise" do
-    promise =
-      Promise.resolve(:ok_value)
-      |> Promise.catch(fn _reason -> :fallback end)
+  describe "catch/2" do
+    test "nil is undefined: the outcome goes through" do
+      assert Promise.catch(Promise.reject(:bad), nil) == Promise.reject(:bad)
+      assert catch_exit(await(Promise.catch(later_rejection(:bad, 1), nil))) == :bad
+      assert await(Promise.catch(later(:value, 1), nil)) == :value
+    end
 
-    assert :ok_value == await(promise)
+    test "it recovers from a rejection" do
+      promise = Promise.catch(Promise.reject(:boom), fn reason -> {:recovered, reason} end)
+      assert await(promise) == {:recovered, :boom}
+    end
+
+    test "it recovers from a rejection of a pending promise" do
+      promise = Promise.catch(later_rejection(:boom, 5), fn reason -> {:recovered, reason} end)
+      assert await(promise) == {:recovered, :boom}
+    end
+
+    test "a fulfilled value goes through" do
+      assert await(Promise.catch(later(:value, 5), fn _reason -> :fallback end)) == :value
+    end
+
+    test "a settled fulfilled promise is returned without a new process" do
+      fulfilled = Promise.resolve(:value)
+      assert Promise.catch(fulfilled, fn _reason -> :fallback end) == fulfilled
+    end
+
+    test "a callback that returns a promise gives the outcome of that promise" do
+      promise = Promise.catch(Promise.reject(:err), fn _reason -> Promise.resolve(:recovered) end)
+      assert await(promise) == :recovered
+    end
+
+    test "a callback that raises rejects the new promise" do
+      promise = Promise.catch(Promise.reject(:err), fn _reason -> raise "callback failure" end)
+      assert %RuntimeError{} = catch_exit(await(promise))
+    end
   end
 
-  test "catch/2 handler can return a new promise" do
-    promise =
-      Promise.reject(:err)
-      |> Promise.catch(fn _reason -> Promise.resolve(:recovered_via_promise) end)
+  describe "finally/2" do
+    test "nil is undefined: the outcome goes through" do
+      assert Promise.finally(Promise.resolve(:value), nil) == Promise.resolve(:value)
+      assert await(Promise.finally(later(:value, 1), nil)) == :value
+      assert catch_exit(await(Promise.finally(later_rejection(:bad, 1), nil))) == :bad
+    end
 
-    assert :recovered_via_promise == await(promise)
+    test "it runs the callback and keeps a fulfilled value" do
+      parent = self()
+      promise = Promise.finally(later(:value, 5), fn -> send(parent, :cleanup) end)
+      assert await(promise) == :value
+      assert_received :cleanup
+    end
+
+    test "it runs the callback and keeps a rejection" do
+      parent = self()
+      promise = Promise.finally(Promise.reject(:bad), fn -> send(parent, :cleanup) end)
+      assert catch_exit(await(promise)) == :bad
+      assert_received :cleanup
+    end
+
+    test "a callback that raises rejects the new promise" do
+      promise = Promise.finally(Promise.resolve(:value), fn -> raise "cleanup failure" end)
+      assert %RuntimeError{message: "cleanup failure"} = catch_exit(await(promise))
+    end
+
+    test "a callback that returns a rejected promise rejects the new promise" do
+      promise = Promise.finally(Promise.resolve(:value), fn -> Promise.reject(:cleanup_bad) end)
+      assert catch_exit(await(promise)) == :cleanup_bad
+    end
   end
 
-  # ---------------------------------------------------------------------------
-  # all/1
-  # ---------------------------------------------------------------------------
+  describe "all/1" do
+    test "it gives the values in the order of the input" do
+      assert await(Promise.all([later(1, 30), 2, later(3, 5)])) == [1, 2, 3]
+    end
 
-  test "all/1 resolves when all promises resolve" do
-    promises = [Promise.resolve(1), Promise.resolve(2), Promise.resolve(3)]
-    assert [1, 2, 3] == await(Promise.all(promises))
+    test "settled input gives a settled promise without a process" do
+      promise = Promise.all([Promise.resolve(1), 2])
+      assert promise.pid == nil
+      assert await(promise) == [1, 2]
+    end
+
+    test "an empty input gives an empty list" do
+      assert await(Promise.all([])) == []
+    end
+
+    test "it rejects with a settled rejection" do
+      promise = Promise.all([Promise.resolve(1), Promise.reject(:fail), Promise.resolve(3)])
+      assert catch_exit(await(promise)) == :fail
+    end
+
+    test "it rejects at the first rejection and does not wait for the other promises" do
+      promise = Promise.all([later(:slow, 2_000), later_rejection(:fast_fail, 10)])
+      {microseconds, reason} = :timer.tc(fn -> catch_exit(await(promise)) end)
+
+      assert reason == :fast_fail
+      assert microseconds < 1_000_000
+    end
+
+    test "the value {:error, reason} does not reject" do
+      assert await(Promise.all([{:error, :value}, later(1, 5)])) == [{:error, :value}, 1]
+    end
   end
 
-  test "all/1 rejects when any promise rejects" do
-    promises = [Promise.resolve(1), Promise.reject(:fail), Promise.resolve(3)]
-    assert :fail == catch_exit(await(Promise.all(promises)))
+  describe "all_settled/1" do
+    test "it gives each outcome in the order of the input" do
+      results = await(Promise.all_settled([later(:ok, 10), later_rejection(:err, 5), :plain]))
+
+      assert results == [
+               %{status: "fulfilled", value: :ok},
+               %{status: "rejected", reason: :err},
+               %{status: "fulfilled", value: :plain}
+             ]
+    end
+
+    test "the value {:error, reason} is fulfilled" do
+      assert await(Promise.all_settled([Promise.resolve({:error, :value})])) ==
+               [%{status: "fulfilled", value: {:error, :value}}]
+    end
+
+    test "an empty input gives an empty list" do
+      assert await(Promise.all_settled([])) == []
+    end
   end
 
-  test "all/1 resolves with empty list" do
-    assert [] == await(Promise.all([]))
+  describe "any/1" do
+    test "it gives the first value that is fulfilled" do
+      # The slow promise does not settle. Thus no time limit decides the
+      # first value.
+      {slow, _resolve, _reject} = Promise.with_resolvers()
+      promise = Promise.any([later_rejection(:e1, 5), slow, later(:fast, 20)])
+      assert await(promise) == :fast
+    end
+
+    test "it prefers a settled value" do
+      assert await(Promise.any([later(:pending, 50), Promise.reject(:e), :settled])) == :settled
+    end
+
+    test "it rejects with AggregateError when all promises reject" do
+      promise = Promise.any([later_rejection(:a, 10), Promise.reject(:b)])
+      assert %Web.AggregateError{errors: [:a, :b]} = catch_exit(await(promise))
+    end
+
+    test "an empty input rejects with AggregateError" do
+      assert %Web.AggregateError{errors: []} = catch_exit(await(Promise.any([])))
+    end
   end
 
-  # ---------------------------------------------------------------------------
-  # all_settled/1
-  # ---------------------------------------------------------------------------
+  describe "race/1" do
+    # The slow promise of these tests does not settle. Thus no time limit
+    # decides the first outcome.
+    test "it gives the outcome of the first promise that settles" do
+      {slow, _resolve, _reject} = Promise.with_resolvers()
+      assert await(Promise.race([slow, later(:fast, 10)])) == :fast
+    end
 
-  test "all_settled/1 collects all results regardless of outcome" do
-    promises = [Promise.resolve(:ok), Promise.reject(:err), Promise.resolve(:also_ok)]
-    results = await(Promise.all_settled(promises))
+    test "it rejects when the first promise that settles is rejected" do
+      {slow, _resolve, _reject} = Promise.with_resolvers()
+      promise = Promise.race([slow, later_rejection(:fast_fail, 10)])
+      assert catch_exit(await(promise)) == :fast_fail
+    end
 
-    assert Enum.any?(results, &match?(%{status: "fulfilled", value: :ok}, &1))
-    assert Enum.any?(results, &match?(%{status: "rejected", reason: :err}, &1))
-    assert Enum.any?(results, &match?(%{status: "fulfilled", value: :also_ok}, &1))
+    test "it prefers a settled promise" do
+      assert await(Promise.race([later(:pending, 50), :settled])) == :settled
+    end
+
+    test "the other promises continue" do
+      parent = self()
+
+      # The slow executor continues when the test lets it.
+      slow =
+        Promise.new(fn resolve, _reject ->
+          send(parent, {:slow, self()})
+
+          receive do
+            :continue -> resolve.(:slow)
+          end
+        end)
+
+      assert await(Promise.race([slow, later(:fast, 5)])) == :fast
+      assert_receive {:slow, executor}
+      send(executor, :continue)
+      assert await(slow) == :slow
+    end
+
+    test "an empty input stays pending" do
+      promise = Promise.race([])
+
+      # The promise has no executor: no process can settle it. Thus the
+      # check needs no wait.
+      assert Process.info(promise.pid, :links) == {:links, []}
+      assert Promise.peek(promise) == :pending
+    end
   end
 
-  test "all_settled/1 maps internal {:error, reason} resolutions to rejected" do
-    # A promise that resolves to {:error, reason} is treated as rejected
-    promise_with_error = Promise.new(fn resolve, _reject -> resolve.({:error, :nested_err}) end)
-    results = await(Promise.all_settled([promise_with_error]))
-    assert [%{status: "rejected", reason: :nested_err}] = results
+  describe "lifetime" do
+    test "a pending promise and its executor stop when the owner stops" do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          promise =
+            Promise.new(fn _resolve, _reject ->
+              send(parent, {:executor, self()})
+              Process.sleep(:infinity)
+            end)
+
+          send(parent, {:promise, promise})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:promise, promise}
+      assert_receive {:executor, executor}
+
+      Process.exit(owner, :kill)
+
+      assert_down(promise.pid)
+      assert_down(executor)
+      assert %TypeError{} = catch_exit(await(promise))
+    end
+
+    test "a settled promise stops when the owner stops" do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          send(parent, {:promise, Promise.new(fn resolve, _reject -> resolve.(1) end)})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:promise, promise}
+      assert await(promise) == 1
+
+      Process.exit(owner, :kill)
+      assert_down(promise.pid)
+    end
+
+    test "a detached executor continues to its end when the owner stops" do
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          promise =
+            Promise.__new__(
+              fn resolve, _reject ->
+                send(parent, {:executor, self()})
+
+                receive do
+                  :continue -> send(parent, :executor_completed)
+                end
+
+                resolve.(:done)
+              end,
+              detached: true
+            )
+
+          send(parent, {:promise, promise})
+        end)
+
+      assert_receive {:promise, promise}
+      assert_receive {:executor, executor}
+      assert_down(owner)
+      assert Process.alive?(promise.pid)
+
+      send(executor, :continue)
+
+      assert_receive :executor_completed
+      assert_down(promise.pid)
+    end
+
+    test "a promise made in an executor has the owner of the first promise" do
+      outer =
+        Promise.new(fn resolve, _reject ->
+          resolve.(%{inner: later(:inner_value, 30)})
+        end)
+
+      # The executor of `outer` stopped. The inner promise continues, because
+      # its owner is the test process.
+      assert %{inner: inner} = await(outer)
+      assert await(inner) == :inner_value
+    end
+
+    test "an outcome that was not delivered stays available" do
+      promise = Promise.__new__(fn resolve, _reject -> resolve.(:kept) end, linger: 10)
+
+      # The wait is longer than the linger time. This negative check has no
+      # other end than a time limit.
+      monitor = Process.monitor(promise.pid)
+      refute_receive {:DOWN, ^monitor, :process, _pid, _reason}, 60
+      assert await(promise) == :kept
+    end
+
+    test "a promise stops when the linger time after the first delivery is completed" do
+      promise = Promise.__new__(fn resolve, _reject -> resolve.(:value) end, linger: 20)
+
+      assert await(promise) == :value
+      assert await(promise) == :value
+      assert_down(promise.pid)
+
+      assert %TypeError{message: message} = catch_exit(await(promise))
+      assert message =~ "The promise is not available"
+      assert inspect(promise) == "#Web.Promise<released>"
+    end
+
+    test "a chained promise on a released promise rejects with TypeError" do
+      promise = Promise.__new__(fn resolve, _reject -> resolve.(:value) end, linger: 0)
+      assert await(promise) == :value
+      assert_down(promise.pid)
+
+      assert %TypeError{} = catch_exit(await(Promise.then(promise, & &1)))
+      assert %TypeError{} = catch_exit(await(Promise.all([promise])))
+      assert %TypeError{} = catch_exit(await(Promise.new(fn resolve, _ -> resolve.(promise) end)))
+    end
+
+    test "the linger time :infinity keeps the outcome until the owner stops" do
+      {promise, resolve, _reject} = Promise.__with_resolvers__(linger: :infinity)
+      resolve.(:kept)
+
+      assert await(promise) == :kept
+
+      # The outcome stays after a delivery. This negative check has no other
+      # end than a time limit.
+      monitor = Process.monitor(promise.pid)
+      refute_receive {:DOWN, ^monitor, :process, _pid, _reason}, 30
+      assert await(promise) == :kept
+    end
+
+    test "a promise stops when it gets an exit signal" do
+      {promise, _resolve, _reject} = Promise.with_resolvers()
+
+      Process.exit(promise.pid, :shutdown)
+
+      assert_down(promise.pid)
+      assert %TypeError{} = catch_exit(await(promise))
+    end
+
+    test "a promise ignores messages that it does not know" do
+      {promise, resolve, _reject} = Promise.with_resolvers()
+      send(promise.pid, :unknown_message)
+      send(promise.pid, {:settle, make_ref(), {:fulfilled, :wrong_token}})
+      resolve.(:correct)
+      assert await(promise) == :correct
+    end
+
+    test "a promise and its executor stop when the supervisor stops the promise" do
+      parent = self()
+
+      promise =
+        Promise.new(fn _resolve, _reject ->
+          send(parent, {:executor, self()})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:executor, executor}
+      monitors = Enum.map([promise.pid, executor], &Process.monitor/1)
+
+      # The supervisor of the application stops its processes with this
+      # signal.
+      Process.exit(promise.pid, :shutdown)
+
+      for monitor <- monitors do
+        assert_receive {:DOWN, ^monitor, :process, _pid, _reason}
+      end
+    end
   end
 
-  test "all_settled/1 handles exit-based rejections" do
-    rejection = Promise.reject(:exit_reason)
-    results = await(Promise.all_settled([rejection]))
-    assert [%{status: "rejected", reason: :exit_reason}] = results
-  end
+  describe "Inspect" do
+    test "a pending promise" do
+      {promise, _resolve, _reject} = Promise.with_resolvers()
+      assert inspect(promise) == "#Web.Promise<pending>"
+    end
 
-  # ---------------------------------------------------------------------------
-  # any/1
-  # Note: any/1 wraps its work in a new task via Promise.new/1. To avoid
-  # cross-process Task ownership errors from Task.yield_many, we pass plain
-  # values (or {:error, reason} tuples to simulate rejection), which get
-  # wrapped *inside* the any/1 executor task and thus have correct ownership.
-  # ---------------------------------------------------------------------------
+    test "a promise that waits for a different promise is pending" do
+      {inner, _resolve, _reject} = Promise.with_resolvers()
+      {outer, resolve, _reject} = Promise.with_resolvers()
+      resolve.(inner)
+      assert inspect(outer) == "#Web.Promise<pending>"
+    end
 
-  test "any/1 resolves with the first fulfilled value" do
-    # :first_ok resolves, {:error, :e1} is treated as a rejection in do_any
-    result = await(Promise.any([{:error, :e1}, :first_ok, {:error, :e2}]))
-    assert result == :first_ok
-  end
+    test "a fulfilled promise" do
+      assert inspect(Promise.resolve(42)) == "#Web.Promise<resolved: 42>"
 
-  test "any/1 rejects with AggregateError when all values are errors" do
-    result = catch_exit(await(Promise.any([{:error, :a}, {:error, :b}])))
-    assert is_struct(result, Promise.AggregateError)
-    assert :a in result.errors
-    assert :b in result.errors
-  end
+      promise = later(15, 1)
+      assert await(promise) == 15
+      assert inspect(promise) == "#Web.Promise<resolved: 15>"
+    end
 
-  test "any/1 rejects with AggregateError for empty list" do
-    result = catch_exit(await(Promise.any([])))
-    assert is_struct(result, Promise.AggregateError)
-    assert result.errors == []
-  end
-
-  # ---------------------------------------------------------------------------
-  # race/1
-  # Same ownership note as any/1 — pass plain values so tasks are created
-  # inside the race/1 executor.
-  # ---------------------------------------------------------------------------
-
-  test "race/1 resolves with the first to settle" do
-    assert await(Promise.race([:fast, :slow])) in [:fast, :slow]
-  end
-
-  test "race/1 rejects when the settling value is {:error, reason}" do
-    # {:error, :fast_err} is the only input, so it must win
-    assert :fast_err == catch_exit(await(Promise.race([{:error, :fast_err}])))
-  end
-
-  # ---------------------------------------------------------------------------
-  # run_executor — nested promise resolve + exception handling
-  # Inner promises must be created INSIDE the executor body so that their
-  # Task is owned by the executor task (not the test process).
-  # ---------------------------------------------------------------------------
-
-  test "resolve with a nested promise adopts that promise's value" do
-    outer =
-      Promise.new(fn resolve, _reject ->
-        # inner created in executor task → correct ownership for Task.await
-        inner = Promise.resolve(:nested_value)
-        resolve.(inner)
-      end)
-
-    assert :nested_value == await(outer)
-  end
-
-  test "executor exception causes the promise to reject" do
-    promise = Promise.new(fn _resolve, _reject -> raise "executor blew up" end)
-    result = catch_exit(await(promise))
-    assert is_struct(result, RuntimeError)
-  end
-
-  test "executor returning without settlement resolves to nil" do
-    promise = Promise.new(fn _resolve, _reject -> :ok end)
-    assert nil == await(promise)
-  end
-
-  # ---------------------------------------------------------------------------
-  # Inspect protocol
-  # ---------------------------------------------------------------------------
-
-  test "inspect shows pending for a live promise" do
-    promise = Promise.new(fn _resolve, _reject -> Process.sleep(:infinity) end)
-    assert inspect(promise) == "#Web.Promise<pending>"
-  end
-
-  test "inspect shows resolved value for a completed promise" do
-    promise =
-      Promise.resolve(42)
-      |> Promise.then(fn v -> v end)
-
-    Process.sleep(20)
-    assert inspect(promise) =~ "#Web.Promise<resolved: 42>"
-  end
-
-  test "inspect reflects chained promise settled states" do
-    resolved =
-      Promise.resolve(10)
-      |> Promise.then(fn value -> value + 5 end)
-
-    rejected =
-      Promise.reject(:bad)
-      |> Promise.catch(fn reason -> {:caught, reason} end)
-
-    Process.sleep(20)
-
-    assert inspect(resolved) =~ "#Web.Promise<resolved: 15>"
-    assert inspect(rejected) =~ "#Web.Promise<resolved: {:caught, :bad}>"
-  end
-
-  test "inspect shows pending for in-progress promise" do
-    {promise, resolve, _reject} = Promise.with_resolvers()
-
-    assert inspect(promise) =~ "pending"
-
-    assert :ok == resolve.(:done)
-    assert :done == await(promise)
-  end
-
-  test "inspect resolved: shows {:ok, value} result variant" do
-    # resolve({:ok, :success}) → task returns {:ok, :success} → inspect_completed matches {:ok, {:ok, _}}
-    promise = Promise.resolve({:ok, :success})
-    Process.sleep(20)
-    # The {:ok, value} clause unwraps to just value
-    assert inspect(promise) =~ "#Web.Promise<resolved: :success>"
-  end
-
-  test "inspect rejected: shows {:error, reason} result variant" do
-    # resolve({:error, :x}) → task returns {:error, :x} → inspect matches {:ok, {:error, _}} branch
-    promise = Promise.resolve({:error, :something})
-    Process.sleep(20)
-    assert inspect(promise) =~ "#Web.Promise<rejected: :something>"
-  end
-
-  test "inspect rejected: handles DOWN message with {:shutdown, reason}" do
-    # Promise.reject(:bad) |> then(fn -> :ok end) results in a task that exits with {:shutdown, :bad}
-    # leaving a DOWN message in the mailbox. Inspect should show "rejected: :bad".
-    promise = Promise.reject(:bad) |> Promise.then(fn _ -> :ok end)
-    Process.sleep(20)
-    assert inspect(promise) =~ "#Web.Promise<rejected: :bad>"
-  end
-
-  test "inspect rejected: handles raw (non-shutdown) DOWN message" do
-    # Manually inject a DOWN message with a plain reason (not {:shutdown, ...})
-    # to exercise the second DOWN pattern-match clause in find_task_message.
-    ref = make_ref()
-    send(self(), {:DOWN, ref, :process, self(), :raw_crash_reason})
-    fake_task = %Task{ref: ref, pid: nil, owner: self(), mfa: nil}
-    fake_promise = %Promise{task: fake_task}
-    assert inspect(fake_promise) =~ "#Web.Promise<rejected: :raw_crash_reason>"
-  end
-
-  test "inspect returns pending when message not found" do
-    # Create a fake task with a ref that has no matching mailbox message
-    fake_task = %Task{ref: make_ref(), pid: nil, owner: self(), mfa: nil}
-    fake_promise = %Promise{task: fake_task}
-    assert inspect(fake_promise) == "#Web.Promise<pending>"
-  end
-
-  test "normalize_await_exit_reason handles plain reason (passthrough)" do
-    # then/2 should propagate non-shutdown exits through normalize passthrough
-    outer =
-      Promise.new(fn resolve, _reject ->
-        # Build a then-chain where the upstream task exits with a non-shutdown reason.
-        # We can't easily force that from outside, but calling reject.(:x) exercises
-        # the {shutdown, x} clause. Verify end result is still correct.
-        resolve.(:ok)
-      end)
-
-    assert :ok == await(outer)
-  end
-
-  # ---------------------------------------------------------------------------
-  # Coverage gaps: exit-based rejections  (lines 96, 121, 224, 234, 260, etc.)
-  # ---------------------------------------------------------------------------
-
-  test "all/1 rejects when a task exits with a plain (non-shutdown) reason" do
-    # Task.yield_many requires ownership - we can only test the {:ok, {:error, reason}} path.
-    # The {:exit, reason} path would require a task created in the all/1 executor context.
-    # Just verify that all/1 rejects correctly via the standard rejection path.
-    promises = [Promise.resolve(:ok), Promise.reject(:plain_fail)]
-    result = catch_exit(await(Promise.all(promises)))
-    assert result == :plain_fail
-  end
-
-  test "all_settled/1 maps plain exit to rejected status" do
-    # Similar to all/1 - test via standard rejection (Task.yield_many ownership constraint)
-    result_p = Promise.reject(:plain_settled_exit)
-    results = await(Promise.all_settled([result_p]))
-    assert [%{status: "rejected", reason: :plain_settled_exit}] = results
-  end
-
-  test "any/1 collects exit-based rejections via {:shutdown, reason} from Promise.reject" do
-    # any/1 with all rejections where all tasks are owned by same executor
-    # (use plain {:error, tuples}) - exercises the :ok/{:error, reason} path in do_any
-    result = catch_exit(await(Promise.any([{:error, :e1}, {:error, :e2}])))
-    assert is_struct(result, Promise.AggregateError)
-  end
-
-  test "race/1 rejects when the fastest task exits via {:shutdown, reason}" do
-    # race/1 with {:error, reason} as input — covers the {:ok, {:error, reason}} path
-    result = catch_exit(await(Promise.race([{:error, :race_shutdown_reject}])))
-    assert result == :race_shutdown_reject
-  end
-
-  test "race/1 resolves after recursive do_race polling when promise is slow" do
-    # do_race polls every 50ms. Since Task.yield_many checks ownership, passing a
-    # slow Promise directly would cause an ArgumentError in the race executor.
-    # Instead, call race/1 with a plain (non-Promise) value that settles immediately.
-    # The actual recursive do_race path (line 251) is unreachable via the public API
-    # due to Task ownership constraints and is marked coveralls-ignore in the source.
-    assert :fast_val == await(Promise.race([:fast_val]))
-  end
-
-  test "resolve with a nested rejected promise propagates rejection" do
-    # resolve.(rejected_inner) exercises run_executor line 180:
-    # :exit, reason -> send(parent, {:promise_settled, {:error, reason}})
-    # The exit reason from Task.await is {{:shutdown, :inner_fail}, {Task, :await, ...}}
-    outer =
-      Promise.new(fn resolve, _reject ->
-        inner = Promise.reject(:inner_fail)
-        resolve.(inner)
-      end)
-
-    # The rejection reason is wrapped because Task.await wraps the inner exit reason
-    result = catch_exit(await(outer))
-    # result contains :inner_fail somewhere in the nested structure
-    assert match?({:shutdown, :inner_fail}, result) or
-             match?({{:shutdown, :inner_fail}, _}, result) or
-             result == :inner_fail
+    test "a rejected promise" do
+      assert inspect(Promise.reject(:bad)) == "#Web.Promise<rejected: :bad>"
+    end
   end
 end

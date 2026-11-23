@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "decoding a transferred ArrayBuffer chunk should give no output": "runner: no MessageChannel",
+    "decoding a transferred Uint8Array chunk should give no output": "runner: no MessageChannel"
+  }
+}

@@ -1,7 +1,10 @@
 defmodule Web.BlobTest do
   use ExUnit.Case, async: true
+  use ExUnitProperties
 
   alias Web.Blob
+
+  doctest Web.File
 
   test "new/2 computes size and normalizes type" do
     blob = Blob.new(["hello", " ", "world"], type: "Text/Plain")
@@ -173,19 +176,277 @@ defmodule Web.BlobTest do
   test "stream/1 returns a readable stream over blob contents" do
     blob = Blob.new(["hel", "lo"])
 
-    assert "hello" == blob |> Blob.stream() |> Enum.join("")
+    assert "hello" == blob |> Blob.stream() |> Web.TestBytes.join()
   end
 
-  test "text/json/array_buffer/bytes can be called multiple times" do
+  test "text/array_buffer/bytes can be called multiple times" do
     blob = Blob.new([~s({"id":1})], type: "application/json")
 
-    assert {:ok, ~s({"id":1})} = Blob.text(blob)
-    assert {:ok, %{"id" => 1}} = Blob.json(blob)
-    assert {:ok, %Web.ArrayBuffer{byte_length: 8}} = Blob.array_buffer(blob)
+    assert ~s({"id":1}) = Web.await(Blob.text(blob))
+    assert %Web.ArrayBuffer{byte_length: 8} = Web.await(Blob.array_buffer(blob))
 
-    assert {:ok, %Web.Uint8Array{} = bytes} = Blob.bytes(blob)
+    assert %Web.Uint8Array{} = bytes = Web.await(Blob.bytes(blob))
     assert Web.Uint8Array.to_binary(bytes) == ~s({"id":1})
 
-    assert {:ok, ~s({"id":1})} = Blob.text(blob)
+    assert ~s({"id":1}) = Web.await(Blob.text(blob))
+  end
+
+  describe "the rules of the File API" do
+    property "the type is ASCII lowercase, or empty with a character outside U+0020 to U+007E" do
+      check all(type <- string(:utf8, max_length: 12)) do
+        printable? = String.to_charlist(type) |> Enum.all?(&(&1 in 0x20..0x7E))
+        expected = if printable?, do: String.downcase(type, :ascii), else: ""
+
+        assert Blob.new([], type: type).type == expected
+        assert Blob.slice(Blob.new(["a"]), 0, 1, type).type == expected
+        assert Web.File.new([], "a", type: type).type == expected
+      end
+    end
+
+    test "the type has no lowercase of Unicode" do
+      assert Blob.new([], type: "İmage/gif").type == ""
+      assert Blob.new([], type: "TEXT/Plain;Charset=UTF-8").type == "text/plain;charset=utf-8"
+    end
+
+    property "slice/4 gives the bytes of the steps slice blob" do
+      check all(
+              parts <- list_of(binary(max_length: 6), max_length: 4),
+              start <- one_of([constant(nil), integer(-30..30)]),
+              finish <- one_of([constant(nil), integer(-30..30)])
+            ) do
+        bytes = IO.iodata_to_binary(parts)
+        size = byte_size(bytes)
+        relative = fn index -> if index < 0, do: max(size + index, 0), else: min(index, size) end
+        from = relative.(start || 0)
+        to = if finish == nil, do: size, else: relative.(finish)
+        expected = binary_part(bytes, from, max(to - from, 0))
+
+        blob = Blob.new(Enum.map(parts, &Blob.new([&1])))
+        assert Blob.to_binary(Blob.slice(blob, start, finish)) == expected
+      end
+    end
+
+    test "slice/1 gives all the bytes, with no type" do
+      sliced = Blob.slice(Blob.new(["abc"], type: "text/plain"))
+
+      assert {sliced.size, sliced.type, Blob.to_binary(sliced)} == {3, "", "abc"}
+    end
+
+    test "a file is a blob: its bytes, its slices, and its streams" do
+      file = Web.File.new(["héllo"], "a.txt", type: "text/plain")
+      blob = Blob.new([file, "!"])
+
+      assert Blob.to_binary(blob) == "héllo!"
+      assert "héllo" = Web.await(Blob.text(file))
+      assert Blob.to_binary(Blob.slice(file, 1)) == "éllo"
+      assert file |> Blob.stream() |> Web.TestBytes.join() == "héllo"
+      assert file |> Blob.text_stream() |> Enum.join() == "héllo"
+    end
+
+    test "a file from a stream gives the bytes of the stream" do
+      stream = Web.ReadableStream.from(["ab", "c"])
+      file = %{Web.File.new([], "s.bin") | stream: stream, size: nil}
+
+      assert "abc" = Web.await(Blob.text(file))
+
+      # A file from a stream that is a part of a blob gives the bytes of
+      # its stream to the blob.
+      file = %{file | stream: Web.ReadableStream.from(["ab", Web.Uint8Array.from("c")])}
+      blob = Blob.new([file, "d"])
+      assert {blob.size, Blob.to_binary(blob)} == {4, "abcd"}
+    end
+
+    test "text/1, array_buffer/1, and bytes/1 return a promise, as the File API specifies" do
+      blob = Blob.new(["a", <<0xFF>>])
+
+      # A buffer and a view have an identity: the test compares the bytes.
+      for {read, module, bytes} <- [
+            {&Blob.text/1, BitString, "a\uFFFD"},
+            {&Blob.array_buffer/1, Web.ArrayBuffer, "a" <> <<0xFF>>},
+            {&Blob.bytes/1, Web.Uint8Array, "a" <> <<0xFF>>}
+          ] do
+        assert %Web.Promise{} = promise = read.(blob)
+        assert {:fulfilled, value} = Web.Promise.peek(promise)
+        assert {kind(value), to_string(value)} == {module, bytes}
+
+        file = %{Web.File.new([], "s.bin") | stream: Web.ReadableStream.from(["a", <<0xFF>>])}
+        assert %Web.Promise{} = promise = read.(file)
+        assert to_string(Web.await(promise)) == bytes
+      end
+    end
+
+    defp kind(%module{}), do: module
+    defp kind(value) when is_binary(value), do: BitString
+
+    test "a read of a file from a stream rejects with the error of the stream" do
+      stream =
+        Web.ReadableStream.new(%{
+          pull: fn controller -> Web.ReadableStreamDefaultController.error(controller, :boom) end
+        })
+
+      file = %{Web.File.new([], "s.bin") | stream: stream, size: nil}
+
+      assert %Web.Promise{} = promise = Blob.text(file)
+      assert catch_exit(Web.await(promise)) == :boom
+
+      # The reader of the first read keeps the lock of the stream.
+      assert %Web.TypeError{} = catch_exit(Web.await(Blob.bytes(file)))
+    end
+
+    test "stream/1 is a byte stream: a reader of the mode byob reads it" do
+      bytes = :binary.copy("x", 70_000)
+      reader = Blob.new([bytes]) |> Blob.stream() |> Web.ReadableStream.get_reader(mode: "byob")
+
+      read = fn read ->
+        view = Web.Uint8Array.new(Web.ArrayBuffer.new(50_000))
+
+        case Web.await(Web.ReadableStreamBYOBReader.read(reader, view)) do
+          %{done: true} -> []
+          %{value: value} -> [Web.Uint8Array.to_binary(value) | read.(read)]
+        end
+      end
+
+      chunks = read.(read)
+      assert IO.iodata_to_binary(chunks) == bytes
+      assert length(chunks) > 1
+
+      # A chunk has the bytes of one part. A part of a nested blob is a part.
+      nested = Blob.new(["", Blob.new(["ab", Blob.new(["c"])]), "d"])
+
+      assert nested |> Blob.stream() |> Enum.map(&Web.Uint8Array.to_binary/1) ==
+               ["ab", "c", "d"]
+    end
+
+    test "text_stream/1 decodes UTF-8 and ignores the charset of the type" do
+      blob =
+        Blob.new([<<0xEF, 0xBB, 0xBF>>, "a", <<0xC3>>, <<0xA9, 0xFF>>],
+          type: "text/plain;charset=latin1"
+        )
+
+      assert blob |> Blob.text_stream() |> Enum.join() == "aé\uFFFD"
+      assert Blob.new([]) |> Blob.text_stream() |> Enum.to_list() == []
+    end
+  end
+
+  describe "the option endings" do
+    defp line_text do
+      list_of(member_of(["\r\n", "\r", "\n", "a", "é", " "]), max_length: 12)
+      |> map(&Enum.join/1)
+    end
+
+    # The steps "convert line endings to native", with the native line
+    # ending of the host.
+    defp native(text, ending) do
+      Regex.replace(~r/\r\n|\r|\n/, text, ending)
+    end
+
+    property ~s("native" converts each line ending of a string part, and "transparent" keeps it) do
+      ending = if match?({:win32, _}, :os.type()), do: "\r\n", else: "\n"
+
+      check all(texts <- list_of(line_text(), max_length: 4)) do
+        joined = Enum.join(texts)
+        native = Blob.new(texts, endings: "native")
+
+        assert Blob.to_binary(native) == Enum.map_join(texts, &native(&1, ending))
+        assert native.size == byte_size(Blob.to_binary(native))
+        assert Blob.to_binary(Blob.new(texts, endings: "transparent")) == joined
+        assert Blob.to_binary(Blob.new(texts)) == joined
+        assert Blob.to_binary(Blob.new(texts, endings: nil)) == joined
+
+        file = Web.File.new(texts, "a.txt", endings: "native")
+        assert Blob.to_binary(file) == Blob.to_binary(native)
+      end
+    end
+
+    test "\"native\" changes only the parts that are strings" do
+      parts = [
+        Web.Uint8Array.from("a\r\n"),
+        Web.ArrayBuffer.new("b\r"),
+        Blob.new(["c\r\n"]),
+        Web.File.new(["d\r"], "d.txt"),
+        "e\r\n"
+      ]
+
+      assert Blob.to_binary(Blob.new(parts, endings: "native")) == "a\r\nb\rc\r\nd\re\n"
+    end
+
+    test "a value that is not in the enumeration EndingType raises Web.TypeError" do
+      for endings <- ["", "Native", "NATIVE", "invalid", :native, 0] do
+        assert_raise Web.TypeError, ~r/is not a valid value of endings/, fn ->
+          Blob.new([], endings: endings)
+        end
+
+        assert_raise Web.TypeError, fn -> Web.File.new([], "a", endings: endings) end
+      end
+    end
+  end
+
+  describe "File" do
+    property "new/3 has the bits, the name, and the options of FilePropertyBag" do
+      check all(
+              parts <- list_of(binary(max_length: 6), max_length: 4),
+              name <- string(:printable, max_length: 12),
+              last_modified <- integer()
+            ) do
+        file = Web.File.new(parts, name, type: "Text/Plain", last_modified: last_modified)
+
+        assert file.name == name
+        assert file.type == "text/plain"
+        assert file.last_modified == last_modified
+        assert file.size == IO.iodata_length(parts)
+        assert Blob.to_binary(file) == IO.iodata_to_binary(parts)
+      end
+    end
+
+    test "new/3 has the time of the last change: the option, or the time now" do
+      before = System.os_time(:millisecond)
+      file = Web.File.new(["a"], "a.txt")
+
+      assert file.last_modified >= before
+      assert file.last_modified <= System.os_time(:millisecond)
+      assert Web.File.new([], "a.txt", last_modified: -5).last_modified == -5
+      assert {file.name, file.type} == {"a.txt", ""}
+    end
+
+    property "new/3 takes the name of the file as a string, not in the options" do
+      # The old form `new(parts, filename: name)` has a keyword list there.
+      not_a_string =
+        one_of([
+          keyword_of(string(:printable)),
+          constant(nil),
+          atom(:alphanumeric),
+          integer(),
+          list_of(integer(0..255))
+        ])
+
+      check all(name <- not_a_string) do
+        assert_raise FunctionClauseError, fn -> Web.File.new(["a"], name) end
+      end
+
+      refute Map.has_key?(Web.File.new(["a"], "a.txt"), :filename)
+    end
+
+    test "FormData makes a new File for a blob, and for a file with a new name" do
+      blob = Blob.new(["a"], type: "text/plain")
+      file = Web.File.new(["b"], "b.txt", last_modified: 123)
+
+      form =
+        Web.FormData.new()
+        |> Web.FormData.append("blob", blob)
+        |> Web.FormData.append("named", blob, "named.txt")
+        |> Web.FormData.append("file", file)
+        |> Web.FormData.append("renamed", file, "c.txt")
+
+      assert %Web.File{name: "blob", type: "text/plain", size: 1} =
+               Web.FormData.get(form, "blob")
+
+      assert %Web.File{name: "named.txt"} = Web.FormData.get(form, "named")
+      assert Web.FormData.get(form, "file") == file
+
+      renamed = Web.FormData.get(form, "renamed")
+      assert %Web.File{name: "c.txt", last_modified: 123} = renamed
+      assert Blob.to_binary(renamed) == "b"
+      refute renamed.id == file.id
+    end
   end
 end

@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "filereader_readAsBinaryString": "scope: the library has no FileReader"
+  }
+}

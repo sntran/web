@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "FileReader readyState during readAsDataURL": "scope: the library has no FileReader",
+    "readAsDataURL result for Blob with specified MIME type": "scope: the library has no FileReader",
+    "readAsDataURL result for Blob with unspecified MIME type": "scope: the library has no FileReader",
+    "readAsDataURL result for empty Blob": "scope: the library has no FileReader"
+  }
+}

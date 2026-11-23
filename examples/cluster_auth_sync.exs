@@ -16,7 +16,7 @@ defmodule ClusterAuthSyncExample do
 
     {:ok, peer, peer_node} = start_peer!()
     local_channel = BroadcastChannel.new(unique_channel_name())
-    request_id = AsyncContext.Variable.new("request_id")
+    request_id = AsyncContext.Variable.new(name: "request_id")
 
     try do
       prime_remote_node!(peer_node)

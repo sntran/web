@@ -1,68 +1,63 @@
 defmodule Web.AsyncContext.Variable do
   @moduledoc """
-  A scoped asynchronous context variable inspired by TC39's `AsyncContext.Variable`.
+  A variable of the asynchronous context, as `AsyncContext.Variable` of the
+  TC39 proposal "AsyncContext".
 
-  Each variable is an opaque handle backed by a unique process-dictionary key. Values
-  are scoped: setting a variable inside `run/3` is visible only to code executing within
-  that callback and any tasks that capture and restore the surrounding
-  `Web.AsyncContext.Snapshot`.
+  A variable has a value only in the callback of `run/4`, and in the work
+  that a `Web.AsyncContext.Snapshot` of that callback runs. A promise and a
+  stream of this library take a snapshot, thus their callbacks see the
+  value in a different process.
 
-  ## Creating a Variable
+  ## Examples
 
-      iex> var = Web.AsyncContext.Variable.new("request_id")
-      iex> is_struct(var, Web.AsyncContext.Variable)
-      true
-
-  ## Running with a Value
-
-      iex> var = Web.AsyncContext.Variable.new("trace")
+      iex> var = Web.AsyncContext.Variable.new(name: "trace")
       iex> Web.AsyncContext.Variable.run(var, "abc-123", fn ->
       ...>   Web.AsyncContext.Variable.get(var)
       ...> end)
       "abc-123"
 
-  ## Default Values
+  With no value, `get/1` gives the default value:
 
-      iex> var = Web.AsyncContext.Variable.new("color", default: :blue)
+      iex> var = Web.AsyncContext.Variable.new(name: "color", default_value: :blue)
       iex> Web.AsyncContext.Variable.get(var)
       :blue
 
-  ## Context Propagation
-
-  Variables registered via `new/2` are automatically captured by
-  `Web.AsyncContext.Snapshot.take/0` and re-entered by
-  `Web.AsyncContext.Snapshot.run/2`. This makes tracing, abort signals, and
-  Logger metadata flow invisibly across BEAM process boundaries.
+  `Web.AsyncContext.Snapshot.new/0` keeps the values of all the variables,
+  and `Web.AsyncContext.Snapshot.run/3` uses them again.
   """
 
   @registry_key {__MODULE__, :__registry__}
 
-  defstruct [:name, :key, :default]
+  defstruct name: "", key: nil, default_value: nil
 
-  @type t :: %__MODULE__{name: String.t(), key: term(), default: term()}
+  @typedoc "A variable. The field `key` is private."
+  @type t :: %__MODULE__{name: String.t(), key: term(), default_value: term()}
 
   @doc """
-  Creates a new context variable.
+  Makes a variable, as the constructor `new AsyncContext.Variable(options)`.
 
   ## Options
 
-    * `:default` — the value returned by `get/1` when the variable has not been
-      set in the current scope. Defaults to `nil`.
+    * `:name` - the name of the variable, for a person that reads it. The
+      value becomes a string. The default is `""`;
+    * `:default_value` - the value of `get/1` when the variable has no
+      value. The default is `nil`.
 
   ## Examples
 
-      iex> var = Web.AsyncContext.Variable.new("request_id")
+      iex> var = Web.AsyncContext.Variable.new(name: "request_id")
       iex> var.name
       "request_id"
   """
-  @spec new(String.t(), keyword()) :: t()
-  def new(name, opts \\ []) when is_binary(name) do
-    default = Keyword.get(opts, :default)
+  @spec new(keyword()) :: t()
+  def new(options \\ []) when is_list(options) do
+    name = options |> Keyword.get(:name, "") |> to_string()
+    default_value = Keyword.get(options, :default_value)
     key = {__MODULE__, make_ref()}
 
-    var = %__MODULE__{name: name, key: key, default: default}
+    var = %__MODULE__{name: name, key: key, default_value: default_value}
 
-    # Register the key (not the full struct) so Snapshot.take/0 knows which
+    # Register the key (not the full struct) so Snapshot.new/0 knows which
     # process-dictionary entries to capture. Storing only keys avoids redundant
     # duplication of name/default metadata in every snapshot.
     registry = Process.get(@registry_key, MapSet.new())
@@ -72,30 +67,34 @@ defmodule Web.AsyncContext.Variable do
   end
 
   @doc """
-  Returns the current value of the variable, or its default if unset.
+  Returns the value of the variable, or its default value when it has no
+  value, as `get()`.
 
   ## Examples
 
-      iex> var = Web.AsyncContext.Variable.new("test", default: 42)
+      iex> var = Web.AsyncContext.Variable.new(default_value: 42)
       iex> Web.AsyncContext.Variable.get(var)
       42
   """
   @spec get(t()) :: term()
-  def get(%__MODULE__{key: key, default: default}) do
+  def get(%__MODULE__{key: key, default_value: default_value}) do
     case Process.get(key, :__async_context_unset__) do
-      :__async_context_unset__ -> default
+      :__async_context_unset__ -> default_value
       value -> value
     end
   end
 
   @doc """
-  Executes `fun` with `var` bound to `value`.
+  Runs `fun` with `value` as the value of the variable, as
+  `run(value, fn, ...args)`. `fun` gets the arguments of the list `args`.
+  Returns the result of `fun`.
 
-  The previous value (if any) is restored after `fun` returns, even if it raises.
+  After `fun`, the variable has its value from before again, also when
+  `fun` raises.
 
   ## Examples
 
-      iex> var = Web.AsyncContext.Variable.new("level")
+      iex> var = Web.AsyncContext.Variable.new(name: "level")
       iex> Web.AsyncContext.Variable.run(var, 1, fn ->
       ...>   Web.AsyncContext.Variable.run(var, 2, fn ->
       ...>     Web.AsyncContext.Variable.get(var)
@@ -103,13 +102,14 @@ defmodule Web.AsyncContext.Variable do
       ...> end)
       2
   """
-  @spec run(t(), term(), (-> result)) :: result when result: var
-  def run(%__MODULE__{key: key} = _var, value, fun) when is_function(fun, 0) do
+  @spec run(t(), term(), function(), list()) :: term()
+  def run(%__MODULE__{key: key} = _var, value, fun, args \\ [])
+      when is_function(fun, length(args)) do
     previous = Process.get(key, :__async_context_unset__)
     Process.put(key, value)
 
     try do
-      fun.()
+      apply(fun, args)
     after
       case previous do
         :__async_context_unset__ -> Process.delete(key)

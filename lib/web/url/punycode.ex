@@ -1,15 +1,44 @@
 defmodule Web.URL.Punycode do
   @moduledoc false
 
-  alias Web.URL.Idna
+  # The "domain to ASCII" operation of the URL Standard.
+  #
+  # A domain that is all ASCII changes only to lowercase. For each other
+  # domain, the operation is ToASCII of Unicode Technical Standard #46, with these
+  # settings: CheckHyphens false, CheckBidi true, CheckJoiners true,
+  # UseSTD3ASCIIRules false, Transitional_Processing false, VerifyDnsLength
+  # false, and IgnoreInvalidPunycode false.
+  #
+  # The data tables come from the `idna` package. This module does not use
+  # the `encode` function of that package, because it applies the IDNA2008
+  # rules, which are not the rules of the URL Standard.
 
-  @contextj_codepoints MapSet.new([0x200C, 0x200D])
+  alias Web.Internal.Ascii
+
+  @virama_combining_class 9
+  @right_to_left_classes [~c"R", ~c"AL", ~c"AN"]
+  # The forbidden domain code points of the URL Standard that are ASCII.
+  defguardp forbidden_domain_byte?(char)
+            when char <= 0x20 or char == 0x7F or
+                   char in [?#, ?%, ?/, ?:, ?<, ?>, ??, ?@, ?[, ?\\, ?], ?^, ?|]
+
+  # The full stops that the URL Standard changes to ".".
+  @separators ["\u3002", "\uFF0E", "\uFF61"]
 
   @spec host_to_ascii(String.t()) :: String.t()
   def host_to_ascii(hostname) do
     case to_ascii(hostname) do
       {:ok, ascii} -> ascii
-      :error -> hostname |> normalize_separators() |> String.downcase()
+      :error -> invalid_host_text(hostname)
+    end
+  end
+
+  # The text that `host_to_ascii/1` returns for a host that is not valid.
+  defp invalid_host_text(hostname) do
+    if String.valid?(hostname) do
+      hostname |> normalize_separators() |> String.downcase()
+    else
+      hostname
     end
   end
 
@@ -27,356 +56,254 @@ defmodule Web.URL.Punycode do
   end
 
   defp to_ascii(hostname) do
-    normalized = normalize_separators(hostname)
-    trimmed = String.trim_trailing(normalized, ".")
-
-    if normalized == "" do
-      {:ok, ""}
+    if String.valid?(hostname) do
+      hostname |> normalize_separators() |> valid_text_to_ascii()
     else
-      case lookup_conformance_output(hostname, normalized) do
-        {:ok, ascii} ->
-          {:ok, ascii}
-
-        :error ->
-          :error
-
-        :miss ->
-          handle_lookup_miss(trimmed, normalized)
-      end
+      :error
     end
   end
 
-  defp convert_host(trimmed, normalized) do
-    if System.find_executable("node") do
-      convert_host_with_node(trimmed, normalized)
-    else
-      convert_host_without_node(trimmed, normalized)
+  defp valid_text_to_ascii(normalized) do
+    cond do
+      normalized == "" -> {:ok, ""}
+      ascii_passthrough_host?(normalized) -> {:ok, Ascii.downcase(normalized)}
+      ends_in_number?(normalized) -> :error
+      true -> unicode_to_ascii(normalized)
     end
   end
 
-  defp handle_lookup_miss(trimmed, normalized) do
-    if ascii_passthrough_host?(normalized) do
-      {:ok, String.downcase(normalized)}
-    else
-      convert_host(trimmed, normalized)
-    end
+  # The URL Standard gives an ASCII domain in lowercase, and does not use the
+  # result of Unicode ToASCII for it. This is also applicable to a label with
+  # the prefix "xn--" that is not valid, because browsers accept such a label.
+  defp ascii_passthrough_host?(hostname) do
+    hostname != "" and Ascii.ascii?(hostname) and not forbidden_domain_text?(hostname)
   end
 
-  defp convert_host_with_node(trimmed, normalized) do
-    with :ok <- validate_host_structure_with_node(trimmed),
-         {:ok, ascii} <- Idna.domain_to_ascii(normalized),
-         :ok <- validate_ascii_host(ascii) do
+  defp forbidden_domain_text?(<<char, _rest::binary>>) when forbidden_domain_byte?(char),
+    do: true
+
+  defp forbidden_domain_text?(<<_char, rest::binary>>), do: forbidden_domain_text?(rest)
+  defp forbidden_domain_text?(<<>>), do: false
+
+  # A host that ends in a number is an IPv4 address, not a domain.
+  defp ends_in_number?(hostname) do
+    last_label =
+      hostname
+      |> String.trim_trailing(".")
+      |> String.split(".", trim: false)
+      |> List.last()
+
+    Ascii.digits?(last_label)
+  end
+
+  defp unicode_to_ascii(domain) do
+    with {:ok, mapped} <- map_code_points(String.to_charlist(domain), []),
+         normalized when is_list(normalized) <- :unicode.characters_to_nfc_list(mapped),
+         {:ok, labels} <- normalized |> split_labels([], []) |> decode_labels([]),
+         true <- valid_labels?(labels),
+         ascii = Enum.map_join(labels, ".", &label_to_ascii/1),
+         false <- ascii == "",
+         false <- forbidden_domain_text?(ascii) do
       {:ok, ascii}
     else
       _ -> :error
     end
   end
 
-  defp convert_host_without_node(trimmed, normalized) do
-    case validate_host_structure(trimmed) do
-      :ok -> convert_host_without_node_after_validation(trimmed, normalized)
-      _ -> :error
+  # ---------------------------------------------------------------------------
+  # UTS #46 processing, step 1: map
+  # ---------------------------------------------------------------------------
+
+  defp map_code_points([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp map_code_points([code_point | rest], acc) do
+    case status(code_point) do
+      :valid -> map_code_points(rest, [code_point | acc])
+      {:mapped, replacement} -> map_code_points(rest, Enum.reverse(replacement, acc))
+      :ignored -> map_code_points(rest, acc)
+      :disallowed -> :error
     end
   end
 
-  defp convert_host_without_node_after_validation(trimmed, normalized) do
-    case strict_to_ascii(trimmed) do
-      {:ok, ascii} ->
-        finalize_ascii_host(ascii, normalized)
-
-      :error ->
-        fallback_host_without_node(trimmed, normalized)
+  # A deviation character is valid, because the processing is not
+  # transitional.
+  defp status(code_point) do
+    case :idna_mapping.uts46_map(code_point) do
+      :V -> :valid
+      {:D, _replacement} -> :valid
+      {:M, replacement} -> {:mapped, replacement}
+      :I -> :ignored
+      :X -> :disallowed
     end
   end
 
-  defp fallback_host_without_node(trimmed, normalized) do
-    if reject_ascii_fallback?(trimmed) do
-      :error
-    else
-      case fallback_to_ascii(trimmed) do
-        {:ok, ascii} -> finalize_ascii_host(ascii, normalized)
-        _ -> :error
-      end
-    end
+  # ---------------------------------------------------------------------------
+  # UTS #46 processing, step 3: break into labels
+  # ---------------------------------------------------------------------------
+
+  defp split_labels([], label, labels) do
+    Enum.reverse([Enum.reverse(label) | labels])
   end
 
-  defp reject_ascii_fallback?(trimmed) do
-    String.match?(trimmed, ~r/^[\x00-\x7F]+$/) and
-      not String.match?(trimmed, ~r/^[A-Za-z0-9.-]+$/)
+  defp split_labels([?. | rest], label, labels) do
+    split_labels(rest, [], [Enum.reverse(label) | labels])
   end
 
-  defp finalize_ascii_host(ascii, normalized) do
-    case validate_ascii_host(ascii) do
-      :ok -> {:ok, maybe_append_trailing_dot(ascii, String.ends_with?(normalized, "."))}
-      _ -> :error
-    end
+  defp split_labels([code_point | rest], label, labels) do
+    split_labels(rest, [code_point | label], labels)
   end
 
-  defp lookup_conformance_output(hostname, normalized) do
-    case Idna.lookup(hostname) do
-      :miss -> Idna.lookup(normalized)
-      result -> result
-    end
-  end
+  # ---------------------------------------------------------------------------
+  # UTS #46 processing, step 4: convert and validate
+  # ---------------------------------------------------------------------------
 
-  defp ascii_passthrough_host?(hostname) do
-    ascii_only? = String.match?(hostname, ~r/^[\x00-\x7F]+$/)
+  defp decode_labels([], acc), do: {:ok, Enum.reverse(acc)}
 
-    no_alabels? =
-      hostname
-      |> String.trim_trailing(".")
-      |> String.split(".", trim: false)
-      |> Enum.reject(&(&1 == ""))
-      |> Enum.all?(fn label -> not String.starts_with?(String.downcase(label), "xn--") end)
-
-    ascii_only? and no_alabels? and
-      not String.match?(hostname, ~r/[\x00-\x20\x7F#%\/:<>?@\[\\\]\^|]/u)
-  end
-
-  defp strict_to_ascii(hostname) do
-    {:ok, hostname |> String.to_charlist() |> :idna.encode([:uts46]) |> List.to_string()}
-  catch
-    :exit, _reason -> :error
-  end
-
-  defp fallback_to_ascii(hostname) do
-    hostname
-    |> String.split(".", trim: false)
-    |> Enum.reduce_while({:ok, []}, fn label, {:ok, acc} -> append_fallback_label(label, acc) end)
-    |> case do
-      {:ok, labels} -> {:ok, labels |> Enum.reverse() |> Enum.join(".")}
+  defp decode_labels([label | rest], acc) do
+    case decode_label(label) do
+      {:ok, decoded} -> decode_labels(rest, [decoded | acc])
       :error -> :error
     end
   end
 
-  defp append_fallback_label(label, acc) do
-    with {:ok, remapped} <- remap_label(label),
-         {:ok, ascii} <- label_to_ascii(remapped) do
-      {:cont, {:ok, [ascii | acc]}}
+  # A label with the prefix "xn--" must be ASCII, must contain valid Punycode,
+  # and must decode to a label that has a character that is not ASCII. The
+  # decoded label must be in the mapped and normalized form.
+  defp decode_label([?x, ?n, ?-, ?- | encoded] = label) do
+    with true <- ascii?(label),
+         {:ok, decoded} <- punycode_decode(encoded),
+         false <- decoded == [] or ascii?(decoded),
+         true <- Enum.all?(decoded, &(status(&1) == :valid)),
+         true <- :unicode.characters_to_nfc_list(decoded) == decoded do
+      {:ok, decoded}
     else
-      _ -> {:halt, :error}
+      _ -> :error
     end
   end
 
-  defp remap_label(label) do
-    label
-    |> String.to_charlist()
-    |> remap_codepoints()
-    |> case do
-      {:ok, chars} -> {:ok, List.to_string(chars)}
-      :error -> :error
-    end
-  end
+  defp decode_label(label), do: {:ok, label}
 
-  defp remap_codepoints(chars) do
-    chars
-    |> do_remap_codepoints()
-    |> :unicode.characters_to_nfc_binary()
-    |> to_string()
-    |> String.to_charlist()
-    |> then(&{:ok, &1})
+  defp punycode_decode(encoded) do
+    {:ok, :punycode.decode(encoded)}
   catch
     _kind, _reason -> :error
   end
 
-  defp do_remap_codepoints([]), do: []
+  defp valid_labels?(labels) do
+    bidi_domain? = Enum.any?(labels, &right_to_left?/1)
+    Enum.all?(labels, &valid_label?(&1, bidi_domain?))
+  end
 
-  defp do_remap_codepoints([cp | rest]) do
-    case :idna_mapping.uts46_map(cp) do
-      status when status in [:V, :D] ->
-        [cp | do_remap_codepoints(rest)]
+  # VerifyDnsLength is false, thus an empty label is permitted.
+  defp valid_label?([], _bidi_domain?), do: true
 
-      {:D, _replacement} ->
-        [cp | do_remap_codepoints(rest)]
+  defp valid_label?(label, bidi_domain?) do
+    not match?([?x, ?n, ?-, ?- | _], label) and
+      not initial_combining_mark?(label) and
+      valid_joiners?(label) and
+      (not bidi_domain? or valid_bidi?(label))
+  end
 
-      mapping ->
-        case replacement_for_mapping(mapping) do
-          :invalid -> exit(:invalid_codepoint)
-          replacement -> do_remap_codepoints(replacement ++ rest)
-        end
+  defp initial_combining_mark?(label) do
+    :idna.check_initial_combiner(label)
+    false
+  catch
+    _kind, _reason -> true
+  end
+
+  # The ContextJ rules of RFC 5892, appendix A.1 and A.2.
+  #
+  # U+200D ZERO WIDTH JOINER must follow a virama.
+  #
+  # U+200C ZERO WIDTH NON-JOINER must follow a virama, or it must be between
+  # a character that joins to the left and a character that joins to the
+  # right. Transparent characters between them have no effect.
+  defp valid_joiners?(label) do
+    valid_joiners?([], label)
+  end
+
+  defp valid_joiners?(_before, []), do: true
+
+  defp valid_joiners?(before, [0x200D | rest]) do
+    after_virama?(before) and valid_joiners?([0x200D | before], rest)
+  end
+
+  defp valid_joiners?(before, [0x200C | rest]) do
+    (after_virama?(before) or
+       (joining_type_after_transparent(before) in [~c"L", ~c"D"] and
+          joining_type_after_transparent(rest) in [~c"R", ~c"D"])) and
+      valid_joiners?([0x200C | before], rest)
+  end
+
+  defp valid_joiners?(before, [code_point | rest]) do
+    valid_joiners?([code_point | before], rest)
+  end
+
+  # `before` has the previous code points, the nearest one first.
+  defp after_virama?([previous | _]) do
+    match?(%{ccc: @virama_combining_class}, :unicode_util.lookup(previous))
+  end
+
+  defp after_virama?([]), do: false
+
+  defp joining_type_after_transparent([]), do: nil
+
+  defp joining_type_after_transparent([code_point | rest]) do
+    case joining_type(code_point) do
+      ~c"T" -> joining_type_after_transparent(rest)
+      type -> type
     end
   end
 
-  defp replacement_for_mapping(mapping) do
-    if mapping == :I do
-      []
-    else
-      case mapping do
-        {status, replacement} when status in [:M, :"3"] -> replacement
-        _ -> :invalid
-      end
+  # The table of the `idna` package has the explicit joining types only. The
+  # Unicode Standard gives the type T (transparent) to each other character
+  # with the general category Mn, Me, or Cf.
+  defp joining_type(code_point) do
+    case :idna_data.joining_types(code_point) do
+      :undefined -> derived_joining_type(:idna_data.lookup(code_point))
+      type -> type
     end
   end
+
+  defp derived_joining_type({category, _bidi_class}) when category in [~c"Mn", ~c"Me", ~c"Cf"] do
+    ~c"T"
+  end
+
+  defp derived_joining_type(_other), do: ~c"U"
+
+  defp right_to_left?(label) do
+    Enum.any?(label, &(:idna_data.bidirectional(&1) in @right_to_left_classes))
+  end
+
+  # The Bidi rule of RFC 5893, section 2. In a Bidi domain name, the rule
+  # applies to each label.
+  defp valid_bidi?(label) do
+    :idna_bidi.check_bidi(label, true)
+    true
+  catch
+    _kind, _reason -> false
+  end
+
+  # ---------------------------------------------------------------------------
+  # UTS #46 ToASCII
+  # ---------------------------------------------------------------------------
 
   defp label_to_ascii(label) do
-    with :ok <- validate_unicode_label(label),
-         :ok <- validate_unicode_alabel_prefix(label) do
-      if String.match?(label, ~r/^[\x00-\x7F]+$/) do
-        {:ok, String.downcase(label)}
-      else
-        {:ok, "xn--" <> encode(label)}
-      end
-    end
-  end
-
-  defp validate_unicode_alabel_prefix(label) do
-    if not String.match?(label, ~r/^[\x00-\x7F]+$/) and
-         String.starts_with?(String.downcase(label), "xn--") do
-      :error
+    if ascii?(label) do
+      List.to_string(label)
     else
-      :ok
+      "xn--" <> List.to_string(:punycode.encode(label))
     end
   end
 
-  defp validate_host_structure(hostname) do
-    labels = String.split(hostname, ".", trim: false)
+  defp ascii?(code_points), do: Enum.all?(code_points, &(&1 < 0x80))
 
-    cond do
-      Enum.any?(labels, &(&1 == "")) -> :error
-      numeric_label?(List.last(labels)) -> :error
-      true -> :ok
-    end
-  end
-
-  defp validate_host_structure_with_node(hostname) do
-    labels = String.split(hostname, ".", trim: false)
-
-    if numeric_label?(List.last(labels)), do: :error, else: :ok
-  end
-
-  defp validate_ascii_host(hostname) do
-    labels = String.split(hostname, ".", trim: false)
-
-    Enum.reduce_while(labels, :ok, fn label, :ok ->
-      case validate_ascii_label(label) do
-        :ok -> {:cont, :ok}
-        :error -> {:halt, :error}
-      end
-    end)
-  end
-
-  defp validate_ascii_label(<<"xn--", encoded::binary>>) do
-    if encoded == "" do
-      :error
-    else
-      try do
-        decoded = encoded |> String.to_charlist() |> :punycode.decode() |> List.to_string()
-
-        with {:ok, remapped} <- remap_label(decoded),
-             :ok <- validate_unicode_alabel_prefix(remapped),
-             normalized when is_binary(normalized) <- "xn--" <> encode(remapped),
-             true <- String.downcase(normalized) == String.downcase("xn--" <> encoded) do
-          :ok
-        else
-          _ -> :error
-        end
-      catch
-        _kind, _reason -> :error
-      end
-    end
-  end
-
-  defp validate_ascii_label(label) do
-    if String.match?(label, ~r/[\x00-\x20]/u) or
-         String.contains?(label, [
-           "#",
-           "%",
-           "/",
-           ":",
-           "<",
-           ">",
-           "?",
-           "@",
-           "[",
-           "\\",
-           "]",
-           "^",
-           "|"
-         ]) do
-      :error
-    else
-      :ok
-    end
-  end
-
-  defp validate_unicode_label(label) do
-    chars = String.to_charlist(label)
-
-    with :ok <- safe_initial_combiner(chars),
-         :ok <- validate_context_rules(chars),
-         :ok <- safe_check_bidi(chars) do
-      :ok
-    else
-      _ -> :error
-    end
-  end
-
-  defp validate_context_rules(chars) do
-    chars
-    |> Enum.with_index()
-    |> Enum.reduce_while(:ok, fn {cp, index}, :ok ->
-      case validate_context_codepoint(chars, cp, index) do
-        :ok -> {:cont, :ok}
-        :error -> {:halt, :error}
-      end
-    end)
-  end
-
-  defp validate_context_codepoint(chars, cp, index) do
-    cond do
-      MapSet.member?(@contextj_codepoints, cp) ->
-        validate_contextj(chars, index)
-
-      :idna_context.contexto_with_rule(cp) ->
-        validate_contexto(chars, index)
-
-      true ->
-        :ok
-    end
-  end
-
-  defp validate_contextj(chars, index) do
-    if :idna_context.valid_contextj(chars, index), do: :ok, else: :error
-  end
-
-  defp validate_contexto(chars, index) do
-    if :idna_context.valid_contexto(chars, index), do: :ok, else: :error
-  end
-
-  defp safe_initial_combiner(chars) do
-    if chars == [] do
-      :ok
-    else
-      try do
-        :idna.check_initial_combiner(chars)
-      catch
-        :exit, _reason -> :error
-      end
-    end
-  end
-
-  defp safe_check_bidi(chars) do
-    if chars == [] do
-      :ok
-    else
-      try do
-        :idna_bidi.check_bidi(chars)
-      catch
-        :exit, _reason -> :error
-      end
-    end
-  end
-
-  defp numeric_label?(label) do
-    label != "" and String.match?(label, ~r/^\d+$/)
-  end
-
-  defp maybe_append_trailing_dot(hostname, true), do: hostname <> "."
-  defp maybe_append_trailing_dot(hostname, false), do: hostname
-
+  # The separators are not ASCII: an ASCII host has none of them.
   defp normalize_separators(hostname) do
-    hostname
-    |> to_string()
-    |> String.replace(~r/[。．｡]/u, ".")
+    cond do
+      Ascii.ascii?(hostname) -> hostname
+      :binary.match(hostname, @separators) == :nomatch -> hostname
+      true -> :binary.replace(hostname, @separators, ".", [:global])
+    end
   end
 end

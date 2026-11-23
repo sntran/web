@@ -1,0 +1,10 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Calling arrayBuffer() on an aborted consumed nonempty request": "runner: the fetch of the runner does not use the signal or the body of a request",
+    "Calling blob() on an aborted consumed nonempty request": "runner: the fetch of the runner does not use the signal or the body of a request",
+    "Calling formData() on an aborted consumed nonempty request": "runner: the fetch of the runner does not use the signal or the body of a request",
+    "Calling json() on an aborted consumed nonempty request": "runner: the fetch of the runner does not use the signal or the body of a request",
+    "Calling text() on an aborted consumed nonempty request": "runner: the fetch of the runner does not use the signal or the body of a request"
+  }
+}

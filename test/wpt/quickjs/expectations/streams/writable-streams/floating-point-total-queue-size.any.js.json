@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Floating point arithmetic must manifest near 0 (total ends up positive, and not clamped)": "runner: the library does the steps of a later microtask before the call returns",
+    "Floating point arithmetic must manifest near 0 (total ends up positive, but clamped)": "runner: the library does the steps of a later microtask before the call returns",
+    "Floating point arithmetic must manifest near 0 (total ends up zero)": "runner: the library does the steps of a later microtask before the call returns",
+    "Floating point arithmetic must manifest near NUMBER.MAX_SAFE_INTEGER (total ends up positive)": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

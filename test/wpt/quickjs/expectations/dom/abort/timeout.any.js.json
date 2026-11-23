@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "AbortSignal timeouts fire in order": "runner: a timer of the library runs in real time between two statements of JavaScript",
+    "AbortSignal.timeout() returns a non-aborted signal": "runner: a timer of the library runs in real time between two statements of JavaScript",
+    "Signal returned by AbortSignal.timeout() times out": "runner: a timer of the library runs in real time between two statements of JavaScript"
+  }
+}

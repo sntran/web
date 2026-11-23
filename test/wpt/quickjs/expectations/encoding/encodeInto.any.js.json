@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "encodeInto() and a detached output buffer": "runner: no MessageChannel"
+  }
+}

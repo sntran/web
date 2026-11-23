@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "ReadableStream teeing: errors in the source should propagate to both branches": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

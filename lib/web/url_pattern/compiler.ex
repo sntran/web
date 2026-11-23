@@ -1,391 +1,254 @@
 defmodule Web.URLPattern.Compiler do
   @moduledoc false
 
-  # Converts a parsed AST (from Web.URLPattern.Parser) into a compiled
-  # `%Regex{}` and a list of `{index, name}` capture-group descriptors.
+  # "Compile a component" of the URL Pattern Standard, with "generate a
+  # regular expression and name list" (2.2) and "generate a pattern string"
+  # (2.3).
   #
-  # Each component may have a different "segment separator" for the default
-  # named-group pattern:
-  #   - pathname  -> "[^/]+"
-  #   - others    -> "[^]+" (match anything)
+  # A component is a map:
   #
-  # Capture groups are numbered left-to-right.  Named groups receive the
-  # name supplied in the pattern; anonymous groups get auto-incremented
-  # integer keys (\"0\", \"1\", …).
+  #     %{pattern: String.t(), regex: :re.mp(), names: [String.t()],
+  #       optional: [boolean()], has_regexp_groups: boolean(),
+  #       parts: [Parser.part()]}
+  #
+  # `optional` tells for each name if its group has the form "(value)?".
 
-  @type capture :: {non_neg_integer(), String.t()}
-  @type compiled :: %{regex: Regex.t(), captures: [capture()]}
+  alias Web.URLPattern.{Parser, RegExp}
 
-  # Default segment patterns per component
-  @segment_pattern %{
-    pathname: "[^/]+?",
-    opaque_pathname: ".*?",
-    hostname: "[^.]+?",
-    protocol: "[a-zA-Z][a-zA-Z0-9+\\-.]*",
-    port: "[0-9]*",
-    default: ".*"
-  }
+  @type component :: %{
+          pattern: String.t(),
+          regex: term(),
+          names: [String.t()],
+          optional: [boolean()],
+          has_regexp_groups: boolean(),
+          parts: [Parser.part()]
+        }
 
-  @doc """
-  Compiles an AST for the given component into a regex and capture list.
+  @full_wildcard ".*"
 
-  Returns `{:ok, compiled}` or `{:error, reason}`.
-  """
-  @spec compile(list(), atom(), boolean()) ::
-          {:ok, compiled()} | {:error, String.t()}
-  def compile(parts, component, ignore_case \\ false) do
-    segment_pat = Map.get(@segment_pattern, component, @segment_pattern[:default])
-    {source, captures, _idx} = parts_to_regex(parts, segment_pat, [], 0)
-    full_source = "^(?:" <> source <> ")$"
+  @doc false
+  # "Compile a component". Raises `Web.TypeError` for a pattern string that
+  # is not valid, and for a regular expression that is not valid.
+  @spec compile(String.t(), (String.t() -> String.t()), Parser.options()) :: component()
+  def compile(input, encode, options) do
+    parts = Parser.parse(input, options, encode)
+    {source, names} = regexp_and_names(parts, options)
 
-    flags = if ignore_case, do: [:caseless], else: []
+    %{
+      pattern: pattern_string(parts, options),
+      regex: RegExp.compile!(source, options.ignore_case),
+      names: names,
+      optional: for(part <- parts, part.type != :fixed_text, do: direct_optional?(part)),
+      has_regexp_groups: Enum.any?(parts, &(&1.type == :regexp)),
+      parts: parts
+    }
+  end
 
-    case Regex.compile(full_source, flags) do
-      {:ok, regex} ->
-        ordered = captures |> Enum.reverse() |> renumber_anonymous_captures()
-        {:ok, %{regex: regex, captures: ordered}}
-
-      {:error, {reason, _}} ->
-        {:error, "Regex compile failed: #{inspect(reason)}"}
+  @doc false
+  # "RegExpBuiltinExec" and "create a component match result": returns the
+  # map of the groups, or `nil` when the input does not match.
+  @spec match(component(), String.t()) :: %{optional(String.t()) => String.t() | nil} | nil
+  def match(%{regex: regex, names: names, optional: optional}, input) do
+    case :re.run(input, regex, [{:capture, :all, :index}]) do
+      {:match, [_whole | captures]} -> groups(Enum.zip(names, optional), captures, input, %{})
+      :nomatch -> nil
     end
-  rescue
-    e in ArgumentError -> {:error, e.message}
   end
 
-  @doc """
-  Returns the canonical string representation of an AST (for `expected_obj`
-  normalization in tests and for the `URLPattern` struct fields).
-  """
-  @spec to_string(list()) :: String.t()
-  def to_string(parts) when is_list(parts) do
-    Enum.map_join(parts, "", &part_to_string/1)
-  end
+  # A group that does not take part in the match is `undefined` in
+  # JavaScript: `nil`. The groups after the last group that matches are not
+  # in the list of `:re.run/3`.
+  #
+  # In ECMAScript, an iteration of a quantifier with a minimum of zero must
+  # not match the empty string. Thus "(.*)?" at the end of the input does
+  # not take part in the match. PCRE2 accepts the empty iteration, and the
+  # group is "": this is `nil` here.
+  defp groups([], _captures, _input, acc), do: acc
+
+  defp groups([{name, optional?} | names], [{start, length} | captures], input, acc)
+       when start >= 0 and (length > 0 or not optional?),
+       do: groups(names, captures, input, Map.put(acc, name, binary_part(input, start, length)))
+
+  defp groups([{name, _optional?} | names], [_unset | captures], input, acc),
+    do: groups(names, captures, input, Map.put(acc, name, nil))
+
+  defp groups([{name, _optional?} | names], [], input, acc),
+    do: groups(names, [], input, Map.put(acc, name, nil))
+
+  # The form "(value)?" of "generate a regular expression and name list".
+  defp direct_optional?(part),
+    do: part.modifier == :optional and part.prefix == "" and part.suffix == ""
 
   # ---------------------------------------------------------------------------
-  # Part → regex fragment
+  # Regular expressions
   # ---------------------------------------------------------------------------
 
-  # Delimiter characters that can serve as a prefix for optional/repeating groups.
-  # When a named group, anonymous group, or wildcard has a modifier (?, +, *),
-  # the immediately preceding delimiter (last char of the preceding literal)
-  # is folded into the optional/repeating wrapper so the separator itself
-  # becomes optional too.
-  #
-  # Example: /foo/:bar?  →  parts [literal "/foo/", name "bar" :optional]
-  #   Without prefix folding: /foo/([^/]+?)?  (doesn't match "/foo" — literal "/" is required)
-  #   With    prefix folding: /foo(?:/([^/]+?))?  (matches "/foo" and "/foo/value")
-  #
-  # The delimiter set matches the component separators: / . - _ for pathname/hostname.
-  @delimiters [?/, ?., ?-, ?_]
-
-  defp parts_to_regex([], _seg, captures, idx) do
-    {"", captures, idx}
-  end
-
-  defp parts_to_regex(parts, seg, captures, idx) do
-    do_parts_to_regex(parts, seg, captures, idx, "")
-  end
-
-  # No more parts — emit remaining literal prefix
-  defp do_parts_to_regex([], _seg, captures, idx, lit_acc) do
-    {Regex.escape(lit_acc), captures, idx}
-  end
-
-  # Literal parts: accumulate into lit_acc buffer (must come BEFORE the modifier check)
-  defp do_parts_to_regex([{:literal, text} | rest], seg, captures, idx, lit_acc) do
-    do_parts_to_regex(rest, seg, captures, idx, lit_acc <> text)
-  end
-
-  # Next part has a modifier — fold the trailing delimiter from the literal into the group
-  defp do_parts_to_regex([next | rest], seg, captures, idx, lit_acc)
-       when is_tuple(next) and elem(next, tuple_size(next) - 1) != :none do
-    # Check if next is a group-type part with a non-:none modifier
-    modifier = elem(next, tuple_size(next) - 1)
-
-    if modifier in [:optional, :one_or_more, :zero_or_more] and group_part?(next) and
-         seg != ".*?" do
-      {prefix, lit_body} = extract_trailing_delimiter(lit_acc)
-
-      if prefix != "" do
-        lit_regex = Regex.escape(lit_body)
-
-        {group_frag, captures2, idx2} =
-          part_to_regex_with_prefix(next, seg, captures, idx, prefix)
-
-        {rest_frag, captures3, idx3} = do_parts_to_regex(rest, seg, captures2, idx2, "")
-        {lit_regex <> group_frag <> rest_frag, captures3, idx3}
-      else
-        {frag, captures2, idx2} = part_to_regex(next, seg, captures, idx)
-        {rest_frag, captures3, idx3} = do_parts_to_regex(rest, seg, captures2, idx2, "")
-        {Regex.escape(lit_acc) <> frag <> rest_frag, captures3, idx3}
-      end
-    else
-      # No prefix folding for this part — emit as normal
-      {frag, captures2, idx2} = part_to_regex(next, seg, captures, idx)
-      {rest_frag, captures3, idx3} = do_parts_to_regex(rest, seg, captures2, idx2, "")
-      {Regex.escape(lit_acc) <> frag <> rest_frag, captures3, idx3}
-    end
-  end
-
-  # Non-literal part with :none modifier — flush lit_acc and process normally
-  defp do_parts_to_regex([part | rest], seg, captures, idx, lit_acc) do
-    {frag, captures2, idx2} = part_to_regex(part, seg, captures, idx)
-    {rest_frag, captures3, idx3} = do_parts_to_regex(rest, seg, captures2, idx2, "")
-    {Regex.escape(lit_acc) <> frag <> rest_frag, captures3, idx3}
-  end
-
-  # Only named groups, anonymous regex groups, and wildcards can be prefixed
-  defp group_part?({:name, _, _, _}), do: true
-  defp group_part?({:regex, _, _}), do: true
-  defp group_part?({:wildcard, _}), do: true
-  defp group_part?(_), do: false
-
-  # Extract trailing delimiter char from literal text, returning {delimiter_char, rest_of_literal}
-  defp extract_trailing_delimiter("") do
-    {"", ""}
-  end
-
-  defp extract_trailing_delimiter(text) do
-    last_char = String.last(text)
-    last_cp = :binary.decode_unsigned(last_char)
-
-    if last_cp in @delimiters do
-      {last_char, String.slice(text, 0, byte_size(text) - byte_size(last_char))}
-    else
-      {"", text}
-    end
-  end
-
-  # Generate regex for a part that needs a prefix delimiter folded in
-  defp part_to_regex_with_prefix({:name, name, custom_pat, modifier}, seg, captures, idx, prefix) do
-    inner_pat = custom_pat || seg
-    esc_prefix = if prefix != "", do: Regex.escape(prefix), else: ""
-    sep = if prefix != "", do: esc_prefix, else: separator_for(seg)
-
-    case modifier do
-      :optional ->
-        # (?:/([^/]+?))?  — whole group including delimiter is optional
-        frag = "(?:" <> esc_prefix <> "(" <> inner_pat <> "))?"
-        {frag, [{idx, name} | captures], idx + 1}
-
-      :one_or_more ->
-        # (?:/([^/]+?(?:/[^/]+?)*))?  i.e. prefix required, then one-or-more
-        frag = esc_prefix <> "(" <> inner_pat <> "(?:" <> sep <> inner_pat <> ")*)"
-        {frag, [{idx, name} | captures], idx + 1}
-
-      :zero_or_more ->
-        # (?:/([^/]+?(?:/[^/]+?)*))?  — whole group with prefix is optional
-        frag = "(?:" <> esc_prefix <> "(" <> inner_pat <> "(?:" <> sep <> inner_pat <> ")*))?"
-        {frag, [{idx, name} | captures], idx + 1}
-    end
-  end
-
-  defp part_to_regex_with_prefix({:regex, pattern, modifier}, seg, captures, idx, prefix) do
-    sanitized = strip_named_subgroups(pattern)
-    esc_prefix = if prefix != "", do: Regex.escape(prefix), else: ""
-    sep = if prefix != "", do: esc_prefix, else: separator_for(seg)
-
-    case modifier do
-      :optional ->
-        frag = "(?:" <> esc_prefix <> "(" <> sanitized <> "))?"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-
-      :one_or_more ->
-        frag = esc_prefix <> "(" <> sanitized <> "(?:" <> sep <> sanitized <> ")*)"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-
-      :zero_or_more ->
-        frag = "(?:" <> esc_prefix <> "(" <> sanitized <> "(?:" <> sep <> sanitized <> ")*))?"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-    end
-  end
-
-  defp part_to_regex_with_prefix({:wildcard, modifier}, _seg, captures, idx, prefix) do
-    esc_prefix = if prefix != "", do: Regex.escape(prefix), else: ""
-
-    case modifier do
-      :optional ->
-        frag = "(?:" <> esc_prefix <> "(.*))?"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-
-      :one_or_more ->
-        frag = esc_prefix <> "(.*)"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-
-      :zero_or_more ->
-        frag = "(?:" <> esc_prefix <> "(.*))?"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-    end
-  end
-
-  # Named group  :name  or  :name(pattern)  with :none modifier
-  defp part_to_regex({:name, name, custom_pat, :none}, seg, captures, idx) do
-    inner_pat = custom_pat || seg
-    frag = "(" <> inner_pat <> ")"
-    {frag, [{idx, name} | captures], idx + 1}
-  end
-
-  # Named group with modifier (fallback when no prefix available)
-  defp part_to_regex({:name, name, custom_pat, modifier}, seg, captures, idx) do
-    inner_pat = custom_pat || seg
-    sep = separator_for(seg)
-
-    case modifier do
-      :optional ->
-        frag = optional_capture_fragment(inner_pat)
-        {frag, [{idx, name} | captures], idx + 1}
-
-      :one_or_more ->
-        frag = "(" <> inner_pat <> "(?:" <> sep <> inner_pat <> ")*)"
-        {frag, [{idx, name} | captures], idx + 1}
-
-      :zero_or_more ->
-        frag = "(" <> inner_pat <> "(?:" <> sep <> inner_pat <> ")*)?"
-        {frag, [{idx, name} | captures], idx + 1}
-    end
-  end
-
-  # Anonymous regex group  (pattern)  with :none modifier
-  defp part_to_regex({:regex, pattern, :none}, _seg, captures, idx) do
-    sanitized = normalize_regex_pattern(pattern) |> strip_named_subgroups()
-    frag = "(" <> sanitized <> ")"
-    {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-  end
-
-  # Anonymous regex group with modifier (fallback when no prefix)
-  defp part_to_regex({:regex, pattern, modifier}, seg, captures, idx) do
-    sanitized = normalize_regex_pattern(pattern) |> strip_named_subgroups()
-    sep = separator_for(seg)
-
-    case modifier do
-      :optional ->
-        frag = optional_capture_fragment(sanitized)
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-
-      :one_or_more ->
-        frag = "(" <> sanitized <> "(?:" <> sep <> sanitized <> ")*)"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-
-      :zero_or_more ->
-        frag = "(" <> sanitized <> "(?:" <> sep <> sanitized <> ")*)?"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-    end
-  end
-
-  # Non-capturing group  {parts}
-  defp part_to_regex({:group, inner_parts, modifier}, seg, captures, idx) do
-    {inner_frag, captures2, idx2} = parts_to_regex(inner_parts, seg, captures, idx)
-    inner_nc = "(?:" <> inner_frag <> ")"
-
-    frag =
-      case modifier do
-        :none -> inner_nc
-        :optional -> inner_nc <> "?"
-        :one_or_more -> inner_nc <> "+"
-        :zero_or_more -> inner_nc <> "*"
-      end
-
-    {frag, captures2, idx2}
-  end
-
-  # Wildcard  *  (matches anything including slashes)  with :none modifier
-  defp part_to_regex({:wildcard, :none}, _seg, captures, idx) do
-    frag = "(.*)"
-    {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-  end
-
-  # Wildcard with modifier (fallback when no prefix)
-  defp part_to_regex({:wildcard, modifier}, _seg, captures, idx) do
-    case modifier do
-      :optional ->
-        frag = "(?:(.+))?"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-
-      :one_or_more ->
-        frag = "(.*)"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-
-      :zero_or_more ->
-        frag = "(?:(.+))?"
-        {frag, [{idx, Integer.to_string(idx)} | captures], idx + 1}
-    end
-  end
-
-  defp separator_for(seg) do
-    # For segment patterns that don't cross slashes, the separator is "/"
-    # For wildcard ".*" patterns, there is no separator (it already matches everything)
-    if seg in [".*", ".*?"], do: "", else: "/"
-  end
-
-  # Re-number anonymous capture groups (those with purely numeric names) so
-  # they are indexed starting at 0, independent of any named groups. The spec
-  # says named groups do not consume from the anonymous-group counter.
-  defp renumber_anonymous_captures(captures) do
-    {result, _anon_idx} =
-      Enum.map_reduce(captures, 0, fn {pos, name}, anon_idx ->
-        if Regex.match?(~r/^\d+$/, name) do
-          {{pos, Integer.to_string(anon_idx)}, anon_idx + 1}
-        else
-          {{pos, name}, anon_idx}
+  @doc false
+  # "Generate a regular expression and name list". The result is the source
+  # text of an ECMAScript regular expression.
+  @spec regexp_and_names([Parser.part()], Parser.options()) :: {String.t(), [String.t()]}
+  def regexp_and_names(parts, options) do
+    {body, names} =
+      Enum.reduce(parts, {[], []}, fn part, {body, names} ->
+        case part do
+          %{type: :fixed_text} -> {[body | fixed_regexp(part)], names}
+          _group -> {[body | group_regexp(part, options)], [part.name | names]}
         end
       end)
 
-    result
+    {IO.iodata_to_binary(["^", body, "$"]), Enum.reverse(names)}
+  end
+
+  defp fixed_regexp(%{modifier: :none, value: value}), do: Parser.escape_regexp_string(value)
+
+  defp fixed_regexp(%{modifier: modifier, value: value}),
+    do: ["(?:", Parser.escape_regexp_string(value), ")", modifier_string(modifier)]
+
+  defp group_regexp(part, options) do
+    value =
+      case part.type do
+        :segment_wildcard -> Parser.segment_wildcard_regexp(options)
+        :full_wildcard -> @full_wildcard
+        :regexp -> part.value
+      end
+
+    prefix = Parser.escape_regexp_string(part.prefix)
+    suffix = Parser.escape_regexp_string(part.suffix)
+    repeat? = part.modifier in [:zero_or_more, :one_or_more]
+
+    group_form(prefix == "" and suffix == "", repeat?, value, prefix, suffix, part.modifier)
+  end
+
+  # The four forms of a group of "generate a regular expression and name
+  # list":
+  #
+  #     (<value>)<modifier>
+  #     ((?:<value>)<modifier>)
+  #     (?:<prefix>(<value>)<suffix>)<modifier>
+  #     (?:<prefix>((?:<value>)(?:<suffix><prefix>(?:<value>))*)<suffix>)?
+  defp group_form(true, false, value, _prefix, _suffix, modifier),
+    do: ["(", value, ")", modifier_string(modifier)]
+
+  defp group_form(true, true, value, _prefix, _suffix, modifier),
+    do: ["((?:", value, ")", modifier_string(modifier), ")"]
+
+  defp group_form(false, false, value, prefix, suffix, modifier),
+    do: ["(?:", prefix, "(", value, ")", suffix, ")", modifier_string(modifier)]
+
+  defp group_form(false, true, value, prefix, suffix, modifier) do
+    [
+      ["(?:", prefix, "((?:", value, ")(?:", suffix, prefix, "(?:", value, "))*)", suffix, ")"],
+      if(modifier == :zero_or_more, do: "?", else: "")
+    ]
   end
 
   # ---------------------------------------------------------------------------
-  # Strip named subgroups that the user embedded in inline regex
-  # e.g.  (?<x>a) → (a)
-  # This keeps our own capture-index accounting correct.
+  # Pattern strings
   # ---------------------------------------------------------------------------
-  defp strip_named_subgroups(pattern) do
-    pattern
-    |> String.replace(~r/\(\?<[^>]+>/, "(")
+
+  @doc false
+  # "Generate a pattern string".
+  @spec pattern_string([Parser.part()], Parser.options()) :: String.t()
+  def pattern_string(parts, options) do
+    parts = List.to_tuple(parts)
+    last = tuple_size(parts) - 1
+
+    0..last//1
+    |> Enum.map(fn index ->
+      previous = if index > 0, do: elem(parts, index - 1)
+      next = if index < last, do: elem(parts, index + 1)
+      part_string(elem(parts, index), previous, next, options)
+    end)
+    |> IO.iodata_to_binary()
   end
 
-  defp normalize_regex_pattern(pattern) do
-    pattern
-    |> String.replace("[[a-z]--a]", "[b-z]")
-    |> String.replace("[\\d&&[0-1]]", "[0-1]")
+  defp part_string(%{type: :fixed_text, modifier: :none} = part, _previous, _next, _options),
+    do: escape_pattern_string(part.value)
+
+  defp part_string(%{type: :fixed_text} = part, _previous, _next, _options),
+    do: ["{", escape_pattern_string(part.value), "}", modifier_string(part.modifier)]
+
+  defp part_string(part, previous, next, options) do
+    custom_name? = not ascii_digit?(part.name)
+
+    grouping? =
+      part.suffix != "" or (part.prefix != "" and part.prefix != options.prefix) or
+        segment_needs_grouping?(part, next, custom_name?) or
+        after_prefix_code_point?(part, previous, options)
+
+    [
+      if(grouping?, do: "{", else: ""),
+      escape_pattern_string(part.prefix),
+      if(custom_name?, do: [":", part.name], else: ""),
+      group_body(part, previous, options, custom_name?, grouping?),
+      suffix_escape(part, custom_name?),
+      escape_pattern_string(part.suffix),
+      if(grouping?, do: "}", else: ""),
+      modifier_string(part.modifier)
+    ]
   end
 
-  defp optional_capture_fragment(".*"), do: "(?:(.+))?"
-  defp optional_capture_fragment(".*?"), do: "(?:(.+?))?"
-  defp optional_capture_fragment(inner_pat), do: "(?:(" <> inner_pat <> "))?"
+  # A group after fixed text that ends with the prefix code point needs a
+  # group: else the prefix code point becomes the prefix of the group.
+  defp after_prefix_code_point?(%{prefix: ""}, %{type: :fixed_text, value: value}, options),
+    do: options.prefix != "" and String.ends_with?(value, options.prefix)
 
-  # ---------------------------------------------------------------------------
-  # Canonical string representation (for display / expected_obj)
-  # ---------------------------------------------------------------------------
+  defp after_prefix_code_point?(_part, _previous, _options), do: false
 
-  defp part_to_string({:literal, text}), do: text
+  # A named segment wildcard that the next part could continue, for example
+  # ":foo" and then the text "bar", needs a group: "{:foo}bar".
+  defp segment_needs_grouping?(part, next, custom_name?) do
+    custom_name? and part.type == :segment_wildcard and part.modifier == :none and
+      next != nil and next.prefix == "" and next.suffix == "" and next_continues_name?(next)
+  end
 
-  defp part_to_string({:name, name, nil, :none}), do: ":#{name}"
-  defp part_to_string({:name, name, nil, mod}), do: ":#{name}#{mod_to_s(mod)}"
-  defp part_to_string({:name, name, pat, :none}), do: ":#{name}(#{pat})"
-  defp part_to_string({:name, name, pat, mod}), do: ":#{name}(#{pat})#{mod_to_s(mod)}"
+  defp next_continues_name?(%{type: :fixed_text, value: value}), do: name_part_start?(value)
+  defp next_continues_name?(next), do: ascii_digit?(next.name)
 
-  defp part_to_string({:regex, pattern, :none}), do: "(#{pattern})"
-  defp part_to_string({:regex, pattern, mod}), do: "(#{pattern})#{mod_to_s(mod)}"
+  defp group_body(%{type: :regexp, value: value}, _previous, _options, _custom?, _grouping?),
+    do: ["(", value, ")"]
 
-  defp part_to_string({:group, inner_parts, :none}) do
-    inner = Enum.map_join(inner_parts, "", &part_to_string/1)
+  defp group_body(%{type: :segment_wildcard}, _previous, options, false, _grouping?),
+    do: ["(", Parser.segment_wildcard_regexp(options), ")"]
 
-    if length(inner_parts) == 1 do
-      "{#{inner}}"
-    else
-      "{#{inner}}"
+  defp group_body(%{type: :segment_wildcard}, _previous, _options, true, _grouping?), do: ""
+
+  defp group_body(%{type: :full_wildcard} = part, previous, _options, custom?, grouping?) do
+    if not custom? and
+         (previous == nil or previous.type == :fixed_text or previous.modifier != :none or
+            grouping? or part.prefix != ""),
+       do: "*",
+       else: ["(", @full_wildcard, ")"]
+  end
+
+  # A named segment wildcard and a suffix that could continue the name, for
+  # example "{:foo\\bar}".
+  defp suffix_escape(%{type: :segment_wildcard, suffix: suffix}, true) when suffix != "" do
+    if name_part_start?(suffix), do: "\\", else: ""
+  end
+
+  defp suffix_escape(_part, _custom?), do: ""
+
+  defp name_part_start?(<<code_point::utf8, _rest::binary>>),
+    do: Parser.valid_name_code_point?(code_point, false)
+
+  defp name_part_start?(_text), do: false
+
+  # The name of a group is not empty.
+  defp ascii_digit?(<<char, _rest::binary>>), do: char in ?0..?9
+
+  @doc false
+  # "Escape a pattern string".
+  @spec escape_pattern_string(String.t()) :: String.t()
+  def escape_pattern_string(input) do
+    for <<char <- input>>, into: "" do
+      if char in ~c"+*?:{}()\\", do: <<?\\, char>>, else: <<char>>
     end
   end
 
-  defp part_to_string({:group, inner_parts, mod}) do
-    inner = Enum.map_join(inner_parts, "", &part_to_string/1)
-    "{#{inner}}#{mod_to_s(mod)}"
-  end
-
-  defp part_to_string({:wildcard, :none}), do: "*"
-  defp part_to_string({:wildcard, mod}), do: "*#{mod_to_s(mod)}"
-
-  defp mod_to_s(:optional), do: "?"
-  defp mod_to_s(:one_or_more), do: "+"
-  defp mod_to_s(:zero_or_more), do: "*"
+  # "Convert a modifier to a string".
+  defp modifier_string(:zero_or_more), do: "*"
+  defp modifier_string(:optional), do: "?"
+  defp modifier_string(:one_or_more), do: "+"
+  defp modifier_string(:none), do: ""
 end

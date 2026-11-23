@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "enqueue() must not synchronously call write algorithm": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

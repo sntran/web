@@ -6,7 +6,6 @@ defmodule WebTest do
   doctest Web
   doctest Web.AbortController
   doctest Web.AbortSignal
-  doctest Web.Body
   doctest Web.ArrayBuffer
   doctest Web.Uint8Array
   doctest Web.Blob
@@ -17,24 +16,37 @@ defmodule WebTest do
   doctest Web.CountQueuingStrategy
   doctest Web.Request
   doctest Web.Response
-  doctest Web.Resolver
   doctest Web.URL
   doctest Web.URLSearchParams
-  doctest Web.DSL
 
   defmodule MockDispatcher do
     @behaviour Web.Dispatcher
 
     def fetch(%Web.Request{} = req) when is_struct(req.url, Web.URL) do
       case Web.URL.href(req.url) do
-        "mock://success/" ->
-          {:ok, Web.Response.new(status: 200, url: Web.URL.href(req.url))}
+        "mock://success" ->
+          {:ok, Web.Response.__network__(status: 200, url: Web.URL.href(req.url))}
 
-        "mock://error/" ->
+        "mock://error" ->
           {:error, :simulated_error}
+
+        "mock://type-error" ->
+          {:error, Web.TypeError.exception("the dispatcher refused the request")}
+
+        "mock://dom-exception" ->
+          {:error, Web.DOMException.exception(name: "NetworkError", message: "no network")}
+
+        # A dispatcher throws when it finds that the signal aborted.
+        "mock://abort" ->
+          Web.AbortSignal.check!(Web.AbortSignal.abort(:stopped_by_the_caller))
       end
     end
   end
+
+  # The dispatcher of a request is an internal field: the public API has no
+  # option for it.
+  defp mock(input, dispatcher \\ MockDispatcher, init \\ []),
+    do: %{Web.Request.new(input, init) | dispatcher: dispatcher}
 
   defmodule UsingWeb do
     use Web
@@ -50,10 +62,8 @@ defmodule WebTest do
 
     def aliases_work? do
       url = URL.new("mock://success")
-      request = Request.new(url, dispatcher: WebTest.MockDispatcher)
-
-      response =
-        Response.new(status: 200, headers: Headers.new(%{"x-test" => "1"}), url: URL.href(url))
+      request = Request.new(url)
+      response = Response.new(nil, status: 200, headers: Headers.new(%{"x-test" => "1"}))
 
       controller = AbortController.new()
       params = URLSearchParams.new("a=1")
@@ -66,33 +76,31 @@ defmodule WebTest do
     end
   end
 
-  test "Web.fetch routes to provided dispatcher directly via options" do
-    assert %Web.Response{ok: true, url: "mock://success/"} =
-             await(Web.fetch("mock://success", dispatcher: MockDispatcher))
+  test "Web.fetch uses the dispatcher of the request" do
+    assert %Web.Response{ok: true, url: "mock://success"} =
+             await(Web.fetch(mock("mock://success")))
 
-    assert :simulated_error =
-             catch_exit(await(Web.fetch("mock://error", dispatcher: MockDispatcher)))
+    assert %Web.TypeError{message: "fetch failed", cause: :simulated_error} =
+             catch_exit(await(Web.fetch(mock("mock://error"))))
   end
 
   test "Web.fetch accepts a Web.URL input" do
-    assert %Web.Response{ok: true, url: "mock://success/"} =
-             await(Web.fetch(Web.URL.new("mock://success"), dispatcher: MockDispatcher))
+    assert %Web.Response{ok: true, url: "mock://success"} =
+             await(Web.fetch(mock(Web.URL.new("mock://success"))))
   end
 
-  test "Web.fetch routes to resolved dispatcher when missing from options" do
+  test "Web.fetch finds the dispatcher of a request that has none" do
     # Resolver.resolve("tcp://localhost:9999") -> Web.Dispatcher.TCP
     # Attempting a real TCP fetch will result in :econnrefused or :nxdomain
     assert _reason = catch_exit(await(Web.fetch("tcp://localhost:59999")))
   end
 
   test "use Web imports fetch/1 and fetch/2" do
-    assert %Web.Response{ok: true, url: "mock://success/"} =
-             UsingWeb.fetch_with_import("mock://success", dispatcher: MockDispatcher) |> await()
+    assert %Web.Response{ok: true, url: "mock://success"} =
+             UsingWeb.fetch_with_import(mock("mock://success")) |> await()
 
-    assert %Web.Response{ok: true, url: "mock://success/"} =
-             UsingWeb.fetch_with_import(Web.URL.new("mock://success"),
-               dispatcher: MockDispatcher
-             )
+    assert %Web.Response{ok: true, url: "mock://success"} =
+             UsingWeb.fetch_with_import(mock(Web.URL.new("mock://success")), [])
              |> await()
   end
 
@@ -104,33 +112,47 @@ defmodule WebTest do
     assert {"aGVsbG8=", "hello"} = UsingWeb.base64_with_imports("hello")
   end
 
-  test "await macro returns value on {:ok, value}" do
-    response = await(Web.fetch("mock://success/", dispatcher: MockDispatcher))
-    assert %Web.Response{ok: true, url: "mock://success/"} = response
+  test "fetch rejects with the error of a dispatcher that is a TypeError or a DOMException" do
+    assert %Web.TypeError{message: "the dispatcher refused the request", cause: nil} =
+             catch_exit(await(Web.fetch(mock("mock://type-error"))))
+
+    assert %Web.DOMException{name: "NetworkError", message: "no network"} =
+             catch_exit(await(Web.fetch(mock("mock://dom-exception"))))
   end
 
-  test "await macro exits on promise rejection" do
-    assert :simulated_error =
-             catch_exit(await(Web.fetch("mock://error/", dispatcher: MockDispatcher)))
+  test "fetch rejects with the abort reason that a dispatcher throws" do
+    assert catch_exit(await(Web.fetch(mock("mock://abort")))) ==
+             :stopped_by_the_caller
   end
 
-  test "await macro raises on unexpected result" do
-    assert_raise RuntimeError, ~r/await: unexpected result: :something_else/, fn ->
-      await(:something_else)
-    end
+  test "await returns the value of a promise" do
+    response = await(Web.fetch(mock("mock://success")))
+    assert %Web.Response{ok: true, url: "mock://success"} = response
   end
 
-  test "use Web imports await macro" do
+  test "await exits with the reason of a rejection" do
+    assert %Web.TypeError{message: "fetch failed", cause: :simulated_error} =
+             catch_exit(await(Web.fetch(mock("mock://error"))))
+  end
+
+  test "await returns a value that is not a promise, as ECMAScript" do
+    assert await(:something_else) == :something_else
+    # The function needs no require.
+    assert Web.await(Web.Promise.resolve(1)) == 1
+  end
+
+  test "use Web imports await" do
     defmodule AwaitTest do
       use Web
 
       def test_await do
-        await(fetch("mock://success/", dispatcher: WebTest.MockDispatcher))
+        request = %{Web.Request.new("mock://success") | dispatcher: WebTest.MockDispatcher}
+        await(fetch(request))
       end
     end
 
     response = AwaitTest.test_await()
-    assert %Web.Response{ok: true, url: "mock://success/"} = response
+    assert %Web.Response{ok: true, url: "mock://success"} = response
   end
 
   test "new/2 macro creates a new URL" do
@@ -165,16 +187,132 @@ defmodule WebTest do
     controller = Web.AbortController.new()
     Web.AbortController.abort(controller)
 
-    assert :aborted =
+    assert %Web.DOMException{name: "AbortError"} =
              catch_exit(await(Web.fetch("https://example.com", signal: controller.signal)))
 
     # Also via Web.URL
     url = Web.URL.new("https://example.com")
-    assert :aborted = catch_exit(await(Web.fetch(url, signal: controller.signal)))
+
+    assert %Web.DOMException{name: "AbortError"} =
+             catch_exit(await(Web.fetch(url, signal: controller.signal)))
 
     # Also via Web.Request
     req = Web.Request.new(url, signal: controller.signal)
-    assert :aborted = catch_exit(await(Web.fetch(req)))
+    assert %Web.DOMException{name: "AbortError"} = catch_exit(await(Web.fetch(req)))
+  end
+
+  defmodule RecordingDispatcher do
+    @behaviour Web.Dispatcher
+
+    # Tells the test process about each request that gets to the dispatcher.
+    def fetch(%Web.Request{} = request) do
+      send(request.options[:test], {:dispatched, request})
+      {:ok, Web.Response.__network__(status: 200, url: Web.URL.href(request.url))}
+    end
+  end
+
+  describe "Web.fetch with input that the Request constructor refuses" do
+    test "rejects with TypeError and does not raise" do
+      for {input, init, message} <- [
+            {"", [], ~r/Invalid URL/},
+            {"not a url", [], ~r/Invalid URL/},
+            {"/relative-only", [], ~r/Invalid URL/},
+            {"http://exa mple.com/", [], ~r/Invalid URL/},
+            {"https://user:secret@example.com/", [], ~r/includes credentials/},
+            {"https://example.com/", [method: "BAD METHOD"], ~r/not a valid HTTP method/},
+            {"https://example.com/", [method: "TRACE"], ~r/HTTP method is unsupported/},
+            {"https://example.com/", [body: "x"], ~r/GET\/HEAD method cannot have body/},
+            {"https://example.com/", [headers: %{"bad name" => "x"}], ~r/Invalid header name/},
+            {"https://example.com/", [headers: [{"x", "a\r\nb"}]], ~r/Invalid header value/},
+            {"https://example.com/", [redirect: "sometimes"], ~r/not a valid redirect mode/},
+            {123, [], ~r/Request input must be/},
+            {nil, [], ~r/Request input must be/},
+            {"https://example.com/", %{}, ~r/Request init must be a keyword list/}
+          ] do
+        promise = Web.fetch(input, init)
+        assert %Web.Promise{} = promise
+
+        assert {:rejected, %Web.TypeError{message: text, cause: nil}} = Web.Promise.wait(promise)
+        assert text =~ message
+      end
+    end
+
+    test "makes no connection" do
+      request = mock("mock://success", RecordingDispatcher, test: self())
+
+      for extra <- [
+            [method: "BAD METHOD"],
+            [body: "x"],
+            [headers: %{"bad name" => "x"}],
+            [redirect: "sometimes"]
+          ] do
+        assert {:rejected, %Web.TypeError{}} =
+                 Web.Promise.wait(Web.fetch(request, extra))
+      end
+
+      refute_receive {:dispatched, _request}, 50
+
+      # The same dispatcher gets a request that is valid.
+      assert %Web.Response{status: 200} = await(Web.fetch(request))
+      assert_receive {:dispatched, %Web.Request{method: "GET"}}
+    end
+
+    test "rejects when the body of the request is already read, and makes no connection" do
+      init = [test: self(), method: "POST"]
+
+      for body <- ["in memory", Web.ReadableStream.from(["a", "b"])] do
+        request =
+          mock("mock://success", RecordingDispatcher, init ++ [body: body, duplex: "half"])
+
+        assert is_binary(await(Web.Request.text(request)))
+
+        assert {:rejected, %Web.TypeError{message: "Request body is already used"}} =
+                 Web.Promise.wait(Web.fetch(request))
+
+        assert_raise Web.TypeError, "Request body is already used", fn ->
+          Web.Request.new(request, method: "PUT")
+        end
+      end
+
+      refute_receive {:dispatched, _request}, 50
+    end
+
+    test "rejects when the body of the request has a reader" do
+      request =
+        mock("mock://success", RecordingDispatcher,
+          test: self(),
+          method: "POST",
+          body: Web.ReadableStream.from(["a"]),
+          duplex: "half"
+        )
+
+      reader = Web.ReadableStream.get_reader(request.body)
+
+      assert {:rejected, %Web.TypeError{message: "Request body is locked"}} =
+               Web.Promise.wait(Web.fetch(request))
+
+      refute_receive {:dispatched, _request}, 50
+
+      # The request can be sent after the lock is released.
+      Web.ReadableStreamDefaultReader.release_lock(reader)
+      assert %Web.Response{status: 200} = await(Web.fetch(request))
+      assert_receive {:dispatched, _request}
+    end
+
+    test "applies init to a request that is the input" do
+      request = mock("mock://success", RecordingDispatcher, test: self())
+
+      assert %Web.Response{status: 200} =
+               await(Web.fetch(request, method: "post", headers: %{"x-test" => "1"}, body: "x"))
+
+      assert_receive {:dispatched, %Web.Request{method: "POST"} = dispatched}
+      assert Web.Headers.get(dispatched.headers, "x-test") == "1"
+
+      assert {:rejected, %Web.TypeError{message: message}} =
+               Web.Promise.wait(Web.fetch(request, body: "x"))
+
+      assert message =~ "GET/HEAD method cannot have body"
+    end
   end
 
   test "Web.btoa and Web.atob round-trip latin1 byte strings" do

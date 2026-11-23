@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "next() that succeeds; return()": "runner: a deferred call of the layer and the next statement of JavaScript race",
+    "next() that succeeds; return() [no awaiting]": "runner: a deferred call of the layer and the next statement of JavaScript race",
+    "return(); next() with delayed cancel() [no awaiting]": "runner: the library reacts before the microtasks of JavaScript"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "enqueue after detaching byobRequest.view.buffer should throw": "runner: no structuredClone"
+  }
+}

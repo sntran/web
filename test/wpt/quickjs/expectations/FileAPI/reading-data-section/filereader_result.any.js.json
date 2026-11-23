@@ -1,0 +1,17 @@
+{
+  "harness": "OK",
+  "failures": {
+    "readAsArrayBuffer": "scope: the library has no FileReader",
+    "readAsBinaryString": "scope: the library has no FileReader",
+    "readAsDataURL": "scope: the library has no FileReader",
+    "readAsText": "scope: the library has no FileReader",
+    "result is null during \"loadstart\" event for readAsArrayBuffer": "scope: the library has no FileReader",
+    "result is null during \"loadstart\" event for readAsBinaryString": "scope: the library has no FileReader",
+    "result is null during \"loadstart\" event for readAsDataURL": "scope: the library has no FileReader",
+    "result is null during \"loadstart\" event for readAsText": "scope: the library has no FileReader",
+    "result is null during \"progress\" event for readAsArrayBuffer": "scope: the library has no FileReader",
+    "result is null during \"progress\" event for readAsBinaryString": "scope: the library has no FileReader",
+    "result is null during \"progress\" event for readAsDataURL": "scope: the library has no FileReader",
+    "result is null during \"progress\" event for readAsText": "scope: the library has no FileReader"
+  }
+}

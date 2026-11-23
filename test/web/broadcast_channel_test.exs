@@ -1,5 +1,10 @@
 defmodule Web.BroadcastChannelTest do
+  # The tests change the settings of the application, thus they cannot run
+  # at the same time as other tests.
   use ExUnit.Case, async: false
+  use ExUnitProperties
+
+  import ExUnit.CaptureLog
 
   doctest Web.BroadcastChannel
 
@@ -9,11 +14,8 @@ defmodule Web.BroadcastChannelTest do
   alias Web.BroadcastChannel
   alias Web.BroadcastChannel.Adapter
   alias Web.DOMException
-  alias Web.Internal.BroadcastChannel, as: Engine
-  alias Web.Internal.Envelope
   alias Web.Internal.StructuredData
-  alias Web.TypeError
-  import ExUnit.CaptureLog
+  alias Web.MessageEvent
 
   defmodule SpyAdapter do
     @behaviour Web.BroadcastChannel.Adapter
@@ -42,7 +44,7 @@ defmodule Web.BroadcastChannelTest do
     def acquire(%__MODULE__{pid: pid} = governor) do
       ref = make_ref()
       send(pid, {:spy_governor, :acquire, ref})
-      Web.Promise.resolve(%Web.Governor.Token{governor: governor, ref: ref})
+      Web.Promise.resolve(%Web.GovernorToken{governor: governor, ref: ref})
     end
 
     def release_token(%__MODULE__{pid: pid}, ref) do
@@ -52,53 +54,69 @@ defmodule Web.BroadcastChannelTest do
   end
 
   setup do
-    original_adapter = Application.get_env(:web, :broadcast_adapter)
-    original_adapter_spy = Application.get_env(:web, :broadcast_adapter_spy)
-    original_governor = Application.get_env(:web, :broadcast_governor)
+    settings = [:broadcast_adapter, :broadcast_adapter_spy, :broadcast_governor]
+    original = Map.new(settings, &{&1, Application.get_env(:web, &1)})
 
     on_exit(fn ->
-      restore_env(:broadcast_adapter, original_adapter)
-      restore_env(:broadcast_adapter_spy, original_adapter_spy)
-      restore_env(:broadcast_governor, original_governor)
+      Enum.each(original, fn
+        {key, nil} -> Application.delete_env(:web, key)
+        {key, value} -> Application.put_env(:web, key, value)
+      end)
     end)
 
-    :ok
+    {:ok, name: "test-#{System.unique_integer([:positive, :monotonic])}"}
   end
 
-  test "default-arg constructor and single-arity post_message are not public" do
-    refute function_exported?(BroadcastChannel, :new, 0)
-    refute function_exported?(BroadcastChannel, :post_message, 1)
-    refute function_exported?(BroadcastChannel, :postMessage, 2)
-    refute function_exported?(BroadcastChannel, :addEventListener, 3)
-    refute function_exported?(BroadcastChannel, :addEventListener, 4)
-    refute function_exported?(BroadcastChannel, :removeEventListener, 3)
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  # Makes a channel, and closes it at the end of the test.
+  defp open(name) do
+    channel = BroadcastChannel.new(name)
+    on_exit(fn -> BroadcastChannel.close(channel) end)
+    channel
   end
 
-  test "constructor coerces names and exposes capability fields" do
-    channel = BroadcastChannel.new(123)
-    null_channel = BroadcastChannel.new(nil)
-    internal_channel = Engine.new(unique_name("internal-default"))
-
-    assert channel.name == "123"
-    assert null_channel.name == "null"
-    assert internal_channel.name =~ "internal-default"
-    assert is_reference(channel.address)
-    assert is_reference(channel.token)
-    assert channel.onmessage == nil
-    assert BroadcastChannel.onmessage(channel) == nil
+  # Makes a channel whose listener sends the data to the test process.
+  defp listen(name, tag) do
+    BroadcastChannel.onmessage(open(name), forward_data(tag))
   end
 
-  test "broadcast adapter exposes the callback contract" do
-    assert [join: 2, leave: 2, broadcast: 3] == Adapter.callback_contract()
+  defp forward(tag) do
+    test = self()
+    fn event -> send(test, {tag, event}) end
   end
 
-  test "broadcast channel public surface only exports standard-facing methods" do
-    exported = BroadcastChannel.__info__(:functions)
+  defp forward_data(tag) do
+    test = self()
+    fn event -> send(test, {tag, event.data}) end
+  end
 
-    refute {:debug_server_pid, 1} in exported
-    refute {:origin, 0} in exported
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
+  end
 
-    assert Enum.sort(exported) == [
+  defp listener_pid(%BroadcastChannel{address: pid}), do: :sys.get_state(pid).target.listener
+
+  defp members(name), do: :pg.get_members(Web.BroadcastChannel, name)
+
+  defp dom_exception(name, fun) do
+    exception = assert_raise DOMException, fun
+    assert exception.name == name
+    exception.message
+  end
+
+  # ---------------------------------------------------------------------------
+  # The public functions
+  # ---------------------------------------------------------------------------
+
+  test "the module has the functions of the Standard" do
+    assert Enum.sort(BroadcastChannel.__info__(:functions)) == [
              {:__struct__, 0},
              {:__struct__, 1},
              {:add_event_listener, 3},
@@ -108,796 +126,636 @@ defmodule Web.BroadcastChannelTest do
              {:new, 1},
              {:onmessage, 1},
              {:onmessage, 2},
+             {:onmessageerror, 1},
+             {:onmessageerror, 2},
              {:post_message, 2},
-             {:remove_event_listener, 3}
+             {:remove_event_listener, 3},
+             {:remove_event_listener, 4}
            ]
   end
 
-  test "spoofed handles with a valid alias and invalid token are rejected" do
-    channel = BroadcastChannel.new(unique_name("spoof"))
-    spoofed = %{channel | token: make_ref()}
-    callback = fn _event -> :ok end
-
-    assert_data_clone_error(fn -> BroadcastChannel.onmessage(spoofed) end)
-    assert_data_clone_error(fn -> BroadcastChannel.onmessage(spoofed, callback) end)
-
-    assert_data_clone_error(fn ->
-      BroadcastChannel.add_event_listener(spoofed, "message", callback)
-    end)
-
-    assert_data_clone_error(fn ->
-      BroadcastChannel.remove_event_listener(spoofed, "message", callback)
-    end)
-
-    assert_data_clone_error(fn ->
-      BroadcastChannel.dispatch_event(spoofed, %{type: "x", target: spoofed})
-    end)
-
-    assert_data_clone_error(fn -> BroadcastChannel.post_message(spoofed, "boom") end)
-  end
-
-  test "closing a channel detaches the capability so all public methods fail with DataCloneError" do
-    channel = BroadcastChannel.new(unique_name("closed-post"))
-    callback = fn _event -> :ok end
-    event = %{type: "x", target: channel}
-
-    assert :ok = BroadcastChannel.close(channel)
-
-    assert_data_clone_error(fn -> BroadcastChannel.onmessage(channel) end)
-    assert_data_clone_error(fn -> BroadcastChannel.onmessage(channel, callback) end)
-
-    assert_data_clone_error(fn ->
-      BroadcastChannel.add_event_listener(channel, "message", callback)
-    end)
-
-    assert_data_clone_error(fn ->
-      BroadcastChannel.remove_event_listener(channel, "message", callback)
-    end)
-
-    assert_data_clone_error(fn -> BroadcastChannel.dispatch_event(channel, event) end)
-    assert_data_clone_error(fn -> BroadcastChannel.post_message(channel, fn -> :boom end) end)
-  end
-
-  test "post_message raises DataCloneError or TypeError for invalid payloads while open" do
-    channel = BroadcastChannel.new(unique_name("clone-error"))
-    buffer = ArrayBuffer.new("hello")
-    ArrayBuffer.detach(buffer)
-
-    exception =
-      assert_raise DOMException, fn ->
-        BroadcastChannel.post_message(channel, fn -> :boom end)
-      end
-
-    assert exception.name == "DataCloneError"
-
-    assert_raise TypeError, fn ->
-      BroadcastChannel.post_message(channel, buffer)
+  test "the name becomes a string" do
+    for {input, name} <- [{:news, "news"}, {42, "42"}, {nil, "null"}, {"text", "text"}] do
+      channel = BroadcastChannel.new(input)
+      assert %BroadcastChannel{name: ^name} = channel
+      assert is_pid(channel.address)
+      BroadcastChannel.close(channel)
     end
   end
 
-  test "post_message broadcasts to peer channels and preserves event shape" do
-    parent = self()
-    channel_name = unique_name("event-shape")
-    sender = BroadcastChannel.new(channel_name)
-
-    receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:message_event, event})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, "hello world")
-
-    assert_receive {:message_event, event}
-    assert %Web.MessageEvent{} = event
-    assert event.target == receiver
-    assert event.type == "message"
-    assert event.data == "hello world"
-    assert event.source == nil
-    assert event.origin == origin()
+  test "the adapter has the contract of its callbacks" do
+    assert Adapter.callback_contract() == [join: 2, leave: 2, broadcast: 3]
   end
 
-  test "message events use the sender origin carried in dispatcher payloads" do
-    parent = self()
-    channel_name = unique_name("sender-origin")
+  # ---------------------------------------------------------------------------
+  # Messages
+  # ---------------------------------------------------------------------------
 
-    receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:payload_origin, event.origin, event.data})
+  describe "a message" do
+    test "arrives at each other channel with the same name", %{name: name} do
+      sender = BroadcastChannel.onmessage(open(name), forward(:sender))
+      first = BroadcastChannel.onmessage(open(name), forward(:first))
+      second = BroadcastChannel.onmessage(open(name), forward(:second))
+      _other = listen(name <> "-other", :other)
+
+      assert :ok = BroadcastChannel.post_message(sender, %{id: 7, state: :done})
+
+      assert_receive {:first, %MessageEvent{} = event}
+      assert event.type == "message"
+      assert event.is_trusted
+      assert event.data == %{id: 7, state: :done}
+      assert event.origin == "node://" <> Atom.to_string(node())
+      assert event.ports == []
+      assert event.target == first
+
+      assert_receive {:second, %MessageEvent{target: ^second, data: %{id: 7}}}
+
+      # The sender, and a channel with a different name, get nothing.
+      refute_receive {:sender, _event}, 30
+      refute_received {:other, _data}
+    end
+
+    test "with no other channel has no effect", %{name: name} do
+      sender = listen(name, :sender)
+
+      assert :ok = BroadcastChannel.post_message(sender, "nobody")
+      refute_receive {:sender, _data}, 30
+    end
+
+    test "the messages of one channel arrive in the sequence of the calls", %{name: name} do
+      sender = open(name)
+      _first = listen(name, :first)
+      _second = listen(name, :second)
+
+      Enum.each(1..200, &BroadcastChannel.post_message(sender, &1))
+
+      for index <- 1..200 do
+        assert_receive {:first, ^index}
+        assert_receive {:second, ^index}
+      end
+    end
+
+    test "a callback with no argument is called", %{name: name} do
+      test = self()
+      sender = open(name)
+      BroadcastChannel.onmessage(open(name), fn -> send(test, :called) end)
+
+      BroadcastChannel.post_message(sender, "trigger")
+
+      assert_receive :called
+    end
+
+    test "each channel gets its own clone", %{name: name} do
+      sender = open(name)
+      _first = listen(name, :first)
+      _second = listen(name, :second)
+      buffer = ArrayBuffer.new("shared")
+
+      BroadcastChannel.post_message(sender, %{"buffer" => buffer})
+
+      assert_receive {:first, %{"buffer" => first}}
+      assert_receive {:second, %{"buffer" => second}}
+
+      assert to_string(first) == "shared"
+      refute first.id == second.id
+      refute first.id == buffer.id
+
+      ArrayBuffer.detach(first)
+      assert to_string(second) == "shared"
+      assert to_string(buffer) == "shared"
+    end
+
+    test "the listener runs in the async context of the sender", %{name: name} do
+      test = self()
+      request_id = Variable.new(name: "request_id")
+      sender = open(name)
+
+      BroadcastChannel.onmessage(open(name), fn _event ->
+        send(test, {:request_id, Variable.get(request_id)})
       end)
 
-    send(dispatcher_pid(receiver), {
-      :broadcast_channel_remote,
-      %{
-        origin: "node://remote@example",
-        serialized: StructuredData.serialize("from-remote"),
-        snapshot: Snapshot.take()
+      Variable.run(request_id, "req-42", fn ->
+        BroadcastChannel.post_message(sender, "with context")
+      end)
+
+      assert_receive {:request_id, "req-42"}
+    end
+
+    test "a message that cannot be cloned raises DataCloneError", %{name: name} do
+      sender = open(name)
+      _receiver = listen(name, :got)
+
+      assert dom_exception("DataCloneError", fn ->
+               BroadcastChannel.post_message(sender, self())
+             end) == "A pid cannot be cloned."
+
+      # The channel continues.
+      BroadcastChannel.post_message(sender, "next")
+      assert_receive {:got, "next"}
+    end
+
+    test "a message that cannot be made gives the event messageerror", %{name: name} do
+      receiver =
+        open(name)
+        |> BroadcastChannel.onmessage(forward(:message))
+        |> BroadcastChannel.onmessageerror(forward(:error))
+
+      record = %StructuredData.Record{
+        plain: false,
+        value: %StructuredData.Node{type: :regex, key: nil, data: {"(", []}}
       }
-    })
 
-    assert_receive {:payload_origin, "node://remote@example", "from-remote"}
+      payload = %{record: record, origin: "node://other@host", snapshot: Snapshot.new()}
+      send(receiver.address, {:broadcast_channel_message, payload})
+
+      assert_receive {:error,
+                      %MessageEvent{
+                        type: "messageerror",
+                        origin: "node://other@host",
+                        is_trusted: true
+                      }}
+
+      refute_receive {:message, _event}, 30
+      assert is_function(BroadcastChannel.onmessageerror(receiver), 1)
+    end
+
+    test "the origin is the node of the sender", %{name: name} do
+      receiver = BroadcastChannel.onmessage(open(name), forward(:got))
+
+      payload = %{
+        record: StructuredData.serialize("from a different node"),
+        origin: "node://remote@example",
+        snapshot: Snapshot.new()
+      }
+
+      send(receiver.address, {:broadcast_channel_message, payload})
+
+      assert_receive {:got, %MessageEvent{origin: "node://remote@example", data: data}}
+      assert data == "from a different node"
+    end
   end
 
-  test "snake_case listener helpers can add and remove listeners" do
-    parent = self()
-    channel_name = unique_name("listener-helpers")
-    sender = BroadcastChannel.new(channel_name)
-    callback = fn event -> send(parent, {:listener, event.data}) end
+  # ---------------------------------------------------------------------------
+  # Listeners
+  # ---------------------------------------------------------------------------
 
-    receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.add_event_listener("message", callback)
-      |> BroadcastChannel.add_event_listener("message", callback)
+  describe "listeners" do
+    test "a slow listener does not delay the other channels", %{name: name} do
+      test = self()
+      sender = open(name)
+      slow = open(name)
+      _fast = listen(name, :fast)
 
-    assert BroadcastChannel.onmessage(receiver) == nil
-
-    _receiver = BroadcastChannel.remove_event_listener(receiver, "message", callback)
-
-    assert :ok = BroadcastChannel.post_message(sender, "gone")
-    refute_receive {:listener, _}
-  end
-
-  test "dispatch_event notifies listeners and reports success" do
-    parent = self()
-
-    channel =
-      BroadcastChannel.new(unique_name("dispatch-event"))
-      |> BroadcastChannel.add_event_listener("custom", fn event ->
-        send(parent, {:manual_dispatch, event.type, event.data})
-      end)
-
-    event = %{type: "custom", data: "payload", target: channel}
-
-    assert {^channel, true} = BroadcastChannel.dispatch_event(channel, event)
-    assert_receive {:manual_dispatch, "custom", "payload"}
-  end
-
-  test "broadcast adapter is resolved from application config at runtime" do
-    parent = self()
-    channel_name = unique_name("adapter-config")
-
-    Application.put_env(:web, :broadcast_adapter_spy, parent)
-    Application.put_env(:web, :broadcast_adapter, SpyAdapter)
-
-    sender = BroadcastChannel.new(channel_name)
-
-    receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:adapter_receiver, event.data})
-      end)
-
-    assert_receive {:spy_join, ^channel_name, _dispatcher_pid}
-
-    assert :ok = BroadcastChannel.post_message(sender, "adapter-path")
-
-    assert_receive {:spy_broadcast, ^channel_name, _dispatcher_pid,
-                    {:broadcast_channel_remote,
-                     %{origin: _, serialized: %{}, snapshot: %Snapshot{}}}}
-
-    assert_receive {:adapter_receiver, "adapter-path"}
-
-    assert :ok = BroadcastChannel.close(sender)
-    assert :ok = BroadcastChannel.close(receiver)
-    assert_receive {:spy_leave, ^channel_name, _dispatcher_pid}
-  end
-
-  test "configured governor wraps remote and local delivery work" do
-    parent = self()
-    channel_name = unique_name("governor-path")
-
-    Application.put_env(:web, :broadcast_governor, %SpyGovernor{pid: parent})
-
-    sender = BroadcastChannel.new(channel_name)
-
-    _receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:governor_receiver, event.data})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, "throttled")
-
-    governor_events =
-      Enum.map(1..4, fn _index ->
-        assert_receive {:spy_governor, event, ref}
-        {event, ref}
-      end)
-
-    acquired = for {:acquire, ref} <- governor_events, do: ref
-    released = for {:release, ref} <- governor_events, do: ref
-
-    assert length(acquired) == 2
-    assert Enum.sort(acquired) == Enum.sort(released)
-    assert_receive {:governor_receiver, "throttled"}
-  end
-
-  test "onmessage updates from inside an onmessage callback use the local path" do
-    parent = self()
-    channel_name = unique_name("self-onmessage")
-    sender = BroadcastChannel.new(channel_name)
-
-    _receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        _channel = BroadcastChannel.onmessage(event.target, nil)
-        send(parent, {:self_cast_message, event.data})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, "first")
-    assert_receive {:self_cast_message, "first"}
-
-    Process.sleep(20)
-    assert :ok = BroadcastChannel.post_message(sender, "second")
-    refute_receive {:self_cast_message, "second"}
-  end
-
-  test "listener helpers use the local path from inside delivery callbacks" do
-    parent = self()
-    channel_name = unique_name("local-listener-helpers")
-    sender = BroadcastChannel.new(channel_name)
-    local_listener = fn event -> send(parent, {:local_dispatch, event.data}) end
-
-    _receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        assert is_function(BroadcastChannel.onmessage(event.target), 1)
-
-        target = BroadcastChannel.add_event_listener(event.target, "local", local_listener)
-
-        assert {^target, true} =
-                 BroadcastChannel.dispatch_event(target, %{
-                   type: "local",
-                   data: event.data,
-                   target: target
-                 })
-
-        _target = BroadcastChannel.remove_event_listener(target, "local", local_listener)
-
-        send(parent, {:local_helpers_complete, event.data})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, "ping")
-
-    assert_receive {:local_dispatch, "ping"}
-    assert_receive {:local_helpers_complete, "ping"}
-  end
-
-  test "posting from inside onmessage uses the self-post path and supports zero-arity callbacks" do
-    parent = self()
-    channel_name = unique_name("self-post")
-    sender = BroadcastChannel.new(channel_name)
-
-    _self_posting =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        if event.data == "first" do
-          assert :ok = BroadcastChannel.post_message(event.target, "second")
+      # The slow listener waits until the test lets it continue.
+      BroadcastChannel.onmessage(slow, fn event ->
+        receive do
+          :continue -> :ok
         end
+
+        send(test, {:slow, event.data})
       end)
 
-    _receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn ->
-        send(parent, :zero_arity_message)
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, "first")
-    assert_receive :zero_arity_message
-    assert_receive :zero_arity_message
-  end
-
-  test "sender does not receive its own broadcast" do
-    parent = self()
-    channel_name = unique_name("self-delivery")
-
-    sender =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:sender_received, event.data})
-      end)
-
-    receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:receiver_received, event.data})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, "ping")
-
-    assert_receive {:receiver_received, "ping"}
-    refute_receive {:sender_received, _}
-    assert receiver.name == channel_name
-  end
-
-  test "posting with no other subscribers is a no-op" do
-    channel = BroadcastChannel.new(unique_name("solo-post"))
-    assert :ok = BroadcastChannel.post_message(channel, "solo")
-    refute_receive _message
-  end
-
-  test "messages are delivered in channel creation order" do
-    parent = self()
-    channel_name = unique_name("creation-order")
-
-    c1 =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:delivered, :c1, event.data})
-      end)
-
-    c2 =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:delivered, :c2, event.data})
-      end)
-
-    c3 =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:delivered, :c3, event.data})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(c1, "from c1")
-    assert :ok = BroadcastChannel.post_message(c3, "from c3")
-    assert :ok = BroadcastChannel.post_message(c2, "done")
-
-    assert_receive {:delivered, :c2, "from c1"}
-    assert_receive {:delivered, :c3, "from c1"}
-    assert_receive {:delivered, :c1, "from c3"}
-    assert_receive {:delivered, :c2, "from c3"}
-    assert_receive {:delivered, :c1, "done"}
-    assert_receive {:delivered, :c3, "done"}
-  end
-
-  test "closing a channel after post_message prevents the queued delivery" do
-    parent = self()
-    channel_name = unique_name("close-after-post")
-    sender = BroadcastChannel.new(channel_name)
-
-    closed_channel =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:closed_channel_received, event.data})
-      end)
-
-    _live_channel =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:live_channel_received, event.data})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, "test")
-    assert :ok = BroadcastChannel.close(closed_channel)
-
-    assert_receive {:live_channel_received, "test"}
-    refute_receive {:closed_channel_received, _}
-  end
-
-  test "closing and creating channels during delivery updates future broadcasts only" do
-    parent = self()
-    channel_name = unique_name("create-during-delivery")
-    c1 = BroadcastChannel.new(channel_name)
-
-    c2 =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:c2_received, event.data})
-
-        if event.data == "first" do
-          assert :ok = BroadcastChannel.close(event.target)
-
-          BroadcastChannel.new(channel_name)
-          |> BroadcastChannel.onmessage(fn next_event ->
-            send(parent, {:c3_received, next_event.data})
-          end)
-
-          assert :ok = BroadcastChannel.post_message(c1, "done")
-        end
-      end)
-
-    assert :ok = BroadcastChannel.post_message(c1, "first")
-    assert :ok = BroadcastChannel.post_message(c2, "second")
-
-    assert_receive {:c2_received, "first"}
-    assert_receive {:c3_received, "done"}
-    refute_receive {:c2_received, "second"}
-  end
-
-  test "closing inside onmessage makes self-post validation fail immediately" do
-    parent = self()
-    channel_name = unique_name("self-close-post")
-    sender = BroadcastChannel.new(channel_name)
-
-    _receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        result =
-          try do
-            assert :ok = BroadcastChannel.close(event.target)
-            BroadcastChannel.post_message(event.target, "again")
-            :unexpected_success
-          rescue
-            exception in [DOMException] -> exception.name
-          end
-
-        send(parent, {:self_close_post, result})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, "first")
-    assert_receive {:self_close_post, "DataCloneError"}
-  end
-
-  test "closing inside onmessage makes local getters fail immediately" do
-    parent = self()
-    channel_name = unique_name("self-close-get")
-    sender = BroadcastChannel.new(channel_name)
-
-    _receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        result =
-          try do
-            assert :ok = BroadcastChannel.close(event.target)
-            BroadcastChannel.onmessage(event.target)
-            :unexpected_success
-          rescue
-            exception in [DOMException] -> exception.name
-          end
-
-        send(parent, {:self_close_get, result})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, "first")
-    assert_receive {:self_close_get, "DataCloneError"}
-  end
-
-  test "internal broadcast channel guards ignore malformed envelopes and unknown messages" do
-    parent = self()
-    channel_name = unique_name("internal-guards")
-    sender = BroadcastChannel.new(channel_name)
-
-    receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:guarded_delivery, event.data})
-      end)
-
-    send(
-      receiver.address,
-      {:"$gen_cast",
-       Envelope.new(
-         make_ref(),
-         {:deliver, self(), make_ref(),
-          %{origin: origin(), serialized: StructuredData.serialize("spoof")}},
-         Snapshot.take()
-       )}
-    )
-
-    send(channel_pid(receiver), :unexpected_info)
-
-    refute_receive {:guarded_delivery, "spoof"}
-
-    assert :ok = BroadcastChannel.post_message(sender, "ok")
-    assert_receive {:guarded_delivery, "ok"}
-  end
-
-  test "internal broadcast channel rejects authenticated methods and ignores casts while closed" do
-    parent = self()
-
-    channel =
-      BroadcastChannel.new(unique_name("internal-closed"))
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:closed_delivery, event.data})
-      end)
-
-    pid = channel_pid(channel)
-    callback = fn _event -> :ok end
-    event = %{type: "x", target: channel}
-
-    :sys.replace_state(pid, &%{&1 | closed: true})
-
-    assert_raw_data_clone_error(raw_request(channel, :get_onmessage))
-    assert_raw_data_clone_error(raw_request(channel, {:set_onmessage, callback}))
-
-    assert_raw_data_clone_error(
-      raw_request(channel, {:add_event_listener, "message", callback, %{}})
-    )
-
-    assert_raw_data_clone_error(
-      raw_request(channel, {:remove_event_listener, "message", callback})
-    )
-
-    assert_raw_data_clone_error(raw_request(channel, {:dispatch_event, event}))
-    assert_raw_data_clone_error(raw_request(channel, {:post_message, "closed", origin()}))
-    assert_raw_data_clone_error(raw_request_with_token(channel, make_ref(), :unexpected_call))
-    assert_raw_data_clone_error(raw_request(channel, :unexpected_call))
-
-    assert :ok =
-             raw_cast(
-               channel,
-               {:deliver, self(), make_ref(),
-                %{origin: origin(), serialized: StructuredData.serialize("ignored")}}
-             )
-
-    assert :ok = raw_cast(channel, :unexpected_cast)
-    refute_receive {:closed_delivery, _}
-
-    assert :ok = BroadcastChannel.close(channel)
-  end
-
-  test "internal broadcast channel accepts legacy envelope wrappers and ignores malformed ones" do
-    parent = self()
-    channel_name = unique_name("legacy-envelope")
-    sender = BroadcastChannel.new(channel_name)
-
-    receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:legacy_wrapper_delivery, event.data})
-      end)
-
-    assert :ok = legacy_raw_request(sender, {:post_message, "legacy-call", origin()})
-    assert_receive {:legacy_wrapper_delivery, "legacy-call"}
-
-    assert :ok =
-             legacy_raw_cast(
-               receiver,
-               {:deliver, self(), make_ref(),
-                %{origin: origin(), serialized: StructuredData.serialize("legacy-cast")}}
-             )
-
-    assert_receive {:legacy_wrapper_delivery, "legacy-cast"}
-
-    assert_raw_data_clone_error(legacy_raw_request(sender, :malformed_wrapper))
-
-    assert :ok = malformed_legacy_raw_cast(receiver, :ignored)
-    refute_receive {:legacy_wrapper_delivery, "ignored"}
-  end
-
-  test "internal broadcast channel callback clauses accept legacy envelope wrappers" do
-    channel = BroadcastChannel.new(unique_name("legacy-envelope-callbacks"))
-    pid = channel_pid(channel)
-    state = :sys.get_state(pid)
-    envelope = Envelope.new(channel.token, :debug_server_pid, Snapshot.take())
-    from = {self(), make_ref()}
-
-    assert {:reply, test_pid, ^state} = Engine.handle_call({:envelope, envelope}, from, state)
-    assert test_pid == self()
-
-    assert {:reply, {:error, %DOMException{name: "DataCloneError"}}, ^state} =
-             Engine.handle_call({:envelope, :bad}, from, state)
-
-    assert {:noreply, ^state} =
-             Engine.handle_cast({:envelope, Envelope.new(channel.token, :noop)}, state)
-
-    assert {:noreply, ^state} = Engine.handle_cast({:envelope, :bad}, state)
-
-    assert :ok = BroadcastChannel.close(channel)
-  end
-
-  test "crashing listeners acknowledge the dispatcher so remaining recipients still receive" do
-    parent = self()
-    channel_name = unique_name("listener-crash")
-    sender = BroadcastChannel.new(channel_name)
-
-    crashing =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn _event ->
-        raise "boom"
-      end)
-
-    monitor_ref = Process.monitor(channel_pid(crashing))
-
-    _receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:after_crash, event.data})
-      end)
-
-    log =
-      capture_log(fn ->
-        assert :ok = BroadcastChannel.post_message(sender, "boom")
-        assert_receive {:DOWN, ^monitor_ref, :process, _, _}
-        assert_receive {:after_crash, "boom"}
-      end)
-
-    assert log =~ "GenServer"
-  end
-
-  test "tampering with local state crashes only that recipient after it acks delivery" do
-    parent = self()
-    channel_name = unique_name("tampered-local-state")
-    sender = BroadcastChannel.new(channel_name)
-
-    tampered =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn _event ->
-        Process.delete({Engine, :local_state})
-      end)
-
-    tampered_ref = Process.monitor(channel_pid(tampered))
-
-    _receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:after_tamper, event.data})
-      end)
-
-    log =
-      capture_log(fn ->
-        assert :ok = BroadcastChannel.post_message(sender, "boom")
-        assert_receive {:DOWN, ^tampered_ref, :process, _, _}
-        assert_receive {:after_tamper, "boom"}
-      end)
-
-    assert log =~ "missing local BroadcastChannel state"
-  end
-
-  test "async context snapshots are restored while listeners run" do
-    parent = self()
-    request_id = Variable.new("request_id")
-    channel_name = unique_name("async-context")
-    sender = BroadcastChannel.new(channel_name)
-
-    _receiver =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn _event ->
-        send(parent, {:request_id, Variable.get(request_id)})
-      end)
-
-    Variable.run(request_id, "req-42", fn ->
-      assert :ok = BroadcastChannel.post_message(sender, "ok")
-    end)
-
-    assert_receive {:request_id, "req-42"}
-  end
-
-  test "each recipient gets an isolated structured clone" do
-    parent = self()
-    channel_name = unique_name("isolated-array-buffer")
-    sender = BroadcastChannel.new(channel_name)
-
-    _first =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        ArrayBuffer.detach(event.data)
-        send(parent, {:first_length, ArrayBuffer.byte_length(event.data)})
-      end)
-
-    _second =
-      BroadcastChannel.new(channel_name)
-      |> BroadcastChannel.onmessage(fn event ->
-        send(parent, {:second_length, ArrayBuffer.byte_length(event.data)})
-      end)
-
-    assert :ok = BroadcastChannel.post_message(sender, ArrayBuffer.new("hello"))
-
-    assert_receive {:first_length, 0}
-    assert_receive {:second_length, 5}
-  end
-
-  test "owner shutdown tears down the capability handle" do
-    parent = self()
-
-    _owner =
-      spawn(fn ->
-        channel = BroadcastChannel.new(unique_name("owned"))
-        send(parent, {:owned_channel, channel})
-      end)
-
-    channel =
-      receive do
-        {:owned_channel, channel} -> channel
-      after
-        1_000 -> flunk("expected owned channel")
+      {time, :ok} =
+        :timer.tc(fn ->
+          Enum.each(1..5, &BroadcastChannel.post_message(sender, &1))
+          for index <- 1..5, do: assert_receive({:fast, ^index})
+          :ok
+        end)
+
+      assert time < 300_000
+      refute_received {:slow, _data}
+
+      listener = listener_pid(slow)
+      for _index <- 1..5, do: send(listener, :continue)
+      for index <- 1..5, do: assert_receive({:slow, ^index})
+    end
+
+    test "the event handler and the listeners get the event", %{name: name} do
+      sender = open(name)
+      removed = forward_data(:removed)
+
+      receiver =
+        open(name)
+        |> BroadcastChannel.add_event_listener("message", forward_data(:listener))
+        |> BroadcastChannel.onmessage(forward_data(:handler))
+        |> BroadcastChannel.add_event_listener("message", removed)
+        |> BroadcastChannel.add_event_listener(:message, forward_data(:once), once: true)
+        |> BroadcastChannel.remove_event_listener("message", removed)
+
+      assert is_function(BroadcastChannel.onmessage(receiver), 1)
+
+      BroadcastChannel.post_message(sender, 1)
+      BroadcastChannel.post_message(sender, 2)
+
+      assert_receive {:listener, 1}
+      assert_receive {:handler, 1}
+      assert_receive {:once, 1}
+      assert_receive {:listener, 2}
+      assert_receive {:handler, 2}
+      refute_receive {:once, 2}, 30
+      refute_received {:removed, _data}
+
+      assert BroadcastChannel.onmessage(receiver, nil) == receiver
+      assert BroadcastChannel.onmessage(receiver) == nil
+
+      assert_raise Web.TypeError, ~r/must be a function/, fn ->
+        BroadcastChannel.onmessage(receiver, :not_a_function)
       end
+    end
 
-    await_data_clone_error(fn -> BroadcastChannel.onmessage(channel) end)
-  end
+    test "dispatch_event gives an event to the listeners, before it returns", %{name: name} do
+      channel = BroadcastChannel.add_event_listener(open(name), "custom", forward(:custom))
+      event = Web.CustomEvent.new("custom", detail: 7)
 
-  defp unique_name(prefix) do
-    "#{prefix}-#{System.unique_integer([:positive, :monotonic])}"
-  end
+      assert {^channel, true} = BroadcastChannel.dispatch_event(channel, event)
+      assert_received {:custom, %Web.CustomEvent{detail: 7, target: ^channel}}
 
-  defp origin do
-    "node://" <> Atom.to_string(node())
-  end
+      assert {^channel, true} = Web.EventTarget.dispatch_event(channel, event)
+      assert_received {:custom, %Web.CustomEvent{detail: 7, target: ^channel}}
+    end
 
-  defp channel_pid(channel) do
-    Engine.debug_server_pid(channel)
-  end
+    test "a listener that raises goes to the log, and the channel continues", %{name: name} do
+      test = self()
+      sender = open(name)
 
-  defp dispatcher_pid(channel) do
-    channel
-    |> channel_pid()
-    |> :sys.get_state()
-    |> Map.fetch!(:dispatcher)
-  end
+      receiver =
+        open(name)
+        |> BroadcastChannel.onmessage(fn event ->
+          if event.data == :bad, do: raise("the listener failed")
+          send(test, {:first, event.data})
+        end)
+        |> BroadcastChannel.add_event_listener("message", forward_data(:second))
 
-  defp restore_env(key, nil) do
-    Application.delete_env(:web, key)
-  end
+      log =
+        capture_log(fn ->
+          BroadcastChannel.post_message(sender, :bad)
+          assert_receive {:second, :bad}
+        end)
 
-  defp restore_env(key, value) do
-    Application.put_env(:web, key, value)
-  end
+      assert log =~ ~s(A listener of the event "message" failed.)
+      assert log =~ "the listener failed"
 
-  defp assert_data_clone_error(fun) do
-    exception = assert_raise DOMException, fun
-    assert exception.name == "DataCloneError"
-    exception
-  end
+      BroadcastChannel.post_message(sender, :good)
+      assert_receive {:first, :good}
+      assert_receive {:second, :good}
+      assert Process.alive?(receiver.address)
+    end
 
-  defp assert_raw_data_clone_error(reply) do
-    assert {:error, %DOMException{name: "DataCloneError"} = exception} = reply
-    exception
-  end
+    test "a listener can use its channel", %{name: name} do
+      test = self()
+      first = listen(name, :first)
 
-  defp raw_request(%BroadcastChannel{} = channel, body, timeout \\ 100) do
-    reply_ref = make_ref()
+      second =
+        BroadcastChannel.onmessage(open(name), fn event ->
+          # Send, change the callback, and close, from the listener.
+          BroadcastChannel.post_message(event.target, {:answer, event.data})
 
-    send(channel.address, {:"$gen_call", {self(), reply_ref}, Envelope.new(channel.token, body)})
+          BroadcastChannel.onmessage(event.target, fn next ->
+            send(test, {:second_callback, next.data})
+            BroadcastChannel.close(next.target)
+            send(test, :closed)
+          end)
+        end)
 
-    receive do
-      {^reply_ref, reply} -> reply
-    after
-      timeout -> flunk("expected raw request reply")
+      BroadcastChannel.post_message(first, 1)
+      assert_receive {:first, {:answer, 1}}
+
+      BroadcastChannel.post_message(first, 2)
+      BroadcastChannel.post_message(first, 3)
+      assert_receive {:second_callback, 2}
+      assert_receive :closed
+      refute_receive {:second_callback, 3}, 50
+
+      eventually(fn -> not Process.alive?(second.address) end)
     end
   end
 
-  defp raw_cast(%BroadcastChannel{} = channel, body) do
-    send(channel.address, {:"$gen_cast", Envelope.new(channel.token, body)})
-    :ok
-  end
+  # ---------------------------------------------------------------------------
+  # Close
+  # ---------------------------------------------------------------------------
 
-  defp raw_request_with_token(%BroadcastChannel{} = channel, token, body, timeout \\ 100) do
-    reply_ref = make_ref()
+  describe "close" do
+    test "a closed channel gets no message", %{name: name} do
+      sender = open(name)
+      receiver = listen(name, :got)
 
-    send(channel.address, {:"$gen_call", {self(), reply_ref}, Envelope.new(token, body)})
+      BroadcastChannel.post_message(sender, 1)
+      assert_receive {:got, 1}
 
-    receive do
-      {^reply_ref, reply} -> reply
-    after
-      timeout -> flunk("expected raw request reply")
+      assert :ok = BroadcastChannel.close(receiver)
+      BroadcastChannel.post_message(sender, 2)
+      refute_receive {:got, 2}, 50
+    end
+
+    test "a channel delivers no event after close returns", %{name: name} do
+      test = self()
+      sender = open(name)
+      receiver = open(name)
+
+      BroadcastChannel.onmessage(receiver, fn event ->
+        send(test, {:got, event.data})
+
+        # The test lets the callback continue when the other messages are in
+        # the mailbox of the listener process.
+        receive do
+          :continue -> :ok
+        end
+
+        BroadcastChannel.close(event.target)
+        send(test, :closed)
+      end)
+
+      Enum.each(1..20, &BroadcastChannel.post_message(sender, &1))
+
+      assert_receive {:got, 1}
+      listener = listener_pid(receiver)
+
+      eventually(fn ->
+        {:messages, messages} = Process.info(listener, :messages)
+        Enum.count(messages, &match?({:"$gen_cast", {:task, _task}}, &1)) == 19
+      end)
+
+      send(listener, :continue)
+      assert_receive :closed
+      refute_receive {:got, _data}, 80
+    end
+
+    test "post_message on a closed channel raises InvalidStateError", %{name: name} do
+      channel = open(name)
+      assert :ok = BroadcastChannel.close(channel)
+
+      assert dom_exception("InvalidStateError", fn ->
+               BroadcastChannel.post_message(channel, "nothing")
+             end) == "The BroadcastChannel is closed."
+
+      # The Standard examines the closed state before the message.
+      dom_exception("InvalidStateError", fn -> BroadcastChannel.post_message(channel, self()) end)
+    end
+
+    test "each other function on a closed channel has no effect", %{name: name} do
+      channel = open(name)
+      callback = fn _event -> :ok end
+
+      assert :ok = BroadcastChannel.close(channel)
+      assert :ok = BroadcastChannel.close(channel)
+
+      assert BroadcastChannel.onmessage(channel, callback) == channel
+      assert BroadcastChannel.onmessage(channel) == nil
+      assert BroadcastChannel.add_event_listener(channel, "message", callback) == channel
+      assert BroadcastChannel.remove_event_listener(channel, "message", callback) == channel
+      assert BroadcastChannel.remove_event_listener(channel, "message", callback, true) == channel
+      assert {^channel, true} = BroadcastChannel.dispatch_event(channel, Web.Event.new("message"))
+    end
+
+    test "the processes stop, and the channel leaves its group", %{name: name} do
+      channel = open(name)
+      server = channel.address
+      listener = listener_pid(channel)
+      store = :sys.get_state(server).target.store
+      assert members(name) == [server]
+
+      BroadcastChannel.close(channel)
+
+      eventually(fn ->
+        not Process.alive?(server) and not Process.alive?(listener) and not Process.alive?(store)
+      end)
+
+      assert members(name) == []
+    end
+
+    test "the channel closes when its holder stops", %{name: name} do
+      test = self()
+
+      holder =
+        spawn(fn ->
+          send(test, {:channel, BroadcastChannel.new(name)})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:channel, channel}
+      assert members(name) == [channel.address]
+
+      Process.exit(holder, :kill)
+
+      eventually(fn -> not Process.alive?(channel.address) end)
+      eventually(fn -> members(name) == [] end)
+    end
+
+    test "a server that is killed leaves its group", %{name: name} do
+      sender = open(name)
+      receiver = listen(name, :got)
+
+      Process.exit(receiver.address, :kill)
+      eventually(fn -> members(name) == [sender.address] end)
+
+      assert :ok = BroadcastChannel.post_message(sender, "nobody")
+      refute_receive {:got, _data}, 30
+    end
+
+    test "Symbol.dispose closes the channel", %{name: name} do
+      channel = open(name)
+
+      assert :ok = Web.Symbol.Protocol.symbol(channel, Web.Symbol.dispose(), [])
+      dom_exception("InvalidStateError", fn -> BroadcastChannel.post_message(channel, 1) end)
+
+      assert :ok = Web.Symbol.Protocol.symbol(channel, Web.Symbol.async_dispose(), [])
+      assert :unsupported = Web.Symbol.Protocol.symbol(channel, Web.Symbol.iterator(), [])
     end
   end
 
-  defp legacy_raw_request(%BroadcastChannel{} = channel, body, timeout \\ 100) do
-    reply_ref = make_ref()
+  # ---------------------------------------------------------------------------
+  # The handle
+  # ---------------------------------------------------------------------------
 
-    send(
-      channel.address,
-      {:"$gen_call", {self(), reply_ref}, {:envelope, Envelope.new(channel.token, body)}}
-    )
+  describe "a handle" do
+    test "with a token that is not correct has no effect", %{name: name} do
+      sender = open(name)
+      _receiver = listen(name, :got)
+      forged = %{sender | token: make_ref()}
 
-    receive do
-      {^reply_ref, reply} -> reply
-    after
-      timeout -> flunk("expected legacy raw request reply")
+      dom_exception("InvalidStateError", fn -> BroadcastChannel.post_message(forged, "forged") end)
+
+      assert :ok = BroadcastChannel.close(forged)
+      assert BroadcastChannel.onmessage(forged) == nil
+      refute_receive {:got, _data}, 30
+
+      # The server ignores a message that it does not know.
+      send(sender.address, :unexpected)
+      send(sender.address, {:broadcast_channel_message, :not_a_payload})
+      GenServer.cast(sender.address, :unexpected)
+      assert GenServer.call(sender.address, :unexpected) == {:error, :detached}
+
+      assert GenServer.call(sender.address, {sender.token, :unexpected}) ==
+               {:error, :unknown_request}
+
+      BroadcastChannel.post_message(sender, "real")
+      assert_receive {:got, "real"}
+    end
+
+    test "can be used from a different process", %{name: name} do
+      sender = open(name)
+      _receiver = listen(name, :got)
+
+      Task.await(Task.async(fn -> BroadcastChannel.post_message(sender, "from a task") end))
+
+      assert_receive {:got, "from a task"}
     end
   end
 
-  defp legacy_raw_cast(%BroadcastChannel{} = channel, body) do
-    send(channel.address, {:"$gen_cast", {:envelope, Envelope.new(channel.token, body)}})
-    :ok
+  # ---------------------------------------------------------------------------
+  # Settings
+  # ---------------------------------------------------------------------------
+
+  describe "settings" do
+    test "the adapter is read when the channel is made", %{name: name} do
+      Application.put_env(:web, :broadcast_adapter_spy, self())
+      Application.put_env(:web, :broadcast_adapter, SpyAdapter)
+
+      channel = BroadcastChannel.new(name)
+      server = channel.address
+      assert_receive {:spy_join, ^name, ^server}
+
+      Application.delete_env(:web, :broadcast_adapter)
+
+      assert :ok = BroadcastChannel.post_message(channel, "by the adapter")
+
+      assert_receive {:spy_broadcast, ^name, ^server, {:broadcast_channel_message, payload}}
+      assert %{origin: "node://" <> _, record: record, snapshot: %Snapshot{}} = payload
+      assert StructuredData.deserialize(record) == "by the adapter"
+
+      assert :ok = BroadcastChannel.close(channel)
+      assert_receive {:spy_leave, ^name, ^server}
+    end
+
+    test "the governor limits post_message in the process that sends", %{name: name} do
+      Application.put_env(:web, :broadcast_governor, %SpyGovernor{pid: self()})
+
+      sender = open(name)
+      _receiver = listen(name, :got)
+
+      assert :ok = BroadcastChannel.post_message(sender, "limited")
+
+      assert_receive {:spy_governor, :acquire, ref}
+      assert_receive {:spy_governor, :release, ^ref}
+      assert_receive {:got, "limited"}
+      refute_received {:spy_governor, _event, _ref}
+    end
   end
 
-  defp malformed_legacy_raw_cast(%BroadcastChannel{} = channel, body) do
-    send(channel.address, {:"$gen_cast", {:envelope, body}})
-    :ok
+  # ---------------------------------------------------------------------------
+  # Properties
+  # ---------------------------------------------------------------------------
+
+  describe "properties" do
+    property "each open channel gets the messages of the others, in sequence" do
+      check all(
+              count <- integer(2..4),
+              posts <- list_of(integer(0..3), max_length: 30),
+              max_runs: 40
+            ) do
+        name = "property-#{System.unique_integer([:positive])}"
+        test = self()
+
+        channels =
+          for index <- 0..(count - 1) do
+            BroadcastChannel.onmessage(BroadcastChannel.new(name), fn event ->
+              send(test, {:got, index, event.data})
+            end)
+          end
+
+        posts =
+          posts
+          |> Enum.map(&rem(&1, count))
+          |> Enum.with_index()
+
+        Enum.each(posts, fn {sender, number} ->
+          BroadcastChannel.post_message(Enum.at(channels, sender), {sender, number})
+        end)
+
+        for receiver <- 0..(count - 1), sender <- 0..(count - 1), sender != receiver do
+          expected = for {^sender, number} <- posts, do: {sender, number}
+          assert collect(receiver, length(expected), sender) == expected
+        end
+
+        Enum.each(channels, &BroadcastChannel.close/1)
+        refute_received {:got, _receiver, _data}
+      end
+    end
+
+    property "a channel that closed gets nothing more, and the others continue" do
+      check all(
+              before <- list_of(integer(), max_length: 10),
+              later <- list_of(integer(), min_length: 1, max_length: 10),
+              max_runs: 40
+            ) do
+        name = "property-#{System.unique_integer([:positive])}"
+        sender = BroadcastChannel.new(name)
+        closing = BroadcastChannel.onmessage(BroadcastChannel.new(name), forward_data(:closing))
+        staying = BroadcastChannel.onmessage(BroadcastChannel.new(name), forward_data(:staying))
+
+        Enum.each(before, &BroadcastChannel.post_message(sender, &1))
+        for message <- before, do: assert_receive({:closing, ^message})
+
+        BroadcastChannel.close(closing)
+        Enum.each(later, &BroadcastChannel.post_message(sender, &1))
+
+        for message <- before ++ later, do: assert_receive({:staying, ^message})
+        refute_received {:closing, _data}
+
+        BroadcastChannel.close(sender)
+        BroadcastChannel.close(staying)
+      end
+    end
   end
 
-  defp await_data_clone_error(fun, attempts \\ 10)
+  # The messages that `receiver` got from `sender`, in their sequence.
+  defp collect(_receiver, 0, _sender), do: []
 
-  defp await_data_clone_error(_fun, 0), do: flunk("expected DataCloneError")
+  defp collect(receiver, count, sender) do
+    receive do
+      {:got, ^receiver, {^sender, _number} = data} ->
+        [data | collect(receiver, count - 1, sender)]
+    after
+      1_000 -> flunk("channel #{receiver} did not get #{count} messages of #{sender}")
+    end
+  end
 
-  defp await_data_clone_error(fun, attempts) do
-    assert_data_clone_error(fun)
-  rescue
-    ExUnit.AssertionError ->
-      Process.sleep(20)
-      await_data_clone_error(fun, attempts - 1)
+  # ---------------------------------------------------------------------------
+  # A cluster
+  # ---------------------------------------------------------------------------
+
+  describe "a cluster" do
+    @describetag :cluster
+
+    setup do
+      # The second node stops with the test process.
+      {_peer, node} = Web.TestCluster.start_peer()
+      {:ok, node: node}
+    end
+
+    test "a message goes to the channels of the other nodes", %{name: name, node: node} do
+      local = listen(name, :local)
+
+      # A process on the second node makes a channel, and sends back each
+      # message with the origin.
+      remote_holder = Web.TestCluster.start_channel(node, name, self())
+
+      assert_receive :remote_ready, 5_000
+      eventually(fn -> length(members(name)) == 2 end)
+
+      buffer = ArrayBuffer.new("bytes")
+      BroadcastChannel.post_message(local, %{"buffer" => buffer, key: :value})
+
+      local_origin = "node://" <> Atom.to_string(node())
+      assert_receive {:remote, %{"buffer" => remote_buffer, key: :value}, ^local_origin}, 5_000
+      assert remote_buffer.data == "bytes"
+
+      BroadcastChannel.post_message(local, "answer please")
+      assert_receive {:local, {"answer from", ^node}}, 5_000
+
+      # The channel of a node that stops leaves the group.
+      Process.exit(remote_holder, :kill)
+      eventually(fn -> members(name) == [local.address] end)
+    end
   end
 end

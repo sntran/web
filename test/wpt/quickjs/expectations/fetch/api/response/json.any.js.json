@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Ensure the correct JSON parser is used": "library: a JSON object is a map, which has no sequence of its keys"
+  }
+}

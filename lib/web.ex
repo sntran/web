@@ -3,7 +3,7 @@ defmodule Web do
   A Universal Fetch Library for Elixir.
 
   This module provides a Web-compliant Fetch API for Elixir, matching the WHATWG Fetch standard.
-  It supports zero-buffer streaming, abort signals, and an extensible dispatcher architecture.
+  It supports zero-buffer streaming and abort signals.
 
   ## The "Web-First" DSL
 
@@ -28,6 +28,8 @@ defmodule Web do
       :boom
   """
 
+  alias Web.Dispatcher.HTTP
+  alias Web.Dispatcher.TCP
   alias Web.Internal.StructuredData
   alias Web.TypeError
 
@@ -54,11 +56,14 @@ defmodule Web do
       alias Web.AbortSignal
       alias Web.ArrayBuffer
       alias Web.AsyncContext
+      alias Web.AsyncIterator
       alias Web.Blob
       alias Web.BroadcastChannel
+      alias Web.ByteLengthQueuingStrategy
       alias Web.CompressionStream
       alias Web.Console
       alias Web.CountingGovernor
+      alias Web.CountQueuingStrategy
       alias Web.CustomEvent
       alias Web.DecompressionStream
       alias Web.DOMException
@@ -67,16 +72,21 @@ defmodule Web do
       alias Web.FormData
       alias Web.Governor
       alias Web.Headers
+      alias Web.Iterator
       alias Web.MessageChannel
       alias Web.MessageEvent
       alias Web.MessagePort
       alias Web.Performance
+      alias Web.PerformanceObserver
+      alias Web.PerformanceObserverEntryList
       alias Web.Promise
       alias Web.ReadableByteStreamController
       alias Web.ReadableStream
+      alias Web.ReadableStreamAsyncIterator
       alias Web.ReadableStreamBYOBReader
       alias Web.ReadableStreamBYOBRequest
       alias Web.ReadableStreamDefaultController
+      alias Web.ReadableStreamDefaultReader
       alias Web.Request
       alias Web.Response
       alias Web.Socket
@@ -99,7 +109,10 @@ defmodule Web do
   end
 
   @doc """
-  Awaits a `Web.Promise` and returns its fulfilled value.
+  Waits for a `Web.Promise` and returns its value, as `await` of ECMAScript.
+
+  If the promise rejects, the calling process exits with the reason. A
+  value that is not a promise is returned with no change, as in ECMAScript.
 
   ## Examples
 
@@ -108,32 +121,58 @@ defmodule Web do
 
       iex> catch_exit(Web.await(Web.Promise.reject(:not_found)))
       :not_found
+
+      iex> Web.await(:not_a_promise)
+      :not_a_promise
   """
-  defmacro await(expr) do
-    quote do
-      case unquote(expr) do
-        %Web.Promise{task: task} ->
-          try do
-            Task.await(task, :infinity)
-          catch
-            :exit, {{:shutdown, reason}, {Task, :await, _details}} ->
-              exit(reason)
-
-            :exit, reason ->
-              exit(reason)
-          end
-
-        other ->
-          raise "await: unexpected result: #{inspect(other)}"
-      end
-    end
-  end
+  @spec await(term()) :: term()
+  def await(%Web.Promise{} = promise), do: Web.Promise.await(promise)
+  def await(value), do: value
 
   @doc """
-  Runs a block with a disposable resource and guarantees `:dispose` runs after.
+  Runs a block with a resource, and releases the resource at the end of the
+  block, as the `using` declaration of ECMAScript.
 
-  Supports `using resource <- expression do ... end`,
-  `using resource = expression do ... end`, and `using expression do ... end`.
+  The three forms are:
+
+      using resource <- expression do ... end
+      using resource = expression do ... end
+      using expression do ... end
+
+  The macro returns the value of the block.
+
+  ## Rules
+
+    * The value of the expression must be disposable, or `nil`. See
+      `Web.Symbol` for the disposable values. For each other value, the
+      macro raises `Web.TypeError` and does not run the block.
+    * A `nil` value has no disposal: the block runs.
+    * The resource is released also when the block raises, throws, or
+      exits. The value that the block threw is thrown again after the
+      disposal.
+    * When the disposal fails, its error is raised. When the block failed
+      too, the macro raises `Web.SuppressedError` with the two errors.
+    * A disposal that returns a `Web.Promise` is awaited.
+
+  For more than one resource, put one `using` in a different one. The
+  resources are then released in the opposite sequence.
+
+  ## Examples
+
+      iex> use Web
+      iex> channel =
+      ...>   using channel <- BroadcastChannel.new("example") do
+      ...>     BroadcastChannel.post_message(channel, %{status: "started"})
+      ...>     channel
+      ...>   end
+      iex> BroadcastChannel.post_message(channel, "after the block")
+      ** (Web.DOMException) The BroadcastChannel is closed.
+
+      iex> use Web
+      iex> using value <- 5 do
+      ...>   value
+      ...> end
+      ** (Web.TypeError) The value is not disposable: 5
   """
   defmacro using(binding, do: block) do
     build_using(binding, block, __CALLER__)
@@ -169,13 +208,56 @@ defmodule Web do
   end
 
   @doc """
-  Returns a structured clone of `value`.
+  Returns a structured clone of `value`, as `structuredClone()` of the HTML
+  Standard.
+
+  A `Web.MessagePort` and a `Web.BroadcastChannel` use the same algorithm
+  for each message.
+
+  ## The values that can be cloned
+
+  All data can be cloned: numbers, atoms, binaries, lists, tuples, maps, and
+  structs that have only data. An Elixir term cannot change, thus the clone
+  of such data is the same term.
+
+  A value that has an identity gets a new identity:
+
+    * a `Web.ArrayBuffer` and a `Web.Uint8Array`. A change of the clone,
+      such as a detach, does not change the source;
+    * a `Web.Blob` and a `Web.File`.
+
+  Two references to one of these values are two references to one new
+  value in the clone. A `Regex` is compiled again.
+
+  ## The values that cannot be cloned
+
+  The function raises `Web.DOMException` with the name `DataCloneError` for
+  a value that refers to something that runs: a pid, a port, a reference,
+  or a function. Thus a stream cannot be cloned. A `Web.Promise`, a
+  `Web.AbortSignal`, a `Web.AbortController`, a `Web.Request`, and a
+  `Web.Response` cannot be cloned in each of their states. A
+  `Web.MessagePort` can only be transferred.
+
+  ## Options
+
+    * `:transfer` - a list of `Web.ArrayBuffer` and `Web.MessagePort`
+      values to move, not to copy. The function detaches each one: the
+      clone has the bytes of a buffer, and a new handle to a port.
+
+  The function changes nothing when it raises.
 
   ## Examples
 
-      iex> clone = Web.structured_clone(%{"items" => [1, 2, 3]})
-      iex> clone
-      %{"items" => [1, 2, 3]}
+      iex> Web.structured_clone(%{status: :ok, items: [1, 2, {3, "four"}]})
+      %{status: :ok, items: [1, 2, {3, "four"}]}
+
+      iex> buffer = Web.ArrayBuffer.new("hello")
+      iex> clone = Web.structured_clone(buffer, transfer: [buffer])
+      iex> {to_string(clone), Web.ArrayBuffer.detached?(buffer)}
+      {"hello", true}
+
+      iex> Web.structured_clone(self())
+      ** (Web.DOMException) A pid cannot be cloned.
   """
   @spec structured_clone(term(), keyword()) :: term()
   def structured_clone(value, options \\ []) do
@@ -183,31 +265,82 @@ defmodule Web do
   end
 
   @doc """
-  Opens a capability-gated TCP or TLS socket.
+  Opens a TCP or TLS socket, as `connect(address, options)` of the Sockets
+  API of WinterTC.
+
+  `address` is a string `"host:port"`, or a `SocketAddress`: a map or a
+  keyword list with `:hostname` and `:port`. The options are the members
+  of `SocketOptions`: `:secure_transport` (`"off"`, the default, `"on"`,
+  or `"starttls"`), `:allow_half_open`, `:sni`, and `:alpn`. See
+  `Web.Socket` for each member and for the settings of the application. A
+  dictionary of Web IDL ignores each other member.
+
+  Raises a `SocketError` (a `Web.TypeError`) for an address or an option
+  that is not valid. The socket connects after the call: see the promise
+  `opened`.
   """
   @spec connect(String.t() | map() | keyword(), map() | keyword()) :: Web.Socket.t()
   def connect(address, options \\ %{}) do
-    Web.Socket.start_socket(self(), address, options)
+    Web.Socket.start_socket(self(), address, socket_options(options))
   end
 
-  @doc """
-  Initiates a network fetch.
+  # The members of `SocketOptions` that the library has.
+  defp socket_options(options) when is_list(options) or is_map(options) do
+    options |> Map.new() |> Map.take([:secure_transport, :allow_half_open, :sni, :alpn])
+  end
 
-  Matches the Javascript Fetch API standard.
+  defp socket_options(options), do: options
+
+  @doc """
+  Initiates a network fetch, as `fetch(input, init)` of the Fetch Standard.
 
   ## Parameters
-    - `input`: A string representing the URL, OR a pre-constructed `Web.Request` struct.
-    - `init`: A keyword list of options (ignored if `input` is already a Request struct).
+    - `input`: A string representing the URL, a `Web.URL`, OR a pre-constructed `Web.Request` struct.
+    - `init`: A keyword list of options, the members of `RequestInit`: see
+      `Web.Request.new/2`. Each option replaces the value of an input request.
       - `:method` (String.t | atom) - HTTP method (default: "GET").
       - `:headers` (Map.t | List.t | Web.Headers.t) - Request headers.
       - `:body` (any) - Request payload.
       - `:redirect` (`"follow" | "error" | "manual"`) - Redirect handling mode.
-      - `:signal` (`Web.AbortSignal.t()` | pid | reference) - Optional abort signal.
-      - `:dispatcher` (module) - Optional override for the request handler.
+      - `:signal` (`Web.AbortSignal.t()`) - Optional abort signal. Each other
+        value except `nil` gives a rejection with `Web.TypeError`.
+
+  ## The schemes
+
+  The steps "scheme fetch" of the Fetch Standard:
+
+    - `http:` and `https:` - an HTTP request on a pool of connections.
+    - `blob:` - the blob of a URL from `Web.URL.create_object_url/1`. A
+      `Range` header of one range gives the status 206 and the bytes of the
+      range.
+    - `about:` - `about:blank` gives the status 200, the header
+      `Content-Type: text/html;charset=utf-8`, and an empty body. Each
+      other `about:` URL gives a network error.
+    - `data:` - the steps "data: URL processor" give the body and the header
+      `Content-Type`: the MIME type of the URL, or
+      `text/plain;charset=US-ASCII`. The body is percent-decoded, and a
+      MIME type that ends with `;base64` gives the forgiving-base64 decode
+      of the body. A URL with no `,` or with a body that is not valid
+      base64 gives a network error.
+    - `file:` and each other scheme - a network error.
+
+  The library adds these schemes:
+
+    - `tcp:`, and an rclone URL such as `my_remote:host:port/path` (a
+      remote name with `_`) - a TCP connection to the host and the port. The
+      port 80 is the default. The request body goes to the peer, and the
+      response body has the bytes that the peer sends until it closes the
+      connection.
 
   ## Returns
     - `%Web.Promise{}` resolving to `Web.Response.t()` on success.
-    - The promise rejects with `reason` on failure.
+    - The function does not raise. Each failure is a rejection of the
+      promise:
+      - `Web.TypeError` for input that `Web.Request.new/2` refuses. The
+        function then makes no connection.
+      - The reason of the signal, when the signal aborts the request.
+      - `Web.TypeError` with the failure in the field `cause`, for each
+        network failure.
 
   ## Examples
 
@@ -221,85 +354,120 @@ defmodule Web do
   """
   @spec fetch(String.t() | Web.URL.t() | Web.Request.t(), keyword()) ::
           Web.Promise.t()
-  def fetch(input, init \\ [])
-
-  def fetch(%Web.Request{} = request, _init) do
+  def fetch(input, init \\ []) do
+    request = Web.Request.new(input, init)
+    :ok = Web.Request.ensure_body_usable!(request)
     Web.AbortSignal.check!(request.signal)
     fetch_request(request)
+  rescue
+    # Input that the `Request` constructor refuses gives a rejection, as the
+    # Fetch Standard specifies. The function makes no connection.
+    error in [TypeError] -> Web.Promise.reject(error)
   catch
     :throw, {:abort, reason} ->
       Web.Promise.reject(reason)
   end
 
-  def fetch(%Web.URL{} = input, init) do
-    fetch(Web.Request.new(input, init))
+  # The process of an HTTP or TCP request is the promise of `fetch`: see
+  # `Web.Dispatcher.RequestProcess`.
+  defp fetch_request(%Web.Request{dispatcher: dispatcher} = request)
+       when dispatcher in [nil, HTTP, TCP] do
+    module = dispatcher || Web.Resolver.resolve(request.url)
+    module.__start__(request, &fetch_error(&1, request))
   end
 
-  def fetch(input, init) when is_binary(input) do
-    fetch(Web.Request.new(input, init))
-  end
+  defp fetch_request(request), do: fetch_with_executor(request)
 
-  defp fetch_request(request) do
+  defp fetch_with_executor(request) do
     Web.Promise.new(fn resolve, reject ->
       try do
         case do_fetch_with_signal(request) do
           {:ok, response} -> resolve.(response)
-          {:error, reason} -> reject.(reason)
+          {:error, reason} -> reject.(fetch_error(reason, request))
         end
       catch
-        # coveralls-ignore-next-line
+        # A dispatcher throws this when the signal aborts the request.
         :throw, {:abort, reason} -> reject.(reason)
       end
     end)
   end
 
-  defp do_fetch_with_signal(%Web.Request{signal: %Web.AbortSignal{} = signal} = request) do
-    Web.AsyncContext.with_signal(signal, fn ->
-      do_fetch(request)
-    end)
+  # The Fetch Standard has two forms of rejection: the abort reason of the
+  # signal, and `TypeError` for each other failure. The field `cause` of the
+  # `TypeError` has the failure of the dispatcher.
+  # The signal of a request is a `Web.AbortSignal`: see `Web.Request.new/2`.
+  defp fetch_error(:aborted, %Web.Request{signal: signal}) do
+    Web.AbortSignal.reason(signal) || Web.AbortSignal.default_reason()
   end
 
-  defp do_fetch_with_signal(%Web.Request{} = request) do
-    do_fetch(request)
+  defp fetch_error(%Web.DOMException{} = error, _request), do: error
+  defp fetch_error(%TypeError{} = error, _request), do: error
+
+  defp fetch_error(reason, _request) do
+    TypeError.exception(message: "fetch failed" <> fetch_error_detail(reason), cause: reason)
   end
 
-  defp do_fetch(request) do
+  defp fetch_error_detail(:redirect_error), do: ": the redirect mode is \"error\""
+  defp fetch_error_detail(:too_many_redirects), do: ": too many redirects"
+
+  defp fetch_error_detail(:redirect_stream_body),
+    do: ": a redirect cannot send a stream body again"
+
+  defp fetch_error_detail(:redirect_unsupported_scheme),
+    do: ": the redirect URL must be HTTP or HTTPS"
+
+  defp fetch_error_detail(:redirect_invalid_location), do: ": the redirect URL is not valid"
+
+  defp fetch_error_detail({:scheme_not_supported, scheme}),
+    do: ": the library cannot fetch a URL with the scheme #{inspect(scheme)}"
+
+  defp fetch_error_detail(:about_url_not_blank), do: ": the only about: URL is about:blank"
+  defp fetch_error_detail(:data_url_not_valid), do: ": the data: URL is not valid"
+
+  defp fetch_error_detail(%{__exception__: true, reason: :timeout}),
+    do: ": the server did not answer in time"
+
+  defp fetch_error_detail(_reason), do: ""
+
+  # The streams that the dispatcher makes get the source of the signal of the
+  # request as their ambient signal: an abort puts them in the errored
+  # state. A signal that no abort can reach changes nothing.
+  defp do_fetch_with_signal(%Web.Request{signal: signal} = request) do
+    case Web.AbortSignal.__source__(signal) do
+      nil -> do_fetch(request)
+      source -> Web.AsyncContext.with_signal(source, fn -> do_fetch(request) end)
+    end
+  end
+
+  # A different dispatcher in the internal field `dispatcher` of the
+  # request. The field is not a part of the public API: the tests set it.
+  defp do_fetch(%Web.Request{dispatcher: dispatcher} = request) do
     Web.AbortSignal.check!(request.signal)
-
-    dispatcher =
-      request.dispatcher ||
-        Web.Resolver.resolve(request.url)
-
     dispatcher.fetch(request)
   end
 
   defp build_using({operator, _meta, [pattern, resource]}, block, caller)
        when operator in [:<-, :=] do
-    resource_var = Macro.unique_var(:using_resource, caller.module || __MODULE__)
-
-    quote do
-      unquote(resource_var) = unquote(resource)
-      unquote(pattern) = unquote(resource_var)
-
-      try do
-        unquote(block)
-      after
-        Web.Symbol.Protocol.symbol(unquote(resource_var), Web.Symbol.dispose(), [])
-      end
-    end
+    using_ast(pattern, resource, block, caller)
   end
 
   defp build_using(resource, block, caller) do
+    using_ast(quote(do: _), resource, block, caller)
+  end
+
+  # The match of the pattern is in the function: the resource is released
+  # also when the match fails.
+  defp using_ast(pattern, resource, block, caller) do
     resource_var = Macro.unique_var(:using_resource, caller.module || __MODULE__)
 
     quote do
       unquote(resource_var) = unquote(resource)
+      :ok = Web.Symbol.check_disposable!(unquote(resource_var))
 
-      try do
+      Web.Symbol.run_using(unquote(resource_var), fn ->
+        unquote(pattern) = unquote(resource_var)
         unquote(block)
-      after
-        Web.Symbol.Protocol.symbol(unquote(resource_var), Web.Symbol.dispose(), [])
-      end
+      end)
     end
   end
 
@@ -319,17 +487,39 @@ defmodule Web do
     |> :erlang.list_to_binary()
   end
 
+  defp base64_text?(<<char, rest::binary>>)
+       when char in ?A..?Z or char in ?a..?z or char in ?0..?9 or char in [?+, ?/, ?=],
+       do: base64_text?(rest)
+
+  defp base64_text?(<<>>), do: true
+  defp base64_text?(_text), do: false
+
+  # A "=", one character or more, and then a character that is not "=".
+  defp data_after_padding?(text) do
+    case :binary.match(text, "=") do
+      :nomatch ->
+        false
+
+      {index, 1} ->
+        tail_start = index + 2
+
+        tail_start < byte_size(text) and
+          binary_part(text, tail_start, byte_size(text) - tail_start) |> String.replace("=", "") !=
+            ""
+    end
+  end
+
   defp normalize_base64(string) do
-    trimmed = String.replace(string, ~r/[\t\n\f\r ]+/, "")
+    trimmed = :binary.replace(string, ["\t", "\n", "\f", "\r", " "], "", [:global])
 
     cond do
       trimmed == "" ->
         {:ok, ""}
 
-      Regex.match?(~r/[^A-Za-z0-9+\/=]/, trimmed) ->
+      not base64_text?(trimmed) ->
         {:error, :invalid}
 
-      Regex.match?(~r/=.+[^=]/, trimmed) ->
+      data_after_padding?(trimmed) ->
         {:error, :invalid}
 
       true ->

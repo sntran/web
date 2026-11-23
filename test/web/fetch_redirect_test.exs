@@ -207,11 +207,11 @@ defmodule Web.FetchRedirectTest do
 
     assert resp.status == 200
     assert resp.url == "http://localhost:#{port}/success"
-    assert Enum.to_list(resp.body) == ["success"]
+    assert Web.TestBytes.binaries(resp.body) == ["success"]
   end
 
   test "redirect loop stops after the fetch maximum", %{port: port} do
-    assert :too_many_redirects =
+    assert %Web.TypeError{cause: :too_many_redirects} =
              catch_exit(await(Web.fetch("http://localhost:#{port}/loop")))
   end
 
@@ -223,7 +223,7 @@ defmodule Web.FetchRedirectTest do
   end
 
   test "redirect error returns redirect_error", %{port: port} do
-    assert :redirect_error =
+    assert %Web.TypeError{cause: :redirect_error} =
              catch_exit(await(Web.fetch("http://localhost:#{port}/redir-301", redirect: "error")))
   end
 
@@ -238,7 +238,7 @@ defmodule Web.FetchRedirectTest do
       )
 
     assert resp.status == 200
-    assert Enum.to_list(resp.body) == ["GET:"]
+    assert Web.TestBytes.binaries(resp.body) == ["GET:"]
   end
 
   test "307 keeps method and body while following a relative location", %{port: port} do
@@ -253,10 +253,10 @@ defmodule Web.FetchRedirectTest do
 
     assert resp.status == 200
     assert resp.url == "http://localhost:#{port}/keep-method"
-    assert Enum.to_list(resp.body) == ["POST:payload"]
+    assert Web.TestBytes.binaries(resp.body) == ["POST:payload"]
   end
 
-  test "307 preserves a streaming request body through redirect follow", %{port: port} do
+  test "307 rejects a request body from a stream", %{port: port} do
     body =
       Web.ReadableStream.new(%{
         start: fn controller ->
@@ -266,53 +266,37 @@ defmodule Web.FetchRedirectTest do
         end
       })
 
-    resp =
-      await(
-        Web.fetch("http://localhost:#{port}/redir-relative",
-          method: "POST",
-          headers: %{"content-length" => "7"},
-          body: body
-        )
+    promise =
+      Web.fetch("http://localhost:#{port}/redir-relative",
+        method: "POST",
+        headers: %{"content-length" => "7"},
+        body: body,
+        duplex: "half"
       )
 
-    assert resp.status == 200
-    assert Enum.to_list(resp.body) == ["POST:payload"]
+    # A stream cannot be sent a second time.
+    assert %Web.TypeError{cause: :redirect_stream_body} = catch_exit(await(promise))
   end
 
   test "follow closes the previous response body before opening the next request", %{port: port} do
     resp = await(Web.fetch("http://localhost:#{port}/redirect-stream", redirect: "follow"))
 
-    assert Enum.to_list(resp.body) == ["success"]
+    assert Web.TestBytes.binaries(resp.body) == ["success"]
   end
 
-  test "308 preserves a streaming request body through redirect follow", %{port: port} do
-    body =
-      Web.ReadableStream.new(%{
-        start: fn controller ->
-          Web.ReadableStreamDefaultController.enqueue(controller, "pay")
-          Web.ReadableStreamDefaultController.enqueue(controller, "load")
-          Web.ReadableStreamDefaultController.close(controller)
-        end
-      })
-
+  test "308 sends a request body from memory again", %{port: port} do
     resp =
-      await(
-        Web.fetch("http://localhost:#{port}/redir-308",
-          method: "POST",
-          headers: %{"content-length" => "7"},
-          body: body
-        )
-      )
+      await(Web.fetch("http://localhost:#{port}/redir-308", method: "POST", body: "payload"))
 
     assert resp.status == 200
     assert_receive {:stream_target_body, "payload"}
-    assert Enum.to_list(resp.body) == ["POST:payload"]
+    assert Web.TestBytes.binaries(resp.body) == ["POST:payload"]
   end
 
   test "redirect with no location returns the original response", %{port: port} do
     resp = await(Web.fetch("http://localhost:#{port}/redir-no-location", redirect: "follow"))
 
     assert resp.status == 301
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
   end
 end

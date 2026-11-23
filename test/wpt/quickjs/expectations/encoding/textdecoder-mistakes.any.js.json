@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "EUC-JP JIS0212 state after a fatal streaming error": "standard: the current Standard changed this test",
+    "fatal stream: iso-2022-jp": "standard: the current Standard changed this test"
+  }
+}

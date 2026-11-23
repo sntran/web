@@ -1,0 +1,19 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Aborting a WritableStream before it starts should cause the writer's unsettled ready promise to reject": "runner: the library does the steps of a later microtask before the call returns",
+    "Aborting a WritableStream causes any outstanding write() promises to be rejected with the reason supplied": "runner: the library does the steps of a later microtask before the call returns",
+    "Aborting a WritableStream prevents further writes after any that are in progress": "runner: the library does the steps of a later microtask before the call returns",
+    "Aborting a WritableStream puts it in an errored state with the error passed to abort()": "runner: the library does the steps of a later microtask before the call returns",
+    "Closing but then immediately aborting a WritableStream causes the stream to error": "runner: the library does the steps of a later microtask before the call returns",
+    "WritableStream if sink's abort throws, the promise returned by multiple writer.abort()s is the same and rejects": "runner: the library does the steps of a later microtask before the call returns",
+    "controller.error(), writer.abort() while there is an in-flight close, and then finish the close": "runner: the promises settle in the sequence of their creation",
+    "controller.error(), writer.abort() while there is an in-flight write, and then finish the write": "runner: the promises settle in the sequence of their creation",
+    "promises returned from other writer methods should be rejected when writer abort() happens during sink start()": "runner: the library does the steps of a later microtask before the call returns",
+    "recursive close() call from abort() aborting signal (not started)": "runner: the library does the steps of a later microtask before the call returns",
+    "when calling abort() twice on the same stream, both should give the same promise that fulfills with undefined": "runner: the library does the steps of a later microtask before the call returns",
+    "writer.abort() while there is an in-flight write, and then finish the write with rejection": "runner: the promises settle in the sequence of their creation",
+    "writer.abort(), controller.error() while there is an in-flight close, and then finish the close": "runner: the promises settle in the sequence of their creation",
+    "writer.abort(), controller.error() while there is an in-flight write, and then finish the write": "runner: the promises settle in the sequence of their creation"
+  }
+}

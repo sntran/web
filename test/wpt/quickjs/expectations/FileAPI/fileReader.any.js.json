@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "FileReader States -- abort": "scope: the library has no FileReader",
+    "FileReader States -- events": "scope: the library has no FileReader",
+    "FileReader interface object": "library: a different result",
+    "no-argument FileReader constructor": "scope: the library has no FileReader"
+  }
+}

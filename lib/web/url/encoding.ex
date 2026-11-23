@@ -1,17 +1,67 @@
 defmodule Web.URL.Encoding do
   @moduledoc false
 
+  alias Web.Internal.Ascii
+
+  # Removes the C0 control characters and the spaces at the start and at the
+  # end. Raises `Web.TypeError` for a value that is not valid UTF-8.
   @spec trim_c0_whitespace(term()) :: String.t()
-  def trim_c0_whitespace(value) do
+  def trim_c0_whitespace(value), do: value |> to_string() |> valid_utf8!() |> trim_c0()
+
+  # `trim_c0_whitespace/1` for a binary that is valid UTF-8 already.
+  @spec trim_c0(binary()) :: binary()
+  def trim_c0(value) do
     value
-    |> to_string()
-    |> String.replace(~r/^[\x00-\x20]+|[\x00-\x20]+$/u, "")
+    |> Ascii.trim_leading(&c0_or_space?/1)
+    |> Ascii.trim_trailing(&c0_or_space?/1)
   end
 
+  defp c0_or_space?(char), do: char <= 0x20
+
+  # Removes each tab, line feed, and carriage return. Raises `Web.TypeError`
+  # for a value that is not valid UTF-8.
   @spec strip_ascii_tab_and_newline(term()) :: String.t()
   def strip_ascii_tab_and_newline(value) do
-    String.replace(to_string(value), ~r/[\x09\x0A\x0D]/u, "")
+    value |> to_string() |> valid_utf8!() |> strip_tab_newline()
   end
+
+  # `strip_ascii_tab_and_newline/1` for a binary that is valid UTF-8 already.
+  @spec strip_tab_newline(binary()) :: binary()
+  def strip_tab_newline(value) do
+    if tab_or_newline?(value),
+      do: :binary.replace(value, ["\t", "\n", "\r"], "", [:global]),
+      else: value
+  end
+
+  defp tab_or_newline?(<<char, _rest::binary>>) when char in [?\t, ?\n, ?\r], do: true
+  defp tab_or_newline?(<<_char, rest::binary>>), do: tab_or_newline?(rest)
+  defp tab_or_newline?(<<>>), do: false
+
+  @spec valid_utf8!(binary()) :: binary()
+  def valid_utf8!(value) do
+    if String.valid?(value),
+      do: value,
+      else: raise(Web.TypeError, "The URL is not valid UTF-8.")
+  end
+
+  # The type of a path segment: "." and ".." are dot segments, also when a
+  # dot is written as "%2e" or "%2E".
+  @spec dot_segment_type(String.t()) :: :single | :double | :none
+  def dot_segment_type(segment) do
+    case count_dots(segment, 0) do
+      1 -> :single
+      2 -> :double
+      _other -> :none
+    end
+  end
+
+  defp count_dots(<<>>, count), do: count
+  defp count_dots(<<?., rest::binary>>, count) when count < 2, do: count_dots(rest, count + 1)
+
+  defp count_dots(<<?%, ?2, e, rest::binary>>, count) when e in [?e, ?E] and count < 2,
+    do: count_dots(rest, count + 1)
+
+  defp count_dots(_segment, _count), do: 3
 
   @spec normalize_special_path_separators(term(), boolean()) :: String.t()
   def normalize_special_path_separators(value, false), do: to_string(value)

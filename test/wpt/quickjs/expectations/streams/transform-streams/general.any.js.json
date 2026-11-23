@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "methods should not not have .apply() or .call() called": "runner: the layer calls a callback with apply",
+    "terminate() should abort writable immediately after readable.cancel()": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

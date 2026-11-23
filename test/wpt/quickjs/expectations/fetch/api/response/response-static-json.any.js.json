@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Check response returned by static json() with input �": "runner: a JavaScript value for JSON",
+    "Check response returned by static json() with input ��": "runner: a JavaScript value for JSON",
+    "Check static json() encodes JSON objects correctly": "runner: a JavaScript value for JSON",
+    "Check static json() propagates JSON serializer errors": "runner: a JavaScript value for JSON"
+  }
+}

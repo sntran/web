@@ -105,8 +105,8 @@ defmodule Web.URLTest do
 
     {:ok, url}
   rescue
-    error in ArgumentError -> {:error, Exception.message(error)}
-    error -> {:error, inspect(error)}
+    # The URL Standard specifies a TypeError for a URL that is not valid.
+    error in Web.TypeError -> {:error, Exception.message(error)}
   end
 
   defp try_parse_url(_input, _base), do: {:error, "invalid input"}
@@ -121,8 +121,8 @@ defmodule Web.URLTest do
     assert_component_match!(url, test_case, "hostname", &URL.hostname/1)
     assert_component_match!(url, test_case, "port", &URL.port/1)
     assert_component_match!(url, test_case, "pathname", &URL.pathname/1)
-    assert_component_match!(url, test_case, "search", fn u -> normalize_search(URL.search(u)) end)
-    assert_component_match!(url, test_case, "hash", fn u -> normalize_fragment(URL.hash(u)) end)
+    assert_component_match!(url, test_case, "search", &URL.search/1)
+    assert_component_match!(url, test_case, "hash", &URL.hash/1)
     assert_component_match!(url, test_case, "origin", &URL.origin/1)
   end
 
@@ -141,32 +141,6 @@ defmodule Web.URLTest do
             message:
               "URL component [#{component}] mismatch: expected #{inspect(expected)}, got #{inspect(actual)}"
         end
-    end
-  end
-
-  defp normalize_search(search_str) do
-    # Normalize search string format
-    if String.starts_with?(search_str, "?") do
-      search_str
-    else
-      "?" <> search_str
-    end
-    |> case do
-      "?" -> ""
-      s -> s
-    end
-  end
-
-  defp normalize_fragment(fragment_str) do
-    # Normalize fragment format
-    if String.starts_with?(fragment_str, "#") do
-      fragment_str
-    else
-      "#" <> fragment_str
-    end
-    |> case do
-      "#" -> ""
-      f -> f
     end
   end
 
@@ -189,13 +163,13 @@ defmodule Web.URLTest do
   end
 
   defp apply_setter(url, "href", value), do: URL.href(url, value)
-  defp apply_setter(url, "protocol", value), do: URL.set_protocol(url, value)
-  defp apply_setter(url, "username", value), do: URL.set_username(url, value)
-  defp apply_setter(url, "password", value), do: URL.set_password(url, value)
-  defp apply_setter(url, "hostname", value), do: URL.set_hostname(url, value)
+  defp apply_setter(url, "protocol", value), do: URL.protocol(url, value)
+  defp apply_setter(url, "username", value), do: URL.username(url, value)
+  defp apply_setter(url, "password", value), do: URL.password(url, value)
+  defp apply_setter(url, "hostname", value), do: URL.hostname(url, value)
   defp apply_setter(url, "host", value), do: URL.host(url, value)
-  defp apply_setter(url, "port", value), do: URL.set_port(url, value)
-  defp apply_setter(url, "pathname", value), do: URL.set_pathname(url, value)
+  defp apply_setter(url, "port", value), do: URL.port(url, value)
+  defp apply_setter(url, "pathname", value), do: URL.pathname(url, value)
   defp apply_setter(url, "search", value), do: URL.search(url, value)
   defp apply_setter(url, "hash", value), do: URL.hash(url, value)
   defp apply_setter(url, _property, _value), do: url
@@ -203,6 +177,30 @@ defmodule Web.URLTest do
   # ============================================================================
   # Custom URL feature tests (NOT covered by WHATWG WPT)
   # ============================================================================
+
+  test "a scheme in upper case is changed to lower case, and the host stays" do
+    for {input, href} <- [
+          {"HTTPS://Example.COM:443/a/b?c=d#e", "https://example.com/a/b?c=d#e"},
+          {"Http://h/x", "http://h/x"},
+          {"HTTP://User:Pass@Host:8080/", "http://User:Pass@host:8080/"},
+          {"FOO://Host/P", "foo://Host/P"},
+          {"FILE:///C:/x", "file:///C:/x"},
+          {"Mailto:A@B", "mailto:A@B"}
+        ] do
+      assert URL.href(URL.new(input)) == href, input
+    end
+
+    assert URL.hostname(URL.new("HTTPS://Example.COM/")) == "example.com"
+  end
+
+  test "an IPv6 host with bytes after the bracket is not valid" do
+    for input <- ["http://[::1]x/", "foo://[::1]x/", "http://[::1]:x/", "foo://[]/"] do
+      assert_raise Web.TypeError, fn -> URL.new(input) end
+    end
+
+    assert URL.href(URL.new("http://[::1]:8080/")) == "http://[::1]:8080/"
+    assert URL.href(URL.new("foo://[::1]:8080/")) == "foo://[::1]:8080/"
+  end
 
   test "rclone style urls are parsed as protocol plus pathname" do
     url = URL.new("my_s3:bucket/file.txt?x=1#frag")
@@ -221,24 +219,81 @@ defmodule Web.URLTest do
     assert inspect(url) == ~s(#Web.URL<"https://example.com/path">)
   end
 
-  test "preserves empty but present authority, search, and hash markers" do
+  test "the href keeps an empty search and hash, and the getters give \"\" for them" do
     url = URL.new("sc://?#")
 
     assert URL.href(url) == "sc://?#"
-    assert URL.search(url) == "?"
-    assert URL.hash(url) == "#"
+    assert URL.search(url) == ""
+    assert URL.hash(url) == ""
+
+    for input <- ["https://example.com/a?#", "my_s3:bucket?#"] do
+      url = URL.new(input)
+
+      assert URL.href(url) == input
+      assert URL.search(url) == ""
+      assert URL.hash(url) == ""
+    end
   end
 
-  test "setters preserve empty but present search and hash markers" do
+  test "the setters of search and hash keep an empty search and hash in the href" do
     url =
-      "https://example.com/path"
+      "https://example.com/path?a=b#top"
       |> URL.new()
       |> URL.search("?")
       |> URL.hash("#")
 
     assert URL.href(url) == "https://example.com/path?#"
-    assert URL.search(url) == "?"
-    assert URL.hash(url) == "#"
+    assert URL.search(url) == ""
+    assert URL.hash(url) == ""
+
+    url = url |> URL.search("") |> URL.hash("")
+    assert URL.href(url) == "https://example.com/path"
+  end
+
+  test "new/2 and the setter of href raise Web.TypeError for a URL that is not valid" do
+    assert_raise Web.TypeError, "Invalid URL: relative URL without a base", fn ->
+      URL.new("/path")
+    end
+
+    assert_raise Web.TypeError, fn -> URL.new("/path", "not a base") end
+    assert_raise Web.TypeError, fn -> URL.new("https://exa mple.com/") end
+
+    url = URL.new("https://example.com/")
+    assert_raise Web.TypeError, fn -> URL.href(url, "https://[::1/") end
+    assert URL.href(URL.href(url, "https://example.org/a")) == "https://example.org/a"
+  end
+
+  test "parse/2 gives the URL of new/2, or nil for a URL that is not valid" do
+    assert URL.parse("https://example.com/a") == URL.new("https://example.com/a")
+    assert URL.href(URL.parse("b", "https://example.com/a/")) == "https://example.com/a/b"
+    assert URL.parse("b", URL.new("https://example.com/a/")) == URL.new("https://example.com/a/b")
+    assert URL.parse("/path") == nil
+    assert URL.parse("/path", "not a base") == nil
+    assert URL.parse("https://example.com/" <> <<0xFF>>) == nil
+  end
+
+  test "can_parse/2 tells if new/2 can parse the URL" do
+    assert URL.can_parse("https://example.com/")
+    assert URL.can_parse("b", "https://example.com/a/")
+    refute URL.can_parse("/path")
+    refute URL.can_parse("https://example.com:99999/")
+    refute URL.can_parse("/path", "https://[::1/")
+  end
+
+  test "to_json/1 gives the href" do
+    url = URL.new("https://user@example.com:8080/a?b#c")
+    assert URL.to_json(url) == URL.href(url)
+    assert URL.to_json(URL.new("sc://?#")) == "sc://?#"
+  end
+
+  test "an error in the setter of protocol and in a blob origin does not raise" do
+    url = URL.new("https://example.com/")
+
+    # The new protocol makes a URL that is not valid: the URL does not change.
+    file = URL.new("file:///test")
+    assert URL.protocol(file, "https") == file
+    assert URL.protocol(URL.protocol(url, "wss")) == "wss:"
+    assert URL.origin(URL.new("blob:not a url")) == "null"
   end
 
   test "search params integration: URLSearchParams can be mutated and reintegrated" do
@@ -280,7 +335,7 @@ defmodule Web.URLTest do
   test "non-special protocol setters preserve empty authority paths" do
     url = URL.new("foo://example.com/")
 
-    assert URL.href(URL.set_protocol(url, "bar")) == "bar://example.com"
+    assert URL.href(URL.protocol(url, "bar")) == "bar://example.com"
     assert URL.href(%URL{protocol: "foo:", pathname: "", kind: :standard}) == "foo:"
   end
 
@@ -300,37 +355,42 @@ defmodule Web.URLTest do
     assert updated_host.password == ""
     assert updated_host.port == ""
 
-    updated_hostname = URL.set_hostname(url, "")
+    updated_hostname = URL.hostname(url, "")
     assert updated_hostname.username == ""
     assert updated_hostname.password == ""
     assert updated_hostname.port == ""
   end
 
-  test "search and hash distinguish absent and empty values" do
-    assert URL.search(%URL{search: "", search_present?: false}) == ""
-    assert URL.hash(%URL{fragment: "", hash_present?: false}) == ""
+  test "search and hash give \"\" for an absent value and for an empty value" do
+    for search <- [nil, ""], fragment <- [nil, ""] do
+      url = %URL{search: search, fragment: fragment}
+      assert URL.search(url) == ""
+      assert URL.hash(url) == ""
+    end
   end
 
   test "file origins and path normalization cover file-specific branches" do
     assert URL.origin(URL.new("file:///tmp/test")) == "null"
-    assert URL.pathname(URL.set_pathname(URL.new("file:///c:/dir"), "/c:/..")) == "/c:/"
+    assert URL.pathname(URL.pathname(URL.new("file:///c:/dir"), "/c:/..")) == "/c:/"
 
-    assert URL.pathname(URL.set_pathname(%URL{protocol: "file:", kind: :standard}, "C|")) ==
+    assert URL.pathname(URL.pathname(%URL{protocol: "file:", kind: :standard}, "C|")) ==
              "/C:"
 
-    assert URL.pathname(URL.set_pathname(URL.new("file://example.com"), "drive")) == "/drive"
+    assert URL.pathname(URL.pathname(URL.new("file://example.com"), "drive")) == "/drive"
 
-    assert URL.pathname(URL.set_pathname(%URL{protocol: "file:", kind: :standard}, "drive")) ==
+    assert URL.pathname(URL.pathname(%URL{protocol: "file:", kind: :standard}, "drive")) ==
              "/drive"
 
-    assert URL.pathname(URL.set_pathname(URL.new("http://example.com/path"), "")) == "/"
+    assert URL.pathname(URL.pathname(URL.new("http://example.com/path"), "")) == "/"
   end
 
   test "port setters handle nil and integer inputs" do
     url = URL.new("http://example.com")
 
-    assert URL.port(URL.set_port(url, nil)) == ""
-    assert URL.port(URL.set_port(url, 8080)) == "8080"
+    # `nil` is the text "null", which has no port number.
+    assert URL.port(URL.port(url, nil)) == ""
+    assert URL.port(URL.port(url, 8080)) == "8080"
+    assert URL.port(URL.port(URL.port(url, 8080), nil)) == "8080"
   end
 
   test "parser handles opaque bases, invalid bases, and url struct bases" do

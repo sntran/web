@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "filereader_readystate": "scope: the library has no FileReader"
+  }
+}

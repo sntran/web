@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "writer.write() promises should resolve in the standard order": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

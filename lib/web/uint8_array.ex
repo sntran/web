@@ -1,6 +1,29 @@
 defmodule Web.Uint8Array do
   @moduledoc """
-  WHATWG-style immutable Uint8Array view over an ArrayBuffer.
+  An immutable `Uint8Array` view of a part of a `Web.ArrayBuffer`.
+
+  A view does not copy the bytes of its buffer. `to_string/1` gives the
+  bytes of the view as a binary. It raises `Web.TypeError` when the buffer
+  is detached.
+
+  ## Chunks of bytes
+
+  Each stream of bytes of this library gives its chunks as `Web.Uint8Array`
+  values, as the Web standards specify: the body of a request or a response,
+  `Web.Blob.stream/1`, the readable side of a socket, of a compression
+  stream, and of `Web.TextEncoderStream`, and a default read of a byte
+  stream. Use `to_string/1` to get the binary of a chunk:
+
+      iex> response = Web.Response.new("hello")
+      iex> Enum.map(response.body, &to_string/1)
+      ["hello"]
+
+  To get all the bytes of a body, use the functions of the body:
+  `Web.Response.text/1`, `Web.Response.bytes/1`, or
+  `Web.Response.array_buffer/1`.
+
+  Each consumer of bytes of this library accepts a binary, a
+  `Web.Uint8Array`, or a `Web.ArrayBuffer`.
 
   ## Examples
 
@@ -8,7 +31,7 @@ defmodule Web.Uint8Array do
       iex> uint8 = Web.Uint8Array.new(buffer, 1, 3)
       iex> uint8.byte_length
       3
-      iex> Web.Uint8Array.to_binary(uint8)
+      iex> to_string(uint8)
       "ell"
   """
 
@@ -36,6 +59,39 @@ defmodule Web.Uint8Array do
 
     build_view(buffer, offset, byte_length)
   end
+
+  @doc """
+  The constant `Uint8Array.BYTES_PER_ELEMENT` of ECMAScript (1): the size
+  of one element in bytes.
+
+  ## Examples
+
+      iex> Web.Uint8Array.bytes_per_element()
+      1
+  """
+  @spec bytes_per_element() :: 1
+  def bytes_per_element, do: 1
+
+  @doc """
+  Makes a `Uint8Array` with a new buffer that has the given bytes.
+
+  The bytes are a binary, iodata, a `Web.ArrayBuffer`, or a
+  `Web.Uint8Array`.
+
+  ## Examples
+
+      iex> bytes = Web.Uint8Array.from("hello")
+      iex> {bytes.byte_length, to_string(bytes)}
+      {5, "hello"}
+
+      iex> Web.Uint8Array.from([104, "i"]) |> to_string()
+      "hi"
+  """
+  @spec from(iodata() | ArrayBuffer.t() | t()) :: t()
+  def from(bytes) when is_binary(bytes), do: bytes |> ArrayBuffer.new() |> new()
+  def from(bytes) when is_list(bytes), do: bytes |> IO.iodata_to_binary() |> from()
+  def from(%ArrayBuffer{} = buffer), do: buffer |> ArrayBuffer.data() |> from()
+  def from(%__MODULE__{} = view), do: view |> to_binary() |> from()
 
   defp ensure_attached!(buffer) do
     if ArrayBuffer.detached?(buffer) do
@@ -69,12 +125,34 @@ defmodule Web.Uint8Array do
   @spec identity(t()) :: reference() | nil
   def identity(%__MODULE__{} = uint8_array), do: uint8_array.id
 
-  @doc """
-  Returns the binary represented by this Uint8Array view.
-  """
+  @doc false
+  # The bytes of the view. A caller of the library uses `to_string/1`: see
+  # the implementation of `String.Chars`.
   @spec to_binary(t()) :: binary()
   def to_binary(%__MODULE__{buffer: buffer, byte_offset: offset, byte_length: len}) do
     data = ArrayBuffer.data(buffer)
     binary_part(data, offset, len)
+  end
+end
+
+defimpl String.Chars, for: Web.Uint8Array do
+  # The bytes of the view, as a binary. A detached buffer raises
+  # `Web.TypeError`.
+  def to_string(view), do: Web.Uint8Array.to_binary(view)
+end
+
+defimpl Inspect, for: Web.Uint8Array do
+  import Inspect.Algebra
+
+  # A short form, because each chunk of a stream of bytes is a view:
+  # `#Web.Uint8Array<"hello">`. The usual limits of `inspect/2` apply to the
+  # bytes.
+  def inspect(%Web.Uint8Array{buffer: buffer} = view, opts) do
+    bytes =
+      if Web.ArrayBuffer.detached?(buffer),
+        do: "detached",
+        else: to_doc(Web.Uint8Array.to_binary(view), opts)
+
+    concat(["#Web.Uint8Array<", bytes, ">"])
   end
 end

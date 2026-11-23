@@ -1,0 +1,19 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Appending a path should cause XHR to fail": "scope: the library has no XMLHttpRequest",
+    "Appending a query string should cause XHR to fail": "scope: the library has no XMLHttpRequest",
+    "Blob URLs can be used in XHR": "scope: the library has no XMLHttpRequest",
+    "Only exact matches should revoke URLs, using XHR": "scope: the library has no XMLHttpRequest",
+    "Revoke blob URL after open(), will fetch": "scope: the library has no XMLHttpRequest",
+    "XHR of a revoked URL should fail": "scope: the library has no XMLHttpRequest",
+    "XHR should return Content-Type from Blob": "scope: the library has no XMLHttpRequest",
+    "XHR with a fragment should succeed": "scope: the library has no XMLHttpRequest",
+    "XHR with method \"CUSTOM\" should fail": "scope: the library has no XMLHttpRequest",
+    "XHR with method \"DELETE\" should fail": "scope: the library has no XMLHttpRequest",
+    "XHR with method \"HEAD\" should fail": "scope: the library has no XMLHttpRequest",
+    "XHR with method \"OPTIONS\" should fail": "scope: the library has no XMLHttpRequest",
+    "XHR with method \"POST\" should fail": "scope: the library has no XMLHttpRequest",
+    "XHR with method \"PUT\" should fail": "scope: the library has no XMLHttpRequest"
+  }
+}

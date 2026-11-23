@@ -1,0 +1,13 @@
+{
+  "harness": "OK",
+  "failures": {
+    "RequestCache \"default\" mode checks the cache for previously cached content and avoids going to the network if a fresh response exists with Etag and fresh response": "runner: no server of WPT",
+    "RequestCache \"default\" mode checks the cache for previously cached content and avoids going to the network if a fresh response exists with Last-Modified and fresh response": "runner: no server of WPT",
+    "RequestCache \"default\" mode checks the cache for previously cached content and goes to the network for stale responses with Etag and stale response": "runner: no server of WPT",
+    "RequestCache \"default\" mode checks the cache for previously cached content and goes to the network for stale responses with Last-Modified and stale response": "runner: no server of WPT",
+    "Responses with the \"Cache-Control: no-store\" header are not stored in the cache with Etag and fresh response": "runner: no server of WPT",
+    "Responses with the \"Cache-Control: no-store\" header are not stored in the cache with Etag and stale response": "runner: no server of WPT",
+    "Responses with the \"Cache-Control: no-store\" header are not stored in the cache with Last-Modified and fresh response": "runner: no server of WPT",
+    "Responses with the \"Cache-Control: no-store\" header are not stored in the cache with Last-Modified and stale response": "runner: no server of WPT"
+  }
+}

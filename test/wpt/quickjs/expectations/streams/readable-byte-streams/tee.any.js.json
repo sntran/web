@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "ReadableStream teeing with byte source: respond() and close() while both branches are pulling": "runner: the library reacts before the microtasks of JavaScript"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "harness": "OK",
+  "failures": {
+    "A new read in a load handler suppresses the old read loadend": "scope: the library has no FileReader",
+    "A new read in an abort handler before loadstart suppresses the old read": "scope: the library has no FileReader",
+    "A new read in an abort handler suppresses the old read loadend": "scope: the library has no FileReader",
+    "test FileReader InvalidStateError exception for readAsArrayBuffer": "scope: the library has no FileReader",
+    "test FileReader InvalidStateError exception for readAsDataURL": "scope: the library has no FileReader",
+    "test FileReader InvalidStateError exception for readAsText": "scope: the library has no FileReader",
+    "test FileReader InvalidStateError exception in onloadstart event for readAsArrayBuffer": "scope: the library has no FileReader",
+    "test FileReader no InvalidStateError exception in loadend event handler for readAsArrayBuffer": "scope: the library has no FileReader",
+    "test abort and restart in onloadstart event for readAsText": "scope: the library has no FileReader"
+  }
+}

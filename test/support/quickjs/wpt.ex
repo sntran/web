@@ -1,0 +1,562 @@
+defmodule Web.Test.QuickJS.WPT do
+  @moduledoc false
+
+  # The expected results of the files of web-platform-tests that QuickJS
+  # runs against the library: see `Web.Test.QuickJS.Bridge`.
+  #
+  # The file `test/wpt/quickjs/expectations/<path of the test>.json` lists
+  # each test that does not pass, with the group of its cause. A test that is
+  # not in the list must pass. A test in the list that passes is also an
+  # error: remove it from the list, as the library now follows the Standard.
+  # The exception is a test with a group of `@unstable`: its result can
+  # change from run to run, thus it can pass or fail, and it stays in the
+  # list.
+  #
+  # With the environment variable `WPT_UPDATE=1`, a run writes the lists
+  # again from its results.
+
+  alias Web.Test.QuickJS.Bridge
+
+  @root Path.expand("../../wpt/quickjs/expectations", __DIR__)
+  @newer_standard "standard: the current Standard changed this test"
+  @microtask "runner: the library does the steps of a later microtask before the call returns"
+  @creation_order "runner: the promises settle in the sequence of their creation"
+  @new_error "runner: an error of the library is a new object each time"
+
+  # The groups of the tests whose result can change from run to run, for a
+  # cause that the runner cannot remove. Such a test can pass or fail.
+  @real_time "runner: a timer of the library runs in real time between two statements of JavaScript"
+  @slow_calls "runner: each call waits until the library is at rest, and the test allows 200 ms for some calls"
+  @deferred_race "runner: a deferred call of the layer and the next statement of JavaScript race"
+  @slow_marks "runner: each call waits until the library is at rest, and the test allows 20 ms between two calls"
+  @unstable [@real_time, @slow_calls, @deferred_race, @slow_marks]
+
+  @doc "Runs the WPT file at `path`, and compares the results with the list."
+  def check!(path) do
+    run = Bridge.run!(path)
+
+    if System.get_env("WPT_UPDATE") in ["1", "true"] do
+      write!(path, run)
+    else
+      compare!(path, run)
+    end
+  end
+
+  defp compare!(path, run) do
+    expected = read(path)
+
+    problems =
+      harness_problem(expected, run) ++
+        for name <- run.order,
+            {status, message} = run.results[name],
+            problem = problem(name, status, message, expected["failures"]),
+            do: problem
+
+    if problems != [] do
+      raise ExUnit.AssertionError,
+        message:
+          "#{length(problems)} results of #{path} differ from #{relative(file(path))}:\n" <>
+            Enum.join(Enum.take(problems, 20), "\n") <> "\n" <> log(run)
+    end
+
+    :ok
+  end
+
+  defp harness_problem(expected, run) do
+    if run.status == Map.get(expected, "harness", "OK"),
+      do: [],
+      else: ["  the harness: #{run.status} #{run.message}"]
+  end
+
+  defp problem(name, "PASS", _message, failures) do
+    if Map.has_key?(failures, name) and failures[name] not in @unstable,
+      do: "  passes now, remove it from the list: #{name}",
+      else: nil
+  end
+
+  defp problem(name, status, message, failures) do
+    if Map.has_key?(failures, name),
+      do: nil,
+      else: "  #{status}: #{name}: #{message}"
+  end
+
+  defp log(%{log: ""}), do: ""
+  defp log(%{log: log}), do: "The output of QuickJS:\n" <> String.slice(log, 0, 2_000)
+
+  defp read(path) do
+    case File.read(file(path)) do
+      {:ok, text} -> JSON.decode!(text)
+      {:error, :enoent} -> %{"harness" => "OK", "failures" => %{}}
+    end
+  end
+
+  # The list has one line for each test, in the sequence of the names: a
+  # change of the library shows as a small change of the file.
+  defp write!(path, run) do
+    # A test with an unstable result is in the list also when it passes.
+    failures =
+      for name <- run.order,
+          {status, message} = run.results[name],
+          cause = cause(path, name, message),
+          status != "PASS" or cause in @unstable do
+        {name, cause}
+      end
+
+    target = file(path)
+
+    if failures == [] and run.status == "OK" do
+      _ = File.rm(target)
+    else
+      lines =
+        failures
+        |> Enum.uniq_by(&elem(&1, 0))
+        |> Enum.sort()
+        |> Enum.map_join(",\n", fn {name, cause} ->
+          "    #{JSON.encode!(name)}: #{JSON.encode!(cause)}"
+        end)
+
+      File.mkdir_p!(Path.dirname(target))
+
+      File.write!(target, """
+      {
+        "harness": #{JSON.encode!(run.status)},
+        "failures": {
+      #{lines}
+        }
+      }
+      """)
+    end
+
+    :ok
+  end
+
+  defp file(path), do: Path.join(@root, path <> ".json")
+  defp relative(path), do: Path.relative_to(path, File.cwd!())
+
+  @doc """
+  The group of the cause of a failure, from the path of the test, its name,
+  and its message. The groups that start with `runner:` are things that the
+  runner does not have yet. The groups that start with `library:` are
+  differences of the library from the Standard. The group `standard:` is
+  for a test of the pinned WPT commit that the current Standard changed.
+  The group `scope:` is for a test of an API that the library will not
+  have.
+  """
+  def cause(path, name, message) do
+    message = message || ""
+    Enum.find_value(causes(), "library: a different result", &match(&1, path, name, message))
+  end
+
+  @no_view_type "scope: the library has only Uint8Array views"
+  @no_guard "scope: a server runtime has no guard for forbidden headers"
+  @no_microtask "runner: the library reacts before the microtasks of JavaScript"
+  @empty_form "standard: RFC 7578 and each browser give the close delimiter for an empty form"
+
+  # The rules, in their sequence: the first rule that gives a group wins.
+  defp causes do
+    [
+      # The read of next() makes the stream pull again. In JavaScript the
+      # pull runs before read() returns. In the runner, the call of that
+      # pull is deferred, and does not hold the answer of the read: the
+      # cancel of return() can come first. On a busy machine, the pull
+      # sometimes comes first (2 to 3 runs of 40, also before round 5). The
+      # same race is in the variant with no await.
+      {:test, "streams/readable-streams/async-iterator.any.js",
+       ~r/^next\(\) that succeeds; return\(\)( \[no awaiting\])?$/, @deferred_race},
+      # The views of the library are `Web.Uint8Array` values. A BYOB read
+      # into a view with elements of more than one byte, or into a
+      # `DataView`, needs a view type of that kind.
+      {:test, "streams/readable-byte-streams/general.any.js", ~r/Uint16Array|Uint32Array/,
+       @no_view_type},
+      {:test, "streams/readable-byte-streams/read-min.any.js", ~r/Uint16Array|DataView/,
+       @no_view_type},
+      # These two tests read into a `Uint16Array` and a `BigUint64Array`, but
+      # their names do not tell it. With a byte view, the first read fills
+      # its view with one byte, and the byobRequest of the pull is null. The
+      # second test checks the type of the view of the result.
+      {:test, "streams/readable-byte-streams/general.any.js",
+       "ReadableStream with byte source: cancel() with partially filled pending pull() request",
+       @no_view_type},
+      {:test, "streams/readable-byte-streams/patched-global.any.js",
+       "Patched then() sees byobRequest after filling all pending pull-into descriptors",
+       @no_view_type}
+    ] ++
+      microtask_causes() ++
+      file_api_dom_causes() ++ fetch_abort_causes() ++ performance_causes() ++ base_causes()
+  end
+
+  # The rules of the files of the Performance Timeline and of User Timing.
+  defp performance_causes do
+    observer_task =
+      "runner: the library runs the task of an observer before the call that queued it returns"
+
+    nil_detail = "runner: nil is undefined in JavaScript, and an entry with no detail has null"
+
+    [
+      # These tests allow 20 ms between a mark and the call of `now()` after
+      # it. Each call waits until the processes of the run are at rest: on a
+      # busy machine, the two calls took 60 ms. In a browser, the calls take
+      # no time.
+      {:test, "user-timing/mark.any.js", ~r/^Entry \d+ startTime is approximately correct/,
+       @slow_marks},
+      # The library runs the task of an observer in the callback process of
+      # the global object, after the call that made the entry. The runner
+      # answers a call when the library is at rest: the callback ran then,
+      # before the next statement of JavaScript, with the entries that came
+      # before it. In a browser, the task runs after the script, thus the
+      # next statements can take the entries, or disconnect the observer.
+      {:test, "performance-timeline/po-disconnect.any.js",
+       ~r/^(An observer disconnected after a mark must not have its callback invoked|Entries queued before disconnect\(\) are not delivered after re-observing)$/,
+       observer_task},
+      {:test, "performance-timeline/po-entries-sort.any.js",
+       "getEntries, getEntriesByType, getEntriesByName sort order", observer_task},
+      {:test, "performance-timeline/po-takeRecords.any.js",
+       "Test PerformanceObserver's takeRecords()", observer_task},
+      # The layer calls a JavaScript function with no `this` value. The
+      # Standard gives the observer as the `this` value of its callback.
+      {:test, "performance-timeline/po-observe.any.js",
+       "Check observer callback parameter and this values",
+       "runner: the layer calls a callback with no this value"},
+      # The layer makes a new array at each read of a `FrozenArray`.
+      {:test, "performance-timeline/supportedEntryTypes.any.js",
+       "supportedEntryTypes caches result", "runner: a FrozenArray is a new array at each read"},
+      # An entry with no detail has the detail `nil`: the bridge gives it to
+      # JavaScript as `undefined`. The Standard gives `null`.
+      {:test, "user-timing/mark-l3.any.js",
+       "mark entries' detail and startTime are customizable.", nil_detail},
+      {:test, "user-timing/measure-with-dict.any.js",
+       "measure entries' detail and start/end are customizable", nil_detail},
+      {:test, "user-timing/structured-serialize-detail.any.js",
+       ~r/the detail is not provided, just return a null value/, nil_detail},
+      # A JavaScript object goes to the library as a reference. The library
+      # cannot clone it, and cannot see a `Symbol` in it.
+      {:test, "user-timing/structured-serialize-detail.any.js",
+       ~r/structured-clone|is cloned|cannot be structured-serialized/,
+       "runner: a JavaScript object goes to the library as a reference, which it cannot clone"},
+      # The runner loads the scripts of a test from their files, with no
+      # fetch: the page has no "resource" entry.
+      {:test, "performance-timeline/case-sensitivity.any.js",
+       ~r/^getEntriesBy(Type|Name) values are case sensitive$/,
+       "runner: the scripts of a test load with no fetch, thus with no resource entry"},
+      # The library has no Resource Timing: a fetch makes no "resource"
+      # entry, and `performance` has no `setResourceTimingBufferSize()`.
+      {:path, "performance-timeline/droppedentriescount.any.js", "library: no Resource Timing"}
+    ]
+  end
+
+  # The rules of the files of `fetch/api/abort/`. The `fetch` of the runner
+  # reads a file of WPT next to the test, and makes a response with the
+  # `Response` constructor: it does not use the signal or the body of the
+  # request. Thus the steps of `fetch` for an aborted signal, and the
+  # disturb of the body of the request, are not in these tests. The other
+  # tests of the files examine the signal of a request.
+  defp fetch_abort_causes do
+    runner_fetch =
+      "runner: the fetch of the runner does not use the signal or the body of a request"
+
+    [
+      {:test, "fetch/api/abort/general.any.js",
+       ~r/^(Aborting rejects with (AbortError|abort reason)( when aborted after fetch\(\) called)?|Signal on request object.*|Signal retained after unrelated properties are overridden by fetch|Already aborted signal rejects immediately|Request is still 'used' if signal is aborted before fetching|response\.\w+\(\) rejects (with abort reason )?if already aborted|Call text\(\) twice on aborted response|Readable stream synchronously cancels with AbortError if aborted before reading)$/,
+       runner_fetch},
+      {:test, "fetch/api/abort/request.any.js", ~r/on an aborted consumed nonempty request$/,
+       runner_fetch}
+    ]
+  end
+
+  # The rules of the File API, of `FormData`, and of the DOM Standard.
+  defp file_api_dom_causes do
+    [
+      # The timers of the library run in real time, also while JavaScript
+      # runs: a short timeout can end before the next statement of the test,
+      # for example before the statement that sets `onabort`. In a browser,
+      # a timer fires only after the statements of the current task.
+      {:test, "dom/abort/timeout.any.js", ~r/./, @real_time},
+      {:test, "dom/abort/abort-signal-any.any.js", ~r/AbortSignal\.timeout\(\)/, @real_time},
+      # These tests allow 200 ms between the set of a blob, which gives the
+      # file its `lastModified`, and `Date.now()` some calls later. Each call
+      # waits until the processes of the run are at rest: on a busy machine,
+      # the calls took up to 858 ms. In a browser, the calls take no time.
+      {:test, "xhr/formdata/set-blob.any.js", ~r/^(blob|file without lastModified)/, @slow_calls},
+      # The global object of the runner is not an `EventTarget`.
+      {:test, "dom/events/EventTarget-removeEventListener.any.js",
+       "removing a null event listener should succeed",
+       "runner: the global object is not an EventTarget"},
+      # A library has no document, thus no origin: the origin of a blob URL
+      # is opaque, its serialization is "null". The test expects the origin
+      # of the page of WPT.
+      {:test, "FileAPI/url/url-format.any.js", ~r/origin|parses correctly/,
+       "scope: a library has no document, thus a blob URL has an opaque origin"},
+      # The URL parser of the Standard resolves the blob URL entry of a
+      # `blob:` URL, thus a `Request` keeps the blob also after a revoke.
+      # `Web.URL` and `Web.Request` do not keep it: the dispatcher reads the
+      # store when the fetch starts.
+      {:test, "FileAPI/url/url-with-fetch.any.js", ~r/^Revoke blob URL after creating Request/,
+       "library: a Request does not keep the blob of its blob URL"}
+    ]
+  end
+
+  # The Streams Standard reacts to the end of `start` and of `pull`, and to
+  # a chunk of a tee, in a microtask. The library reacts at once, and the
+  # bridge answers when the library is at rest. Thus in these tests the
+  # library pulls before the next statement of JavaScript, or a cancel of
+  # JavaScript comes after a pull that the Standard does later.
+  defp microtask_causes do
+    for {path, names} <- [
+          {"streams/readable-byte-streams/general.any.js",
+           [
+             "Automatic pull() after start() and read()",
+             "Automatic pull() after start() and read(view)",
+             "autoAllocateChunkSize",
+             "Respond to pull() by enqueue() asynchronously",
+             "Respond to multiple pull() by separate enqueue()",
+             "getReader(), read(view), then cancel()",
+             "read() twice, then enqueue() twice",
+             "Multiple read(view), close() and respond()",
+             "Multiple read(view), big enqueue()",
+             "Multiple read(view) and multiple enqueue()"
+           ]},
+          {"streams/readable-byte-streams/read-min.any.js",
+           [
+             "getReader(), read({ min }), then cancel()",
+             "cancel() with partially filled pending read({ min }) request"
+           ]},
+          {"streams/readable-byte-streams/tee.any.js",
+           ["respond() and close() while both branches are pulling"]}
+        ],
+        name <- names do
+      prefix =
+        if String.ends_with?(path, "tee.any.js"),
+          do: "ReadableStream teeing with byte source: ",
+          else: "ReadableStream with byte source: "
+
+      {:test, path, prefix <> name, @no_microtask}
+    end ++
+      [
+        {:test, "streams/readable-byte-streams/respond-after-enqueue.any.js",
+         "byobRequest.respond() after enqueue() with double read should not crash",
+         @no_microtask},
+        {:test, "streams/readable-streams/async-iterator.any.js",
+         ~r/^next\(\) that succeeds; return\(\)|^return\(\); next\(\) with delayed cancel\(\) \[no awaiting\]/,
+         @no_microtask},
+        # A getter `then` on `Object.prototype` runs in a reaction of the
+        # runner, during the answer of a request.
+        {:text, ["came during the request"], "runner: a request in a getter of Object.prototype"}
+      ]
+  end
+
+  defp base_causes do
+    [
+      # The Encoding Standard now starts a new decoder after a fatal error
+      # ("Set this's do not flush to false"). These tests expect the state
+      # of the decoder after the error.
+      {:test, "encoding/textdecoder-mistakes.any.js",
+       "EUC-JP JIS0212 state after a fatal streaming error", @newer_standard},
+      {:test, "encoding/textdecoder-mistakes.any.js", "fatal stream: iso-2022-jp",
+       @newer_standard},
+      # The library does at once the steps that JavaScript does in a later
+      # microtask, for example the start of a stream or the end of a write.
+      # The bridge answers a call when the library is at rest: thus a test
+      # sees the end of these steps before JavaScript does them.
+      {:test, "streams/readable-streams/general.any.js",
+       ~r/^ReadableStream: should (call pull when trying to read from a started, empty stream|only call pull once on a non-empty stream read from before start fulfills)$/,
+       @microtask},
+      {:test, "streams/readable-streams/tee.any.js",
+       "ReadableStream teeing: errors in the source should propagate to both branches",
+       @microtask},
+      {:test, "streams/readable-streams/reentrant-strategies.any.js",
+       "tee() inside size() should work", @microtask},
+      {:test, "streams/writable-streams/floating-point-total-queue-size.any.js", ~r//,
+       @microtask},
+      # The bridge sends the settled promises in the sequence in which
+      # JavaScript made them, not in the sequence in which they settled.
+      {:test, "encoding/streams/backpressure.any.js", ~r//, @creation_order},
+      # The size function of a strategy object is a usual JavaScript function
+      # of the layer: it has a prototype, and its length is 1.
+      {:test, "streams/queuing-strategies.any.js",
+       ~r/size should (not have a prototype property|not be a constructor|have the right length)$/,
+       "runner: the size function of a strategy is a usual function"},
+      # An error that the library makes is a new JavaScript object each time
+      # that it goes to JavaScript.
+      {:test, "streams/readable-streams/bad-strategies.any.js",
+       ~r/^Readable stream: invalid strategy\.size return value/, @new_error},
+      {:test, "streams/writable-streams/bad-strategies.any.js",
+       "Writable stream: invalid strategy.size return value", @new_error},
+      {:text, ["apply() should not be called"], "runner: the layer calls a callback with apply"},
+      # The library cannot read a property of a JavaScript object, such as
+      # `byteLength`. A binary of Elixir is bytes: a string has a byte length.
+      {:test, "streams/writable-streams/byte-length-queuing-strategy.any.js", ~r//,
+       "runner: the library cannot read a property of a JavaScript object"},
+      {:test, "streams/queuing-strategies.any.js",
+       "ByteLengthQueuingStrategy: size behaves as expected with strange arguments",
+       "library: a binary has a byte length, and an object is not a map"},
+      # `TextEncoderStream` converts a chunk to a string with `String.Chars`
+      # of Elixir, not with the conversion of JavaScript.
+      {:test, "encoding/streams/encode-bad-chunks.any.js", ~r//,
+       "scope: the rules of JavaScript to convert a value to a string"},
+      # The Fetch Standard forbids some headers for the code of a web page,
+      # such as `Cookie` and `Set-Cookie`, and allows only some headers for
+      # a request in the mode "no-cors". A server runtime has no page and no
+      # CORS: Node.js and Deno send each header too. The guard "immutable"
+      # of a response is in the library.
+      {:path, "fetch/api/headers/headers-no-cors.any.js", @no_guard},
+      {:test, "fetch/api/headers/headers-forbidden-override.any.js", ~r/is forbidden to use/,
+       @no_guard},
+      {:test, "fetch/api/headers/header-setcookie.any.js",
+       "Set-Cookie is a forbidden response header", @no_guard},
+      {:test, "fetch/api/request/request-headers.any.js",
+       ~r/^(Adding invalid (no-cors )?request header|Check that (no-cors )?request constructor is filtering)/,
+       @no_guard},
+      # The rules of the files of `Request`, `Response`, and the body.
+      #
+      # A binary of Elixir is bytes. A JavaScript string that a stream gives
+      # comes to the library as a binary, and a body takes a binary as a
+      # chunk of bytes: Elixir code makes streams of binaries. The Fetch
+      # Standard requires a `Uint8Array`.
+      {:test, "fetch/api/response/response-stream-bad-chunk.any.js",
+       ~r/^ReadableStream with non-Uint8Array chunk/,
+       "library: a binary chunk of a body is bytes"},
+      # Each browser encodes a form with no entries as the close delimiter
+      # of RFC 7578, and fails these tests (wpt.fyi). The library does the
+      # same: `formData()` of that body gives a form, as in
+      # `fetch/api/body/formdata.any.js`.
+      {:test, "fetch/api/response/response-consume-empty.any.js",
+       "Consume empty FormData response body as text", @empty_form},
+      {:test, "fetch/api/request/request-consume-empty.any.js",
+       "Consume empty FormData request body as text", @empty_form},
+      # A JSON object is a map of Elixir, and a map has no sequence of its
+      # keys: the bridge gives the keys of the object in the sequence of the
+      # map. The `fetch` of a `data:` URL is in the library: the test now
+      # comes to this step.
+      {:test, "fetch/api/response/json.any.js", "Ensure the correct JSON parser is used",
+       "library: a JSON object is a map, which has no sequence of its keys"},
+      # The JSON `null` is `nil` in the library, and the bridge gives `nil`
+      # to JavaScript as `undefined`.
+      {:test, "fetch/api/request/request-consume.any.js", "Consume JSON from text: '\"null\"'",
+       "runner: the JSON null is nil, which is undefined in JavaScript"},
+      # WPT has no file `hello.txt`: the server of WPT gives a response with
+      # the status 404, and the `fetch` of the runner rejects.
+      {:text, ["hello.txt gave the status 404"], "runner: no server of WPT"},
+      # The `fetch` of the runner makes its response with the `Response`
+      # constructor. A response of `Web.fetch/2` has immutable headers.
+      {:test, "fetch/api/response/response-headers-guard.any.js",
+       "Ensure response headers are immutable",
+       "runner: the fetch of the runner makes a response with the constructor"},
+      # The library gives each branch of the clone its own chunk. A buffer of
+      # JavaScript that comes back from the library is a new object: thus
+      # the first branch cannot give the same object.
+      {:test, "fetch/api/response/response-clone.any.js",
+       "Check response clone use structureClone for teed ReadableStreams (Uint8Arraychunk)",
+       "runner: a buffer of JavaScript comes back as a new object"},
+      {:test, "fetch/api/response/response-clone.any.js",
+       ~r/^Check response clone use structureClone for teed ReadableStreams/, @no_view_type},
+      # The BEAM has no shared memory: a chunk from a `SharedArrayBuffer` is
+      # a usual buffer in the library.
+      {:test, "compression/compression-bad-chunks.any.js", ~r/shared|SharedArrayBuffer/,
+       "scope: the BEAM has no shared memory"},
+      # `Response.json()` serializes a JavaScript value. The library gets a
+      # reference to a JavaScript object, and a lone surrogate becomes
+      # U+FFFD before it comes to the library.
+      {:test, "fetch/api/response/response-static-json.any.js",
+       ~r/encodes JSON objects correctly|propagates JSON serializer errors|with input/,
+       "runner: a JavaScript value for JSON"},
+      # The rules of the TransformStream, the WritableStream, and the pipe.
+      # In JavaScript, the start of a stream, the end of a write or a close,
+      # and the reaction to a cancel come in a microtask after the call. The
+      # bridge answers a call when the library is at rest, thus these steps
+      # are complete before the next statement of the test. For example, a
+      # writable stream is "errored" where JavaScript has it "erroring" (its
+      # start is not complete), and a write that JavaScript queues starts.
+      {:test, "streams/transform-streams/cancel.any.js",
+       "readable.cancel() and a parallel writable.close() should reject if a transformer.cancel() calls controller.error()",
+       @microtask},
+      {:test, "streams/transform-streams/errors.any.js",
+       ~r/^(abort should set the close reason for the writable when it happens before cancel during start|controller\.error\(\) should (do nothing the second time it is called|close writable immediately after readable\.cancel\(\)))/,
+       @microtask},
+      {:test, "streams/transform-streams/general.any.js",
+       "terminate() should abort writable immediately after readable.cancel()", @microtask},
+      {:test, "streams/transform-streams/reentrant-strategies.any.js",
+       ~r/^writer\.(write|close|abort)\(\) inside size\(\) should work$/, @microtask},
+      {:test, "streams/transform-streams/terminate.any.js",
+       ~r/^controller\.error\(\) after controller\.terminate\(\) with(out)? queued chunk/,
+       @microtask},
+      {:test, "streams/writable-streams/aborting.any.js",
+       ~r/^(Aborting a WritableStream (before it starts|prevents further writes after any|puts it in an errored state|causes any outstanding write)|Closing but then immediately aborting|promises returned from other writer methods should be rejected when writer abort\(\) happens during sink start|WritableStream if sink's abort throws, the promise returned by multiple writer\.abort\(\)s is the same|when calling abort\(\) twice on the same stream)/,
+       @microtask},
+      # The stream of this test has started when `getWriter()` returns: the
+      # close of the listener of the signal is in flight, and it completes.
+      # In JavaScript, the start is complete in a later microtask: the close
+      # waits, and the abort rejects it. `test/web/writable_stream_abort_listener_test.exs`
+      # has the two cases.
+      {:test, "streams/writable-streams/aborting.any.js",
+       "recursive close() call from abort() aborting signal (not started)", @microtask},
+      {:test, "streams/writable-streams/close.any.js",
+       ~r/^(when close is called on a WritableStream in writable state, ready should return a fulfilled promise|releaseLock\(\) should not change the result of sync close\(\)|close\(\) on an erroring stream should reject)$/,
+       @microtask},
+      {:test, "streams/writable-streams/general.any.js",
+       "ready promise should fire before closed on releaseLock", @microtask},
+      {:test, "streams/writable-streams/reentrant-strategy.any.js",
+       "writer.write() promises should resolve in the standard order", @microtask},
+      {:test, "streams/writable-streams/start.any.js",
+       "when start() rejects, writer promises should reject in standard order", @microtask},
+      {:test, "streams/piping/general-addition.any.js",
+       "enqueue() must not synchronously call write algorithm", @microtask},
+      {:test, "streams/piping/multiple-propagation.any.js",
+       ~r/^Piping from an errored readable stream to (an erroring|a closing) writable stream$/,
+       @microtask},
+      # The promises of a write, an abort, and `closed` settle in the same
+      # step of the library. The bridge sends them in the sequence of their
+      # creation.
+      {:test, "streams/writable-streams/aborting.any.js",
+       ~r/^(writer\.abort\(\)|controller\.error\(\)), .*while there is an in-flight (write|close), and then finish|^writer\.abort\(\) while there is an in-flight write, and then finish the write with rejection$/,
+       @creation_order},
+      # The conversion of WebIDL to an async sequence is not in the layer
+      # yet: `ReadableStream.from()` needs it.
+      {:text, ["async_sequence is not in the layer"], "runner: no async sequence"},
+      # A string of Elixir is UTF-8: a lone surrogate of a JavaScript string
+      # becomes U+FFFD before it comes to the library. These tests split a
+      # character between two chunks.
+      {:test, "encoding/streams/encode-utf8.any.js", ~r/surrogate|split/,
+       "runner: no lone surrogate in a string"},
+      # The runner times out a test only when the library is at rest, and
+      # JavaScript has nothing to do: a promise of the library does not
+      # settle.
+      {:text, ["Test timed out"], "library: a promise does not settle"},
+      {:text, ["Invalid high water mark"], "library: the checks of a high water mark"},
+      # The library will not have `XMLHttpRequest` and `FileReader`: `fetch`
+      # and the promises of `Blob` replace them.
+      {:text, ["'XMLHttpRequest' is not defined"], "scope: the library has no XMLHttpRequest"},
+      {:text, ["'FileReader' is not defined"], "scope: the library has no FileReader"},
+      {:text, ["no server of WPT"], "runner: no server of WPT"},
+      {:name, ~r/'(\w+)' is not defined/, "runner: no "},
+      {:text, ["structuredClone"], "runner: no structuredClone"},
+      {:name, ~r/The library has no ([\w.?]+\/\d)/, "library: no "},
+      {:text, ["ArgumentError", "TypeError"], "library: ArgumentError, not TypeError"}
+    ]
+  end
+
+  defp match({:test, test_path, %Regex{} = regex, group}, path, name, _message),
+    do: if(path == test_path and Regex.match?(regex, name), do: group)
+
+  defp match({:test, test_path, test_name, group}, path, name, _message),
+    do: if(path == test_path and name == test_name, do: group)
+
+  defp match({:path, prefix, group}, path, _name, _message),
+    do: if(String.starts_with?(path, prefix), do: group)
+
+  defp match({:text, texts, group}, _path, _name, message),
+    do: if(Enum.all?(texts, &String.contains?(message, &1)), do: group)
+
+  defp match({:name, regex, group}, _path, _name, message) do
+    case capture(regex, message) do
+      nil -> nil
+      name -> group <> name
+    end
+  end
+
+  defp capture(regex, message) do
+    case Regex.run(regex, message) do
+      [_match, name] -> name
+      nil -> nil
+    end
+  end
+end

@@ -3,19 +3,21 @@ defmodule Web.DecompressionStream do
   WHATWG-compliant `DecompressionStream`.
 
   Decompresses a stream of binary data using the specified format, backed by
-  Erlang's native `:zlib` module.
+  Erlang's native `:zlib` module. The format `"brotli"` has a decoder in
+  Elixir: Erlang/OTP has no brotli.
 
-  ## OTP 26 process-ownership
-
-  Since OTP 26 the zlib NIF resource is bound to the process that called
-  `:zlib.open/0`. The `Agent` that owns the z-stream is started inside
-  the engine's `start/2` callback, which runs in the gen_statem's init
-  process. This links the Agent to the stream's lifecycle: if the stream
-  is garbage-collected or crashes, the Agent (and thus the zlib port) is
-  automatically terminated.
+  The stream gives its output in chunks of approximately 64 KiB, and makes
+  the next chunk only when a read asks for a chunk. Thus a small compressed
+  chunk that expands much does not fill the memory. The Compression
+  Standard puts all the output of a chunk in the queue at once. Here a write
+  that gives more than one chunk is complete only when the reads took its
+  chunks. The decoder is the decoder of `Web.fetch/2`. It opens its zlib
+  handle in the worker process of the stream, which runs each callback: the
+  handle belongs to that process, and closes when the stream stops.
 
   ## Supported formats
 
+    * `"brotli"` — brotli decompression (RFC 7932)
     * `"gzip"` — gzip decompression (window bits 31)
     * `"deflate"` — zlib-wrapped deflate (window bits 15)
     * `"deflate-raw"` — raw deflate without zlib wrapper (window bits −15)
@@ -25,18 +27,30 @@ defmodule Web.DecompressionStream do
       iex> ds = Web.DecompressionStream.new("gzip")
       iex> writer = Web.WritableStream.get_writer(ds.writable)
       iex> compressed = :zlib.gzip("hello world")
-      iex> Web.await(Web.WritableStreamDefaultWriter.write(writer, compressed))
-      :ok
-      iex> Web.await(Web.WritableStreamDefaultWriter.close(writer))
-      :ok
-      iex> Enum.join(ds.readable, "")
+      iex> write = Web.WritableStreamDefaultWriter.write(writer, compressed)
+      iex> close = Web.WritableStreamDefaultWriter.close(writer)
+      iex> Enum.map_join(ds.readable, &to_string/1)
       "hello world"
+      iex> {Web.await(write), Web.await(close)}
+      {:ok, :ok}
+
+  The transform of a chunk starts only when a read asks for a chunk, as the
+  Compression Standard specifies: the readable side has the high water mark
+  0, and the writable side has the high water mark 1. Thus start the read
+  before you wait for a write.
+
+  Each chunk of the readable side is a `Web.Uint8Array`, as the Compression
+  Standard specifies. A chunk for the writable side is a binary, a
+  `Web.Uint8Array`, or a `Web.ArrayBuffer`.
   """
 
   use Web.Stream
 
   require Logger
 
+  alias Web.CountQueuingStrategy
+  alias Web.Internal.Bytes
+  alias Web.Internal.ContentDecoder
   alias Web.ReadableStreamDefaultController
   alias Web.TypeError
   alias Web.Uint8Array
@@ -48,18 +62,28 @@ defmodule Web.DecompressionStream do
           writable: Web.WritableStream.t()
         }
 
-  @valid_formats ~w[gzip deflate deflate-raw]
+  @valid_formats ~w[brotli gzip deflate deflate-raw]
+
+  # The Compression Standard sets up the stream with the steps "set up a
+  # TransformStream" of the Streams Standard. These steps give the writable
+  # side the high water mark 1 and the readable side the high water mark 0.
+  # The size of each chunk is 1 on the two sides. Thus the transform of a
+  # chunk starts only when a reader asks for a chunk.
+  @queuing [
+    high_water_mark: 1,
+    writable_size: :count,
+    strategy: %CountQueuingStrategy{high_water_mark: 0}
+  ]
 
   @doc """
   Creates a new `DecompressionStream` for the given `format`.
 
-  Raises `Web.TypeError` if `format` is not one of `"gzip"`, `"deflate"`, or
-  `"deflate-raw"`.
+  Raises `Web.TypeError` if `format` is not one of `"brotli"`, `"gzip"`,
+  `"deflate"`, or `"deflate-raw"`.
   """
   @spec new(String.t()) :: t()
   def new(format) when format in @valid_formats do
-    window_bits = window_bits_for(format)
-    {:ok, pid} = start_link(window_bits: window_bits)
+    {:ok, pid} = start_link([format: format] ++ @queuing)
 
     %__MODULE__{
       readable: %Web.ReadableStream{controller_pid: pid},
@@ -81,84 +105,33 @@ defmodule Web.DecompressionStream do
 
   @impl Web.Stream
   def start(_pid, opts) do
-    window_bits = Keyword.fetch!(opts, :window_bits)
-
-    # Agent.start_link runs in the gen_statem's init process, so the Agent is
-    # linked to the stream process. If the stream terminates, the Agent (and
-    # thus the zlib port) is automatically cleaned up.
-    {:ok, agent} =
-      Agent.start_link(fn ->
-        z = :zlib.open()
-        :zlib.inflateInit(z, window_bits)
-        z
-      end)
-
-    {:producer_consumer, %{zlib_agent: agent}}
+    {:producer_consumer, %{format: Keyword.fetch!(opts, :format), decoder: nil}}
   end
 
+  # The callbacks run in the worker process of the stream: the decoder
+  # starts at the first chunk, thus its zlib handle belongs to the worker.
   @impl Web.Stream
-  def write(chunk, ctrl, %{zlib_agent: agent} = state) do
+  def write(chunk, ctrl, state) do
     bin = to_binary!(chunk, "DecompressionStream")
     maybe_log_runtime_event("write", byte_size(bin))
-    result = run_zlib(agent, fn z -> :zlib.inflate(z, bin) end, "DecompressionStream")
-
-    case result do
-      {:ok, decompressed_chunks} ->
-        for c <- decompressed_chunks do
-          ReadableStreamDefaultController.wait_for_capacity(ctrl)
-          ReadableStreamDefaultController.enqueue(ctrl, c)
-        end
-
-        {:ok, state}
-
-      {:error, e} ->
-        stop_agent(agent)
-        raise TypeError, zlib_error_message(e)
-    end
+    decoder = ContentDecoder.push(decoder(state), bin)
+    {:ok, %{state | decoder: drain(decoder, ctrl)}}
   end
 
+  # The Compression Standard gives a `TypeError` when the stream closes
+  # before the end of the compressed data. This is also true for a stream
+  # with no data.
   @impl Web.Stream
-  def flush(ctrl, %{zlib_agent: agent} = state) do
-    # Attempt to flush any remaining buffered output.
-    # Per the WHATWG Compression specification, closing a decompression
-    # stream before the compressed payload is complete MUST raise a
-    # TypeError. Zlib signals this via :buf_error (Z_BUF_ERROR) when
-    # there is no more output and Z_STREAM_END was never seen. We do NOT
-    # suppress this error — a truncated stream is an integrity violation.
-    # NOTE: In OTP 27+ inflate/2 returns {:ok, []} instead of raising
-    # :buf_error with empty input, so the rescue and error branches below
-    # are unreachable in current runtimes but kept for older OTP.
+  def flush(ctrl, state) do
     maybe_log_runtime_event("flush", 0)
-    result = run_zlib(agent, fn z -> :zlib.inflate(z, <<>>) end, "DecompressionStream")
-
-    # Always stop the agent — whether flush succeeds or fails.
-    stop_agent(agent)
-
-    case result do
-      {:ok, final_chunks} ->
-        # coveralls-ignore-start
-        # In practice, inflate(<<>>) after a complete stream returns [].
-        # This guard is kept for hypothetical edge cases where decompressor
-        # state yields final output only on Z_FINISH flush.
-        for chunk <- final_chunks, byte_size(chunk) > 0 do
-          ReadableStreamDefaultController.wait_for_capacity(ctrl)
-          ReadableStreamDefaultController.enqueue(ctrl, chunk)
-        end
-
-        # coveralls-ignore-stop
-
-        {:ok, state}
-
-      # coveralls-ignore-start
-      {:error, e} ->
-        raise TypeError, zlib_error_message(e)
-        # coveralls-ignore-stop
-    end
+    _decoder = state |> decoder() |> ContentDecoder.finish() |> drain(ctrl)
+    {:ok, %{state | decoder: nil}}
   end
 
+  # A cancel or an abort runs in the worker too: the handle closes at once.
   @impl Web.Stream
-  def terminate(_event, %{zlib_agent: agent}) do
-    stop_agent(agent)
+  def terminate(_event, %{decoder: decoder}) do
+    if decoder, do: ContentDecoder.close(decoder)
     :ok
   end
 
@@ -166,40 +139,37 @@ defmodule Web.DecompressionStream do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp window_bits_for("gzip"), do: 31
-  defp window_bits_for("deflate"), do: 15
-  defp window_bits_for("deflate-raw"), do: -15
+  defp decoder(%{decoder: nil, format: format}), do: ContentDecoder.format(format)
+  defp decoder(%{decoder: decoder}), do: decoder
 
-  defp to_binary!(bin, _ctx) when is_binary(bin), do: bin
-  defp to_binary!(%Uint8Array{} = arr, _ctx), do: Uint8Array.to_binary(arr)
+  # Each piece goes to the readable side when it has space. A piece is
+  # never empty.
+  defp drain(decoder, ctrl) do
+    case ContentDecoder.pull(decoder) do
+      {:piece, piece, decoder} ->
+        ReadableStreamDefaultController.wait_for_capacity(ctrl)
+        ReadableStreamDefaultController.enqueue(ctrl, Uint8Array.from(piece))
+        drain(decoder, ctrl)
 
-  defp to_binary!(_, ctx),
-    do: raise(TypeError, "#{ctx} chunk must be a binary or Uint8Array")
-
-  # Stop the Agent idempotently.
-  defp stop_agent(agent) do
-    if Process.alive?(agent), do: Agent.stop(agent, :normal)
-  end
-
-  defp run_zlib(agent, operation, context) do
-    metadata = runtime_metadata()
-
-    case Agent.get(agent, fn z ->
-           try do
-             {:ok, operation.(z)}
-           rescue
-             e in ErlangError -> {:error, e}
-           end
-         end) do
-      {:ok, _result} = ok ->
-        ok
-
-      {:error, e} ->
-        maybe_log_zlib_failure(metadata, context, e)
-
-        {:error, e}
+      {_more_or_done, decoder} ->
+        decoder
     end
+  rescue
+    error in ContentDecoder.Error ->
+      maybe_log_zlib_failure(runtime_metadata(), "DecompressionStream", error)
+      reraise TypeError, [message: error_message(error)], __STACKTRACE__
   end
+
+  defp error_message(%{reason: :incomplete}),
+    do: "Decompression failed: the compressed data is not complete"
+
+  defp error_message(%{reason: :invalid}), do: "Decompression failed: invalid data"
+
+  defp to_binary!(chunk, ctx) when is_list(chunk) do
+    raise TypeError, "#{ctx} chunk must be a binary, a Uint8Array, or an ArrayBuffer"
+  end
+
+  defp to_binary!(chunk, ctx), do: Bytes.to_binary!(chunk, ctx)
 
   defp maybe_log_runtime_event(stage, bytes) do
     metadata = runtime_metadata()
@@ -238,25 +208,4 @@ defmodule Web.DecompressionStream do
       )
     end
   end
-
-  defp zlib_error_message(%ErlangError{original: :data_error}),
-    do: "Decompression failed: invalid data"
-
-  # coveralls-ignore-start
-  # The following clauses handle errors that are unreachable in OTP 27+:
-  # inflate/2 with empty input returns {:ok, []} rather than raising :buf_error;
-  # :stream_error and the catch-all patterns require API misuse.
-  defp zlib_error_message(%ErlangError{original: :buf_error}),
-    do: "Decompression failed: compressed stream is truncated or incomplete"
-
-  defp zlib_error_message(%ErlangError{original: :stream_error}),
-    do: "Decompression failed: stream error"
-
-  defp zlib_error_message(%ErlangError{original: {:error, reason}}),
-    do: "Decompression failed: #{inspect(reason)}"
-
-  defp zlib_error_message(%ErlangError{original: reason}),
-    do: "Decompression failed: #{inspect(reason)}"
-
-  # coveralls-ignore-stop
 end

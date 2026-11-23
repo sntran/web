@@ -1,7 +1,7 @@
 defmodule Web.MixProject do
   use Mix.Project
 
-  @version "0.4.0"
+  @version "0.5.0"
   @repo_url "https://github.com/sntran/web"
   @description "A protocol-agnostic, zero-buffer suite of Web Standard APIs for Elixir."
 
@@ -69,12 +69,22 @@ defmodule Web.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:finch, "~> 0.21"},
+      {:mint, "~> 1.6"},
       {:castore, "~> 1.0"},
-      {:idna, "~> 7.1"},
-      {:jason, "~> 1.4"},
+      {:idna, "~> 8.0"},
       {:benchee, "~> 1.5", only: [:dev, :test]},
       {:stream_data, "~> 1.3", only: :test},
+      # An HTTP server for the tests, and for the benchmark of the HTTP
+      # clients in `bench/`.
+      {:bandit, "~> 1.5", only: [:dev, :test]},
+      {:plug, "~> 1.16", only: [:dev, :test]},
+      # The benchmark `bench/http_clients.exs` compares `Web.fetch/2` with
+      # Req. Req is not a dependency of the package.
+      {:req, "~> 0.5", only: :dev},
+      # The TLA+ model checker, in Elixir. It checks the specifications in
+      # `tla/`, and the property tests use it to compare the code with them.
+      {:accord,
+       github: "sntran/accord", branch: "feat/native-tla-checker", only: :test, runtime: false},
       {:excoveralls, "~> 0.18", only: :test},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false}

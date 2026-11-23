@@ -54,6 +54,8 @@ defmodule Web.Platform.TestTest do
         %{state | current: next, max: Kernel.max(max, next)}
       end)
 
+      # The server keeps the request for some time, thus the requests of
+      # the test run at the same time.
       try do
         Process.sleep(delay_ms)
         send_response(socket, status, headers, body)
@@ -71,6 +73,7 @@ defmodule Web.Platform.TestTest do
       :gen_tcp.close(socket)
     end
 
+    # A slow server.
     defp serve_script(socket, {:response, status, headers, body, delay_ms}) do
       Process.sleep(delay_ms)
       send_response(socket, status, headers, body)
@@ -82,6 +85,7 @@ defmodule Web.Platform.TestTest do
            {:partial_response, status, headers, partial_body, total_length, delay_ms}
          ) do
       send_partial_response(socket, status, headers, partial_body, total_length)
+      # The rest of the body does not come during this time: the body stalls.
       Process.sleep(delay_ms)
       :gen_tcp.close(socket)
     end

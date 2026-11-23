@@ -1,0 +1,14 @@
+{
+  "harness": "OK",
+  "failures": {
+    "a character following one split between chunks should be correctly encoded": "runner: no lone surrogate in a string",
+    "a character split between chunks should be correctly encoded": "runner: no lone surrogate in a string",
+    "a leading surrogate chunk should be carried past empty chunks": "runner: no lone surrogate in a string",
+    "a non-terminal unpaired leading surrogate should immediately be replaced": "runner: no lone surrogate in a string",
+    "an unmatched surrogate at the end of a chunk followed by a plane 1 character split into two chunks should result in the encoded plane 1 character appearing in the last output chunk": "runner: no lone surrogate in a string",
+    "an unmatched surrogate at the end of a chunk followed by an ascii character in the next chunk should be replaced with the replacement character at the start of the next output chunk": "runner: no lone surrogate in a string",
+    "an unmatched surrogate at the end of a chunk followed by an astral character in the next chunk should be replaced with the replacement character at the start of the next output chunk": "runner: no lone surrogate in a string",
+    "two consecutive astral characters each split down the middle should be correctly reassembled": "runner: no lone surrogate in a string",
+    "two consecutive astral characters each split down the middle with an invalid surrogate in the middle should be correctly encoded": "runner: no lone surrogate in a string"
+  }
+}

@@ -75,6 +75,6 @@ defmodule Web.Bench.GzipBenchStream do
   end
 
   defp to_binary!(bin) when is_binary(bin), do: bin
-  defp to_binary!(%Uint8Array{} = arr), do: Uint8Array.to_binary(arr)
+  defp to_binary!(%Uint8Array{} = arr), do: to_string(arr)
   defp to_binary!(other), do: raise(TypeError, "expected binary chunk, got: #{inspect(other)}")
 end

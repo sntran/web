@@ -14,6 +14,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # The oldest versions that the package accepts, and the newest ones.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.19"
+            otp: "28"
+          - elixir: "1.20"
+            otp: "29"
+            newest: true
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -21,8 +32,8 @@ jobs:
       - name: Setup BEAM
         uses: erlef/setup-beam@v1
         with:
-          elixir-version: "1.19"
-          otp-version: "28"
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
 
       - name: Cache dependencies
         uses: actions/cache@v4
@@ -36,14 +47,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: tmp/wpt_cache
-          key: ${{ runner.os }}-wpt-cache-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-wpt-cache-
+          key: ${{ runner.os }}-wpt-cache-${{ hashFiles('test/support/wpt.ex') }}
 
       - name: Install dependencies
         run: mix deps.get
 
+      # The format can be different between two versions of Elixir.
       - name: Check formatting
+        if: matrix.newest
         run: mix format --check-formatted
 
       - name: Static analysis
@@ -52,7 +63,12 @@ jobs:
       - name: Compile with warnings as errors
         run: mix compile --warnings-as-errors
 
+      - name: Test
+        if: ${{ !matrix.newest }}
+        run: mix test --warnings-as-errors
+
       - name: Test and coverage
+        if: matrix.newest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: mix coveralls.github

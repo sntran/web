@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "ReadableStream: should call pull when trying to read from a started, empty stream": "runner: the library does the steps of a later microtask before the call returns",
+    "ReadableStream: should only call pull once on a non-empty stream read from before start fulfills": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "when start() rejects, writer promises should reject in standard order": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

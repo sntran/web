@@ -1,0 +1,11 @@
+{
+  "harness": "OK",
+  "failures": {
+    "ByteLengthQueuingStrategy: size behaves as expected with strange arguments": "library: a binary has a byte length, and an object is not a map",
+    "ByteLengthQueuingStrategy: size should not be a constructor": "runner: the size function of a strategy is a usual function",
+    "ByteLengthQueuingStrategy: size should not have a prototype property": "runner: the size function of a strategy is a usual function",
+    "CountQueuingStrategy: size should have the right length": "runner: the size function of a strategy is a usual function",
+    "CountQueuingStrategy: size should not be a constructor": "runner: the size function of a strategy is a usual function",
+    "CountQueuingStrategy: size should not have a prototype property": "runner: the size function of a strategy is a usual function"
+  }
+}

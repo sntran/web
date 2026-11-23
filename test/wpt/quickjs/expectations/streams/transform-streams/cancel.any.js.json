@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "readable.cancel() and a parallel writable.close() should reject if a transformer.cancel() calls controller.error()": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

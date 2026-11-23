@@ -4,9 +4,26 @@ defmodule Web.URL do
 
   Provides a pure data structure representing a URL, compatible with both standard URLs
   and RClone-style URLs.
+
+  ## The attributes
+
+  Each attribute of the `URL` class has a getter `name/1`, for example
+  `hostname/1`. Each attribute that the Standard lets you set also has a
+  setter `name/2`, for example `hostname/2`. A setter returns the new URL.
+  The fields of the struct are internal: use the functions.
+
+  A setter converts its value to a string, as Web IDL converts a value to
+  a `USVString`: `nil` is the JavaScript `null`, thus the text `"null"`.
+  For example, `port(url, nil)` does not change the port, and
+  `hash(url, nil)` gives the fragment `"null"`. The empty string clears a
+  port, a query, or a fragment.
   """
 
-  alias Web.URL.{Encoding, IP, Parser}
+  defguardp alpha?(char) when char in ?A..?Z or char in ?a..?z
+  defguardp digit?(char) when char in ?0..?9
+
+  alias Web.Internal.Ascii
+  alias Web.URL.{Encoding, FastPath, IP, Parser}
 
   defstruct protocol: "",
             username: "",
@@ -40,10 +57,11 @@ defmodule Web.URL do
           kind: :standard | :rclone
         }
 
-  @rclone_scheme ~r/^[A-Za-z0-9.+-]*_[A-Za-z0-9_+.-]*:(?!\/\/)/
-
   @doc """
   Creates a URL from a string and optional base URL.
+
+  Raises `Web.TypeError` when the string is not a valid URL, or when the
+  base URL is not valid.
 
   ## Examples
 
@@ -54,6 +72,9 @@ defmodule Web.URL do
       iex> url = Web.URL.new("remote:path/to/file")
       iex> {Web.URL.protocol(url), Web.URL.pathname(url)}
       {"remote:", "path/to/file"}
+
+      iex> Web.URL.new("/path")
+      ** (Web.TypeError) Invalid URL: relative URL without a base
   """
   @spec new(String.t() | t(), String.t() | t() | nil) :: t()
   def new(url, base \\ nil)
@@ -61,10 +82,72 @@ defmodule Web.URL do
   def new(%__MODULE__{} = url, _base), do: url
 
   def new(url, base) when is_binary(url) do
-    trimmed = Encoding.trim_c0_whitespace(url)
+    # The parser checks that the text is valid UTF-8, and removes the C0
+    # characters again. This trim is for the short parse and for the check
+    # of an rclone URL.
+    trimmed = Encoding.trim_c0(url)
 
-    if rclone_url?(trimmed), do: parse_rclone(trimmed), else: parse_standard(trimmed, base)
+    case base == nil and FastPath.parse(trimmed) do
+      {:ok, fields} ->
+        Map.merge(%__MODULE__{}, fields)
+
+      _other ->
+        if rclone_url?(trimmed),
+          do: trimmed |> Encoding.valid_utf8!() |> parse_rclone(),
+          else: parse_standard(trimmed, base)
+    end
   end
+
+  @doc """
+  Parses a string with an optional base URL, as `new/2` does. Returns the
+  URL, or `nil` when the string or the base URL is not valid.
+
+  ## Examples
+
+      iex> url = Web.URL.parse("/docs", "https://example.com/start")
+      iex> Web.URL.href(url)
+      "https://example.com/docs"
+
+      iex> Web.URL.parse("/docs")
+      nil
+  """
+  @spec parse(String.t() | t(), String.t() | t() | nil) :: t() | nil
+  def parse(url, base \\ nil) do
+    new(url, base)
+  rescue
+    Web.TypeError -> nil
+  end
+
+  @doc """
+  Returns `true` when `new/2` can parse the string with the optional base
+  URL. Returns `false` when `new/2` raises `Web.TypeError`.
+
+  ## Examples
+
+      iex> Web.URL.can_parse("https://example.com/")
+      true
+
+      iex> Web.URL.can_parse("/docs")
+      false
+
+      iex> Web.URL.can_parse("/docs", "https://example.com/")
+      true
+  """
+  @spec can_parse(String.t() | t(), String.t() | t() | nil) :: boolean()
+  def can_parse(url, base \\ nil), do: parse(url, base) != nil
+
+  @doc """
+  Returns the serialized URL (href). `JSON.stringify` uses this value for a
+  URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com/search?q=elixir")
+      iex> Web.URL.to_json(url)
+      "https://example.com/search?q=elixir"
+  """
+  @spec to_json(t()) :: String.t()
+  def to_json(%__MODULE__{} = url), do: href(url)
 
   @doc """
   Returns the serialized URL (href).
@@ -101,9 +184,19 @@ defmodule Web.URL do
     end
   end
 
+  @doc """
+  Sets the URL from a serialized URL (href). Raises `Web.TypeError` when the
+  value is not a valid URL.
+
+  ## Examples
+
+      iex> url = Web.URL.new("https://example.com/")
+      iex> Web.URL.href(url, "https://example.org/docs") |> Web.URL.hostname()
+      "example.org"
+  """
   @spec href(t(), String.t()) :: t()
   def href(%__MODULE__{} = _url, value) do
-    new(value)
+    value |> usv_string() |> new()
   end
 
   @doc """
@@ -119,26 +212,26 @@ defmodule Web.URL do
   def protocol(%__MODULE__{} = url), do: url.protocol
 
   @doc """
-  Sets the protocol of the URL.
+  Sets the protocol of the URL, as the setter of the attribute `protocol`.
+  A value that is not valid gives the URL with no change.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com")
-      iex> Web.URL.set_protocol(url, "ftp") |> Web.URL.protocol()
+      iex> Web.URL.protocol(url, "ftp") |> Web.URL.protocol()
       "ftp:"
   """
-  @spec set_protocol(t(), String.t()) :: t()
-  def set_protocol(%__MODULE__{} = url, value) do
+  @spec protocol(t(), String.t()) :: t()
+  def protocol(%__MODULE__{} = url, value) do
     protocol =
       value
-      |> to_string()
+      |> usv_string()
       |> Encoding.strip_ascii_tab_and_newline()
       |> String.split(":", parts: 2)
       |> hd()
       |> String.downcase()
 
-    if String.match?(protocol, ~r/^[a-z][a-z0-9+.-]*$/) and
-         protocol_transition_allowed?(url, protocol) do
+    if scheme_name?(protocol) and protocol_transition_allowed?(url, protocol) do
       try do
         updated =
           url
@@ -153,7 +246,7 @@ defmodule Web.URL do
           updated
         end
       rescue
-        ArgumentError -> url
+        Web.TypeError -> url
       end
     else
       url
@@ -180,11 +273,15 @@ defmodule Web.URL do
     maybe_bracket_ipv6(hostname) <> ":" <> port
   end
 
+  @doc """
+  Sets the host and the port of the URL, as the setter of the attribute
+  `host`. A value that is not valid gives the URL with no change.
+  """
   @spec host(t(), String.t()) :: t()
   def host(%__MODULE__{} = url, value) do
     candidate =
       value
-      |> to_string()
+      |> usv_string()
       |> Encoding.strip_ascii_tab_and_newline()
       |> String.split(host_setter_delimiters(url.protocol), parts: 2)
       |> hd()
@@ -220,19 +317,20 @@ defmodule Web.URL do
   def hostname(%__MODULE__{} = url), do: maybe_bracket_ipv6(url.hostname)
 
   @doc """
-  Sets the hostname portion of the URL.
+  Sets the hostname of the URL, as the setter of the attribute `hostname`.
+  A value that is not valid gives the URL with no change.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com")
-      iex> Web.URL.set_hostname(url, "google.com") |> Web.URL.hostname()
+      iex> Web.URL.hostname(url, "google.com") |> Web.URL.hostname()
       "google.com"
   """
-  @spec set_hostname(t(), String.t()) :: t()
-  def set_hostname(%__MODULE__{} = url, value) do
+  @spec hostname(t(), String.t()) :: t()
+  def hostname(%__MODULE__{} = url, value) do
     candidate =
       value
-      |> to_string()
+      |> usv_string()
       |> Encoding.strip_ascii_tab_and_newline()
       |> String.split(host_setter_delimiters(url.protocol), parts: 2)
       |> hd()
@@ -259,12 +357,14 @@ defmodule Web.URL do
   def username(%__MODULE__{} = url), do: url.username
 
   @doc """
-  Sets the username portion of the URL using URL userinfo percent-encoding.
+  Sets the username of the URL, as the setter of the attribute `username`.
+  The value gets the percent-encoding of the userinfo. A URL that cannot
+  have credentials does not change.
   """
-  @spec set_username(t(), String.t()) :: t()
-  def set_username(%__MODULE__{} = url, value) do
+  @spec username(t(), String.t()) :: t()
+  def username(%__MODULE__{} = url, value) do
     if url.protocol != "file:" and has_authority?(url) and url.hostname != "" do
-      encoded = Encoding.encode_userinfo_component(value)
+      encoded = value |> usv_string() |> Encoding.encode_userinfo_component()
 
       %{
         url
@@ -284,12 +384,14 @@ defmodule Web.URL do
   def password(%__MODULE__{} = url), do: url.password
 
   @doc """
-  Sets the password portion of the URL using URL userinfo percent-encoding.
+  Sets the password of the URL, as the setter of the attribute `password`.
+  The value gets the percent-encoding of the userinfo. A URL that cannot
+  have credentials does not change.
   """
-  @spec set_password(t(), String.t()) :: t()
-  def set_password(%__MODULE__{} = url, value) do
+  @spec password(t(), String.t()) :: t()
+  def password(%__MODULE__{} = url, value) do
     if url.protocol != "file:" and has_authority?(url) and url.hostname != "" do
-      encoded = Encoding.encode_userinfo_component(value)
+      encoded = value |> usv_string() |> Encoding.encode_userinfo_component()
 
       %{
         url
@@ -315,32 +417,30 @@ defmodule Web.URL do
   def port(%__MODULE__{} = url), do: url.port
 
   @doc """
-  Sets the port portion of the URL.
+  Sets the port of the URL, as the setter of the attribute `port`. The
+  empty string removes the port. An integer is the same as its text. A
+  value that does not start with a port number from 0 to 65535 gives the
+  URL with no change, also `nil`, which is the text `"null"`.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com")
-      iex> Web.URL.set_port(url, 8080) |> Web.URL.port()
+      iex> Web.URL.port(url, 8080) |> Web.URL.port()
       "8080"
+
+      iex> url = Web.URL.new("https://example.com:8080")
+      iex> {url |> Web.URL.port(nil) |> Web.URL.port(), url |> Web.URL.port("") |> Web.URL.port()}
+      {"8080", ""}
   """
-  @spec set_port(t(), String.t() | integer() | nil) :: t()
-  def set_port(%__MODULE__{} = url, value) do
+  @spec port(t(), String.t() | integer() | nil) :: t()
+  def port(%__MODULE__{} = url, value) do
     if url.protocol == "file:" or url.hostname == "" do
       %{url | kind: :standard, port: ""}
     else
       port =
-        case value do
-          nil ->
-            ""
-
-          "" ->
-            ""
-
-          int when is_integer(int) ->
-            Integer.to_string(int)
-
-          binary ->
-            normalize_port_setter_value(url.port, binary)
+        case usv_string(value) do
+          "" -> ""
+          text -> normalize_port_setter_value(url.port, text)
         end
 
       %{url | kind: :standard, port: normalize_default_port_for_setter(url.protocol, port)}
@@ -360,49 +460,57 @@ defmodule Web.URL do
   def pathname(%__MODULE__{} = url), do: url.pathname
 
   @doc """
-  Sets the pathname portion of the URL.
+  Sets the pathname of the URL, as the setter of the attribute `pathname`.
+  A URL with an opaque path does not change.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com")
-      iex> Web.URL.set_pathname(url, "new-path") |> Web.URL.pathname()
+      iex> Web.URL.pathname(url, "new-path") |> Web.URL.pathname()
       "/new-path"
   """
-  @spec set_pathname(t(), String.t()) :: t()
-  def set_pathname(%__MODULE__{} = url, value) do
+  @spec pathname(t(), String.t()) :: t()
+  def pathname(%__MODULE__{} = url, value) do
     if opaque_path_url?(url) do
       url
     else
       %{
         url
         | pathname:
-            normalize_path(url, value |> to_string() |> Encoding.strip_ascii_tab_and_newline())
+            normalize_path(url, value |> usv_string() |> Encoding.strip_ascii_tab_and_newline())
       }
     end
   end
 
   @doc """
-  Returns the search (query) portion of the URL, including the '?'.
+  Returns the search (query) portion of the URL, with the "?" at the start.
+  Returns `""` when the URL has no query, or when its query is empty.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com/search?q=elixir")
       iex> Web.URL.search(url)
       "?q=elixir"
+
+      iex> url = Web.URL.new("https://example.com/search?")
+      iex> {Web.URL.search(url), Web.URL.href(url)}
+      {"", "https://example.com/search?"}
   """
   @spec search(t()) :: String.t()
   def search(%__MODULE__{} = url) do
     case effective_search(url) do
-      nil -> ""
-      "" when url.search_present? -> "?"
-      "" -> ""
+      search when search in [nil, ""] -> ""
       search -> "?" <> search
     end
   end
 
+  @doc """
+  Sets the query of the URL, as the setter of the attribute `search`. The
+  empty string removes the query.
+  """
   @spec search(t(), String.t()) :: t()
   def search(%__MODULE__{} = url, value) do
-    normalized = value |> to_string() |> Encoding.strip_ascii_tab_and_newline()
+    normalized = value |> usv_string() |> Encoding.strip_ascii_tab_and_newline()
 
     case normalized do
       "" ->
@@ -421,23 +529,30 @@ defmodule Web.URL do
   end
 
   @doc """
-  Returns the hash portion of the URL, including the '#'.
+  Returns the hash (fragment) portion of the URL, with the "#" at the start.
+  Returns `""` when the URL has no fragment, or when its fragment is empty.
 
   ## Examples
 
       iex> url = Web.URL.new("https://example.com/#top")
       iex> Web.URL.hash(url)
       "#top"
+
+      iex> url = Web.URL.new("https://example.com/#")
+      iex> {Web.URL.hash(url), Web.URL.href(url)}
+      {"", "https://example.com/#"}
   """
   @spec hash(t()) :: String.t()
-  def hash(%__MODULE__{fragment: nil}), do: ""
-  def hash(%__MODULE__{fragment: "", hash_present?: true}), do: "#"
-  def hash(%__MODULE__{fragment: ""}), do: ""
+  def hash(%__MODULE__{fragment: fragment}) when fragment in [nil, ""], do: ""
   def hash(%__MODULE__{fragment: fragment}), do: "#" <> fragment
 
+  @doc """
+  Sets the fragment of the URL, as the setter of the attribute `hash`. The
+  empty string removes the fragment.
+  """
   @spec hash(t(), String.t()) :: t()
   def hash(%__MODULE__{} = url, value) do
-    case value |> to_string() |> Encoding.strip_ascii_tab_and_newline() do
+    case value |> usv_string() |> Encoding.strip_ascii_tab_and_newline() do
       "" ->
         put_fragment(url, nil)
 
@@ -473,7 +588,7 @@ defmodule Web.URL do
       "null"
     end
   rescue
-    ArgumentError -> "null"
+    Web.TypeError -> "null"
   end
 
   def origin(%__MODULE__{protocol: "file:"}), do: "null"
@@ -500,10 +615,40 @@ defmodule Web.URL do
   @spec search_params(t()) :: Web.URLSearchParams.t()
   def search_params(%__MODULE__{} = url), do: url.search_params
 
+  @doc false
+  # `true` for an rclone URL, such as `remote:path`. The dispatcher of
+  # `Web.fetch/2` uses it.
   @spec rclone?(t()) :: boolean()
   def rclone?(%__MODULE__{} = url), do: url.kind == :rclone
 
-  defp rclone_url?(value), do: String.match?(value, @rclone_scheme)
+  # An rclone URL starts with a remote name: letters, digits, ".", "+", "-",
+  # and "_", with one "_" or more. Then ":" comes, and not "//".
+  defp rclone_url?(value), do: rclone_remote?(value, false)
+
+  defp rclone_remote?(<<char, rest::binary>>, underscore?)
+       when alpha?(char) or digit?(char) or char in [?., ?+, ?-],
+       do: rclone_remote?(rest, underscore?)
+
+  defp rclone_remote?(<<?_, rest::binary>>, _underscore?), do: rclone_remote?(rest, true)
+  defp rclone_remote?(<<?:, ?/, ?/, _rest::binary>>, _underscore?), do: false
+  defp rclone_remote?(<<?:, _rest::binary>>, underscore?), do: underscore?
+  defp rclone_remote?(_value, _underscore?), do: false
+
+  # The conversion of Web IDL to a `USVString` for a setter: `nil` is the
+  # JavaScript `null`, which becomes the text "null".
+  defp usv_string(nil), do: "null"
+  defp usv_string(value), do: to_string(value)
+
+  # A lower-case letter, then lower-case letters, digits, "+", "-", and ".".
+  defp scheme_name?(<<char, rest::binary>>) when char in ?a..?z, do: scheme_rest?(rest)
+  defp scheme_name?(_value), do: false
+
+  defp scheme_rest?(<<char, rest::binary>>)
+       when char in ?a..?z or digit?(char) or char in [?+, ?-, ?.],
+       do: scheme_rest?(rest)
+
+  defp scheme_rest?(<<>>), do: true
+  defp scheme_rest?(_value), do: false
 
   defp parse_standard(value, base) do
     value
@@ -530,7 +675,7 @@ defmodule Web.URL do
       pathname: path,
       search: normalized_search,
       fragment: normalize_fragment_value(fragment_value),
-      search_params: Web.URLSearchParams.new(normalized_search || ""),
+      search_params: Web.URLSearchParams.__parse__(normalized_search || ""),
       hash: hash_value(normalize_fragment_value(fragment_value)),
       authority_present?: false,
       search_present?: String.contains?(path_and_search, "?"),
@@ -546,7 +691,7 @@ defmodule Web.URL do
   end
 
   defp standard_path_for_href(%{pathname: pathname, protocol: protocol}) when pathname == "" do
-    if protocol == "file:" or Parser.special_scheme?(protocol) or protocol == "mock:" do
+    if protocol == "file:" or Parser.special_scheme?(protocol) do
       "/"
     else
       nil
@@ -564,11 +709,18 @@ defmodule Web.URL do
   end
 
   defp serialize_search(%__MODULE__{} = url) do
-    case effective_search(url) do
+    case __query__(url) do
       nil -> ""
       search -> "?" <> search
     end
   end
+
+  # The query of the URL, with no "?": `nil` for no query, and `""` for an
+  # empty query. The getter of `search` gives `""` for the two. The request
+  # target of an HTTP request must know the difference.
+  @doc false
+  @spec __query__(t()) :: String.t() | nil
+  def __query__(%__MODULE__{} = url), do: effective_search(url)
 
   defp serialize_fragment(%__MODULE__{fragment: nil}), do: ""
   defp serialize_fragment(%__MODULE__{fragment: fragment}), do: "#" <> fragment
@@ -578,7 +730,12 @@ defmodule Web.URL do
   end
 
   defp put_search(%__MODULE__{} = url, search) do
-    %{url | search: search, search_params: Web.URLSearchParams.new(search), search_present?: true}
+    %{
+      url
+      | search: search,
+        search_params: Web.URLSearchParams.__parse__(search),
+        search_present?: true
+    }
   end
 
   defp put_fragment(%__MODULE__{} = url, nil) do
@@ -603,15 +760,17 @@ defmodule Web.URL do
     Encoding.encode_query_component(search, Parser.special_scheme?(protocol))
   end
 
-  defp effective_search(%__MODULE__{search: nil}), do: nil
-
-  defp effective_search(%__MODULE__{} = url) do
-    derived = Web.URLSearchParams.new(url.search || "")
-
-    if url.search_params == derived do
-      url.search
+  # The query of the URL, after the changes of its URLSearchParams. A change
+  # runs the "update steps" of the URL Standard: the query is the
+  # serialization of the list, and an empty serialization is no query.
+  defp effective_search(%__MODULE__{search: search, search_params: params}) do
+    if params.url_query == (search || "") do
+      search
     else
-      Web.URLSearchParams.to_string(url.search_params)
+      case Web.URLSearchParams.to_string(params) do
+        "" -> nil
+        query -> query
+      end
     end
   end
 
@@ -652,16 +811,16 @@ defmodule Web.URL do
   defp normalize_port_value(current_port, value) do
     stripped = value |> to_string() |> Encoding.strip_ascii_tab_and_newline()
 
-    case Regex.run(~r/^\d+/, stripped) do
-      [digits] ->
+    case Ascii.split_digits(stripped) do
+      {"", _rest} ->
+        current_port
+
+      {digits, _rest} ->
         if String.to_integer(digits) <= 65_535 do
           digits
         else
           current_port
         end
-
-      nil ->
-        current_port
     end
   end
 
@@ -695,10 +854,15 @@ defmodule Web.URL do
 
   defp host_value_includes_port?(candidate) do
     if String.starts_with?(candidate, "[") do
-      Regex.match?(~r/^\[[^\]]+\]:/, candidate)
+      bracketed_with_port?(candidate)
     else
       String.contains?(candidate, ":")
     end
+  end
+
+  # "[", one or more characters that are not "]", "]", then ":".
+  defp bracketed_with_port?("[" <> rest) do
+    match?([inside, ":" <> _port] when inside != "", :binary.split(rest, "]"))
   end
 
   defp normalize_default_port_for_setter(protocol, port) do
@@ -949,15 +1113,7 @@ defmodule Web.URL do
 
   defp pop_path_segment(segments, _preserve_drive_root?), do: Enum.drop(segments, -1)
 
-  defp dot_segment_type(segment) do
-    normalized = Regex.replace(~r/%2e/i, segment, ".")
-
-    case normalized do
-      "." -> :single
-      ".." -> :double
-      _ -> :none
-    end
-  end
+  defp dot_segment_type(segment), do: Encoding.dot_segment_type(segment)
 
   defp maybe_bracket_ipv6(hostname) do
     if String.contains?(hostname, ":") do
@@ -975,6 +1131,81 @@ defmodule Web.URL do
       hostname != "" -> "/" <> path
       true -> "/" <> path
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Blob URLs, as the File API specifies: "partial interface URL"
+  # ---------------------------------------------------------------------------
+
+  alias Web.Internal.BlobURLStore
+
+  @doc """
+  Makes a blob URL for a `Web.Blob` or a `Web.File`, as
+  `URL.createObjectURL(obj)` of the File API. `Web.fetch/2` of the URL
+  gives the bytes and the type of the blob.
+
+  The URL is `"blob:null/"` and a UUID. A library has no document, thus
+  its origin is opaque: its serialization is `"null"`, as for a document
+  with an opaque origin in a browser.
+
+  The URL belongs to the calling process: when that process stops, the
+  URL is revoked, as the File API revokes the URLs of a document that
+  goes away.
+
+  ## Examples
+
+      iex> url = Web.URL.create_object_url(Web.Blob.new(["hello"]))
+      iex> String.starts_with?(url, "blob:null/")
+      true
+      iex> Web.URL.revoke_object_url(url)
+      :ok
+  """
+  @spec create_object_url(Web.Blob.t() | Web.File.t()) :: String.t()
+  def create_object_url(%blob_type{} = blob) when blob_type in [Web.Blob, Web.File] do
+    url = "blob:null/" <> uuid()
+    :ok = BlobURLStore.add(url, blob)
+    url
+  end
+
+  def create_object_url(object) do
+    raise Web.TypeError, "The object of a blob URL must be a Blob, got: #{inspect(object)}"
+  end
+
+  @doc """
+  Revokes a blob URL, as `URL.revokeObjectURL(url)` of the File API. A
+  fetch of the URL then fails. A URL that is not a blob URL in the store,
+  for example a URL with a fragment, has no effect.
+  """
+  @spec revoke_object_url(String.t()) :: :ok
+  def revoke_object_url(url) when is_binary(url) do
+    with %__MODULE__{protocol: "blob:"} = record <- parse(url),
+         blob when blob != nil <- __blob_url_entry__(record) do
+      BlobURLStore.remove(href(record))
+    else
+      _not_an_entry -> :ok
+    end
+  end
+
+  @doc false
+  # The blob URL entry of a URL, as the steps "resolve a blob URL" give
+  # it: the object, or `nil`.
+  @spec __blob_url_entry__(t()) :: Web.Blob.t() | Web.File.t() | nil
+  def __blob_url_entry__(%__MODULE__{protocol: "blob:"} = url) do
+    url |> href() |> String.split("#", parts: 2) |> hd() |> BlobURLStore.resolve()
+  end
+
+  def __blob_url_entry__(%__MODULE__{}), do: nil
+
+  # A UUID of version 4, as RFC 4122 specifies.
+  defp uuid do
+    <<a::48, _version::4, b::12, _variant::2, c::62>> = :crypto.strong_rand_bytes(16)
+    <<u0::32, u1::16, u2::16, u3::16, u4::48>> = <<a::48, 4::4, b::12, 2::2, c::62>>
+
+    [u0, u1, u2, u3, u4]
+    |> Enum.zip([8, 4, 4, 4, 12])
+    |> Enum.map_join("-", fn {value, size} ->
+      value |> Integer.to_string(16) |> String.downcase() |> String.pad_leading(size, "0")
+    end)
   end
 end
 

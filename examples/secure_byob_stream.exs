@@ -14,10 +14,7 @@ defmodule SecureByobStreamExample do
   @view_bytes 65_536
 
   def run do
-    {:ok, source_state} =
-      Agent.start_link(fn ->
-        %{capability_sample: [], pulls: 0, sent: 0}
-      end)
+    {:ok, source_state} = Agent.start_link(fn -> %{pulls: 0, sent: 0} end)
 
     controller = AbortController.new()
 
@@ -35,14 +32,12 @@ defmodule SecureByobStreamExample do
 
       reader = ReadableStream.get_reader(stream, mode: "byob")
       scratch = Uint8Array.new(ArrayBuffer.new(@view_bytes))
-      buffer_id = ArrayBuffer.identity(scratch.buffer)
 
-      IO.puts("consumer buffer=#{inspect(buffer_id)} bytes=#{scratch.byte_length}")
+      IO.puts("consumer buffer bytes=#{scratch.byte_length}")
 
       stats =
         drain(reader, scratch, %{
-          buffer_id: buffer_id,
-          buffer_reused?: true,
+          buffer_length_kept?: true,
           bytes: 0,
           reads: 0
         })
@@ -53,11 +48,8 @@ defmodule SecureByobStreamExample do
       :ok = AbortController.abort(controller, :demo_complete)
 
       IO.puts("completed reads=#{stats.reads} bytes=#{stats.bytes}")
-      IO.puts("buffer reused on every read=#{stats.buffer_reused?}")
-
-      IO.puts(
-        "sample capabilities=#{Enum.map_join(source_stats.capability_sample, ", ", &inspect/1)}"
-      )
+      IO.puts("buffer length kept on every read=#{stats.buffer_length_kept?}")
+      IO.puts("source pulls=#{source_stats.pulls}")
     after
       if Process.alive?(source_state) do
         Agent.stop(source_state)
@@ -65,17 +57,21 @@ defmodule SecureByobStreamExample do
     end
   end
 
+  # The source writes into the view of the BYOB request. At the end, it
+  # closes the stream, and responds with 0 bytes: the read that waits gets
+  # its buffer back.
   defp pump_socket_chunk(controller, source_state) do
     case ReadableByteStreamController.byob_request(controller) do
       %ReadableStreamBYOBRequest{} = request ->
-        remember_capability(source_state, request.address)
+        view = ReadableStreamBYOBRequest.view(request)
 
-        case next_socket_chunk(source_state, request.view_byte_length) do
+        case next_socket_chunk(source_state, view.byte_length) do
           :done ->
             ReadableByteStreamController.close(controller)
+            ReadableStreamBYOBRequest.respond(request, 0)
 
           {:chunk, chunk, pull_number} ->
-            maybe_log_capability(request, pull_number, chunk)
+            maybe_log_request(view, pull_number, chunk)
             ReadableStreamBYOBRequest.respond(request, chunk)
         end
 
@@ -101,26 +97,11 @@ defmodule SecureByobStreamExample do
     end)
   end
 
-  defp remember_capability(source_state, address) do
-    Agent.update(source_state, fn %{capability_sample: capability_sample} = state ->
-      next_sample =
-        cond do
-          address in capability_sample -> capability_sample
-          length(capability_sample) >= 3 -> capability_sample
-          true -> capability_sample ++ [address]
-        end
-
-      %{state | capability_sample: next_sample}
-    end)
+  defp maybe_log_request(view, pull_number, chunk) when pull_number <= 3 do
+    IO.puts("pull=#{pull_number} fill=#{byte_size(chunk)}/#{view.byte_length}")
   end
 
-  defp maybe_log_capability(request, pull_number, chunk) when pull_number <= 3 do
-    IO.puts(
-      "pull=#{pull_number} capability=#{inspect(request.address)} fill=#{byte_size(chunk)}/#{request.view_byte_length}"
-    )
-  end
-
-  defp maybe_log_capability(_request, _pull_number, _chunk), do: :ok
+  defp maybe_log_request(_view, _pull_number, _chunk), do: :ok
 
   defp drain(reader, scratch, stats) do
     case await_promise(ReadableStreamBYOBReader.read(reader, scratch)) do
@@ -130,30 +111,27 @@ defmodule SecureByobStreamExample do
       %{value: %Uint8Array{} = view, done: false} ->
         read_number = stats.reads + 1
 
-        buffer_reused? =
-          stats.buffer_reused? and ArrayBuffer.identity(view.buffer) == stats.buffer_id
+        # A BYOB read moves the buffer into the stream. The buffer that the
+        # reader gave is now detached. The result has a buffer of the same
+        # length, which the reader uses for the subsequent read.
+        buffer_length_kept? =
+          stats.buffer_length_kept? and ArrayBuffer.detached?(scratch.buffer) and
+            ArrayBuffer.byte_length(view.buffer) == @view_bytes
 
         if read_number <= 3 or rem(read_number, 16) == 0 do
-          IO.puts(
-            "read=#{read_number} bytes=#{view.byte_length} consumer_buffer=#{inspect(ArrayBuffer.identity(view.buffer))}"
-          )
+          IO.puts("read=#{read_number} bytes=#{view.byte_length}")
         end
 
-        drain(reader, scratch, %{
+        drain(reader, Uint8Array.new(view.buffer), %{
           stats
           | reads: read_number,
             bytes: stats.bytes + view.byte_length,
-            buffer_reused?: buffer_reused?
+            buffer_length_kept?: buffer_length_kept?
         })
     end
   end
 
-  defp await_promise(%Web.Promise{task: task}) do
-    Task.await(task, :infinity)
-  catch
-    :exit, {{:shutdown, reason}, {Task, :await, _details}} -> exit(reason)
-    :exit, reason -> exit(reason)
-  end
+  defp await_promise(%Web.Promise{} = promise), do: Web.await(promise)
 end
 
 SecureByobStreamExample.run()

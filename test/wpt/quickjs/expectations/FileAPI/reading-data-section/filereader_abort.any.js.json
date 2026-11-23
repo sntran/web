@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Aborting a reused reader after a previous read completed": "scope: the library has no FileReader",
+    "Aborting after read": "scope: the library has no FileReader",
+    "Aborting before read": "scope: the library has no FileReader"
+  }
+}

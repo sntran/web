@@ -53,8 +53,7 @@ source =
 IO.puts("[mem] start bytes=#{:erlang.memory(:total)}")
 
 response =
-  Response.new(
-    body: source,
+  Response.new(source,
     headers: %{"content-type" => "multipart/form-data; boundary=#{boundary}"}
   )
 
@@ -68,7 +67,10 @@ route =
 
 IO.puts("route=#{inspect(route)}")
 
-%Web.File{} = payload = Web.FormData.get(form_data, "payload")
+# The name of the entry is the name of the field. The name of the file
+# comes from the parameter `filename` of the part.
+%Web.File{name: "payload.bin"} = payload = Web.FormData.get(form_data, "payload")
+IO.puts("file=#{payload.name} type=#{payload.type}")
 payload_stream = Web.File.stream(payload)
 
 {:ok, sink_state} =
@@ -79,7 +81,8 @@ payload_stream = Web.File.stream(payload)
 sink =
   WritableStream.new(%{
     write: fn chunk, _controller ->
-      size = byte_size(IO.iodata_to_binary(chunk))
+      # Each chunk of a file stream is a `Web.Uint8Array`.
+      size = chunk.byte_length
 
       Agent.get_and_update(sink_state, fn %{bytes: bytes, checkpoint: checkpoint} = state ->
         next = bytes + size
@@ -102,8 +105,8 @@ total_written = Agent.get(sink_state, & &1.bytes)
 IO.puts("payload_bytes=#{payload_bytes} written_bytes=#{total_written}")
 IO.puts("[mem] end bytes=#{:erlang.memory(:total)}")
 
-Web.FormData.cancel(form_data, :normal)
-await(ReadableStream.cancel(source, :done))
+# The parser of the form read all the bytes of the source. The parser
+# stops when its owner, this process, stops.
 await(WritableStream.abort(sink, :done))
 
 Enum.each([source.controller_pid, sink.controller_pid], fn pid ->
@@ -117,11 +120,12 @@ Process.sleep(50)
 
 cleanup_pids = [
   {"source", source.controller_pid},
-  {"coordinator", form_data.coordinator},
   {"payload_stream", payload_stream.controller_pid},
   {"sink", sink.controller_pid}
 ]
 
+# The file stream of the form ended. It stops when the linger time goes by
+# (`config :web, linger: ms`).
 Enum.each(cleanup_pids, fn {name, pid} ->
   IO.puts("cleanup #{name}=#{inspect(pid)} alive?=#{Process.alive?(pid)}")
 end)

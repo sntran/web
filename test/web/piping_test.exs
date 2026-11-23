@@ -27,7 +27,7 @@ defmodule Web.PipingTest do
 
     promise = ReadableStream.pipe_to(source, sink)
 
-    assert Task.await(promise.task, 1_000) == :ok
+    assert Web.Promise.await(promise) == :ok
     assert_receive {:chunk, "a"}
     assert_receive {:chunk, "b"}
     assert_receive {:chunk, "c"}
@@ -78,9 +78,9 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise = ReadableStream.pipe_to(source, sink, preventClose: true)
+    promise = ReadableStream.pipe_to(source, sink, prevent_close: true)
 
-    assert Task.await(promise.task, 1_000) == :ok
+    assert Web.Promise.await(promise) == :ok
     refute_received :sink_closed
     assert WritableStream.__get_slots__(sink.controller_pid).state == :writable
   end
@@ -122,7 +122,7 @@ defmodule Web.PipingTest do
     :ok = AbortController.abort(controller, reason)
     send(sink_write_pid, :continue)
 
-    assert catch_exit(await(promise)) == {:aborted, :my_custom_reason}
+    assert catch_exit(await(promise)) == :my_custom_reason
     assert_receive {:source_cancelled, :my_custom_reason}
     assert_receive {:sink_aborted, :my_custom_reason}
   end
@@ -147,8 +147,8 @@ defmodule Web.PipingTest do
 
     promise = ReadableStream.pipe_to(source, sink)
 
-    assert catch_exit(await(promise)) == {:errored, :boom}
-    assert_receive {:sink_aborted, {:errored, :boom}}
+    assert catch_exit(await(promise)) == :boom
+    assert_receive {:sink_aborted, :boom}
 
     source_2 =
       ReadableStream.new(%{
@@ -165,9 +165,9 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise_2 = ReadableStream.pipe_to(source_2, sink_2, preventAbort: true)
+    promise_2 = ReadableStream.pipe_to(source_2, sink_2, prevent_abort: true)
 
-    assert catch_exit(await(promise_2)) == {:errored, :boom}
+    assert catch_exit(await(promise_2)) == :boom
     refute_received {:sink_aborted_prevented, _reason}
   end
 
@@ -195,8 +195,8 @@ defmodule Web.PipingTest do
 
     promise = ReadableStream.pipe_to(source, sink)
 
-    assert catch_exit(await(promise)) == {:errored, :sink_boom}
-    assert_receive {:source_cancelled, {:errored, :sink_boom}}
+    assert catch_exit(await(promise)) == :sink_boom
+    assert_receive {:source_cancelled, :sink_boom}
 
     source_2 =
       ReadableStream.new(%{
@@ -217,22 +217,31 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise_2 = ReadableStream.pipe_to(source_2, sink_2, preventCancel: true)
+    promise_2 = ReadableStream.pipe_to(source_2, sink_2, prevent_cancel: true)
 
-    assert catch_exit(await(promise_2)) == {:errored, :sink_boom}
+    assert catch_exit(await(promise_2)) == :sink_boom
     refute_received {:source_cancelled_prevented, _reason}
   end
 
-  test "pipe_to/3 accepts readable and writable pids" do
-    source = ReadableStream.from(["pid-path"])
+  test "pipe_to/3 rejects and pipe_through/3 raises for a value that is not a stream" do
+    source = ReadableStream.from(["a"])
+    sink = WritableStream.new(%{})
 
-    sink =
-      WritableStream.new(%{
-        write: fn _chunk, _controller -> :ok end
-      })
+    assert %Web.TypeError{message: "The source of a pipe must be a ReadableStream" <> _} =
+             catch_exit(await(ReadableStream.pipe_to(source.controller_pid, sink)))
 
-    promise = ReadableStream.pipe_to(source.controller_pid, sink.controller_pid)
-    assert Task.await(promise.task, 1_000) == :ok
+    assert %Web.TypeError{message: "The destination of a pipe must be a WritableStream" <> _} =
+             catch_exit(await(ReadableStream.pipe_to(source, sink.controller_pid)))
+
+    refute ReadableStream.locked?(source)
+
+    assert_raise Web.TypeError, ~r/must be a ReadableStream/, fn ->
+      ReadableStream.pipe_through(:not_a_stream, TransformStream.new())
+    end
+
+    assert_raise Web.TypeError, ~r/must be a WritableStream/, fn ->
+      ReadableStream.pipe_through(source, %{readable: source, writable: :not_a_stream})
+    end
   end
 
   test "pipe_to/3 fails fast when source or sink is already locked" do
@@ -241,7 +250,7 @@ defmodule Web.PipingTest do
 
     sink = WritableStream.new(%{})
 
-    promise = ReadableStream.pipe_to(source.controller_pid, sink)
+    promise = ReadableStream.pipe_to(source, sink)
 
     assert %Web.TypeError{message: "ReadableStream is already locked"} =
              catch_exit(await(promise))
@@ -250,7 +259,7 @@ defmodule Web.PipingTest do
     sink_2 = WritableStream.new(%{})
     _writer = WritableStream.get_writer(sink_2)
 
-    promise_2 = ReadableStream.pipe_to(source_2, sink_2.controller_pid)
+    promise_2 = ReadableStream.pipe_to(source_2, sink_2)
 
     assert %Web.TypeError{message: "WritableStream is already locked"} =
              catch_exit(await(promise_2))
@@ -261,12 +270,12 @@ defmodule Web.PipingTest do
     sink = WritableStream.new(%{})
     _writer = WritableStream.get_writer(sink)
 
-    promise = ReadableStream.pipe_to(source.controller_pid, sink.controller_pid)
+    promise = ReadableStream.pipe_to(source, sink)
 
     assert %Web.TypeError{message: "WritableStream is already locked"} =
              catch_exit(await(promise))
 
-    assert :ok = ReadableStream.get_reader(source.controller_pid)
+    assert :ok = ReadableStream.__get_reader__(source.controller_pid)
     assert :ok = ReadableStream.release_lock(source.controller_pid)
   end
 
@@ -306,13 +315,13 @@ defmodule Web.PipingTest do
     assert_receive :source_pull_started
     assert :ok = AbortController.abort(controller, :timeout)
 
-    assert catch_exit(await(promise)) == {:aborted, :timeout}
+    assert catch_exit(await(promise)) == :timeout
     assert_receive {:source_cancelled_preemptively, :timeout}
     assert_receive {:sink_aborted_preemptively, :timeout}
     refute_received :sink_write_called
   end
 
-  test "pipe_to/3 preserves custom token abort reasons while blocked" do
+  test "pipe_to/3 rejects with the reason of the signal while a pull waits" do
     parent = self()
 
     source =
@@ -338,17 +347,18 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise = ReadableStream.pipe_to(source, sink, signal: :pipe_token)
+    controller = AbortController.new()
+    promise = ReadableStream.pipe_to(source, sink, signal: controller.signal)
 
     assert_receive :token_pull_started
-    send(promise.task.pid, {:abort, :pipe_token, :token_reason})
+    :ok = AbortController.abort(controller, :token_reason)
 
-    assert catch_exit(await(promise)) == {:aborted, :token_reason}
+    assert catch_exit(await(promise)) == :token_reason
     assert_receive {:token_source_cancelled, :token_reason}
     assert_receive {:token_sink_aborted, :token_reason}
   end
 
-  test "pipe_to/3 normalizes token aborts without explicit reasons" do
+  test "pipe_to/3 rejects with an AbortError for an abort with no reason" do
     parent = self()
 
     source =
@@ -374,13 +384,39 @@ defmodule Web.PipingTest do
         end
       })
 
-    promise = ReadableStream.pipe_to(source, sink, signal: :pipe_token_default)
+    controller = AbortController.new()
+    promise = ReadableStream.pipe_to(source, sink, signal: controller.signal)
 
     assert_receive :token_default_pull_started
-    send(promise.task.pid, {:abort, :pipe_token_default})
+    :ok = AbortController.abort(controller)
 
-    assert catch_exit(await(promise)) == {:aborted, :aborted}
-    assert_receive {:token_default_source_cancelled, :aborted}
-    assert_receive {:token_default_sink_aborted, :aborted}
+    assert %Web.DOMException{name: "AbortError"} = catch_exit(await(promise))
+    assert_receive {:token_default_source_cancelled, %Web.DOMException{name: "AbortError"}}
+    assert_receive {:token_default_sink_aborted, %Web.DOMException{name: "AbortError"}}
+  end
+
+  test "pipe_to/3 and pipe_through/3 refuse a signal that is not an AbortSignal" do
+    # The member `signal` of `StreamPipeOptions` has the type `AbortSignal`:
+    # the conversion of the options comes before the steps of the method.
+    for signal <- [:pipe_token, make_ref(), self(), "signal", %{aborted: true}] do
+      source = ReadableStream.from(["a"])
+      message = "The value is not an AbortSignal: #{inspect(signal)}"
+
+      assert %Web.TypeError{message: ^message} =
+               catch_exit(
+                 await(ReadableStream.pipe_to(source, WritableStream.new(), signal: signal))
+               )
+
+      assert_raise Web.TypeError, message, fn ->
+        ReadableStream.pipe_through(source, TransformStream.new(), signal: signal)
+      end
+
+      # The stream has no lock and is not disturbed.
+      refute ReadableStream.locked?(source)
+      assert Enum.to_list(source) == ["a"]
+    end
+
+    source = ReadableStream.from(["a"])
+    assert await(ReadableStream.pipe_to(source, WritableStream.new(), signal: nil)) == :ok
   end
 end

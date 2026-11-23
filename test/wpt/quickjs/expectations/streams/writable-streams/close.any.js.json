@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "close() on an erroring stream should reject": "runner: the library does the steps of a later microtask before the call returns",
+    "releaseLock() should not change the result of sync close()": "runner: the library does the steps of a later microtask before the call returns",
+    "when close is called on a WritableStream in writable state, ready should return a fulfilled promise": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

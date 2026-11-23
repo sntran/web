@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Revoke blob URL after creating Request, then clone Request, will fetch": "library: a Request does not keep the blob of its blob URL",
+    "Revoke blob URL after creating Request, will fetch": "library: a Request does not keep the blob of its blob URL"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "abort should set the close reason for the writable when it happens before cancel during start, and cancel should reject": "runner: the library does the steps of a later microtask before the call returns",
+    "controller.error() should close writable immediately after readable.cancel()": "runner: the library does the steps of a later microtask before the call returns",
+    "controller.error() should do nothing the second time it is called": "runner: the library does the steps of a later microtask before the call returns"
+  }
+}

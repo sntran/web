@@ -79,18 +79,21 @@ defmodule Web.MIMETest do
     assert MIME.sniff(["[", "1", "]"]) == "application/json"
   end
 
-  test "blob/1 uses MIME parsing and sniffing for response bodies" do
-    response =
-      Response.new(
-        body: "<!doctype html><html><head></head><body>x</body></html>",
-        headers: [{"content-type", "application/octet-stream"}]
-      )
+  test "blob/1 gets its type from the header only, and does not examine the body" do
+    html = "<!doctype html><html><head></head><body>x</body></html>"
 
+    response = Response.new(html, headers: [{"content-type", "application/octet-stream"}])
     {response, clone} = Response.clone(response)
-    blob = await(Response.blob(response))
 
-    assert blob.type == "text/html"
+    assert await(Response.blob(response)).type == "application/octet-stream"
     assert await(Response.text(clone)) =~ "<html>"
+
+    # A body from a stream has no header `content-type`, thus the type is "".
+    no_header = Response.new(Web.ReadableStream.from([html]))
+    assert await(Response.blob(no_header)).type == ""
+
+    # `Web.MIME.sniff/1` examines the bytes when that is necessary.
+    assert MIME.sniff(html) == "text/html"
   end
 
   defp run_mime_sniffing_test!(_test_case, input, expected_mime) do
@@ -113,7 +116,7 @@ defmodule Web.MIMETest do
     if is_nil(input) or is_nil(header) or is_nil(expected_mime) do
       :ok
     else
-      response = Response.new(body: input, headers: [{"content-type", header}])
+      response = Response.new(input, headers: [{"content-type", header}])
       actual_mime = await(Response.blob(response)).type
 
       if normalize_mime_type(actual_mime) == normalize_mime_type(expected_mime) do

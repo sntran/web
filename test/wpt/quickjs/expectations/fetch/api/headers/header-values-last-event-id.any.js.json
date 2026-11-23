@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "fetch() sends the bytes of a non-ASCII Last-Event-ID header value unchanged": "runner: no server of WPT"
+  }
+}

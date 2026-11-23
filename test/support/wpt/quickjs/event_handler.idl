@@ -1,0 +1,6 @@
+// The event handlers of the HTML Standard, which dom.idl uses: see
+// https://html.spec.whatwg.org/#eventhandler. The file html.idl of WPT is
+// large, thus the runner reads only these definitions.
+[LegacyTreatNonObjectAsNull]
+callback EventHandlerNonNull = any (Event event);
+typedef EventHandlerNonNull? EventHandler;

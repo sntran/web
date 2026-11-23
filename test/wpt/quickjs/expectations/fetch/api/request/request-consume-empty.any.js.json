@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Consume empty FormData request body as text": "standard: RFC 7578 and each browser give the close delimiter for an empty form"
+  }
+}

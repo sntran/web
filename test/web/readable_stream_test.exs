@@ -9,6 +9,7 @@ defmodule Web.ReadableStreamTest do
   alias Web.ReadableStreamBYOBReader
   alias Web.ReadableStreamDefaultController
   alias Web.ReadableStreamDefaultReader
+  alias Web.Test.StreamEngine
   alias Web.TypeError
 
   setup do
@@ -43,7 +44,8 @@ defmodule Web.ReadableStreamTest do
         Enum.each(stream, fn _ -> raise "error" end)
       end
 
-      Process.sleep(50)
+      # The release of the lock is a call. Thus the stream has no reader
+      # when the enumeration returns.
       assert ReadableStream.__get_slots__(pid).reader_pid == nil
     end
 
@@ -51,7 +53,7 @@ defmodule Web.ReadableStreamTest do
       ReadableStream.enqueue(pid, "a")
       ReadableStream.enqueue(pid, "b")
       assert Enum.take(stream, 1) == ["a"]
-      Process.sleep(50)
+      # The halt is a call that removes the reader.
       assert ReadableStream.__get_slots__(pid).reader_pid == nil
     end
 
@@ -69,107 +71,107 @@ defmodule Web.ReadableStreamTest do
       assert {:done, "ab"} = next.({:cont, "a"})
     end
 
-    test "Enumerable release_lock rescues", %{stream: stream, controller_pid: pid} do
+    test "a halt after the reducer released the lock", %{stream: stream, controller_pid: pid} do
       ReadableStream.enqueue(pid, "a")
-      # Rescue in halt
-      Enum.reduce_while(stream, 0, fn _x, _acc ->
-        ReadableStream.release_lock(pid)
-        {:halt, :stopped}
-      end)
 
-      # Rescue in done
-      {:ok, p2} = ReadableStream.start_link()
-      s2 = %ReadableStream{controller_pid: p2}
-      ReadableStream.enqueue(p2, "a")
-      ReadableStream.close(p2)
+      assert Enum.reduce_while(stream, 0, fn _chunk, _acc ->
+               ReadableStream.release_lock(pid)
+               {:halt, :stopped}
+             end) == :stopped
+    end
 
-      Enum.each(s2, fn _ ->
-        ReadableStream.error(p2, :force_unexpected_release)
-      end)
+    test "an enumeration raises the error of a stream that fails during the reduce", %{
+      stream: stream,
+      controller_pid: pid
+    } do
+      ReadableStream.enqueue(pid, "a")
 
-      # Rescue in error/rescue
-      {:ok, p3} = ReadableStream.start_link()
-      s3 = %ReadableStream{controller_pid: p3}
-      ReadableStream.enqueue(p3, "a")
+      error =
+        assert_raise TypeError, "The stream is errored.", fn ->
+          Enum.each(stream, fn _chunk -> ReadableStream.error(pid, :failed) end)
+        end
 
-      assert_raise RuntimeError, fn ->
-        Enum.each(s3, fn _ ->
-          ReadableStream.error(p3, :force_unexpected_release)
-          raise "bomb"
-        end)
-      end
+      assert error.cause == :failed
+      refute ReadableStream.locked?(stream)
+    end
+
+    test "a reducer that throws or exits releases the lock", %{
+      stream: stream,
+      controller_pid: pid
+    } do
+      ReadableStream.enqueue(pid, "a")
+      ReadableStream.enqueue(pid, "b")
+
+      assert catch_throw(Enum.each(stream, fn _chunk -> throw(:stop) end)) == :stop
+      refute ReadableStream.locked?(stream)
+
+      assert catch_exit(Enum.each(stream, fn _chunk -> exit(:stop) end)) == :stop
+      refute ReadableStream.locked?(stream)
     end
   end
 
   describe "ReadableStream process" do
+    test "new/2 refuses an underlying source that is not a map" do
+      for source <- [self(), fn _controller -> :ok end, {Kernel, :send, [self()]}, %URI{}, nil] do
+        assert_raise Web.TypeError, ~r/Invalid underlying source/, fn ->
+          ReadableStream.new(source)
+        end
+      end
+    end
+
     test "various sources" do
       parent = self()
 
       # PID source
       {:ok, p1} = ReadableStream.start_link(source: parent)
       receive do: ({:pull, ^p1} -> :ok)
-      assert :ok = Task.await(ReadableStream.cancel(p1, :r1).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(p1, :r1))
       receive do: ({:web_stream_cancel, ^p1, :r1} -> :ok)
 
       # Function source
       {:ok, p2} = ReadableStream.start_link(source: fn x -> send(parent, {:f, x}) end)
       receive do: ({:f, %Web.ReadableStreamDefaultController{pid: ^p2}} -> :ok)
-      assert :ok = Task.await(ReadableStream.cancel(p2, :r2).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(p2, :r2))
       receive do: ({:f, :r2} -> :ok)
 
       # MFA source
       {:ok, p3} = ReadableStream.start_link(source: {Kernel, :send, [parent]})
       receive do: (%Web.ReadableStreamDefaultController{pid: ^p3} -> :ok)
-      assert :ok = Task.await(ReadableStream.cancel(p3, :r3).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(p3, :r3))
       receive do: (:r3 -> :ok)
 
       # Nil source
       {:ok, p4} = ReadableStream.start_link(source: nil)
       ReadableStream.enqueue(p4, "a")
-      assert :ok = Task.await(ReadableStream.cancel(p4, :r4).task, 1_000)
-    end
-
-    test "internal events and desired size", %{controller_pid: pid} do
-      assert ReadableStream.get_desired_size(pid) == 2
-      send(pid, {:internal, :maybe_pull})
-      ReadableStream.close(pid)
-      send(pid, {:internal, :maybe_pull})
-      send(pid, {:internal, :flush_requests})
-      ReadableStream.error(pid, :fail)
-      send(pid, {:internal, :maybe_pull})
-      send(pid, {:internal, :flush_requests})
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(p4, :r4))
     end
 
     test "new/2 honors byte-length strategies for desired size" do
-      stream =
-        ReadableStream.new(%{},
-          high_water_mark: 5,
-          strategy: Web.ByteLengthQueuingStrategy.new(5)
-        )
+      stream = ReadableStream.new(%{}, Web.ByteLengthQueuingStrategy.new(high_water_mark: 5))
 
       ReadableStream.enqueue(stream.controller_pid, "ab")
 
       assert ReadableStream.get_desired_size(stream.controller_pid) == 3
     end
 
-    test "new/2 normalizes defaults and source strategy metadata" do
-      function_stream = ReadableStream.new(fn _controller -> :ok end)
+    test "new/2 takes only the members of UnderlyingSource from the source" do
+      source_strategy = Web.ByteLengthQueuingStrategy.new(high_water_mark: 7)
 
-      assert ReadableStream.get_desired_size(function_stream.controller_pid) == 1
-
-      source_strategy = Web.ByteLengthQueuingStrategy.new(7)
+      # The keys :high_water_mark and :strategy of a source have no effect,
+      # as each key that is not a member of the dictionary. A source with no
+      # pull function does not change the queue: the size is stable.
+      idle_stream = ReadableStream.new(%{high_water_mark: 7, strategy: source_strategy})
+      assert ReadableStream.get_desired_size(idle_stream.controller_pid) == 1
 
       source_stream =
         ReadableStream.new(%{
           high_water_mark: 7,
-          strategy: source_strategy,
           pull: fn controller ->
             ReadableStreamDefaultController.enqueue(controller, "abc")
             ReadableStreamDefaultController.close(controller)
           end
         })
 
-      assert ReadableStream.get_desired_size(source_stream.controller_pid) == 7
       assert Enum.join(source_stream, "") == "abc"
     end
 
@@ -179,7 +181,9 @@ defmodule Web.ReadableStreamTest do
       ReadableStream.enqueue(stream.controller_pid, "ab")
 
       assert ReadableStream.__get_slots__(stream.controller_pid).stream_type == :bytes
-      assert ReadableStream.get_desired_size(stream.controller_pid) == -1
+      # A byte stream has the high water mark 0, as the Streams Standard
+      # specifies, and its queue counts bytes.
+      assert ReadableStream.get_desired_size(stream.controller_pid) == -2
 
       reader = ReadableStream.get_reader(stream, mode: "byob")
       assert %ReadableStreamBYOBReader{} = reader
@@ -211,10 +215,17 @@ defmodule Web.ReadableStreamTest do
       end
     end
 
-    test "get_reader/2 accepts an explicit default mode" do
+    test "get_reader/2 accepts only the mode byob, as the Streams Standard" do
       stream = ReadableStream.new()
 
-      assert %ReadableStreamDefaultReader{} = ReadableStream.get_reader(stream, mode: "default")
+      for mode <- ["default", "nope", :byob, 1] do
+        assert_raise TypeError, ~r/Invalid reader mode/, fn ->
+          ReadableStream.get_reader(stream, mode: mode)
+        end
+      end
+
+      refute ReadableStream.locked?(stream)
+      assert %ReadableStreamDefaultReader{} = ReadableStream.get_reader(stream, mode: nil)
     end
 
     test "get_reader/2 raises already locked for BYOB mode when a byte stream is locked" do
@@ -237,7 +248,10 @@ defmodule Web.ReadableStreamTest do
       end)
 
       receive do: (:locked -> :ok)
-      Process.sleep(100)
+
+      # The stream gets the DOWN message of the reader from the runtime. No
+      # message to the test tells when the stream handled it.
+      eventually(fn -> ReadableStream.__get_slots__(pid).reader_pid == nil end)
       assert ReadableStream.__get_slots__(pid).reader_pid == nil
 
       # Send a DOWN message with a ref that doesn't match
@@ -253,8 +267,11 @@ defmodule Web.ReadableStreamTest do
     end
 
     test "unlocked actions", %{controller_pid: pid} do
-      assert {:error, :not_locked_by_reader} = ReadableStream.read(pid)
-      assert {:error, :not_locked_by_reader} = ReadableStream.release_lock(pid)
+      assert {:error, :not_locked_by_reader} = StreamEngine.read(pid)
+
+      # A release by a process that has no lock has no effect, as in the
+      # Streams Standard.
+      assert :ok = ReadableStream.release_lock(pid)
     end
 
     test "disturbed?/1, locked?/1, and read_all/1 helpers" do
@@ -313,22 +330,29 @@ defmodule Web.ReadableStreamTest do
       assert_receive :resource_halted, 1_000
     end
 
-    test "from/1 halts untouched enumerators on cancel" do
-      stream = ReadableStream.from(["a", "b", "c"])
+    test "a cancel before the first pull does not start the enumerable" do
+      parent = self()
+
+      resource =
+        Stream.resource(
+          fn -> send(parent, :resource_started) end,
+          fn acc -> {["a"], acc} end,
+          fn _acc -> send(parent, :resource_halted) end
+        )
+
+      # With the limit 0, the stream does not pull before a read.
+      stream = ReadableStream.from_enumerable(resource, high_water_mark: 0)
 
       assert :ok = await(ReadableStream.cancel(stream, :stop))
+      refute_receive :resource_started, 50
+      refute_received :resource_halted
     end
 
     test "from/1 swallows continuation halt exceptions on cancel" do
       stream =
-        ReadableStream.from(fn
-          {:cont, nil} ->
-            {:suspended, "a",
-             fn
-               {:halt, _acc} -> raise "boom"
-               {:cont, _acc} -> {:done, nil}
-             end}
-        end)
+        ReadableStream.from(
+          Stream.resource(fn -> :ok end, fn acc -> {["a"], acc} end, fn _acc -> raise "boom" end)
+        )
 
       assert ["a"] = Enum.take(stream, 1)
       assert :ok = await(ReadableStream.cancel(stream, :stop))
@@ -336,53 +360,72 @@ defmodule Web.ReadableStreamTest do
 
     test "from/1 swallows continuation halt throws on cancel" do
       stream =
-        ReadableStream.from(fn
-          {:cont, nil} ->
-            {:suspended, "a",
-             fn
-               {:halt, _acc} -> throw(:boom)
-               {:cont, _acc} -> {:done, nil}
-             end}
-        end)
+        ReadableStream.from(
+          Stream.resource(fn -> :ok end, fn acc -> {["a"], acc} end, fn _acc -> throw(:boom) end)
+        )
 
       assert ["a"] = Enum.take(stream, 1)
       assert :ok = await(ReadableStream.cancel(stream, :stop))
     end
 
-    test "from/1 normalizes URLSearchParams, Blob, ArrayBuffer, and Uint8Array" do
-      params = Web.URLSearchParams.new(%{"a" => "1", "b" => "2"})
-      assert "a=1&b=2" = params |> ReadableStream.from() |> Enum.join("")
+    # ReadableStream.from(asyncIterable) of the Streams Standard.
+    test "from/1 takes an iterable, and refuses a value that is not one" do
+      params = Web.URLSearchParams.new(%{"a" => "1"})
+      assert [{"a", "1"}] = params |> ReadableStream.from() |> Enum.to_list()
 
-      blob = Web.Blob.new(["he", "ll", "o"])
-      assert "hello" = blob |> ReadableStream.from() |> Enum.join("")
+      for value <- ["text", nil, Web.Blob.new(["a"]), Web.ArrayBuffer.new("a")] do
+        assert_raise Web.TypeError, fn -> ReadableStream.from(value) end
+      end
 
-      buffer = Web.ArrayBuffer.new("hello")
-      assert "hello" = buffer |> ReadableStream.from() |> Enum.join("")
-
-      bytes = Web.Uint8Array.new(Web.ArrayBuffer.new("hello"), 1, 3)
-      assert "ell" = bytes |> ReadableStream.from() |> Enum.join("")
-
-      nested_blob = Web.Blob.new(["a", Web.Blob.new(["b", "c"]), "d"])
-      assert "abcd" = nested_blob |> ReadableStream.from() |> Enum.join("")
+      source = ReadableStream.from([1, 2])
+      copy = ReadableStream.from(source)
+      assert copy != source
+      assert Enum.to_list(copy) == [1, 2]
     end
 
-    test "from/1 streams blob parts lazily across multiple pull cycles" do
+    test "the internal from gives the bytes of URLSearchParams, Blob, ArrayBuffer, and Uint8Array" do
+      params = Web.URLSearchParams.new(%{"a" => "1", "b" => "2"})
+      assert "a=1&b=2" = params |> ReadableStream.__from__() |> Web.TestBytes.join()
+
+      blob = Web.Blob.new(["he", "ll", "o"])
+      assert "hello" = blob |> ReadableStream.__from__() |> Web.TestBytes.join()
+
+      # A stream of bytes gives each chunk as a Uint8Array.
+      buffer = Web.ArrayBuffer.new("hello")
+
+      assert [%Web.Uint8Array{byte_length: 5} = chunk] =
+               buffer |> ReadableStream.__from__() |> Enum.to_list()
+
+      assert to_string(chunk) == "hello"
+
+      bytes = Web.Uint8Array.new(Web.ArrayBuffer.new("hello"), 1, 3)
+      assert [^bytes] = bytes |> ReadableStream.__from__() |> Enum.to_list()
+
+      nested_blob = Web.Blob.new(["a", Web.Blob.new(["b", "c"]), "d"])
+
+      assert ["a", "b", "c", "d"] =
+               nested_blob |> ReadableStream.__from__() |> Web.TestBytes.binaries()
+    end
+
+    test "the internal from streams blob parts lazily across multiple pull cycles" do
       parts = Enum.map(1..1_000, &Integer.to_string/1)
       blob = Web.Blob.new(parts)
-      stream = ReadableStream.from(blob)
+      stream = ReadableStream.__from__(blob)
       reader = ReadableStream.get_reader(stream)
 
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "1", done: false}
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: "2", done: false}
+
+      read_binary = fn ->
+        assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
+        Web.TestBytes.binary(value)
+      end
+
+      assert read_binary.() == "1"
+      assert read_binary.() == "2"
 
       remaining =
-        3..1_000
-        |> Enum.map(fn expected ->
-          assert await(ReadableStreamDefaultReader.read(reader)) == %{
-                   value: Integer.to_string(expected),
-                   done: false
-                 }
+        Enum.map(3..1_000, fn expected ->
+          assert read_binary.() == Integer.to_string(expected)
         end)
 
       assert length(remaining) == 998
@@ -390,7 +433,7 @@ defmodule Web.ReadableStreamTest do
       assert :ok = ReadableStreamDefaultReader.release_lock(reader)
     end
 
-    test "from/1 traverses nested blobs lazily without preloading controller queue" do
+    test "the internal from traverses nested blobs lazily without preloading controller queue" do
       chunk_a = :binary.copy("a", 64_000)
       chunk_b = :binary.copy("b", 64_000)
       chunk_c = :binary.copy("c", 64_000)
@@ -404,15 +447,18 @@ defmodule Web.ReadableStreamTest do
           Web.Blob.new([chunk_c])
         ])
 
-      stream = ReadableStream.from(blob)
+      stream = ReadableStream.__from__(blob)
       reader = ReadableStream.get_reader(stream)
 
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: chunk_a, done: false}
+      assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
+      assert Web.TestBytes.binary(value) == chunk_a
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: chunk_b, done: false}
+      assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
+      assert Web.TestBytes.binary(value) == chunk_b
       assert :queue.len(ReadableStream.__get_slots__(stream.controller_pid).queue) <= 1
-      assert await(ReadableStreamDefaultReader.read(reader)) == %{value: chunk_c, done: false}
+      assert %{value: value, done: false} = await(ReadableStreamDefaultReader.read(reader))
+      assert Web.TestBytes.binary(value) == chunk_c
       assert await(ReadableStreamDefaultReader.read(reader)) == %{value: nil, done: true}
       assert :ok = ReadableStreamDefaultReader.release_lock(reader)
     end
@@ -427,7 +473,7 @@ defmodule Web.ReadableStreamTest do
       assert %ReadableStream{} =
                ReadableStream.from(fn acc, fun -> Enumerable.List.reduce(["a"], acc, fun) end)
 
-      assert_raise ArgumentError, ~r/cannot normalize body/, fn -> ReadableStream.from(123) end
+      assert_raise TypeError, ~r/Cannot make a ReadableStream/, fn -> ReadableStream.from(123) end
     end
 
     test "from/1 wraps enumerable functions in a readable stream with tee support" do
@@ -447,24 +493,19 @@ defmodule Web.ReadableStreamTest do
 
     test "from/1 enumerable cancellation and nil-source cancel paths do not crash" do
       stream = ReadableStream.from(1..10)
-      assert :ok = Task.await(ReadableStream.cancel(stream.controller_pid, :stop_now).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(stream.controller_pid, :stop_now))
 
       {:ok, nil_pid} = ReadableStream.start_link(source: nil)
-      assert :ok = Task.await(ReadableStream.cancel(nil_pid, :noop).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(nil_pid, :noop))
       assert ReadableStream.__get_slots__(nil_pid).state == :closed
     end
 
-    test "from/1 blob cancellation stops the lazy parts queue" do
-      stream = ReadableStream.from(Web.Blob.new(["a", "b", "c"]))
+    test "the internal from stops the lazy parts queue of a blob at a cancel" do
+      stream = ReadableStream.__from__(Web.Blob.new(["a", "b", "c"]))
 
-      assert :ok = Task.await(ReadableStream.cancel(stream.controller_pid, :stop_now).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(stream.controller_pid, :stop_now))
 
       assert ReadableStream.__get_slots__(stream.controller_pid).state == :closed
-    end
-
-    test "error callback is callable" do
-      callback_state = %{source: %{}, pid: self(), started: false}
-      assert {:ok, ^callback_state} = ReadableStream.error(:boom, callback_state)
     end
 
     test "default controller error helper transitions stream to errored" do
@@ -497,12 +538,13 @@ defmodule Web.ReadableStreamTest do
     end
 
     test "tee/1 marks the source as disturbed" do
-      stream = ReadableStream.from("hello")
+      stream = ReadableStream.__from__("hello")
       assert ReadableStream.disturbed?(stream) == false
 
       _branches = ReadableStream.tee(stream)
-      Process.sleep(50)
 
+      # The tee process reads the source after the branches pull.
+      eventually(fn -> ReadableStream.disturbed?(stream) end)
       assert ReadableStream.disturbed?(stream) == true
     end
 
@@ -536,37 +578,95 @@ defmodule Web.ReadableStreamTest do
       wait_for_stream_state(error_pid, :errored)
     end
 
-    test "start callbacks that throw transition the stream to errored" do
-      {:ok, pid} =
-        ReadableStream.start_link(
-          source: %{
-            start: fn _controller ->
+    test "start callbacks that throw make the constructor throw, and start no stream" do
+      test = self()
+
+      thrown =
+        catch_throw(
+          ReadableStream.new(%{
+            start: fn controller ->
+              send(test, {:controller, controller})
               throw(:start_thrown)
             end
-          }
+          })
         )
 
-      Process.sleep(50)
-      assert ReadableStream.__get_slots__(pid).state == :errored
+      assert thrown == :start_thrown
+      assert_receive {:controller, controller}
+      refute Process.alive?(controller.pid)
+    end
+
+    test "start callbacks run in the process that makes the stream, before new returns" do
+      test = self()
+
+      stream =
+        ReadableStream.new(%{
+          start: fn controller ->
+            send(test, {:start, self()})
+            # The controller is usable: the desired size is the limit.
+            send(test, {:size, ReadableStreamDefaultController.desired_size(controller)})
+            ReadableStreamDefaultController.enqueue(controller, :first)
+          end,
+          pull: fn controller -> ReadableStreamDefaultController.close(controller) end
+        })
+
+      assert_received {:start, ^test}
+      assert_received {:size, 1}
+      assert Enum.to_list(stream) == [:first]
+    end
+
+    test "start callbacks that return a promise hold the first pull until it fulfils" do
+      test = self()
+      {started, resolve, _reject} = Web.Promise.with_resolvers()
+
+      stream =
+        ReadableStream.new(%{
+          start: fn _controller -> started end,
+          pull: fn controller ->
+            send(test, :pulled)
+            ReadableStreamDefaultController.enqueue(controller, :chunk)
+            ReadableStreamDefaultController.close(controller)
+          end
+        })
+
+      refute_receive :pulled, 50
+      resolve.(:ok)
+      assert Enum.to_list(stream) == [:chunk]
+      assert_received :pulled
+    end
+
+    test "start callbacks that return a promise that rejects put the stream in the errored state" do
+      stream = ReadableStream.new(%{start: fn _controller -> Web.Promise.reject(:failed) end})
+      reader = ReadableStream.get_reader(stream)
+
+      assert catch_exit(await(ReadableStreamDefaultReader.read(reader))) == :failed
     end
 
     test "task down paths handle normal and abnormal exits" do
-      sleeper = fn _controller -> Process.sleep(5_000) end
+      test = self()
 
+      # The pull does not end in the test. Thus the task of the pull stays
+      # active.
+      sleeper = fn _controller ->
+        send(test, {:pulling, self()})
+        Process.sleep(5_000)
+      end
+
+      # The stream starts the task before it handles a later message. Thus
+      # the next call gets the reference of the task. The stream handles the
+      # messages of the test in the sequence that the test sends them.
       {:ok, normal_pid} = ReadableStream.start_link(source: %{pull: sleeper})
       send(normal_pid, {:internal, :maybe_pull})
-      Process.sleep(50)
+      assert_receive {:pulling, _worker}
       normal_ref = ReadableStream.__get_slots__(normal_pid).task_ref
       send(normal_pid, {:DOWN, normal_ref, :process, self(), :normal})
-      Process.sleep(50)
       assert ReadableStream.__get_slots__(normal_pid).state == :readable
 
       {:ok, abnormal_pid} = ReadableStream.start_link(source: %{pull: sleeper})
       send(abnormal_pid, {:internal, :maybe_pull})
-      Process.sleep(50)
+      assert_receive {:pulling, _worker}
       abnormal_ref = ReadableStream.__get_slots__(abnormal_pid).task_ref
       send(abnormal_pid, {:DOWN, abnormal_ref, :process, self(), :kaboom})
-      Process.sleep(50)
       assert ReadableStream.__get_slots__(abnormal_pid).state == :errored
     end
 
@@ -574,31 +674,17 @@ defmodule Web.ReadableStreamTest do
       parent = self()
 
       spawn_link(fn ->
-        ReadableStream.get_reader(pid)
-        res = ReadableStream.read(pid)
+        ReadableStream.__get_reader__(pid)
+        res = StreamEngine.read(pid)
         send(parent, {:res, res})
       end)
 
-      Process.sleep(50)
+      wait_for_read_request(pid)
       ReadableStream.enqueue(pid, "v")
       receive do: ({:res, {:ok, "v"}} -> :ok)
     end
 
     test "edge cases" do
-      # maybe_pull when queue full
-      {:ok, p1} = ReadableStream.start_link(high_water_mark: 1)
-      ReadableStream.enqueue(p1, "a")
-      send(p1, {:internal, :maybe_pull})
-
-      # flush_requests when queue NOT empty
-      {:ok, p2} = ReadableStream.start_link()
-      ReadableStream.enqueue(p2, "a")
-      # This sends flush_requests, but queue not empty
-      ReadableStream.close(p2)
-
-      # force_unknown_error
-      assert {:error, :unexpected} = ReadableStream.force_unknown_error(p1)
-
       # disturbed and desired size
       {:ok, p3} = ReadableStream.start_link(high_water_mark: 5)
       assert ReadableStream.__get_slots__(p3).disturbed == false
@@ -611,22 +697,22 @@ defmodule Web.ReadableStreamTest do
       {:ok, p4} = ReadableStream.start_link(high_water_mark: 1)
       ReadableStream.enqueue(p4, "a")
       ReadableStream.enqueue(p4, "b")
-      ReadableStream.get_reader(p4)
+      ReadableStream.__get_reader__(p4)
       # queue was 2, now 1. 1 < 1 is false.
-      ReadableStream.read(p4)
+      StreamEngine.read(p4)
 
       # One pending request on close
       {:ok, p5} = ReadableStream.start_link()
       parent = self()
 
       spawn_link(fn ->
-        ReadableStream.get_reader(p5)
+        ReadableStream.__get_reader__(p5)
         send(parent, :locked)
-        send(parent, {:r1, ReadableStream.read(p5)})
+        send(parent, {:r1, StreamEngine.read(p5)})
       end)
 
       receive do: (:locked -> :ok)
-      Process.sleep(50)
+      wait_for_read_request(p5)
       ReadableStream.close(p5)
       assert_receive {:r1, :done}
 
@@ -634,13 +720,13 @@ defmodule Web.ReadableStreamTest do
       {:ok, p6} = ReadableStream.start_link()
 
       spawn_link(fn ->
-        ReadableStream.get_reader(p6)
+        ReadableStream.__get_reader__(p6)
         send(parent, :locked_too)
-        send(parent, {:r3, ReadableStream.read(p6)})
+        send(parent, {:r3, StreamEngine.read(p6)})
       end)
 
       receive do: (:locked_too -> :ok)
-      Process.sleep(50)
+      wait_for_read_request(p6)
       ReadableStream.error(p6, :boom)
       assert_receive {:r3, {:error, {:errored, :boom}}}
     end
@@ -662,35 +748,6 @@ defmodule Web.ReadableStreamTest do
       ReadableStream.__get_slots__(pid)
 
       assert :fail = catch_exit(await(ReadableStreamDefaultReader.read(reader)))
-
-      # Errored WITHOUT reason (forced) — promise rejects with TypeError
-      {:ok, p2} = ReadableStream.start_link()
-      s2 = %ReadableStream{controller_pid: p2}
-      r2 = ReadableStream.get_reader(s2)
-      ReadableStream.error(p2, :force_error_no_reason)
-      ReadableStream.__get_slots__(p2)
-
-      assert %TypeError{message: "The stream is errored."} =
-               catch_exit(await(ReadableStreamDefaultReader.read(r2)))
-
-      # Unexpected read — promise rejects with the error
-      {:ok, p3} = ReadableStream.start_link()
-      s3 = %ReadableStream{controller_pid: p3}
-      r3 = ReadableStream.get_reader(s3)
-      ReadableStream.error(p3, :force_unexpected_read)
-      ReadableStream.__get_slots__(p3)
-      assert :unexpected = catch_exit(await(ReadableStreamDefaultReader.read(r3)))
-
-      # Unexpected release — release_lock still raises directly
-      {:ok, p4} = ReadableStream.start_link()
-      s4 = %ReadableStream{controller_pid: p4}
-      r4 = ReadableStream.get_reader(s4)
-      ReadableStream.error(p4, :force_unexpected_release)
-      ReadableStream.__get_slots__(p4)
-
-      assert_raise TypeError, ~r/Unknown error/, fn ->
-        ReadableStreamDefaultReader.release_lock(r4)
-      end
     end
 
     test "PID mismatch", %{controller_pid: pid} do
@@ -699,9 +756,8 @@ defmodule Web.ReadableStreamTest do
       assert %TypeError{message: "This reader is no longer locked."} =
                catch_exit(await(ReadableStreamDefaultReader.read(r)))
 
-      assert_raise TypeError, ~r/longer locked/, fn ->
-        ReadableStreamDefaultReader.release_lock(r)
-      end
+      # A release by a reader that has no lock has no effect.
+      assert :ok = ReadableStreamDefaultReader.release_lock(r)
     end
 
     test "cancel", %{stream: stream} do
@@ -740,9 +796,9 @@ defmodule Web.ReadableStreamTest do
           end
         })
 
-      # The controller should catch the error and become errored
-      # Enum.to_list calls get_reader then read.
-      assert_raise TypeError, ~r/errored/, fn ->
+      # The stream goes to the errored state, and the enumeration raises the
+      # error of the source.
+      assert_raise RuntimeError, "Ouch!", fn ->
         Enum.to_list(stream)
       end
     end
@@ -786,20 +842,21 @@ defmodule Web.ReadableStreamTest do
 
       # Cancel branch A
       reader_a = ReadableStream.get_reader(branch_a)
-      ReadableStreamDefaultReader.cancel(reader_a)
+      ReadableStreamDefaultReader.cancel(reader_a, :reason_a)
 
       # Branch B should still be able to get data
       reader_b = ReadableStream.get_reader(branch_b)
-      # Wait a bit for async start/pull to complete if needed
-      Process.sleep(50)
+      # The read waits for the chunk.
       assert await(ReadableStreamDefaultReader.read(reader_b)) == %{value: "data", done: false}
       assert_receive :pull_called
 
-      # Cancel branch B
-      ReadableStreamDefaultReader.cancel(reader_b)
+      # The cancel of one branch has no effect on the source.
+      refute_receive :original_cancelled, 50
 
-      # Composed tee keeps source lifecycle independent of branch cancellation.
-      refute_receive :original_cancelled
+      # Cancel branch B. The two branches are now cancelled, thus the source
+      # is cancelled, as the Streams Standard specifies.
+      ReadableStreamDefaultReader.cancel(reader_b, :reason_b)
+      assert_receive :original_cancelled
     end
 
     test "tee branch cancellation during flow keeps other branch and source active" do
@@ -829,9 +886,12 @@ defmodule Web.ReadableStreamTest do
       assert await(ReadableStreamDefaultReader.read(left_reader)) == %{value: 0, done: false}
       assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 0, done: false}
 
-      assert :ok = await(ReadableStreamDefaultReader.cancel(left_reader))
+      # The promise of this cancel stays pending until the second branch is
+      # cancelled or the stream ends, as in the Streams Standard.
+      left_cancel = ReadableStreamDefaultReader.cancel(left_reader)
 
       assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 1, done: false}
+      assert Web.Promise.peek(left_cancel) == :pending
       assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 2, done: false}
       assert await(ReadableStreamDefaultReader.read(right_reader)) == %{value: 3, done: false}
 
@@ -872,12 +932,13 @@ defmodule Web.ReadableStreamTest do
 
       task_pid = Agent.get(counter, & &1)
       assert Process.alive?(task_pid)
+      task_monitor = Process.monitor(task_pid)
 
       # Cancel stream
-      assert :ok = Task.await(ReadableStream.cancel(stream.controller_pid, :abort).task, 1_000)
+      assert :ok = Web.Promise.await(ReadableStream.__cancel__(stream.controller_pid, :abort))
 
       # Task should be shut down
-      Process.sleep(100)
+      assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, _reason}
       refute Process.alive?(task_pid)
       Agent.stop(counter)
     end
@@ -903,11 +964,7 @@ defmodule Web.ReadableStreamTest do
     end
 
     test "tee/1 allows 16 chunks to queue on the fast branch" do
-      check all(
-              chunk_count <- StreamData.integer(16..16),
-              delay_ms <- StreamData.integer(50..80),
-              max_runs: 10
-            ) do
+      check all(chunk_count <- StreamData.integer(16..16), max_runs: 10) do
         {:ok, counter} = Agent.start_link(fn -> 1 end)
 
         try do
@@ -927,24 +984,29 @@ defmodule Web.ReadableStreamTest do
           [fast_branch, slow_branch] = ReadableStream.tee(stream)
 
           expected = Enum.to_list(1..chunk_count)
-          started_at = System.monotonic_time(:millisecond)
+          test = self()
+          ref = make_ref()
 
-          fast_task = Task.async(fn -> Enum.to_list(fast_branch) end)
-
+          # The slow branch takes one chunk. Then it waits for the test
+          # before it takes the next chunk.
           slow_task =
-            Task.async(fn -> Enum.each(slow_branch, fn _ -> Process.sleep(delay_ms) end) end)
+            Task.async(fn ->
+              Enum.map(slow_branch, fn chunk ->
+                send(test, {:slow_branch, ref, chunk})
+                receive do: (:continue -> chunk)
+              end)
+            end)
 
+          assert_receive {:slow_branch, ^ref, 1}
+
+          # The fast branch gets all the chunks while the slow branch waits:
+          # the chunks queue on the slow branch.
+          fast_task = Task.async(fn -> Enum.to_list(fast_branch) end)
           assert {:ok, ^expected} = Task.yield(fast_task, 10_000)
-          fast_elapsed_ms = System.monotonic_time(:millisecond) - started_at
-          assert :ok = Task.await(slow_task, 10_000)
-          slow_elapsed_ms = System.monotonic_time(:millisecond) - started_at
+          refute_received {:slow_branch, ^ref, 2}
 
-          # The fast branch must complete long before the slow branch finishes.
-          # With HWM=16, all chunks buffer into the fast branch so it completes
-          # without waiting for the slow branch to process each chunk.
-          # The slow branch takes ~chunk_count * delay_ms. The fast branch
-          # should finish in a fraction of that time.
-          assert fast_elapsed_ms < slow_elapsed_ms / 4
+          for _chunk <- expected, do: send(slow_task.pid, :continue)
+          assert Task.await(slow_task, 10_000) == expected
         after
           if Process.alive?(counter), do: Agent.stop(counter)
         end
@@ -1003,7 +1065,6 @@ defmodule Web.ReadableStreamTest do
           }
         )
 
-      Process.sleep(20)
       Web.Stream.terminate(pid, :error, :force_terminate)
       assert_receive {:terminated, {:error, :force_terminate}}, 500
     end
@@ -1018,12 +1079,11 @@ defmodule Web.ReadableStreamTest do
       assert ReadableStream.disturbed?(:some_atom) == false
     end
 
-    test "locked?/1 returns false for nil, binary, list, and unknown types" do
-      assert ReadableStream.locked?(nil) == false
-      assert ReadableStream.locked?("binary") == false
-      assert ReadableStream.locked?(["list"]) == false
-      # Catch-all clause (line 387)
-      assert ReadableStream.locked?(:some_atom) == false
+    test "the lock of a body is false for nil, binary, list, and unknown types" do
+      assert ReadableStream.__locked__(nil) == false
+      assert ReadableStream.__locked__("binary") == false
+      assert ReadableStream.__locked__(["list"]) == false
+      assert ReadableStream.__locked__(:some_atom) == false
     end
 
     # --- cancel/2 struct overload (line 453) ---
@@ -1032,7 +1092,7 @@ defmodule Web.ReadableStreamTest do
       {:ok, pid} = ReadableStream.start_link()
       stream = %ReadableStream{controller_pid: pid}
       result = ReadableStream.cancel(stream, :test_cancel)
-      assert :ok == Task.await(result.task, 1_000)
+      assert :ok == Web.Promise.await(result)
     end
 
     # --- await_stream_state retry loop (lines 741-742) ---
@@ -1044,7 +1104,7 @@ defmodule Web.ReadableStreamTest do
       stream = %ReadableStream{controller_pid: pid}
       ReadableStream.enqueue(pid, "a")
       cancel_promise = ReadableStream.cancel(stream, :slow_cancel)
-      assert :ok == Task.await(cancel_promise.task, 2_000)
+      assert :ok == Web.Promise.await(cancel_promise)
     end
 
     # --- safe_get_slots dead-pid catch (line 749) ---
@@ -1053,11 +1113,11 @@ defmodule Web.ReadableStreamTest do
       {:ok, pid} = ReadableStream.start_link()
       stream = %ReadableStream{controller_pid: pid}
       # Use a non-linked shutdown to kill the stream cleanly
+      # The stop returns when the process stopped.
       :gen_statem.stop(pid)
-      Process.sleep(20)
       refute Process.alive?(pid)
       cancel_promise = ReadableStream.cancel(stream, :already_dead)
-      assert :ok == Task.await(cancel_promise.task, 1_000)
+      assert :ok == Web.Promise.await(cancel_promise)
     end
 
     # --- desired_size/1 (ReadableStreamDefaultController line 61) ---
@@ -1072,23 +1132,38 @@ defmodule Web.ReadableStreamTest do
           end
         }).controller_pid
 
-      Process.sleep(50)
+      # The function `start` runs before `new` returns, and its close is a
+      # call.
       assert ReadableStream.__get_slots__(pid).state == :closed
     end
   end
 
-  defp wait_for_stream_state(pid, expected_state, attempts \\ 20)
-
-  defp wait_for_stream_state(pid, expected_state, attempts) when attempts > 0 do
-    if ReadableStream.__get_slots__(pid).state == expected_state do
-      :ok
-    else
-      Process.sleep(25)
-      wait_for_stream_state(pid, expected_state, attempts - 1)
-    end
+  defp wait_for_stream_state(pid, expected_state) do
+    eventually(fn -> ReadableStream.__get_slots__(pid).state == expected_state end)
+    assert ReadableStream.__get_slots__(pid).state == expected_state
   end
 
-  defp wait_for_stream_state(pid, expected_state, 0) do
-    assert ReadableStream.__get_slots__(pid).state == expected_state
+  # Waits until the stream keeps a read that waits for a chunk. The read
+  # comes from a different process, thus the test cannot put it in a
+  # sequence with its own messages.
+  defp wait_for_read_request(pid) do
+    eventually(fn -> not :queue.is_empty(ReadableStream.__get_slots__(pid).read_requests) end)
+  end
+
+  # Examines the condition until it is true, with a limit of 2 seconds for
+  # a busy machine. Use it only when no message tells that a different
+  # process did its step.
+  defp eventually(condition, attempts \\ 200) do
+    cond do
+      condition.() ->
+        :ok
+
+      attempts > 1 ->
+        Process.sleep(10)
+        eventually(condition, attempts - 1)
+
+      true ->
+        flunk("The condition did not become true in the time limit.")
+    end
   end
 end

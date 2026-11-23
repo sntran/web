@@ -5,6 +5,24 @@ defmodule Web.FormData do
   Programmatically constructed instances store entries eagerly. Multipart-parsed
   instances are live-backed by a coordinator process that discovers entries lazily.
 
+  ## A form as a body
+
+  A form is a body of a `Web.Request` or a `Web.Response`. The body is
+  encoded as `multipart/form-data`, as the HTML Standard specifies, and the
+  header `content-type` gets the boundary of the form:
+
+      iex> form = Web.FormData.new() |> Web.FormData.append("name", "value")
+      iex> response = Web.Response.new(form)
+      iex> headers = response.headers
+      iex> "multipart/form-data; boundary=" <> boundary = Web.Headers.get(headers, "content-type")
+      iex> text = Web.await(Web.Response.text(response))
+      iex> String.split(text, "\\r\\n") -- ["--" <> boundary, "--" <> boundary <> "--"]
+      [~s(Content-Disposition: form-data; name="name"), "", "value", ""]
+
+  The bytes of a file are read from its stream chunk by chunk. A form with
+  all its data in memory has a content length, and `Web.fetch/2` can send it
+  again after a redirect.
+
   ## Social Contract
 
   - Live iteration: `Web.FormData` is an `Enumerable` collection of
@@ -18,6 +36,7 @@ defmodule Web.FormData do
 
   alias __MODULE__.Parser
   alias Web.File
+  alias Web.Internal.Iterable
 
   @type name :: String.t()
   @type value :: String.t() | File.t()
@@ -31,16 +50,38 @@ defmodule Web.FormData do
   defstruct entries: [], boundary: nil, coordinator: nil
 
   @doc """
-  Creates a new FormData container.
+  Creates a new FormData with no entries, as `new FormData()` of the
+  XMLHttpRequest Standard. A server runtime has no form element, thus the
+  constructor has no arguments.
+
+  The form gets a new random boundary for its `multipart/form-data`
+  encoding.
   """
-  @spec new(keyword()) :: t()
-  def new(opts \\ []) do
-    boundary = Keyword.get(opts, :boundary, default_boundary())
-    %__MODULE__{entries: [], boundary: normalize_boundary(boundary)}
-  end
+  @spec new() :: t()
+  def new, do: %__MODULE__{entries: [], boundary: default_boundary()}
 
   @doc """
-  Appends a value for a field name.
+  Appends a value for a field name, as `append(name, value)` and
+  `append(name, blobValue, filename)` of the XMLHttpRequest Standard.
+
+  A value that is a `Web.Blob` or a `Web.File` becomes a `Web.File`, as
+  the steps "create an entry" of the XMLHttpRequest Standard specify. The
+  name of the file is `filename`. When `filename` is `nil`, a file keeps
+  its name, and a blob gets the name `"blob"`. A `filename` with a value
+  that is not a blob raises `Web.TypeError`, as no overload of the method
+  has these arguments.
+
+  A name and a value that is not a blob become strings, as Web IDL
+  converts a value to a `USVString`: `nil` is the JavaScript `null`, thus
+  the text `"null"`.
+
+  ## Examples
+
+      iex> blob = Web.Blob.new(["bytes"], type: "text/plain")
+      iex> form = Web.FormData.new() |> Web.FormData.append("upload", blob, "notes.txt")
+      iex> %Web.File{name: name, type: type} = Web.FormData.get(form, "upload")
+      iex> {name, type}
+      {"notes.txt", "text/plain"}
   """
   @spec append(t(), term(), term(), String.t() | nil) :: t()
   def append(form, name, value, filename \\ nil)
@@ -52,13 +93,15 @@ defmodule Web.FormData do
   end
 
   def append(%__MODULE__{entries: entries} = form, name, value, filename) do
-    normalized_name = to_string(name)
-    normalized_value = normalize_value(normalized_name, value, filename)
+    normalized_name = usv_string(name)
+    normalized_value = normalize_value(value, filename)
     %{form | entries: entries ++ [{normalized_name, normalized_value}]}
   end
 
   @doc """
   Sets a single value for a field name, replacing existing entries.
+
+  A blob or a file becomes a `Web.File` with the rules of `append/4`.
   """
   @spec set(t(), term(), term(), String.t() | nil) :: t()
   def set(form, name, value, filename \\ nil)
@@ -70,7 +113,7 @@ defmodule Web.FormData do
   end
 
   def set(%__MODULE__{} = form, name, value, filename) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
 
     form
     |> delete(normalized_name)
@@ -90,7 +133,7 @@ defmodule Web.FormData do
   end
 
   def delete(%__MODULE__{entries: entries} = form, name) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
 
     %{
       form
@@ -104,12 +147,12 @@ defmodule Web.FormData do
   """
   @spec get(t(), term()) :: value() | nil
   def get(%__MODULE__{coordinator: pid}, name) when is_pid(pid) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
     Parser.get(pid, normalized_name)
   end
 
   def get(%__MODULE__{entries: entries}, name) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
 
     entries
     |> Enum.find(fn {entry_name, _value} -> entry_name == normalized_name end)
@@ -124,12 +167,12 @@ defmodule Web.FormData do
   """
   @spec get_all(t(), term()) :: [value()]
   def get_all(%__MODULE__{coordinator: pid}, name) when is_pid(pid) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
     Parser.get_all(pid, normalized_name)
   end
 
   def get_all(%__MODULE__{entries: entries}, name) do
-    normalized_name = to_string(name)
+    normalized_name = usv_string(name)
 
     entries
     |> Enum.filter(fn {entry_name, _value} -> entry_name == normalized_name end)
@@ -137,20 +180,23 @@ defmodule Web.FormData do
   end
 
   @doc """
-  Returns whether the field name exists.
+  Returns `true` if an entry has the name, as `has()` of the
+  XMLHttpRequest Standard.
   """
-  @spec has?(t(), term()) :: boolean()
-  def has?(%__MODULE__{coordinator: pid}, name) when is_pid(pid) do
-    normalized_name = to_string(name)
+  @spec has(t(), term()) :: boolean()
+  def has(%__MODULE__{coordinator: pid}, name) when is_pid(pid) do
+    normalized_name = usv_string(name)
     Parser.has?(pid, normalized_name)
   end
 
-  def has?(%__MODULE__{} = form, name) do
+  def has(%__MODULE__{} = form, name) do
     not is_nil(get(form, name))
   end
 
   @doc """
-  Returns ordered entries.
+  Returns the entries in their sequence, as `entries()` of the iterable of
+  the XMLHttpRequest Standard: an enumerable of `[name, value]` lists. The
+  form itself is the same enumerable.
   """
   @spec entries(t()) :: Enumerable.t()
   def entries(%__MODULE__{} = form) do
@@ -158,12 +204,63 @@ defmodule Web.FormData do
   end
 
   @doc """
-  Parses a multipart/form-data body into a live-backed FormData container.
+  Returns the names of the entries, as `keys()` of the iterable of the
+  XMLHttpRequest Standard. A name of more than one entry comes one time for
+  each entry.
+
+  ## Examples
+
+      iex> form = Web.FormData.new() |> Web.FormData.append("a", "1") |> Web.FormData.append("a", "2")
+      iex> form |> Web.FormData.keys() |> Enum.to_list()
+      ["a", "a"]
   """
+  @spec keys(t()) :: Enumerable.t()
+  def keys(%__MODULE__{} = form), do: Stream.map(form, fn [name, _value] -> name end)
+
+  @doc """
+  Returns the values of the entries, as `values()` of the iterable of the
+  XMLHttpRequest Standard: each value is a string or a `Web.File`.
+
+  ## Examples
+
+      iex> form = Web.FormData.new() |> Web.FormData.append("a", "1") |> Web.FormData.append("b", "2")
+      iex> form |> Web.FormData.values() |> Enum.to_list()
+      ["1", "2"]
+  """
+  @spec values(t()) :: Enumerable.t()
+  def values(%__MODULE__{} = form), do: Stream.map(form, fn [_name, value] -> value end)
+
+  @doc """
+  Calls `callback` for each entry, as `forEach()` of the iterable of the
+  XMLHttpRequest Standard. Returns `:ok`.
+
+  The callback gets the value, the name, and the form, in this sequence,
+  as Web IDL specifies. A callback of arity 0, 1, or 2 gets the first
+  arguments, as a JavaScript function that ignores the other arguments.
+  Each other callback raises `Web.TypeError`.
+
+  ## Examples
+
+      iex> form = Web.FormData.new() |> Web.FormData.append("a", "1")
+      iex> Web.FormData.for_each(form, fn value, name, ^form -> send(self(), {name, value}) end)
+      :ok
+      iex> {:messages, messages} = Process.info(self(), :messages)
+      iex> messages
+      [{"a", "1"}]
+  """
+  @spec for_each(t(), function()) :: :ok
+  def for_each(%__MODULE__{} = form, callback),
+    do: Iterable.for_each(form, form, callback)
+
+  @doc false
+  # Parses a `multipart/form-data` body into a form that a coordinator
+  # process backs: the step of `formData()` of the Fetch Standard for a
+  # multipart body. See `Web.Request.form_data/1`.
   @spec parse(Web.ReadableStream.t() | binary() | iodata(), String.t(), keyword()) :: t()
   def parse(stream_or_binary, boundary, opts \\ []) do
     normalized_boundary = normalize_boundary(boundary)
-    source = Web.ReadableStream.from(stream_or_binary)
+    # The parser takes the lock of the stream process in its start.
+    source = Web.ReadableStream.__from__(stream_or_binary)
 
     case Parser.start_link(source, normalized_boundary, opts) do
       {:ok, pid} ->
@@ -181,41 +278,52 @@ defmodule Web.FormData do
     end
   end
 
-  @doc """
-  Cancels a live-backed FormData coordinator and all open child streams.
-  """
-  @spec cancel(t(), term()) :: :ok
-  def cancel(form, reason \\ :cancelled)
-
-  def cancel(%__MODULE__{coordinator: pid}, reason) when is_pid(pid) do
-    Parser.cancel(pid, reason)
+  @doc false
+  # Returns `true` if the form can be encoded more than one time: its
+  # entries are in memory, and no file has a stream that can be read only
+  # one time. A request with such a body can follow a redirect that sends
+  # the body again.
+  @spec static?(t()) :: boolean()
+  def static?(%__MODULE__{coordinator: nil, entries: entries}) do
+    Enum.all?(entries, fn
+      {_name, %File{stream: stream}} -> is_nil(stream)
+      {_name, _value} -> true
+    end)
   end
 
-  def cancel(%__MODULE__{}, _reason), do: :ok
+  def static?(%__MODULE__{}), do: false
 
-  @doc """
-  Returns the multipart Content-Type header value for this form.
-  """
+  @doc false
+  # The value of the header `content-type` for the body of the form.
   @spec content_type(t()) :: String.t()
   def content_type(%__MODULE__{boundary: boundary}) do
     "multipart/form-data; boundary=" <> boundary
   end
 
-  defp normalize_value(_name, %File{} = file, filename) when is_binary(filename) do
-    %{file | filename: filename}
+  # The steps "create an entry" of the XMLHttpRequest Standard. A blob that
+  # is not a file becomes a new File object with the same bytes and the name
+  # "blob". A file name that the caller gives makes a new File object with
+  # the same bytes and that name. The new file keeps the type and the time
+  # of the last change.
+  defp normalize_value(%File{} = file, nil), do: file
+
+  defp normalize_value(%File{} = file, filename),
+    do: %{file | id: make_ref(), name: to_string(filename)}
+
+  defp normalize_value(%Web.Blob{} = blob, filename),
+    do: File.new(blob.parts, to_string(filename || "blob"), type: blob.type)
+
+  defp normalize_value(value, nil), do: usv_string(value)
+
+  defp normalize_value(value, _filename) do
+    raise Web.TypeError,
+          "The value of an entry with a file name must be a Blob, not #{inspect(value)}."
   end
 
-  defp normalize_value(_name, %File{} = file, _filename), do: file
-
-  defp normalize_value(name, %Web.Blob{} = blob, filename) do
-    File.new(blob.parts,
-      name: name,
-      filename: filename || "blob",
-      type: blob.type
-    )
-  end
-
-  defp normalize_value(_name, value, _filename), do: to_string(value)
+  # The conversion of Web IDL to a `USVString`: `nil` is the JavaScript
+  # `null`, which becomes the text "null".
+  defp usv_string(nil), do: "null"
+  defp usv_string(value), do: to_string(value)
 
   # Drains a live coordinator to a static entries list, stopping the coordinator
   # process. Used internally by mutation operations (append/set/delete) on live forms.
@@ -246,8 +354,9 @@ defmodule Web.FormData do
     alias Web.AbortSignal
     alias Web.AsyncContext.Snapshot
     alias Web.File
+    alias Web.FormData.Encoder
+    alias Web.Internal.Bytes
     alias Web.ReadableStream
-    alias Web.ReadableStreamDefaultController
     alias Web.TypeError
 
     @header_separator "\r\n\r\n"
@@ -256,7 +365,7 @@ defmodule Web.FormData do
       caller = self()
       owner = Keyword.get(opts, :owner, self())
       reply_ref = make_ref()
-      snapshot = Snapshot.take()
+      snapshot = Snapshot.new()
 
       {_owner_pid, owner_ref} =
         spawn_monitor(fn ->
@@ -314,9 +423,11 @@ defmodule Web.FormData do
       :ok
     end
 
+    # A parser that stopped cannot give the rest of the file part: the
+    # stream gets an error, not an end.
     def child_pull(pid, part_id, controller) do
       case call(pid, {:pull_file, part_id, controller}) do
-        {:error, _reason} -> close_pull_controller(controller)
+        {:error, reason} -> ReadableStream.error(controller.pid, file_error(reason))
         _ -> :ok
       end
 
@@ -339,7 +450,7 @@ defmodule Web.FormData do
       owner_ref = Process.monitor(owner)
       Snapshot.restore(snapshot)
 
-      case :gen_statem.start_link(__MODULE__, {source, boundary, opts, snapshot}, []) do
+      case :gen_statem.start_link(__MODULE__, {source, boundary, opts, snapshot, self()}, []) do
         {:ok, pid} = result ->
           send(caller, {reply_ref, result})
           owner_loop(pid, owner, owner_ref)
@@ -352,16 +463,11 @@ defmodule Web.FormData do
 
     defp owner_loop(pid, owner, owner_ref) do
       receive do
+        # The owner of the form stopped, thus the parser stops. The parser
+        # traps exits: it does its terminate, which ends its file stream.
         {:DOWN, ^owner_ref, :process, ^owner, _reason} ->
-          if Process.alive?(pid) do
-            Process.exit(pid, :shutdown)
-          end
-
-          receive do
-            {:EXIT, ^pid, _exit_reason} -> :ok
-          after
-            0 -> :ok
-          end
+          Process.exit(pid, :shutdown)
+          :ok
 
         {:EXIT, ^pid, _reason} ->
           :ok
@@ -372,8 +478,11 @@ defmodule Web.FormData do
     def callback_mode, do: :handle_event_function
 
     @impl true
-    def init({%ReadableStream{controller_pid: source_pid}, boundary, opts, snapshot}) do
+    def init({%ReadableStream{} = source, boundary, opts, snapshot, parent}) do
       Process.flag(:message_queue_data, :off_heap)
+      # The exit of the parent, the process of the owner, comes as a
+      # message: the parser then stops with its terminate.
+      Process.flag(:trap_exit, true)
       Snapshot.restore(snapshot)
 
       struct_snapshot = Keyword.get(opts, :struct_snapshot)
@@ -384,7 +493,8 @@ defmodule Web.FormData do
       case aborted_reason(subscription) do
         nil ->
           data = %{
-            source_pid: source_pid,
+            parent: parent,
+            source_pid: nil,
             source_lock_released?: false,
             signal_subscription: subscription,
             async_context: snapshot,
@@ -403,9 +513,9 @@ defmodule Web.FormData do
             materializing?: false
           }
 
-          case safe_get_reader(source_pid) do
-            :ok ->
-              {:ok, :running, data}
+          case lock_source(source) do
+            {:ok, source_pid} ->
+              {:ok, :running, %{data | source_pid: source_pid}}
 
             {:error, :already_locked} ->
               {:stop, TypeError.exception("ReadableStream is already locked")}
@@ -442,8 +552,10 @@ defmodule Web.FormData do
 
     def handle_event({:call, from}, :materialize, :running, data) do
       case ensure_answer(:materialize, begin_materialization(data)) do
+        # The parse is complete: each call that waits gets its answer.
         {:reply, entries, done_data} ->
-          {:stop_and_reply, :normal, [{:reply, from, {:ok, entries}}], done_data}
+          {:ok, done_data, actions} = resolve_pending(done_data)
+          {:stop_and_reply, :normal, [{:reply, from, {:ok, entries}} | actions], done_data}
 
         {:error, reason, next_data} ->
           abort_later(reason, next_data, [{:reply, from, {:error, reason}}])
@@ -460,15 +572,9 @@ defmodule Web.FormData do
     end
 
     def handle_event({:call, from}, {:cancel_file, part_id, _reason}, :running, data) do
-      data = maybe_mark_file_discard(data, part_id)
-
-      case resolve_pending(data) do
-        {:ok, next_data, actions} ->
-          reply_or_stop(next_data, [{:reply, from, :ok} | actions])
-
-        {:error, reason, next_data, actions} ->
-          abort_later(reason, next_data, [{:reply, from, :ok} | actions])
-      end
+      data
+      |> maybe_mark_file_discard(part_id)
+      |> answer_pending([{:reply, from, :ok}])
     end
 
     def handle_event({:call, from}, {:pull_file, part_id, controller}, :running, data) do
@@ -506,22 +612,35 @@ defmodule Web.FormData do
     defp serve_query(from, request, data) do
       case maybe_reply(request, data) do
         {:reply, reply} ->
-          reply_or_stop(data, [{:reply, from, {:ok, reply}}])
+          answer_pending(data, [{:reply, from, {:ok, reply}}])
 
         :need_more ->
           case ensure_answer(request, data) do
             {:reply, reply, next_data} ->
-              reply_or_stop(next_data, [{:reply, from, {:ok, reply}}])
+              answer_pending(next_data, [{:reply, from, {:ok, reply}}])
 
+            # The query waits after the calls that waited before it.
             {:blocked, next_data} ->
               waiter = %{from: from, request: request}
-
-              {:keep_state, %{next_data | pending: next_data.pending ++ [waiter]},
-               hibernate_actions()}
+              answer_pending(%{next_data | pending: next_data.pending ++ [waiter]}, [])
 
             {:error, reason, next_data} ->
               abort_later(reason, next_data, [{:reply, from, {:error, reason}}])
           end
+      end
+    end
+
+    # A query can read more of the body, or discard a file part: a call that
+    # waits can have its answer now. Thus each call that waits gets its
+    # answer, also when no pull of a file stream comes after the query. See
+    # `tla/FormDataParser.tla`.
+    defp answer_pending(data, actions) do
+      case resolve_pending(data) do
+        {:ok, next_data, pending_actions} ->
+          reply_or_stop(next_data, actions ++ pending_actions)
+
+        {:error, reason, next_data, pending_actions} ->
+          abort_later(reason, next_data, actions ++ pending_actions)
       end
     end
 
@@ -753,17 +872,17 @@ defmodule Web.FormData do
     defp produce_file_chunk(data, controller) do
       case scan_body(data.buffer, data.delimiter_prefix, data.retain_bytes) do
         {:data, emit, rest} ->
-          ReadableStreamDefaultController.enqueue(controller, emit)
+          ReadableStream.enqueue(controller.pid, Web.Uint8Array.from(emit))
           {:ok, bump_file_size(%{data | buffer: rest}, byte_size(emit))}
 
         {:boundary, emit, rest, transition} ->
           next_data = bump_file_size(data, byte_size(emit))
 
           if emit != "" do
-            ReadableStreamDefaultController.enqueue(controller, emit)
+            ReadableStream.enqueue(controller.pid, Web.Uint8Array.from(emit))
           end
 
-          ReadableStreamDefaultController.close(controller)
+          ReadableStream.close(controller.pid)
           {:ok, finalize_file_part(next_data, rest, transition)}
 
         :need_more ->
@@ -850,16 +969,20 @@ defmodule Web.FormData do
            index
          )
          when ei < index do
-      discard_child_stream(cf.stream_pid, :skipped)
+      discard_child_stream(cf.stream_pid, discard_error())
       %{data | current_file: %{cf | mode: :discard}}
     end
 
     defp maybe_discard_before_index(data, _index), do: data
 
+    defp discard_error do
+      TypeError.exception("The file part is not complete: a read of its form went past it.")
+    end
+
     defp begin_materialization(%{materializing?: true} = data), do: data
 
     defp begin_materialization(%{current_file: %{mode: :await_pull} = current_file} = data) do
-      discard_child_stream(current_file.stream_pid, :materialized)
+      discard_child_stream(current_file.stream_pid, discard_error())
       %{data | materializing?: true, current_file: %{current_file | mode: :discard}}
     end
 
@@ -913,13 +1036,16 @@ defmodule Web.FormData do
         {:error, %TypeError{} = reason} ->
           {:error, reason}
 
+        # The steps of `formData()` of the Fetch Standard: the type of a
+        # file is the value of the header `Content-Type` of the part, or
+        # `text/plain` when the part has no such header.
         headers when is_map(headers) ->
           with disposition when is_binary(disposition) <-
                  Map.get(headers, "content-disposition") ||
                    {:error,
                     TypeError.exception("Malformed multipart body: missing content-disposition")},
                {:ok, %{name: name, filename: filename}} <- parse_content_disposition(disposition) do
-            {:ok, build_part_info(name, filename, Map.get(headers, "content-type", ""))}
+            {:ok, build_part_info(name, filename, Map.get(headers, "content-type", "text/plain"))}
           else
             {:error, %TypeError{} = reason} -> {:error, reason}
           end
@@ -938,8 +1064,16 @@ defmodule Web.FormData do
       end
     end
 
+    # The value of a parameter is a token, or text in quotation marks.
+    #
+    # A browser does not escape a backslash in such text: the HTML Standard
+    # escapes only a line feed, a carriage return, and a quotation mark, with
+    # a percent sign. Thus a backslash stays as it is, and a file name such
+    # as `C:\dir\file.txt` is not changed. Some other clients escape a
+    # quotation mark with a backslash. Thus a quotation mark after a
+    # backslash is part of the text, unless the parameter ends there.
     defp parse_disposition_params(value) do
-      ~r/;\s*([!#$%&'*+\-.^_`|~0-9A-Za-z]+\*?)\s*=\s*("(?:\\.|[^"])*"|[^;]*)/u
+      ~r/;\s*([!#$%&'*+\-.^_`|~0-9A-Za-z]+\*?)\s*=\s*("(?:[^"]|(?<=\\)"(?!\s*(?:;|\z)))*"|[^;]*)/u
       |> Regex.scan(value, capture: :all_but_first)
       |> Enum.reduce(%{}, fn [name, raw_value], acc ->
         decoded_value =
@@ -960,7 +1094,7 @@ defmodule Web.FormData do
            byte_size(value) >= 2 do
         value
         |> binary_part(1, byte_size(value) - 2)
-        |> String.replace(~r/\\(.)/u, "\\1")
+        |> String.replace("\\\"", "\"")
       else
         value
       end
@@ -1005,8 +1139,53 @@ defmodule Web.FormData do
 
     defp percent_decode(<<char, rest::binary>>, acc), do: percent_decode(rest, [<<char>> | acc])
 
+    # A read of the source. The parser waits for the source, and it takes a
+    # cancel of the form, an abort of its signal, and the stop of its owner
+    # while it waits: a source that stalls does not keep them. See
+    # `tla/FormDataParser.tla`.
     defp read_more(data) do
-      case ReadableStream.read(data.source_pid) do
+      source = data.source_pid
+      monitor = Process.monitor(source)
+      send(source, {:"$gen_call", {self(), monitor}, {:read, self()}})
+
+      case await_read(data, monitor) do
+        {:reply, reply} ->
+          Process.demonitor(monitor, [:flush])
+          read_reply(reply, data)
+
+        {:stop, reason} ->
+          Process.demonitor(monitor, [:flush])
+          {:error, reason, data}
+      end
+    end
+
+    defp await_read(data, monitor) do
+      receive do
+        {^monitor, reply} ->
+          {:reply, reply}
+
+        # A source that stopped gives the reply of `Web.Stream.call/3` for a
+        # stream that is gone.
+        {:DOWN, ^monitor, :process, _pid, _reason} ->
+          {:reply, {:error, :not_locked_by_reader}}
+
+        {:"$gen_call", from, {:cancel, reason}} ->
+          :gen_statem.reply(from, :ok)
+          {:stop, reason}
+
+        {:EXIT, parent, _reason} when parent == data.parent ->
+          {:stop, gone_error()}
+
+        message when elem(message, 0) in [:abort, :DOWN] ->
+          case abort_reason_from_message(message, data.signal_subscription) do
+            {:ok, reason} -> {:stop, reason}
+            :ignore -> await_read(data, monitor)
+          end
+      end
+    end
+
+    defp read_reply(reply, data) do
+      case reply do
         {:ok, chunk} ->
           case normalize_chunk(chunk) do
             {:ok, binary} -> {:ok, %{data | buffer: data.buffer <> binary}}
@@ -1024,13 +1203,23 @@ defmodule Web.FormData do
       end
     end
 
-    defp normalize_chunk(chunk) when is_binary(chunk), do: {:ok, chunk}
-    defp normalize_chunk(%Web.Uint8Array{} = chunk), do: {:ok, Web.Uint8Array.to_binary(chunk)}
-    defp normalize_chunk(chunk) when is_list(chunk), do: {:ok, IO.iodata_to_binary(chunk)}
+    # The error of a call to a parser that stopped, and of the stop of its
+    # owner.
+    defp gone_error do
+      TypeError.exception(
+        "The form data is not available. Its body ended, or its parser stopped."
+      )
+    end
 
-    defp normalize_chunk(_chunk) do
-      {:error,
-       TypeError.exception("Multipart stream chunk must be binary, Uint8Array, or iodata")}
+    defp normalize_chunk(chunk) do
+      case Bytes.to_binary(chunk) do
+        {:ok, binary} ->
+          {:ok, binary}
+
+        :error ->
+          {:error,
+           TypeError.exception("Multipart stream chunk must be binary, Uint8Array, or iodata")}
+      end
     end
 
     defp malformed(message, data), do: {:error, TypeError.exception(message), data}
@@ -1043,8 +1232,11 @@ defmodule Web.FormData do
       end
     end
 
+    # The parser is a process that runs at the same time as a cancel of the
+    # file stream. Thus it uses the functions with no check: a chunk or a
+    # close for a stream that is closed has no effect.
     defp close_pull_controller(controller) do
-      ReadableStreamDefaultController.close(controller)
+      ReadableStream.close(controller.pid)
     end
 
     defp freeze_entries(entries, materialized?) do
@@ -1072,7 +1264,7 @@ defmodule Web.FormData do
             type: :token,
             token: make_ref(),
             aborted: true,
-            reason: AbortSignal.reason(signal) || :aborted
+            reason: AbortSignal.reason(signal) || AbortSignal.default_reason()
           }
       end
     end
@@ -1155,11 +1347,9 @@ defmodule Web.FormData do
 
     defp release_source_lock(%{source_lock_released?: true} = data), do: data
 
+    # The two functions below have no effect on a source that stopped.
     defp release_source_lock(%{source_pid: source_pid} = data) do
-      if Process.alive?(source_pid) do
-        _ = safe_call(fn -> ReadableStream.release_lock(source_pid) end)
-      end
-
+      _ = ReadableStream.release_lock(source_pid)
       %{data | source_lock_released?: true}
     end
 
@@ -1168,33 +1358,30 @@ defmodule Web.FormData do
     defp maybe_cancel_source(_data, nil), do: :ok
 
     defp maybe_cancel_source(%{source_pid: source_pid}, reason) do
-      if Process.alive?(source_pid) do
-        _ =
-          safe_call(fn -> Web.Stream.control_call(source_pid, {:terminate, :cancel, reason}) end)
-      end
-
+      _outcome = Web.Promise.wait(ReadableStream.__cancel__(source_pid, reason))
       :ok
     end
 
+    # The parser cannot give the rest of the file part: the file stream gets
+    # an error, thus its reader does not take a short file as complete. A
+    # cancel would close the stream as at the end of the file.
     defp error_child_stream(nil, _reason), do: :ok
-
-    defp error_child_stream(stream_pid, %TypeError{} = reason) when is_pid(stream_pid) do
-      if Process.alive?(stream_pid) do
-        ReadableStream.error(stream_pid, reason)
-      end
-
-      :ok
-    end
-
-    defp error_child_stream(_stream_pid, nil), do: :ok
 
     defp error_child_stream(stream_pid, reason) when is_pid(stream_pid) do
       if Process.alive?(stream_pid) do
-        Web.Stream.control_cast(stream_pid, {:terminate, :cancel, reason})
+        ReadableStream.error(stream_pid, file_error(reason))
       end
 
       :ok
     end
+
+    # A stop with no reason, or the stop of the owner, gives a TypeError.
+    # An abort gives its reason, as the body stream of the Fetch Standard.
+    defp file_error(reason) when reason in [nil, :normal, :shutdown] do
+      TypeError.exception("The file part is not complete: its form stopped.")
+    end
+
+    defp file_error(reason), do: reason
 
     defp discard_child_stream(stream_pid, reason) when is_pid(stream_pid) do
       error_child_stream(stream_pid, reason)
@@ -1238,11 +1425,16 @@ defmodule Web.FormData do
         {:error, normalize_call_exit(reason)}
     end
 
+    # The lock step of a reader: see `ReadableStream.__lock__/2`. A stream
+    # that cannot have a process raises a `TypeError`.
+    defp lock_source(source) do
+      ReadableStream.__lock__(source, &safe_get_reader/1)
+    rescue
+      error in TypeError -> {:error, error}
+    end
+
     defp safe_get_reader(pid) do
-      case ReadableStream.get_reader(pid) do
-        :ok -> :ok
-        {:error, :already_locked} -> {:error, :already_locked}
-      end
+      with :ok <- ReadableStream.__get_reader__(pid), do: {:ok, pid}
     catch
       :exit, reason ->
         {:error, normalize_call_exit(reason)}
@@ -1265,7 +1457,7 @@ defmodule Web.FormData do
       opening_size = byte_size(data.opening_boundary)
 
       case data.buffer do
-        <<opening::binary-size(opening_size), rest::binary>>
+        <<opening::binary-size(^opening_size), rest::binary>>
         when opening == data.opening_boundary ->
           parse_opening_boundary_rest(data, rest)
 
@@ -1310,23 +1502,24 @@ defmodule Web.FormData do
        }}
     end
 
-    defp build_file_entry(
-           data,
-           %{name: name, filename: filename, type: type},
-           part_id,
-           entry_index
-         ) do
+    # The steps of the multipart/form-data parser of the Fetch Standard: a
+    # part with a file name is a new File object with that name and the
+    # type of the part. The name of the field is the name of the entry. The
+    # bytes come later, from the body.
+    defp build_file_entry(data, %{filename: filename, type: type}, part_id, entry_index) do
+      file = File.new([], filename, type: type)
+
       case data.materializing? do
         true ->
-          build_materialized_file_entry(name, filename, type, part_id, entry_index)
+          build_materialized_file_entry(file, part_id, entry_index)
 
         false ->
-          build_live_file_entry(name, filename, type, part_id, entry_index, data.async_context)
+          build_live_file_entry(file, part_id, entry_index, data.async_context)
       end
     end
 
-    defp build_materialized_file_entry(name, filename, type, part_id, entry_index) do
-      file = File.new([], name: name, filename: filename, type: type, size: nil, stream: nil)
+    defp build_materialized_file_entry(file, part_id, entry_index) do
+      file = %{file | size: nil}
 
       current_file = %{
         id: part_id,
@@ -1340,7 +1533,7 @@ defmodule Web.FormData do
       {file, current_file}
     end
 
-    defp build_live_file_entry(name, filename, type, part_id, entry_index, %Snapshot{} = snapshot) do
+    defp build_live_file_entry(file, part_id, entry_index, %Snapshot{} = snapshot) do
       coordinator_pid = self()
 
       stream =
@@ -1351,7 +1544,7 @@ defmodule Web.FormData do
           })
         end)
 
-      file = File.new([], name: name, filename: filename, type: type, size: nil, stream: stream)
+      file = %{file | size: nil, stream: stream}
 
       current_file = %{
         id: part_id,
@@ -1405,10 +1598,13 @@ defmodule Web.FormData do
       {:file, %{name: name, filename: filename, type: content_type}}
     end
 
+    # A name in quotation marks has escapes for a line feed, a carriage
+    # return, and a quotation mark, as the HTML Standard specifies for the
+    # encoding of a form. The parameter `filename*` has its own encoding.
     defp parse_form_data_disposition(value) do
       params = parse_disposition_params(value)
-      name = Map.get(params, "name")
-      filename = Map.get(params, "filename*") || Map.get(params, "filename")
+      name = unescape(Map.get(params, "name"))
+      filename = Map.get(params, "filename*") || unescape(Map.get(params, "filename"))
 
       case name do
         nil ->
@@ -1422,6 +1618,9 @@ defmodule Web.FormData do
       end
     end
 
+    defp unescape(nil), do: nil
+    defp unescape(text), do: Encoder.unescape(text)
+
     defp unwrap!(:await_ready, {:ok, :ok}), do: :ok
     defp unwrap!(:value, {:ok, value}), do: value
     defp unwrap!(:next_entry, {:ok, {:found, entry}}), do: {:ok, entry}
@@ -1429,10 +1628,12 @@ defmodule Web.FormData do
     defp unwrap!(_kind, {:error, %TypeError{} = reason}), do: raise(reason)
     defp unwrap!(_kind, {:error, reason}), do: exit(reason)
 
-    defp safe_call(fun) do
-      fun.()
-    catch
-      :exit, _ -> :ok
+    # The parser stopped before the call: its form is not available, as a
+    # stream that is gone (see `Web.Stream.call/3`). A body that fails is a
+    # `TypeError` in the Fetch Standard.
+    defp normalize_call_exit({reason, {:gen_statem, :call, _args}})
+         when reason in [:noproc, :normal, :shutdown, :killed] do
+      gone_error()
     end
 
     defp normalize_call_exit(reason) do

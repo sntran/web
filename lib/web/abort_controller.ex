@@ -43,7 +43,13 @@ defmodule Web.AbortController do
   end
 
   @doc """
-  Aborts the controller's signal.
+  Aborts the controller's signal, as `abort(reason)`. The default reason is
+  a `Web.DOMException` with the name `AbortError`.
+
+  The listeners of the event `abort` of the signal, and of the signals of
+  `Web.AbortSignal.any/1` that depend on it, run in the calling process
+  before this function returns, as the DOM Standard specifies. A second
+  abort does nothing.
 
   ## Examples
 
@@ -51,16 +57,8 @@ defmodule Web.AbortController do
       iex> Web.AbortController.abort(controller, :manual_cancel)
       :ok
   """
-  def abort(%__MODULE__{signal: %Web.AbortSignal{pid: pid}}, reason \\ :aborted) do
-    if Process.alive?(pid) do
-      try do
-        GenServer.call(pid, {:abort, reason}, :infinity)
-      catch
-        :exit, _ -> :ok
-      end
-    end
-
-    :ok
+  def abort(%__MODULE__{signal: signal}, reason \\ Web.DOMException.abort_error()) do
+    Web.AbortSignal.__signal_abort__(signal, reason)
   end
 
   defp make_signal_ref(pid) do

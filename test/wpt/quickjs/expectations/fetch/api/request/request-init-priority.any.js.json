@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "fetch() with a 'auto' priority completes successfully": "runner: no server of WPT",
+    "fetch() with a 'high' priority completes successfully": "runner: no server of WPT",
+    "fetch() with a 'low' priority completes successfully": "runner: no server of WPT"
+  }
+}

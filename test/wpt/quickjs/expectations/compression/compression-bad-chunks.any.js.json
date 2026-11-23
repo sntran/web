@@ -1,0 +1,13 @@
+{
+  "harness": "OK",
+  "failures": {
+    "chunk of type SharedArrayBuffer should error the stream for brotli": "scope: the BEAM has no shared memory",
+    "chunk of type SharedArrayBuffer should error the stream for deflate": "scope: the BEAM has no shared memory",
+    "chunk of type SharedArrayBuffer should error the stream for deflate-raw": "scope: the BEAM has no shared memory",
+    "chunk of type SharedArrayBuffer should error the stream for gzip": "scope: the BEAM has no shared memory",
+    "chunk of type shared Uint8Array should error the stream for brotli": "scope: the BEAM has no shared memory",
+    "chunk of type shared Uint8Array should error the stream for deflate": "scope: the BEAM has no shared memory",
+    "chunk of type shared Uint8Array should error the stream for deflate-raw": "scope: the BEAM has no shared memory",
+    "chunk of type shared Uint8Array should error the stream for gzip": "scope: the BEAM has no shared memory"
+  }
+}

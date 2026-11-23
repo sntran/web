@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "URL: no structured serialize/deserialize support": "runner: no structuredClone",
+    "URLSearchParams: no structured serialize/deserialize support": "runner: no structuredClone"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Blob URL parses correctly": "scope: a library has no document, thus a blob URL has an opaque origin",
+    "Origin of Blob URL matches our origin": "scope: a library has no document, thus a blob URL has an opaque origin",
+    "Origin of Blob URL matches our origin for Files": "scope: a library has no document, thus a blob URL has an opaque origin"
+  }
+}

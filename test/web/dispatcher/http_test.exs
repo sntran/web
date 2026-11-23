@@ -5,6 +5,7 @@ defmodule Web.Dispatcher.HTTPTest do
   @moduletag capture_log: true
 
   alias Web.Dispatcher.HTTP
+  alias Web.Internal.LazyStream
   alias Web.Request
 
   defmodule HTTPServer do
@@ -36,8 +37,18 @@ defmodule Web.Dispatcher.HTTPTest do
           end
 
           Enum.each(responses, fn
+            # The pause is a part of the scenario: a slow server.
             {:sleep, ms} ->
               Process.sleep(ms)
+
+            # The server stops until the test lets it continue. Thus the
+            # test can do a step before the next part of the response.
+            :gate ->
+              send(parent, {:http_server_gate, port, self()})
+
+              receive do
+                :go -> :ok
+              end
 
             chunk ->
               case :gen_tcp.send(socket, chunk) do
@@ -46,21 +57,26 @@ defmodule Web.Dispatcher.HTTPTest do
               end
           end)
 
-          if observer do
-            case :gen_tcp.recv(socket, 0, 200) do
-              {:error, :closed} -> send(observer, :http_client_closed)
-              _ -> :ok
-            end
+          cond do
+            # The server tells the observer when the client closes the
+            # connection.
+            observer ->
+              read_until_closed(socket)
+              send(observer, :http_client_closed)
+
+            drop_on_body? ->
+              :ok
+
+            # The server closes its side for writes, and reads until the
+            # client closes the connection. A socket that closes with bytes
+            # that it did not read sends a reset, and the reset can drop the
+            # end of the response.
+            true ->
+              _result = :gen_tcp.shutdown(socket, :write)
+              read_until_closed(socket)
           end
 
-          if drop_on_body? do
-            :gen_tcp.close(socket)
-          else
-            # Give the client enough time to consume the final buffered bytes under suite load.
-            Process.sleep(50)
-            :gen_tcp.close(socket)
-          end
-
+          :gen_tcp.close(socket)
           :gen_tcp.close(listen_socket)
         end
       end)
@@ -69,6 +85,13 @@ defmodule Web.Dispatcher.HTTPTest do
         {:port, port} -> port
       after
         1000 -> raise "HTTPServer failed to start"
+      end
+    end
+
+    defp read_until_closed(socket) do
+      case :gen_tcp.recv(socket, 0) do
+        {:ok, _data} -> read_until_closed(socket)
+        {:error, _reason} -> :ok
       end
     end
   end
@@ -90,8 +113,7 @@ defmodule Web.Dispatcher.HTTPTest do
     assert resp.status_text == "OK"
     assert Web.Headers.get(resp.headers, "content-length") == "5"
 
-    chunks = resp.body |> Enum.to_list()
-    assert Enum.join(chunks) == "hello"
+    assert Web.TestBytes.join(resp.body) == "hello"
   end
 
   test "fetch/1 accepts a raw request with a nil body" do
@@ -109,7 +131,7 @@ defmodule Web.Dispatcher.HTTPTest do
     }
 
     assert {:ok, resp} = HTTP.fetch(req)
-    assert Enum.to_list(resp.body) == ["ok"]
+    assert Web.TestBytes.binaries(resp.body) == ["ok"]
   end
 
   test "fetch/1 streams enumerable request bodies without normalizing them to readable streams" do
@@ -119,11 +141,12 @@ defmodule Web.Dispatcher.HTTPTest do
     req =
       Request.new("http://localhost:#{port}/stream-body",
         method: :post,
-        body: Stream.map(["da", "ta"], & &1)
+        body: Stream.map(["da", "ta"], & &1),
+        duplex: "half"
       )
 
     assert {:ok, resp} = HTTP.fetch(req)
-    assert Enum.to_list(resp.body) == ["ok"]
+    assert Web.TestBytes.binaries(resp.body) == ["ok"]
   end
 
   test "fetch/1 accepts raw iodata list bodies" do
@@ -141,11 +164,13 @@ defmodule Web.Dispatcher.HTTPTest do
     }
 
     assert {:ok, resp} = HTTP.fetch(req)
-    assert Enum.to_list(resp.body) == ["ok"]
+    assert Web.TestBytes.binaries(resp.body) == ["ok"]
   end
 
   test "fetch/1 surfaces raw invalid body types as request build errors" do
-    port = HTTPServer.start_link([])
+    # The server waits after the request: the only failure is the chunk of
+    # the body, which is not bytes.
+    port = HTTPServer.start_link([:gate])
 
     req = %Request{
       url: Web.URL.new("http://localhost:#{port}/raw-invalid"),
@@ -158,7 +183,12 @@ defmodule Web.Dispatcher.HTTPTest do
       options: [redirect: "follow", signal: nil]
     }
 
-    assert {:error, _} = HTTP.fetch(req)
+    # A map is an enumerable: its first chunk is the pair `{:bad, :body}`.
+    assert {:error, %Web.TypeError{message: "The request body chunk must be" <> _}} =
+             HTTP.fetch(req)
+
+    assert_receive {:http_server_gate, ^port, server}
+    send(server, :go)
   end
 
   test "fetch/1 surfaces non-enumerable raw body types as request build errors" do
@@ -199,8 +229,7 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/path", method: :get)
     {:ok, resp} = HTTP.fetch(req)
 
-    chunks = resp.body |> Enum.to_list()
-    assert Enum.join(chunks) == "hello"
+    assert Web.TestBytes.join(resp.body) == "hello"
   end
 
   test "fetch/1 covers invalid connection path cleanly" do
@@ -227,17 +256,14 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}")
     {:ok, resp} = HTTP.fetch(req)
 
-    chunks = resp.body |> Enum.to_list()
-    assert Enum.join(chunks) == "he"
+    # The body is shorter than its content length. The reader gets an error,
+    # not a part of the body.
+    assert %Web.TypeError{message: message} = body_error(resp)
+    assert message =~ "body"
   end
 
   test "fetch/1 handles query variables in path explicitly correctly" do
     req = Request.new("http://localhost_nxdomain:80/?query=1")
-    assert {:error, _} = HTTP.fetch(req)
-  end
-
-  test "fetch/1 defaults empty protocol urls to http before connecting" do
-    req = Request.new("/relative-only")
     assert {:error, _} = HTTP.fetch(req)
   end
 
@@ -248,16 +274,38 @@ defmodule Web.Dispatcher.HTTPTest do
     assert {:error, _} = HTTP.fetch(req)
   end
 
-  test "fetch/1 returns request errors for invalid request metadata after connecting" do
-    port = HTTPServer.start_link([])
+  test "fetch/1 gives the body nil for a status that permits no body" do
+    for status <- [204, 304] do
+      port = HTTPServer.start_link(["HTTP/1.1 #{status} Status\r\nx-test: 1\r\n\r\n"])
 
-    req =
-      Request.new("http://localhost:#{port}/path",
-        method: "bad method",
-        headers: %{"bad header" => "value"}
-      )
+      {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/none"))
 
-    assert {:error, _} = HTTP.fetch(req)
+      assert resp.status == status
+      assert resp.body == nil
+      assert resp.type == "basic"
+      assert Web.Headers.get(resp.headers, "x-test") == "1"
+      assert Web.Promise.await(Web.Response.text(resp)) == ""
+    end
+  end
+
+  test "fetch/1 gives the body nil for a HEAD request" do
+    port = HTTPServer.start_link(["HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n"])
+
+    {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/head", method: "HEAD"))
+
+    assert resp.status == 200
+    assert resp.body == nil
+    assert Web.Headers.get(resp.headers, "content-length") == "5"
+  end
+
+  test "fetch/1 gives a response for a status that the constructor refuses" do
+    port = HTTPServer.start_link(["HTTP/1.1 999 Unusual\r\ncontent-length: 2\r\n\r\nok"])
+
+    {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/unusual"))
+
+    assert resp.status == 999
+    assert resp.ok == false
+    assert Web.Promise.await(Web.Response.text(resp)) == "ok"
   end
 
   test "fetch/1 handles a deferred chunked completion with an empty body" do
@@ -272,7 +320,7 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert resp.status == 200
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
   end
 
   test "fetch/1 keeps polling when chunk framing arrives incomplete" do
@@ -289,7 +337,7 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert resp.status == 200
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
   end
 
   test "fetch/1 keeps reading when headers arrive across multiple socket reads" do
@@ -304,7 +352,7 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert resp.status == 200
-    assert Enum.to_list(resp.body) == []
+    assert Web.TestBytes.binaries(resp.body) == []
   end
 
   test "fetch/1 reads body data that arrives after headers in later recv cycles" do
@@ -318,16 +366,17 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/deferred-body")
     {:ok, resp} = HTTP.fetch(req)
 
-    assert Enum.to_list(resp.body) == ["data"]
+    assert Web.TestBytes.binaries(resp.body) == ["data"]
   end
 
   test "fetch/1 aborts an in-flight body stream and closes the connection" do
     controller = Web.AbortController.new()
     parent = self()
 
+    # The server sends the rest of the body only after the abort.
     port =
       HTTPServer.start_link(
-        ["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", {:sleep, 500}, "data"],
+        ["HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", :gate, "data"],
         false,
         false,
         self()
@@ -339,15 +388,19 @@ defmodule Web.Dispatcher.HTTPTest do
     task =
       Task.async(fn ->
         send(parent, :http_body_started)
-        Enum.to_list(resp.body)
+        body_error(resp)
       end)
 
     assert_receive :http_body_started
-    Process.sleep(20)
+    assert_receive {:http_server_gate, ^port, server}, 2000
+    # The read of the task waits for the body.
+    eventually(fn -> read_waits?(resp) end)
     assert :ok = Web.AbortController.abort(controller, :timeout)
 
-    assert {:ok, []} = Task.yield(task, 1000)
-    assert_receive :http_client_closed, 1000
+    # The time limits are large for a busy machine.
+    assert {:ok, %Web.TypeError{message: "The stream is errored."}} = Task.yield(task, 2000)
+    send(server, :go)
+    assert_receive :http_client_closed, 2000
   end
 
   test "fetch/1 returns aborted for an already-aborted signal before streaming begins" do
@@ -368,7 +421,10 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert :ok = Web.AbortController.abort(controller, :timeout)
-    assert Enum.to_list(resp.body) == []
+    assert %Web.TypeError{message: "The stream is errored."} = body_error(resp)
+
+    reader = Web.ReadableStream.get_reader(resp.body)
+    assert catch_exit(Web.Promise.await(Web.ReadableStreamDefaultReader.read(reader))) == :timeout
   end
 
   test "fetch/1 halts before the first body recv when aborted after headers" do
@@ -385,7 +441,7 @@ defmodule Web.Dispatcher.HTTPTest do
     {:ok, resp} = HTTP.fetch(req)
 
     assert :ok = Web.AbortController.abort(controller, :timeout)
-    assert Enum.to_list(resp.body) == []
+    assert %Web.TypeError{message: "The stream is errored."} = body_error(resp)
   end
 
   test "fetch/1 keeps waiting for delayed body chunks while the signal stays alive" do
@@ -401,10 +457,10 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/delayed-body", signal: controller.signal)
     {:ok, resp} = HTTP.fetch(req)
 
-    assert Enum.to_list(resp.body) == ["data"]
+    assert Web.TestBytes.binaries(resp.body) == ["data"]
   end
 
-  test "fetch/1 normalizes transport closure to aborted when abort arrives during recv" do
+  test "fetch/1 gives an error when the transport closes before the body is complete" do
     parent = self()
 
     port =
@@ -417,23 +473,26 @@ defmodule Web.Dispatcher.HTTPTest do
         true
       )
 
-    req = Request.new("http://localhost:#{port}/token-close", signal: :queued_abort)
+    req =
+      Request.new("http://localhost:#{port}/token-close",
+        signal: Web.AbortController.new().signal
+      )
+
     {:ok, resp} = HTTP.fetch(req)
 
     task =
       Task.async(fn ->
         send(parent, :http_recv_started)
-        Enum.to_list(resp.body)
+        body_error(resp)
       end)
 
-    assert_receive :http_recv_started, 100
-    Process.sleep(1)
-    send(task.pid, {:abort, :queued_abort})
+    assert_receive :http_recv_started, 1000
 
-    assert {:ok, []} = Task.yield(task, 1000)
+    assert {:ok, error} = Task.yield(task, 1000)
+    assert is_exception(error)
   end
 
-  test "fetch/1 returns error when bridge process dies before response head" do
+  test "fetch/1 returns an error when the process of the request stops before the head" do
     port =
       HTTPServer.start_link([
         {:sleep, 200},
@@ -456,24 +515,60 @@ defmodule Web.Dispatcher.HTTPTest do
     try do
       send(task_pid, :go)
 
-      bridge_pid =
-        receive do
-          {:trace, ^task_pid, :spawn, spawned_pid, _mfa} ->
-            spawned_pid
-        after
-          1000 ->
-            flunk("did not capture bridge spawn")
-        end
+      # The process of the request, which is also the promise.
+      assert_receive {:trace, ^task_pid, :spawn, request_pid, _mfa}, 1000
+      Process.exit(request_pid, :kill)
 
-      Process.exit(bridge_pid, :kill)
-
-      assert {:ok, {:error, reason}} = Task.yield(task, 2000)
-      assert reason in [:killed, :noproc]
+      # The process is the promise: the await gets the error of a promise
+      # that stopped.
+      assert {:ok, {:error, %Web.TypeError{message: "The promise is not available." <> _}}} =
+               Task.yield(task, 2000)
     after
       if Process.alive?(task_pid) do
         :erlang.trace(task_pid, false, [:procs])
       end
     end
+  end
+
+  test "an informational response before the response is ignored" do
+    for informational <- [
+          "HTTP/1.1 100 Continue\r\n\r\n",
+          "HTTP/1.1 103 Early Hints\r\nlink: </style.css>; rel=preload\r\n\r\n"
+        ] do
+      port =
+        HTTPServer.start_link([
+          informational,
+          "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-final: yes\r\n\r\nok"
+        ])
+
+      assert {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/informational"))
+      assert resp.status == 200
+      assert Web.Headers.get(resp.headers, "x-final") == "yes"
+      assert Web.Headers.get(resp.headers, "link") == nil
+      assert Web.await(Web.Response.text(resp)) == "ok"
+    end
+  end
+
+  test "the trailers of a chunked response are not in the body" do
+    port =
+      HTTPServer.start_link([
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-sum\r\n\r\n",
+        "2\r\nok\r\n0\r\nx-sum: 1\r\n\r\n"
+      ])
+
+    assert {:ok, resp} = HTTP.fetch(Request.new("http://localhost:#{port}/trailers"))
+    assert Web.await(Web.Response.text(resp)) == "ok"
+    assert Web.Headers.get(resp.headers, "x-sum") == nil
+  end
+
+  test "a redirect of a request with no response body follows the redirect mode" do
+    port =
+      HTTPServer.start_link([
+        "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n"
+      ])
+
+    req = Request.new("http://localhost:#{port}/head", method: "HEAD", redirect: "error")
+    assert HTTP.fetch(req) == {:error, :redirect_error}
   end
 
   test "fetch/1 aborts on next pull after first chunk" do
@@ -483,24 +578,28 @@ defmodule Web.Dispatcher.HTTPTest do
       HTTPServer.start_link([
         "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n",
         "data",
-        {:sleep, 100},
+        :gate,
         "more"
       ])
 
     req = Request.new("http://localhost:#{port}/abort-next-pull", signal: controller.signal)
     {:ok, resp} = HTTP.fetch(req)
+    assert_receive {:http_server_gate, ^port, server}, 2000
 
-    chunks =
-      Enum.reduce(resp.body, [], fn chunk, acc ->
-        if acc == [] do
-          :ok = Web.AbortController.abort(controller, :timeout)
-        end
+    parent = self()
 
-        [chunk | acc]
+    # An abort after the first chunk stops the body with an error. The
+    # server sends the rest of the body after the abort.
+    assert_raise Web.TypeError, "The stream is errored.", fn ->
+      Enum.each(resp.body, fn chunk ->
+        send(parent, {:chunk, Web.TestBytes.binary(chunk)})
+        :ok = Web.AbortController.abort(controller, :timeout)
+        send(server, :go)
       end)
+    end
 
-    # Aborting after the first delivered chunk should stop subsequent pulls.
-    assert Enum.reverse(chunks) == ["data"]
+    assert_received {:chunk, "data"}
+    refute_received {:chunk, "more"}
   end
 
   test "fetch/1 populates status_text from HTTP status code map" do
@@ -523,5 +622,34 @@ defmodule Web.Dispatcher.HTTPTest do
     req = Request.new("http://localhost:#{port}/500", method: :get)
     {:ok, resp} = HTTP.fetch(req)
     assert resp.status_text == "Internal Server Error"
+  end
+
+  # A read of the body waits in the stream process for a chunk.
+  defp read_waits?(resp) do
+    case LazyStream.state(resp.body.lazy) do
+      {:process, stream} ->
+        {_state, data} = :sys.get_state(stream)
+        not :queue.is_empty(data.read_requests)
+
+      _no_process ->
+        false
+    end
+  end
+
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("the condition did not become true")
+      true -> Process.sleep(5) && eventually(fun, attempts - 1)
+    end
+  end
+
+  # Reads the body and returns the exception that the read raises.
+  defp body_error(resp) do
+    _chunks = Enum.to_list(resp.body)
+    flunk("the body read did not raise")
+  rescue
+    error in [ExUnit.AssertionError] -> reraise error, __STACKTRACE__
+    error -> error
   end
 end

@@ -81,12 +81,42 @@ defmodule Web.HeadersTest do
 
       assert Headers.get(headers, "set-cookie") == "a=1, b=2"
       assert Headers.get_set_cookie(headers) == ["a=1", "b=2"]
-      assert Headers.getSetCookie(headers) == ["a=1", "b=2"]
     end
 
-    test "missing headers return nil by default" do
+    # The steps "sort and combine" of the Fetch Standard.
+    test "the iteration gives each set-cookie value as a pair, and joins the other values" do
+      headers =
+        Headers.new([
+          {"set-cookie", "b=2"},
+          {"x-list", "1"},
+          {"Set-Cookie", "a=1"},
+          {"x-list", "2"},
+          {"accept", "*/*"}
+        ])
+
+      expected = [
+        {"accept", "*/*"},
+        {"set-cookie", "b=2"},
+        {"set-cookie", "a=1"},
+        {"x-list", "1, 2"}
+      ]
+
+      assert Enum.to_list(Headers.entries(headers)) == expected
+      assert Enum.to_list(headers) == expected
+      assert Enum.count(headers) == 4
+
+      assert Enum.to_list(Headers.keys(headers)) == [
+               "accept",
+               "set-cookie",
+               "set-cookie",
+               "x-list"
+             ]
+
+      assert Enum.to_list(Headers.values(headers)) == ["*/*", "b=2", "a=1", "1, 2"]
+    end
+
+    test "a missing header gives nil (null)" do
       assert Headers.get(Headers.new(), "missing") == nil
-      assert Headers.get(Headers.new(), "missing", :default) == :default
     end
   end
 
@@ -156,6 +186,187 @@ defmodule Web.HeadersTest do
       impl = Enumerable.impl_for!(headers)
 
       assert impl.slice(headers) == {:error, impl}
+    end
+  end
+
+  describe "the checks of the Fetch Standard" do
+    test "refuse a name that is not an HTTP token, in each function" do
+      headers = Headers.new(%{"a" => "1"})
+
+      for name <- ["", "bad name", "a:b", "a\r\n", "é", "a(b", %{}, {"a"}] do
+        for fun <- [
+              fn -> Headers.new([{name, "x"}]) end,
+              fn -> Headers.append(headers, name, "x") end,
+              fn -> Headers.set(headers, name, "x") end,
+              fn -> Headers.get(headers, name) end,
+              fn -> Headers.has(headers, name) end,
+              fn -> Headers.delete(headers, name) end
+            ] do
+          assert_raise Web.TypeError, ~r/Invalid header name/, fun
+        end
+      end
+    end
+
+    test "convert nil to the text \"null\" and a number to its text, as a ByteString" do
+      headers = Headers.new([{nil, nil}, {1, 2}])
+
+      assert Enum.to_list(Headers.entries(headers)) == [{"1", "2"}, {"null", "null"}]
+      assert Headers.get(headers, nil) == "null"
+      assert Headers.has(headers, 1)
+      assert headers |> Headers.set(nil, "x") |> Headers.get("null") == "x"
+      assert headers |> Headers.append("a", nil) |> Headers.get("a") == "null"
+      refute headers |> Headers.delete(nil) |> Headers.has("null")
+    end
+
+    test "accept each character of an HTTP token in a name" do
+      name = "!#$%&'*+-.^_`|~09AZaz"
+      headers = Headers.new([{name, "x"}])
+      assert Headers.get(headers, name) == "x"
+      assert Enum.to_list(Headers.keys(headers)) == [String.downcase(name)]
+    end
+
+    test "refuse a value with a NUL, CR, or LF character" do
+      for value <- ["a\r\nb: c", "a\nb", "a\rb", <<"a", 0, "b">>] do
+        assert_raise Web.TypeError, ~r/Invalid header value/, fn ->
+          Headers.new([{"x-test", value}])
+        end
+
+        assert_raise Web.TypeError, ~r/Invalid header value/, fn ->
+          Headers.set(Headers.new(), "x-test", value)
+        end
+      end
+
+      assert_raise Web.TypeError, ~r/Invalid header value/, fn ->
+        Headers.new([{"x-test", %{}}])
+      end
+    end
+
+    test "remove the HTTP whitespace at the two ends of a value" do
+      headers = Headers.new([{"x-test", " \t\r\n a  b \n\r\t "}, {"x-empty", " \t "}])
+      assert Headers.get(headers, "x-test") == "a  b"
+      assert Headers.get(headers, "x-empty") == ""
+    end
+
+    test "accept a value that is a number or an atom" do
+      headers = Headers.new([{"content-length", 12}, {"x-flag", true}])
+      assert Headers.get(headers, "content-length") == "12"
+      assert Headers.get(headers, "x-flag") == "true"
+    end
+
+    test "append the values of map keys that are the same name" do
+      headers = Headers.new(%{"X-Test" => "1", "x-test" => "2"})
+      assert Headers.get(headers, "x-test") |> String.split(", ") |> Enum.sort() == ["1", "2"]
+    end
+
+    test "refuse input that is not a collection of pairs" do
+      assert_raise Web.TypeError, ~r/Each header must be a pair/, fn ->
+        Headers.new(["a"])
+      end
+
+      assert_raise Web.TypeError, ~r/Headers must be/, fn -> Headers.new("a: b") end
+    end
+
+    property "a valid name and value are kept, with the name in lowercase" do
+      token = string([?a..?z, ?A..?Z, ?0..?9, ?-, ?_], min_length: 1)
+      value = string([0x21..0x7E], min_length: 1)
+
+      check all(name <- token, value <- value) do
+        headers = Headers.new([{name, value}])
+        assert Headers.get(headers, name) == value
+        assert Headers.has(headers, String.upcase(name))
+        assert Enum.to_list(headers) == [{String.downcase(name), value}]
+      end
+    end
+
+    property "each text is accepted with the standard result, or raises TypeError" do
+      check all(name <- string(:printable), value <- string(:printable)) do
+        try do
+          Headers.new([{name, value}])
+        rescue
+          error in Web.TypeError -> assert error.message =~ "Invalid header"
+        else
+          headers ->
+            [{stored_name, stored_value}] = Enum.to_list(headers)
+            assert stored_name == String.downcase(name, :ascii)
+            assert stored_value == String.trim(value, " ") |> trim_http_whitespace()
+            refute stored_value =~ ~r/[\0\r\n]/
+        end
+      end
+    end
+
+    defp trim_http_whitespace(value) do
+      value
+      |> String.replace(~r/\A[\t\n\r ]+/, "")
+      |> String.replace(~r/[\t\n\r ]+\z/, "")
+    end
+  end
+
+  describe "the guard \"immutable\"" do
+    # The token characters of RFC 9110 for a header name.
+    defp token,
+      do: string(Enum.concat([?a..?z, ?A..?Z, ?0..?9, ~c"!#$%&'*+-.^_`|~"]), min_length: 1)
+
+    # The responses of the Fetch Standard with the guard "immutable".
+    defp immutable_headers do
+      [
+        Web.Response.error().headers,
+        Web.Response.redirect("https://example.com/").headers,
+        Web.Response.__network__(status: 200, headers: Headers.__network__([{"a", "1"}])).headers
+      ]
+    end
+
+    property "refuses each change, and a copy of the headers accepts it" do
+      check all(name <- token(), value <- string(:alphanumeric)) do
+        for headers <- immutable_headers() do
+          assert headers.guard == "immutable"
+
+          for change <- [
+                &Headers.append(&1, name, value),
+                &Headers.set(&1, name, value),
+                &Headers.delete(&1, name),
+                &put_in(&1[name], value),
+                &Headers.pop(&1, name)
+              ] do
+            assert_raise Web.TypeError, "The headers are immutable.", fn -> change.(headers) end
+          end
+
+          copy = Headers.new(headers)
+          assert copy.guard == "none"
+          assert copy |> Headers.append(name, value) |> Headers.get(name) =~ value
+        end
+      end
+    end
+
+    test "examines the name and the value before the guard, as the Fetch Standard" do
+      headers = Web.Response.error().headers
+
+      assert_raise Web.TypeError, ~r/Invalid header name/, fn ->
+        Headers.append(headers, "bad name", "x")
+      end
+
+      assert_raise Web.TypeError, ~r/Invalid header value/, fn ->
+        Headers.set(headers, "x", "a\nb")
+      end
+
+      assert_raise Web.TypeError, ~r/Invalid header name/, fn -> Headers.delete(headers, "") end
+    end
+
+    test "is not in the headers of a response, a request, or a JSON response" do
+      for headers <- [
+            Web.Response.new("x").headers,
+            Web.Response.json(%{}).headers,
+            Web.Request.new("https://example.com").headers,
+            Web.Response.new(nil, headers: Web.Response.error().headers).headers
+          ] do
+        assert headers.guard == "none"
+        assert %Headers{} = Headers.append(headers, "x", "1")
+      end
+    end
+
+    test "stays in the clone of a response" do
+      {original, clone} = Web.Response.clone(Web.Response.redirect("https://example.com/"))
+      assert original.headers.guard == "immutable"
+      assert clone.headers.guard == "immutable"
     end
   end
 

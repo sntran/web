@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Check observer callback parameter and this values": "runner: the layer calls a callback with no this value"
+  }
+}

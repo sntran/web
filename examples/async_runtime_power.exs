@@ -1,8 +1,8 @@
 defmodule AsyncRuntimePowerExample do
   @moduledoc """
   Demonstrates invisible async context propagation across multipart parsing,
-  file streaming, compression tasks, logger metadata, console grouping, and
-  ambient abort signals.
+  file streaming, compression tasks, logger metadata, and console grouping,
+  and an abort signal that stops the source of an upload.
 
   Usage:
     mix run examples/async_runtime_power.exs
@@ -14,7 +14,7 @@ defmodule AsyncRuntimePowerExample do
   alias Web.File
 
   def run do
-    user = AsyncContext.Variable.new("user")
+    user = AsyncContext.Variable.new(name: "user")
     controller = AbortController.new()
     boundary = "runtime-power-boundary"
     request_id = "req-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -29,9 +29,18 @@ defmodule AsyncRuntimePowerExample do
       Console.group("Secure Compressed Proxy")
 
       try do
-        form = FormData.parse(upload_stream(boundary), boundary, signal: controller.signal)
+        request =
+          Request.new("https://example.com/upload",
+            method: "POST",
+            headers: %{"content-type" => "multipart/form-data; boundary=#{boundary}"},
+            body: upload_stream(boundary, controller.signal),
+            duplex: "half",
+            signal: controller.signal
+          )
+
+        form = await(Request.form_data(request))
         parent = self()
-        snapshot = AsyncContext.Snapshot.take()
+        snapshot = AsyncContext.Snapshot.new()
 
         proxy_task =
           Task.async(fn ->
@@ -42,6 +51,7 @@ defmodule AsyncRuntimePowerExample do
                     Console.info("metadata field received: #{value}")
 
                   [_name, %File{} = file] ->
+                    Console.info("file received: #{file.name}")
                     compression = CompressionStream.new("gzip")
                     send(parent, {:compression_pid, compression.readable.controller_pid})
 
@@ -49,7 +59,8 @@ defmodule AsyncRuntimePowerExample do
                     |> File.stream()
                     |> ReadableStream.pipe_through(compression)
                     |> Enum.each(fn chunk ->
-                      send(parent, {:compressed_chunk, byte_size(chunk)})
+                      # Each chunk of a stream of bytes is a `Web.Uint8Array`.
+                      send(parent, {:compressed_chunk, chunk.byte_length})
                       Process.sleep(10)
                     end)
                 end)
@@ -119,7 +130,10 @@ defmodule AsyncRuntimePowerExample do
     end)
   end
 
-  defp upload_stream(boundary) do
+  # The signal of a request does not stop a read of its body, as the Fetch
+  # Standard specifies. Thus the source of the upload stops itself when the
+  # signal aborts: the stream goes to the errored state with the reason.
+  defp upload_stream(boundary, signal) do
     payload =
       multipart_payload(boundary, [
         %{name: "meta", value: "confidential"},
@@ -135,6 +149,12 @@ defmodule AsyncRuntimePowerExample do
     {:ok, cursor} = Agent.start_link(fn -> chunks end)
 
     ReadableStream.new(%{
+      start: fn controller ->
+        EventTarget.add_event_listener(signal, "abort", fn ->
+          Console.warn("upload source stopped: #{inspect(AbortSignal.reason(signal))}")
+          ReadableStreamDefaultController.error(controller, AbortSignal.reason(signal))
+        end)
+      end,
       pull: fn controller ->
         Process.sleep(15)
 
@@ -197,7 +217,7 @@ defmodule AsyncRuntimePowerExample do
 
   defp do_chunk_binary(binary, size, acc) do
     take = min(size, byte_size(binary))
-    <<chunk::binary-size(take), rest::binary>> = binary
+    <<chunk::binary-size(^take), rest::binary>> = binary
     do_chunk_binary(rest, size, [chunk | acc])
   end
 

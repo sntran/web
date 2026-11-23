@@ -33,7 +33,7 @@ defmodule Web.Benchmarks.Throughput do
     stream = factory.()
     source = ReadableStream.from(Stream.duplicate(@chunk, @chunk_count))
     compressed = ReadableStream.pipe_through(source, stream)
-    _ = await(Response.bytes(Response.new(body: compressed)))
+    _ = await(Response.bytes(Response.new(compressed)))
   end
 end
 

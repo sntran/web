@@ -3,13 +3,14 @@ defmodule Web.WritableStreamTest do
   import Web, only: [await: 1]
   use ExUnitProperties
 
+  alias Web.Test.StreamEngine
   alias Web.TypeError
   alias Web.WritableStream
   alias Web.WritableStreamDefaultController
   alias Web.WritableStreamDefaultWriter
 
   test "new/1 validates the underlying sink type" do
-    assert_raise ArgumentError, ~r/underlying_sink must be a map/, fn ->
+    assert_raise TypeError, ~r/underlying sink must be a map/, fn ->
       WritableStream.new(:not_a_map)
     end
   end
@@ -22,7 +23,7 @@ defmodule Web.WritableStreamTest do
         start: fn controller ->
           send(
             parent,
-            {:controller_size, WritableStreamDefaultController.desired_size(controller)}
+            {:controller_size, StreamEngine.desired_size(controller)}
           )
 
           WritableStreamDefaultController.error(controller, :boom)
@@ -31,7 +32,7 @@ defmodule Web.WritableStreamTest do
 
     assert_receive {:controller_size, 1}
     assert_wait(fn -> WritableStream.__get_slots__(stream.controller_pid).state == :errored end)
-    assert WritableStream.desired_size(stream) == nil
+    assert StreamEngine.desired_size(stream) == nil
   end
 
   test "successful start callbacks leave the stream writable" do
@@ -40,7 +41,7 @@ defmodule Web.WritableStreamTest do
     stream =
       WritableStream.new(%{
         start: fn controller ->
-          send(parent, {:start_ok, WritableStreamDefaultController.desired_size(controller)})
+          send(parent, {:start_ok, StreamEngine.desired_size(controller)})
           :ok
         end
       })
@@ -62,31 +63,35 @@ defmodule Web.WritableStreamTest do
 
     assert :ok = await(WritableStreamDefaultWriter.abort(abort_writer, :no_abort_callback))
 
-    assert_raise TypeError, "This writer is no longer locked.", fn ->
-      WritableStreamDefaultWriter.release_lock(abort_writer)
-    end
+    # A release of a lock that is released already has no effect, as in the
+    # Streams Standard.
+    assert :ok = WritableStreamDefaultWriter.release_lock(abort_writer)
+    assert :ok = WritableStreamDefaultWriter.release_lock(abort_writer)
   end
 
-  test "pid convenience wrappers and callback error clause are covered" do
-    callback_state = %{sink: %{}, pid: self()}
-    assert {:ok, ^callback_state} = WritableStream.error(:boom, callback_state)
-
+  test "the functions that take the pid of a stream" do
     stream =
       WritableStream.new(%{
         write: fn _chunk, _controller -> :ok end
       })
 
-    assert :ok = WritableStream.get_writer(stream.controller_pid)
-    assert :ok = WritableStream.write(stream.controller_pid, "chunk")
-    assert :ok = WritableStream.ready(stream.controller_pid)
-    assert :ok = Task.await(WritableStream.close(stream.controller_pid).task, 1_000)
-    assert {:error, :not_locked_by_writer} = WritableStream.release_lock(stream.controller_pid)
-
-    abort_stream = WritableStream.new(%{})
-    assert :ok = WritableStream.get_writer(abort_stream.controller_pid)
+    assert :ok = StreamEngine.lock_writer(stream.controller_pid)
+    assert :ok = StreamEngine.write(stream.controller_pid, self(), "chunk")
+    assert :ok = StreamEngine.ready(stream.controller_pid, self())
 
     assert :ok =
-             Task.await(WritableStream.abort(abort_stream.controller_pid, :pid_abort).task, 1_000)
+             Web.Promise.await(StreamEngine.terminate(stream.controller_pid, :close, nil))
+
+    assert :ok = StreamEngine.release_writer(stream.controller_pid)
+    assert :ok = StreamEngine.release_writer(stream.controller_pid)
+
+    abort_stream = WritableStream.new(%{})
+    assert :ok = StreamEngine.lock_writer(abort_stream.controller_pid)
+
+    assert :ok =
+             Web.Promise.await(
+               StreamEngine.terminate(abort_stream.controller_pid, :abort, :pid_abort)
+             )
 
     assert WritableStream.__get_slots__(abort_stream.controller_pid).state == :errored
   end
@@ -109,7 +114,7 @@ defmodule Web.WritableStreamTest do
     write_task = Task.async(fn -> await(WritableStreamDefaultWriter.write(writer, "chunk-1")) end)
 
     assert_receive {:sink_write, sink_task_pid, "chunk-1"}
-    assert WritableStream.backpressure?(stream) == true
+    assert StreamEngine.backpressure?(stream) == true
     assert WritableStreamDefaultWriter.desired_size(writer) == 0
     assert Task.yield(write_task, 50) == nil
 
@@ -120,7 +125,7 @@ defmodule Web.WritableStreamTest do
 
     assert {:ok, :ok} = Task.yield(write_task, 1_000)
     assert {:ok, :ok} = Task.yield(ready_task, 1_000)
-    assert WritableStream.backpressure?(stream) == false
+    assert StreamEngine.backpressure?(stream) == false
     assert WritableStreamDefaultWriter.desired_size(writer) == 1
   end
 
@@ -144,12 +149,12 @@ defmodule Web.WritableStreamTest do
       })
 
     pid = stream.controller_pid
-    assert :ok = WritableStream.get_writer(pid)
+    assert :ok = StreamEngine.lock_writer(pid)
 
-    write_a = Task.async(fn -> WritableStream.write(pid, owner_pid, "a") end)
+    write_a = Task.async(fn -> StreamEngine.write(pid, owner_pid, "a") end)
     assert_receive {:sink_write, sink_a, "a"}
 
-    write_b = Task.async(fn -> WritableStream.write(pid, owner_pid, "b") end)
+    write_b = Task.async(fn -> StreamEngine.write(pid, owner_pid, "b") end)
 
     assert_wait(fn ->
       WritableStream.__get_slots__(pid).queued_write_requests
@@ -157,14 +162,14 @@ defmodule Web.WritableStreamTest do
       |> Kernel.==(1)
     end)
 
-    close_task = Task.async(fn -> WritableStream.close(pid, owner_pid) end)
+    close_task = Task.async(fn -> StreamEngine.close(pid, owner_pid) end)
 
     assert_wait(fn ->
       slots = WritableStream.__get_slots__(pid)
       slots.state == :closing and not is_nil(slots.pending_close_request)
     end)
 
-    assert {:error, :closing} = WritableStream.close(pid, owner_pid)
+    assert {:error, :closing} = StreamEngine.close(pid, owner_pid)
 
     send(sink_a, {:continue, "a"})
     assert {:ok, :ok} = Task.yield(write_a, 1_000)
@@ -177,7 +182,7 @@ defmodule Web.WritableStreamTest do
     assert {:ok, :ok} = Task.yield(close_task, 1_000)
   end
 
-  test "erroring the stream rejects pending writes ready requests and close requests" do
+  test "an error waits for the write in flight, and then rejects the writes ready and close" do
     parent = self()
     owner_pid = self()
 
@@ -187,18 +192,18 @@ defmodule Web.WritableStreamTest do
           send(parent, {:sink_write, self(), chunk})
 
           receive do
-            :wait_forever -> :ok
+            :continue -> :ok
           end
         end
       })
 
     pid = stream.controller_pid
-    assert :ok = WritableStream.get_writer(pid)
+    assert :ok = StreamEngine.lock_writer(pid)
 
-    write_a = Task.async(fn -> WritableStream.write(pid, owner_pid, "a") end)
-    assert_receive {:sink_write, _sink_pid, "a"}
+    write_a = Task.async(fn -> StreamEngine.write(pid, owner_pid, "a") end)
+    assert_receive {:sink_write, sink_pid, "a"}
 
-    write_b = Task.async(fn -> WritableStream.write(pid, owner_pid, "b") end)
+    write_b = Task.async(fn -> StreamEngine.write(pid, owner_pid, "b") end)
 
     assert_wait(fn ->
       WritableStream.__get_slots__(pid).queued_write_requests
@@ -206,24 +211,35 @@ defmodule Web.WritableStreamTest do
       |> Kernel.==(1)
     end)
 
-    ready_task = Task.async(fn -> WritableStream.ready(pid, owner_pid) end)
-    close_task = Task.async(fn -> WritableStream.close(pid, owner_pid) end)
+    ready_task = Task.async(fn -> StreamEngine.ready(pid, owner_pid) end)
+    assert_wait(fn -> :queue.len(WritableStream.__get_slots__(pid).ready_waiters) == 1 end)
+
+    # A close fulfils the promise `ready`, as WritableStreamClose specifies.
+    close_task = Task.async(fn -> StreamEngine.close(pid, owner_pid) end)
+    assert {:ok, :ok} = Task.yield(ready_task, 1_000)
 
     assert_wait(fn ->
       slots = WritableStream.__get_slots__(pid)
-
-      slots.state == :closing and
-        not is_nil(slots.pending_close_request) and
-        :queue.len(slots.ready_waiters) == 1
+      slots.state == :closing and not is_nil(slots.pending_close_request)
     end)
 
     WritableStream.error(pid, :boom)
 
-    assert {:ok, {:error, {:errored, :boom}}} = Task.yield(write_a, 1_000)
+    # The stream is erroring: the promise `ready` rejects immediately, and
+    # the write in flight continues, as the Streams Standard specifies.
+    assert {:error, {:errored, :boom}} = StreamEngine.ready(pid, owner_pid)
+    assert WritableStream.__get_slots__(pid).state == :erroring
+    assert StreamEngine.desired_size(pid) == nil
+    assert Task.yield(write_a, 0) == nil
+
+    send(sink_pid, :continue)
+
+    # The sink returned normally: the write fulfils. Then the error is
+    # complete, and the requests that wait reject.
+    assert {:ok, :ok} = Task.yield(write_a, 1_000)
     assert {:ok, {:error, {:errored, :boom}}} = Task.yield(write_b, 1_000)
-    assert {:ok, {:error, {:errored, :boom}}} = Task.yield(ready_task, 1_000)
     assert {:ok, {:error, {:errored, :boom}}} = Task.yield(close_task, 1_000)
-    assert_wait(fn -> WritableStream.__get_slots__(pid).state == :errored end)
+    assert WritableStream.__get_slots__(pid).state == :errored
   end
 
   test "a writable stream cannot have two active writers at once" do
@@ -257,9 +273,10 @@ defmodule Web.WritableStreamTest do
     assert %TypeError{message: "This writer is no longer locked."} =
              catch_exit(await(WritableStreamDefaultWriter.abort(released_writer, :late)))
 
-    assert_raise TypeError, "This writer is no longer locked.", fn ->
-      WritableStreamDefaultWriter.release_lock(released_writer)
-    end
+    assert %TypeError{message: "This writer is no longer locked."} =
+             catch_exit(await(WritableStreamDefaultWriter.closed(released_writer)))
+
+    assert :ok = WritableStreamDefaultWriter.release_lock(released_writer)
 
     parent = self()
 
@@ -281,8 +298,9 @@ defmodule Web.WritableStreamTest do
 
     assert_receive {:closing_write, sink_pid, "first"}
 
-    close_task = Task.async(fn -> await(WritableStreamDefaultWriter.close(closing_writer)) end)
-    Process.sleep(50)
+    # The test process sends the close request before the next write. Thus
+    # the stream handles the close first.
+    close_promise = WritableStreamDefaultWriter.close(closing_writer)
 
     assert %TypeError{message: "The stream is closing."} =
              catch_exit(await(WritableStreamDefaultWriter.write(closing_writer, "second")))
@@ -292,9 +310,13 @@ defmodule Web.WritableStreamTest do
 
     send(sink_pid, :continue)
     assert {:ok, :ok} = Task.yield(write_task, 1_000)
-    assert {:ok, :ok} = Task.yield(close_task, 1_000)
+    assert :ok = await(close_promise)
 
-    assert :ok = await(WritableStreamDefaultWriter.close(closing_writer))
+    # A second close is an error, as in the Streams Standard.
+    assert %TypeError{message: "The stream is closed."} =
+             catch_exit(await(WritableStreamDefaultWriter.close(closing_writer)))
+
+    assert :ok = await(WritableStreamDefaultWriter.closed(closing_writer))
 
     assert %TypeError{message: "The stream is closed."} =
              catch_exit(await(WritableStreamDefaultWriter.write(closing_writer, "after-close")))
@@ -306,31 +328,31 @@ defmodule Web.WritableStreamTest do
     errored_writer = WritableStream.get_writer(errored_stream)
     assert :ok = await(WritableStreamDefaultWriter.abort(errored_writer, :boom))
 
-    assert %TypeError{message: "This writer is no longer locked."} =
-             catch_exit(await(WritableStreamDefaultWriter.write(errored_writer, "late")))
+    # A write, the promise `ready`, and the promise `closed` reject with the
+    # error of the stream, as in the Streams Standard.
+    assert catch_exit(await(WritableStreamDefaultWriter.write(errored_writer, "late"))) == :boom
+    assert catch_exit(await(WritableStreamDefaultWriter.ready(errored_writer))) == :boom
+    assert catch_exit(await(WritableStreamDefaultWriter.closed(errored_writer))) == :boom
 
-    assert %TypeError{message: "This writer is no longer locked."} =
-             catch_exit(await(WritableStreamDefaultWriter.ready(errored_writer)))
-
-    assert %TypeError{message: "This writer is no longer locked."} =
+    assert %TypeError{message: "The stream is errored."} =
              catch_exit(await(WritableStreamDefaultWriter.close(errored_writer)))
 
-    assert %TypeError{message: "This writer is no longer locked."} =
-             catch_exit(await(WritableStreamDefaultWriter.abort(errored_writer, :again)))
-
-    assert_raise TypeError, "This writer is no longer locked.", fn ->
-      WritableStreamDefaultWriter.release_lock(errored_writer)
-    end
+    # An abort of an errored stream has no effect.
+    assert :ok = await(WritableStreamDefaultWriter.abort(errored_writer, :again))
+    assert :ok = WritableStreamDefaultWriter.release_lock(errored_writer)
   end
 
-  test "abort/2 returns quickly while cleanup continues in the background" do
+  test "abort/2 settles after the abort callback of the sink is complete" do
     parent = self()
 
     stream =
       WritableStream.new(%{
         abort: fn reason ->
           send(parent, {:abort_started, self(), reason})
-          Process.sleep(200)
+
+          # The callback continues when the test tells it to continue. Thus
+          # the test examines the stream while the callback runs.
+          receive do: (:finish_abort -> :ok)
           send(parent, {:abort_finished, reason})
           :ok
         end
@@ -341,8 +363,8 @@ defmodule Web.WritableStreamTest do
     abort_task =
       Task.async(fn -> await(WritableStreamDefaultWriter.abort(writer, :slow_boom)) end)
 
-    assert_receive {:abort_started, _sink_pid, :slow_boom}
-    assert {:ok, :ok} = Task.yield(abort_task, 50)
+    assert_receive {:abort_started, sink_pid, :slow_boom}
+    assert Task.yield(abort_task, 50) == nil
     assert Process.alive?(stream.controller_pid)
 
     slots = WritableStream.__get_slots__(stream.controller_pid)
@@ -351,16 +373,18 @@ defmodule Web.WritableStreamTest do
     assert slots.active_operation == :abort
     assert is_reference(slots.task_ref)
 
-    assert WritableStream.desired_size(stream) == nil
+    assert StreamEngine.desired_size(stream) == nil
 
-    assert %TypeError{message: "This writer is no longer locked."} =
-             catch_exit(await(WritableStreamDefaultWriter.write(writer, "late")))
+    # A write to the errored stream rejects with the reason of the abort.
+    assert catch_exit(await(WritableStreamDefaultWriter.write(writer, "late"))) == :slow_boom
 
-    assert %TypeError{message: "This writer is no longer locked."} =
+    assert %TypeError{message: "The stream is errored."} =
              catch_exit(await(WritableStreamDefaultWriter.close(writer)))
 
     refute_receive {:abort_finished, :slow_boom}, 100
-    assert_receive {:abort_finished, :slow_boom}, 300
+    send(sink_pid, :finish_abort)
+    assert_receive {:abort_finished, :slow_boom}
+    assert {:ok, :ok} = Task.yield(abort_task, 500)
 
     assert_wait(fn ->
       slots = WritableStream.__get_slots__(stream.controller_pid)
@@ -368,7 +392,7 @@ defmodule Web.WritableStreamTest do
     end)
   end
 
-  test "abort task failures do not replace the original errored reason" do
+  test "an abort callback that throws rejects the abort, and keeps the reason of the stream" do
     raised_stream =
       WritableStream.new(%{
         abort: fn _reason ->
@@ -378,15 +402,15 @@ defmodule Web.WritableStreamTest do
 
     raised_writer = WritableStream.get_writer(raised_stream)
 
-    assert :ok = await(WritableStreamDefaultWriter.abort(raised_writer, :boom))
+    assert %RuntimeError{message: "abort failed"} =
+             catch_exit(await(WritableStreamDefaultWriter.abort(raised_writer, :boom)))
 
     assert_wait(fn ->
       slots = WritableStream.__get_slots__(raised_stream.controller_pid)
       slots.state == :errored and slots.error_reason == :boom and is_nil(slots.active_operation)
     end)
 
-    assert %TypeError{message: "This writer is no longer locked."} =
-             catch_exit(await(WritableStreamDefaultWriter.write(raised_writer, "late")))
+    assert catch_exit(await(WritableStreamDefaultWriter.write(raised_writer, "late"))) == :boom
 
     thrown_stream =
       WritableStream.new(%{
@@ -397,38 +421,34 @@ defmodule Web.WritableStreamTest do
 
     thrown_writer = WritableStream.get_writer(thrown_stream)
 
-    assert :ok = await(WritableStreamDefaultWriter.abort(thrown_writer, :boom))
+    assert catch_exit(await(WritableStreamDefaultWriter.abort(thrown_writer, :boom))) ==
+             :abort_thrown
 
     assert_wait(fn ->
       slots = WritableStream.__get_slots__(thrown_stream.controller_pid)
       slots.state == :errored and slots.error_reason == :boom and is_nil(slots.active_operation)
     end)
 
-    assert %TypeError{message: "This writer is no longer locked."} =
+    assert %TypeError{message: "The stream is errored."} =
              catch_exit(await(WritableStreamDefaultWriter.close(thrown_writer)))
   end
 
   test "start and write callback failures move the stream into errored" do
-    raised_start_stream =
-      WritableStream.new(%{
-        start: fn _controller ->
-          raise "start failed"
-        end
-      })
+    # A value that the function `start` throws is thrown by the constructor,
+    # as in the Streams Standard.
+    assert_raise RuntimeError, "start failed", fn ->
+      WritableStream.new(%{start: fn _controller -> raise "start failed" end})
+    end
 
-    thrown_start_stream =
-      WritableStream.new(%{
-        start: fn _controller ->
-          throw(:start_thrown)
-        end
-      })
+    assert catch_throw(WritableStream.new(%{start: fn _controller -> throw(:start_thrown) end})) ==
+             :start_thrown
 
-    assert_wait(fn ->
-      WritableStream.__get_slots__(raised_start_stream.controller_pid).state == :errored
-    end)
+    # A promise from `start` that rejects puts the stream in the errored state.
+    rejected_start_stream =
+      WritableStream.new(%{start: fn _controller -> Web.Promise.reject(:start_rejected) end})
 
     assert_wait(fn ->
-      WritableStream.__get_slots__(thrown_start_stream.controller_pid).state == :errored
+      WritableStream.__get_slots__(rejected_start_stream.controller_pid).state == :errored
     end)
 
     raised_write_stream =
@@ -440,7 +460,7 @@ defmodule Web.WritableStreamTest do
 
     raised_writer = WritableStream.get_writer(raised_write_stream)
 
-    assert %TypeError{message: "The stream is errored."} =
+    assert %RuntimeError{message: "write failed"} =
              catch_exit(await(WritableStreamDefaultWriter.write(raised_writer, "boom")))
 
     thrown_write_stream =
@@ -452,7 +472,7 @@ defmodule Web.WritableStreamTest do
 
     thrown_writer = WritableStream.get_writer(thrown_write_stream)
 
-    assert %TypeError{message: "The stream is errored."} =
+    assert :write_thrown =
              catch_exit(await(WritableStreamDefaultWriter.write(thrown_writer, "boom")))
   end
 
@@ -461,7 +481,7 @@ defmodule Web.WritableStreamTest do
     parent = self()
 
     spawn(fn ->
-      assert :ok = WritableStream.get_writer(writer_lock_stream.controller_pid)
+      assert :ok = StreamEngine.lock_writer(writer_lock_stream.controller_pid)
       send(parent, :writer_locked)
     end)
 
@@ -471,38 +491,36 @@ defmodule Web.WritableStreamTest do
       WritableStream.__get_slots__(writer_lock_stream.controller_pid).writer_pid == nil
     end)
 
-    slow_stream =
-      WritableStream.new(%{
-        write: fn _chunk, _controller ->
-          Process.sleep(5_000)
-        end
-      })
+    # The write does not end in the test. Thus the task of the write stays
+    # active.
+    slow_write = fn _chunk, _controller ->
+      send(parent, {:writing, self()})
+      Process.sleep(5_000)
+    end
 
-    assert :ok = WritableStream.get_writer(slow_stream.controller_pid)
-    spawn(fn -> WritableStream.write(slow_stream.controller_pid, parent, "x") end)
-    Process.sleep(50)
+    slow_stream = WritableStream.new(%{write: slow_write})
+
+    # The stream starts the task before it handles a later message. Thus the
+    # next call gets the reference of the task. The stream handles the
+    # messages of the test in the sequence that the test sends them.
+    assert :ok = StreamEngine.lock_writer(slow_stream.controller_pid)
+    spawn(fn -> StreamEngine.write(slow_stream.controller_pid, parent, "x") end)
+    assert_receive {:writing, _worker}
 
     normal_ref = WritableStream.__get_slots__(slow_stream.controller_pid).task_ref
     send(slow_stream.controller_pid, {:DOWN, normal_ref, :process, self(), :normal})
-    Process.sleep(50)
 
     assert WritableStream.__get_slots__(slow_stream.controller_pid).state == :writable
     :gen_statem.stop(slow_stream.controller_pid)
 
-    abnormal_stream =
-      WritableStream.new(%{
-        write: fn _chunk, _controller ->
-          Process.sleep(5_000)
-        end
-      })
+    abnormal_stream = WritableStream.new(%{write: slow_write})
 
-    assert :ok = WritableStream.get_writer(abnormal_stream.controller_pid)
-    spawn(fn -> WritableStream.write(abnormal_stream.controller_pid, parent, "x") end)
-    Process.sleep(50)
+    assert :ok = StreamEngine.lock_writer(abnormal_stream.controller_pid)
+    spawn(fn -> StreamEngine.write(abnormal_stream.controller_pid, parent, "x") end)
+    assert_receive {:writing, _worker}
 
     abnormal_ref = WritableStream.__get_slots__(abnormal_stream.controller_pid).task_ref
     send(abnormal_stream.controller_pid, {:DOWN, abnormal_ref, :process, self(), :kaboom})
-    Process.sleep(50)
 
     assert WritableStream.__get_slots__(abnormal_stream.controller_pid).state == :errored
   end
@@ -529,13 +547,13 @@ defmodule Web.WritableStreamTest do
 
     write_task =
       Task.async(fn ->
-        WritableStream.write(closing_stream.controller_pid, owner_pid, "chunk")
+        StreamEngine.write(closing_stream.controller_pid, owner_pid, "chunk")
       end)
 
     assert_receive {:closing_state, sink_pid}
 
     close_task =
-      Task.async(fn -> WritableStream.close(closing_stream.controller_pid, owner_pid) end)
+      Task.async(fn -> StreamEngine.close(closing_stream.controller_pid, owner_pid) end)
 
     assert_wait(fn ->
       WritableStream.__get_slots__(closing_stream.controller_pid).state == :closing
@@ -543,16 +561,27 @@ defmodule Web.WritableStreamTest do
 
     :gen_statem.cast(closing_stream.controller_pid, :unknown)
 
-    assert :ok = WritableStream.abort(closing_stream.controller_pid, owner_pid, :closing_abort)
+    # The abort waits for the write in flight: the stream is erroring.
+    abort_task =
+      Task.async(fn ->
+        StreamEngine.abort(closing_stream.controller_pid, owner_pid, :closing_abort)
+      end)
+
+    assert_wait(fn ->
+      WritableStream.__get_slots__(closing_stream.controller_pid).state == :erroring
+    end)
+
+    :gen_statem.cast(closing_stream.controller_pid, :unknown)
+    send(sink_pid, :continue)
+    assert {:ok, :ok} = Task.yield(abort_task, 1_000)
 
     assert_wait(fn ->
       WritableStream.__get_slots__(closing_stream.controller_pid).state == :errored
     end)
 
     :gen_statem.cast(closing_stream.controller_pid, :unknown)
-    assert {:ok, {:error, {:errored, :closing_abort}}} = Task.yield(write_task, 1_000)
+    assert {:ok, :ok} = Task.yield(write_task, 1_000)
     assert {:ok, {:error, {:errored, :closing_abort}}} = Task.yield(close_task, 1_000)
-    send(sink_pid, :continue)
 
     errored_stream = WritableStream.new()
     errored_writer = WritableStream.get_writer(errored_stream)
@@ -568,6 +597,7 @@ defmodule Web.WritableStreamTest do
   test "race to abort does not crash and concurrent writes do not hang" do
     stream =
       WritableStream.new(%{
+        # A slow sink: the abort comes while the writes wait in the queue.
         write: fn _chunk, _controller ->
           Process.sleep(50)
           :ok
@@ -597,23 +627,25 @@ defmodule Web.WritableStreamTest do
 
     assert Enum.all?(write_results, fn
              {_task, {:ok, :ok}} -> true
-             {_task, {:ok, {:type_error, _message}}} -> true
+             {_task, {:ok, {:rejected, :race_abort}}} -> true
              _ -> false
            end)
 
     assert Enum.any?(write_results, fn
-             {_task, {:ok, {:type_error, _message}}} -> true
+             {_task, {:ok, {:rejected, :race_abort}}} -> true
              _ -> false
            end)
 
     assert {:ok, :ok} = Task.yield(abort_task, 2_000)
     assert_wait(fn -> WritableStream.__get_slots__(stream.controller_pid).state == :errored end)
-    assert WritableStream.locked?(stream.controller_pid) == false
+    # The writer keeps its lock on the errored stream, as in the Streams
+    # Standard.
+    assert StreamEngine.writer_locked?(stream.controller_pid) == true
     assert Process.alive?(stream.controller_pid)
 
+    # A write to the errored stream rejects with the reason of the abort.
     late_write_task = Task.async(fn -> attempt_write(writer, "late") end)
-    assert {:ok, {:type_error, message}} = Task.yield(late_write_task, 1_000)
-    assert message in ["The stream is errored.", "This writer is no longer locked."]
+    assert {:ok, {:rejected, :race_abort}} = Task.yield(late_write_task, 1_000)
   end
 
   property "writing a list of chunks to a synchronous sink preserves order" do
@@ -651,7 +683,7 @@ defmodule Web.WritableStreamTest do
 
       assert received == chunks
       assert_receive :closed
-      assert WritableStream.desired_size(stream) == nil
+      assert StreamEngine.desired_size(stream) == 0
       assert :ok = WritableStreamDefaultWriter.release_lock(writer)
     end
   end
@@ -675,7 +707,7 @@ defmodule Web.WritableStreamTest do
     :ok
   catch
     :exit, %TypeError{message: msg} -> {:type_error, msg}
-    :exit, _ -> {:type_error, "unexpected error"}
+    :exit, reason -> {:rejected, reason}
   end
 
   defp assert_wait(fun, attempts \\ 20)

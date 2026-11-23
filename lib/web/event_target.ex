@@ -1,152 +1,228 @@
 defmodule Web.EventTarget do
   @moduledoc """
-  Public event-target interface for process-backed Web objects.
+  An object that gets events, as `EventTarget` of the DOM Standard.
 
-  Evented structs may expose a direct `event_target_pid` so listener routing can
-  stay capability-local without any central registry lookup.
+  `new/0` makes an event target, as `new EventTarget()`. A
+  `Web.AbortSignal`, a `Web.MessagePort`, and a `Web.BroadcastChannel` are
+  event targets too. The functions of this module accept each of them.
+
+      iex> target = Web.EventTarget.new()
+      iex> me = self()
+      iex> target = Web.EventTarget.add_event_listener(target, "ping", fn event -> send(me, event.type) end)
+      iex> {^target, true} = Web.EventTarget.dispatch_event(target, Web.Event.new("ping"))
+      iex> receive do: (type -> type)
+      "ping"
+
+  ## The dispatch
+
+  `dispatch_event/2` runs the listeners in the calling process, one after
+  the other, before it returns, as the DOM Standard specifies. A listener
+  can add and remove listeners, and dispatch other events. The result is
+  `false` when a listener called `Web.Event.prevent_default/1`.
+
+  The listener steps are those of the DOM Standard for each target:
+
+    * the listeners with the option `:capture` run first, then the others,
+      each group in the sequence of the adds;
+    * a listener that a different listener removed, or whose signal
+      aborted, does not run;
+    * a listener with the option `:once` is removed before it runs;
+    * `Web.Event.prevent_default/1` in a listener with the option
+      `:passive` has no effect;
+    * a listener that comes during a dispatch runs in the next dispatch.
+
+  A message port and a broadcast channel fire their events, such as
+  `message`, in a process of their own.
+
+  ## The lifetime
+
+  A listener of a target of `new/0` or of a signal belongs to the process
+  that added it: when that process stops, its listeners go away. A target
+  of `new/0` is a small process. It stops when the process that made it
+  stopped and it has no listener, after the linger time
+  (`config :web, linger: ms`).
+
+  A listener of a message port or of a broadcast channel stays until a
+  process removes it, or until the port or the channel closes.
   """
 
-  alias Web.AsyncContext.Snapshot
-  alias Web.Internal.EventTarget.Server
+  alias Web.Internal.EventTarget.Dispatch
+  alias Web.Internal.EventTarget.Store
 
-  @type event :: %{required(:type) => String.t() | atom()}
+  defstruct [:pid]
+
+  @type t :: %__MODULE__{pid: pid()}
+
+  @type event :: Web.Event.event()
   @type callback :: (event() -> any()) | (-> any())
 
-  @callback handle_add_listener(struct(), String.t() | atom(), callback(), map()) ::
-              :ok | {:ok, struct()}
-  @callback handle_dispatch(struct(), event()) :: :ok | {:ok, struct()}
-  @optional_callbacks handle_add_listener: 4, handle_dispatch: 2
+  @doc """
+  Makes an event target with no listener, as `new EventTarget()`.
+  """
+  @spec new() :: t()
+  def new, do: %__MODULE__{pid: Store.start(Web.Promise.owner())}
 
-  defmacro __using__(_opts) do
-    quote do
-      @behaviour Web.EventTarget
+  @doc """
+  Adds a listener for the events of a type, as
+  `addEventListener(type, callback, options)`.
 
-      @impl Web.EventTarget
-      def handle_add_listener(target, _type, _callback, _options), do: {:ok, target}
+  The options are `:capture`, `:passive`, `:once`, and `:signal`, as the
+  members of `AddEventListenerOptions`. The default of each one is `false`,
+  and of `:signal` it is `nil`. A boolean in place of the options is the
+  option `:capture`. A listener with the same type, callback, and capture
+  is not added again. A callback that is `nil` adds no listener.
 
-      @impl Web.EventTarget
-      def handle_dispatch(target, _event), do: {:ok, target}
-
-      defoverridable handle_add_listener: 4, handle_dispatch: 2
-
-      defimpl Web.EventTarget.Protocol, for: __MODULE__ do
-        def add_event_listener(target, type, callback, options) do
-          Web.EventTarget.__add_event_listener__(target, type, callback, options)
-        end
-
-        def remove_event_listener(target, type, callback) do
-          Web.EventTarget.__remove_event_listener__(target, type, callback)
-        end
-
-        def dispatch_event(target, event) do
-          Web.EventTarget.__dispatch_event__(target, event)
-        end
-      end
-    end
-  end
-
-  @spec add_event_listener(target, String.t() | atom(), callback(), keyword() | map()) :: target
+  Raises a `Web.TypeError` when `:signal` is not a `Web.AbortSignal`.
+  """
+  @spec add_event_listener(
+          target,
+          String.t() | atom(),
+          callback() | nil,
+          keyword() | map() | boolean()
+        ) :: target
         when target: var
   def add_event_listener(target, type, callback, options \\ %{})
+
+  def add_event_listener(target, _type, nil, options) do
+    _options = flatten_more(options)
+    target
+  end
+
+  def add_event_listener(target, type, callback, options)
       when is_function(callback, 0) or is_function(callback, 1) do
-    Web.EventTarget.Protocol.add_event_listener(target, type, callback, options)
+    Web.EventTarget.Protocol.add_event_listener(target, type, callback, flatten_more(options))
   end
 
-  def unquote(:addEventListener)(target, type, callback, options \\ %{}) do
-    add_event_listener(target, type, callback, options)
-  end
+  @doc """
+  Removes the listener with the type, the callback, and the capture of the
+  options, as `removeEventListener(type, callback, options)`.
+  """
+  @spec remove_event_listener(
+          target,
+          String.t() | atom(),
+          callback() | nil,
+          keyword() | map() | boolean()
+        ) :: target
+        when target: var
+  def remove_event_listener(target, type, callback, options \\ %{})
 
-  @spec remove_event_listener(target, String.t() | atom(), callback()) :: target when target: var
-  def remove_event_listener(target, type, callback)
+  def remove_event_listener(target, _type, nil, _options), do: target
+
+  def remove_event_listener(target, type, callback, options)
       when is_function(callback, 0) or is_function(callback, 1) do
-    Web.EventTarget.Protocol.remove_event_listener(target, type, callback)
+    Web.EventTarget.Protocol.remove_event_listener(target, type, callback, flatten(options))
   end
 
-  def unquote(:removeEventListener)(target, type, callback) do
-    remove_event_listener(target, type, callback)
-  end
+  @doc """
+  Dispatches an event to the target, as `dispatchEvent(event)`. Returns the
+  target, and `false` when a listener canceled the event.
 
+  The event is a `Web.Event`, or an event of a module with its fields, such
+  as `Web.CustomEvent`. Raises a `Web.DOMException` with the name
+  `InvalidStateError` for an event that is in a dispatch now, or that is
+  not initialized: see `Web.Event`.
+  """
   @spec dispatch_event(target, event()) :: {target, boolean()} when target: var
   def dispatch_event(target, %{type: type} = event) when is_binary(type) or is_atom(type) do
     Web.EventTarget.Protocol.dispatch_event(target, event)
   end
 
-  def unquote(:dispatchEvent)(target, event) do
-    dispatch_event(target, event)
-  end
+  # The steps "flatten": a boolean is the option `capture`.
+  defp flatten(capture) when is_boolean(capture), do: capture
+  defp flatten(options), do: options |> Map.new() |> Map.get(:capture, false) == true
 
-  @spec event_target_pid!(map()) :: pid()
-  defp event_target_pid!(%{event_target_pid: event_target_pid}) when is_pid(event_target_pid) do
-    if Process.alive?(event_target_pid) do
-      event_target_pid
-    else
-      raise ArgumentError, "Unknown EventTarget pid: #{inspect(event_target_pid)}"
+  # The steps "flatten more", and the conversion of the dictionary
+  # `AddEventListenerOptions` of Web IDL: the member `signal` is a signal.
+  defp flatten_more(capture) when is_boolean(capture), do: %{capture: capture}
+
+  defp flatten_more(options) when is_list(options) or is_map(options) do
+    options = Map.new(options)
+    signal = Map.get(options, :signal)
+
+    unless is_nil(signal) or is_struct(signal, Web.AbortSignal) do
+      raise Web.TypeError, "The option signal is not a Web.AbortSignal: #{inspect(signal)}"
     end
-  end
 
-  defp event_target_pid!(target) do
-    raise ArgumentError, "Unknown EventTarget handle: #{inspect(target)}"
+    options
   end
 
   @doc false
-  def __add_event_listener__(%{} = target, type, callback, options)
-      when is_function(callback, 0) or is_function(callback, 1) do
-    event_target_pid = event_target_pid!(target)
+  # The steps "add an event listener" for a target whose process keeps the
+  # listeners, with the options of "flatten more". `nil` is a target with
+  # no process: a port or a channel that is closed. A listener with a
+  # signal that aborted is not added. The abort of the signal removes the
+  # listener.
+  @spec __add__(pid() | nil, String.t() | atom(), callback(), map()) :: :ok
+  def __add__(nil, _type, _callback, _options), do: :ok
 
-    if self() == event_target_pid do
-      GenServer.cast(event_target_pid, {:add_event_listener, type, callback, options})
+  def __add__(pid, type, callback, %{} = options) do
+    signal = Map.get(options, :signal)
+
+    if signal != nil and Web.AbortSignal.aborted?(signal) do
+      :ok
     else
-      :ok = Server.add_event_listener(event_target_pid, type, callback, options)
-    end
-
-    target
-  end
-
-  @doc false
-  def __remove_event_listener__(%{} = target, type, callback)
-      when is_function(callback, 0) or is_function(callback, 1) do
-    event_target_pid = event_target_pid!(target)
-
-    if self() == event_target_pid do
-      GenServer.cast(event_target_pid, {:remove_event_listener, type, callback})
-    else
-      :ok = Server.remove_event_listener(event_target_pid, type, callback)
-    end
-
-    target
-  end
-
-  @doc false
-  def __dispatch_event__(%{} = target, %{type: type} = event)
-      when is_binary(type) or is_atom(type) do
-    event_target_pid = event_target_pid!(target)
-    snapshot = Snapshot.take()
-
-    dispatched? =
-      if self() == event_target_pid do
-        GenServer.cast(event_target_pid, {:dispatch_event, event, snapshot})
-        true
-      else
-        Server.dispatch_event(event_target_pid, event, snapshot)
+      case Store.request(pid, {:add, to_string(type), callback, options}, :exists) do
+        {:added, id} when signal != nil -> remove_at_abort(signal, pid, id)
+        _other -> :ok
       end
-
-    {target, dispatched?}
+    end
   end
+
+  defp remove_at_abort(signal, pid, id) do
+    case Web.AbortSignal.__add_algorithm__(signal, {Store, :remove_listener, [pid, id]}) do
+      :ok -> :ok
+      :aborted -> Store.remove_listener(pid, id)
+    end
+  end
+
+  @doc false
+  # The steps "remove an event listener", for a target whose process keeps
+  # the listeners.
+  @spec __remove__(pid() | nil, String.t() | atom(), callback(), boolean()) :: :ok
+  def __remove__(nil, _type, _callback, _capture), do: :ok
+
+  def __remove__(pid, type, callback, capture) do
+    _ok = Store.request(pid, {:remove, to_string(type), callback, capture}, :ok)
+    :ok
+  end
+
+  @doc false
+  @spec __dispatch__(term(), pid() | nil, event()) :: boolean()
+  def __dispatch__(target, pid, event), do: Dispatch.dispatch(target, event, pid)
 end
 
 defprotocol Web.EventTarget.Protocol do
-  @spec add_event_listener(
-          term(),
-          String.t() | atom(),
-          Web.EventTarget.callback(),
-          keyword() | map()
-        ) ::
+  @moduledoc false
+
+  # The functions of `Web.EventTarget` for each kind of event target of the
+  # library. Only the library implements this protocol. The options of an
+  # add are a map of "flatten more", and the capture of a remove is a
+  # boolean.
+
+  @spec add_event_listener(term(), String.t() | atom(), Web.EventTarget.callback(), map()) ::
           term()
   def add_event_listener(target, type, callback, options)
 
-  @spec remove_event_listener(term(), String.t() | atom(), Web.EventTarget.callback()) :: term()
-  def remove_event_listener(target, type, callback)
+  @spec remove_event_listener(term(), String.t() | atom(), Web.EventTarget.callback(), boolean()) ::
+          term()
+  def remove_event_listener(target, type, callback, capture)
 
   @spec dispatch_event(term(), Web.EventTarget.event()) :: {term(), boolean()}
   def dispatch_event(target, event)
+end
+
+defimpl Web.EventTarget.Protocol, for: Web.EventTarget do
+  def add_event_listener(target, type, callback, options) do
+    :ok = Web.EventTarget.__add__(target.pid, type, callback, options)
+    target
+  end
+
+  def remove_event_listener(target, type, callback, capture) do
+    :ok = Web.EventTarget.__remove__(target.pid, type, callback, capture)
+    target
+  end
+
+  def dispatch_event(target, event) do
+    {target, Web.EventTarget.__dispatch__(target, target.pid, event)}
+  end
 end

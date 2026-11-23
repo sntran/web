@@ -1,122 +1,351 @@
 # Benchmarks
 
-This draft captures the benchmark suite for the responsive-core refactor and is intended to feed the main `README.md`.
+The scripts in `bench/` measure the properties that the library promises:
+a stream that keeps no data, a mailbox that does not delay an abort, and a
+form upload with flat memory. One script compares `Web.fetch/2` with other
+HTTP clients.
 
-## Environment
+The numbers below are from one or more runs of each script. A range shows
+two or more runs. Run the scripts on your machine to get your numbers.
 
 | Field | Value |
 | --- | --- |
-| Hardware | Intel Core i5-7400 @ 3.00 GHz, 4 cores, 15.57 GB RAM |
-| OS | Linux 6.6.87.2-microsoft-standard-WSL2 (x86_64) |
-| Erlang/OTP | 28.4 |
-| Elixir | 1.19.5 |
+| Hardware | Intel Xeon @ 2.30 GHz, 4 cores, 15.7 GB of memory (a virtual machine) |
+| Operating system | Linux 6.18 (x86_64) |
+| Erlang/OTP | 29.1.2 |
+| Elixir | 1.20.5 |
 
-## Selective Receive: O(1) Verification
+## Speed of a stream
 
-Benchmark script: `mix run bench/selective_receive.exs`
+```shell
+mix run bench/stream_throughput.exs
+```
 
-Method:
+The script reads 512 MiB in chunks of 64 KiB with `Enum`.
 
-- Preload a dedicated benchmark process mailbox with unrelated `{:data_chunk, n}` messages.
-- Compare a legacy FIFO control receive (`receive do :control -> ... end`) against the ref-tagged selective receive pattern used by the responsive core (`receive do {:control, ^ref} -> ... end`).
-- Reuse the same clogged mailbox for 2,000 control receives per iteration so mailbox setup cost does not dominate the result.
-
-Assumption:
-
-- This comparison now uses the current checkout `9babea0 (HEAD)` against the immediately previous commit `fa74d7f (HEAD~1)`.
-- `fa74d7f` predates `Web.Stream.control_call/3`, `Web.Stream.control_cast/2`, and `Process.flag(:message_queue_data, :off_heap)` in [lib/web/stream.ex](/home/esente/Projects/sntran/web/lib/web/stream.ex), so the benchmark’s legacy side models the old untagged control-message receive behavior from that codebase while the current side models the ref-tagged receive now present at `HEAD`.
-
-### Results
-
-Benchee reports below are per benchmark iteration, where each iteration performs 2,000 control receives against the same preloaded mailbox.
-
-| Mailbox Depth | `fa74d7f` (`HEAD~1`) avg | `9babea0` (`HEAD`) avg | Approx. per receive | Percent Improvement |
-| --- | --- | --- | --- | --- |
-| 1,000 | 13.06 ms | 0.64 ms | 6.53 us -> 0.32 us | 95.10% |
-| 10,000 | 123.00 ms | 0.79 ms | 61.50 us -> 0.40 us | 99.36% |
-| 100,000 | 1.76 s | 2.78 ms | 880.00 us -> 1.39 us | 99.84% |
-
-Observed throughput ratios from Benchee:
-
-- `1k`: `HEAD` is `20.33x` faster than `HEAD~1`.
-- `10k`: `HEAD` is `155.28x` faster than `HEAD~1`.
-- `100k`: `HEAD` is `631.67x` faster than `HEAD~1`.
-
-### Summary
-
-- The `fa74d7f` control path scales linearly with mailbox depth: `13.06 ms` at `1k`, `123.00 ms` at `10k`, and `1.76 s` at `100k`.
-- The `9babea0` ref-tagged path stays effectively flat in the sub-millisecond to low-millisecond range: `0.64 ms`, `0.79 ms`, and `2.78 ms` for the same depths.
-- This is the expected signature of Erlang's reference-optimized selective receive and is the core proof that control-plane messages no longer suffer mailbox-scanning overhead under data-plane pressure.
-
-### Clogged Pipe Abort Latency
-
-Benchmark script: `mix run bench/clogged_abort_latency.exs`
-
-Method:
-
-- Start a `WritableStream` with a blocked first write so the stream stays active.
-- Flood the controller mailbox with 50,000 raw write calls.
-- Measure elapsed microseconds from `WritableStream.abort(stream, :emergency_stop)` to the sink `abort/1` callback firing.
-- Collect 15 samples per revision and report percentile latencies.
-
-Results:
-
-| Metric | `fa74d7f` (`HEAD~1`) | `9babea0` (`HEAD`) | Delta |
+| Source | MiB each second | Chunks each second | Increase of memory |
 | --- | --- | --- | --- |
-| p50 | 1,512,308 us | 1,446,793 us | 4.33% faster |
-| p95 | 4,679,517 us | 16,133,241 us | 244.76% slower |
-| p99 | 4,679,517 us | 16,133,241 us | 244.76% slower |
-| avg | 2,194,247.2 us | 3,023,890.8 us | 37.81% slower |
+| A readable stream from `ReadableStream.from/1` | 5943–7383 | 95091–118136 | 0.7 MiB |
+| The stream through one transform stream | 3084–3329 | 49348–53265 | 0.7 MiB |
+| A response body of `fetch`, from a server on the machine | 1307–1641 | 1961–11709 | 20.4–21.4 MiB |
 
-Summary:
+The build before the removal of the time limit of a callback ran in turns
+with this build, on the same day: it gave 6228–7635 MiB each second for the
+readable stream, and 2871–2934 for the transform stream. The numbers are
+higher than in the earlier version of this table (4999–5089 and 2005–2340)
+because the machine gave more on that day, not because of the code.
 
-- This harness did not show the clean p99 win we expected from priority messaging.
-- `HEAD` improved median abort latency slightly, but long-tail results were worse in this run.
-- Because the distribution is noisy and the result contradicts the existing regression test, this benchmark should be treated as exploratory rather than README headline material until the abort path is instrumented more precisely inside the engine.
+The memory does not increase with the number of bytes. The body of
+`fetch` is limited by the server of the script, which sends from one
+process. Its increase of memory is the peak of the memory of the VM: it
+includes the chunks that the reader took and that the garbage collector
+did not free yet, and it changes much from run to run. The code before
+the changes of the body gave the same range, 1.5–25 MiB.
 
-### Memory and GC Isolation
+A `TransformStream` has two processes, one for each side, as the Streams
+Standard gives each side its own state. The two sides share
+[[backpressure]] in one `:atomics` cell: a change of the backpressure costs
+no message, and a pull sends one message only when the writable side holds
+a write. A transform stream with no function `transform` runs no worker:
+the writable side sends each chunk to the readable side. An identity
+transform thus costs 13 messages for each chunk, where it cost 17. In 5
+rounds in turns with the build before these changes, the stream through one
+transform stream gave 2104–2319 MiB each second (median 2182), where it
+gave 1396–1559 (median 1496). The readable stream had the same range in the
+two builds.
 
-Benchmark script: `mix run bench/gc_isolation.exs`
+The streams follow the pull rules of the Streams Standard:
 
-Method:
+  * `ReadableStream.from/1` has the high water mark 0, and each pull takes
+    one element of the enumerable. The stream process sends the pull to the
+    process of the enumerable, and that process answers the stream
+    process directly: a pull costs two messages, and no other process.
+  * The pulls of one stream run one after the other. A larger high water
+    mark thus does not make `from/1` faster: it only lets the source work
+    before a read.
+  * The internal readers (`Enum` and the body functions) take all the
+    chunks of the queue in one message. A source that enqueues many chunks
+    for one pull, such as the body of a `fetch` response, thus gives many
+    chunks for each message. A pipe reads one chunk each time the
+    destination is ready, as the Streams Standard specifies. With 20000
+    small chunks, a pipe through a `TransformStream` takes 24–29 µs for each
+    chunk (median 26.7), where it took 40–42 µs with a message for each
+    change of the backpressure, and 31–34 µs when the two sides were one
+    process. With 2000 chunks of 16 KiB through a `TextEncoderStream` and a
+    `TextDecoderStream`, the time does not change: the encode and the decode
+    are most of it.
 
-- Create a `WritableStream` whose sink gzip-compresses each chunk through a zlib-owning `Agent`.
-- Flood the stream controller with 1,600 writes of 64 KiB each for a total of 100 MiB.
-- Sample `:erlang.process_info/2` for `:garbage_collection`, `:total_heap_size`, and `:message_queue_len` while the stream drains.
+Version 0.5.0 runs the callbacks of a stream in one worker process for the
+life of the stream. Before, each callback started a task through one
+supervisor: a readable stream read 2028 MiB each second, and a transform
+stream 841 MiB.
 
-Results:
+The cost of each element, for one process that reads 20000 small elements:
 
-| Metric | `fa74d7f` (`HEAD~1`) | `9babea0` (`HEAD`) | Delta |
+| Pipeline | Before 0.5.0 | 0.5.0 |
+| --- | --- | --- |
+| `ReadableStream.from` read with `Enum` | 26–32 µs | 7.1–7.8 µs |
+| `ReadableStream.new` with a `pull` that enqueues one chunk, read with `Enum` | — | 9–11 µs |
+| `from` through one `TransformStream` | 87 µs | 24–29 µs |
+| `Web.Promise.new` and `Web.await` | — | 7.8–8.5 µs |
+| A message to a process and its answer (for comparison) | 2.3 µs | 2.5 µs |
+| Elixir `Stream` in one process (for comparison) | 0.07 µs | 0.07 µs |
+
+Many streams at the same time use all the cores. The machine has 4 cores,
+thus 16 streams do not read more than 4 streams.
+
+| Streams at the same time | Before 0.5.0 | 0.5.0 |
+| --- | --- | --- |
+| 1 | 38400 chunks/s | 159597–193136 chunks/s |
+| 4 | 52836 chunks/s | 489195–490112 chunks/s |
+| 16 | 68457 chunks/s | 221742–226365 chunks/s |
+
+### The cost of one operation
+
+```shell
+mix run bench/operation_cost.exs
+```
+
+The script measures the cost of one element or one operation, for one
+process. The table gives the range of the medians of 5 runs, in turns: the
+build before the last changes of the streams, and this build.
+
+| Operation | Before | Now |
+| --- | --- | --- |
+| `ReadableStream.from` read with `Enum` | 6.3–7.3 µs (median 6.7) | 4.6–6.5 µs (median 5.6) |
+| `ReadableStream.new` with a `pull` that enqueues one chunk | 9.8–10.7 µs (median 10.0) | 9.2–10.4 µs (median 10.0) |
+| `from` through one `TransformStream` | 18.5–22.3 µs (median 19.0) | 17.2–20.9 µs (median 19.0) |
+| A write to a `WritableStream` | 17.4–25.3 µs (median 22.6) | 16.8–25.6 µs (median 19.4) |
+| `text/1` of a response with a body in memory | 1.35–1.54 µs (median 1.39) | 1.35–1.88 µs (median 1.43) |
+| `Web.Promise.new` and `Web.await` | 7.7–8.4 µs (median 8.0) | 7.4–9.0 µs (median 7.6) |
+| A message to a process and its answer | 0.59–0.63 µs (median 0.60) | 0.56–0.78 µs (median 0.59) |
+
+A callback has no time limit now, as in the Streams Standard. Thus a
+callback, and a pull that goes to the process of an enumerable, start no
+timer: a read of `from/1` costs approximately 1 µs less for each element,
+and the read was faster in each of the 5 rounds. The other operations have
+the same range in the two builds. The claim of a body with no process
+looks in the registry only when its state needs it: with a look at each
+claim, `text/1` took 1.75–2.03 µs, where the build before took 1.23–1.66.
+
+These numbers come from a different script than the table above, on a
+different day: compare the numbers of one table only.
+
+## A form upload of 1 GiB
+
+```shell
+mix run bench/form_data_memory.exs
+```
+
+One file of 1 GiB goes through `Web.FormData` in the two directions, in
+chunks of 64 KiB.
+
+| Direction | Seconds | Increase of memory |
+| --- | --- | --- |
+| Parse a `multipart/form-data` body, and read the file as a stream | 0.81 | 1.8 MB |
+| Encode a form with a file that has a stream | 0.37 | 0.3 MB |
+
+Before version 0.5.0, a read with `Enum` kept each chunk for 5 seconds:
+the parse of this file added 1156 MB.
+
+The file stream of the encode comes from `ReadableStream.from/1`, and the
+body of the form is a second such stream. Each chunk is thus two pulls
+in series, approximately 22 µs. That is the cost of the pull rules of
+the Streams Standard: a stream that takes chunks before a read encoded
+the file in 0.07 s.
+
+## An abort with a full mailbox
+
+```shell
+mix run bench/clogged_abort_latency.exs
+```
+
+The script puts the write requests of a different process into the
+mailbox of a writable stream, then aborts the stream. It measures the time
+to the call of the function `abort` of the sink.
+
+| Requests in the mailbox | Time (median, three runs) |
+| --- | --- |
+| 1000 | 56–90 µs |
+| 50000 | 918–1116 µs |
+| 200000 | 4159–5320 µs |
+
+An abort is a priority message of Erlang/OTP: the stream gets it before the
+requests of the other processes. It must not pass the earlier messages of
+its own sender, for example a `write` before the abort: the sender thus
+sends a usual fence message before the priority message, and the stream
+takes the messages of that sender up to the fence first. To find the fence,
+the stream examines its mailbox, thus the time increases with the number
+of requests, by approximately 20–30 ns for each request. With no fence, the
+time stayed at 75–115 µs, but a `write` and then an `abort` of one process
+lost the write. Before version 0.5.0, the stream handled each request
+first: with 5000 requests the abort took 24.6 ms, and the time increased
+with the square of the number of requests.
+
+## Compression
+
+```shell
+mix run bench/throughput.exs
+```
+
+The script compresses 32 MiB with `Web.CompressionStream` and with `:zlib`
+in a transform stream that the script makes.
+
+| Pipeline | Time for 32 MiB |
+| --- | --- |
+| `Web.CompressionStream` | 92.3 ms |
+| `:zlib` in a transform stream | 97.6 ms |
+
+## Brotli
+
+The decoder of brotli is in Elixir (`Web.Internal.Brotli.Decoder`). The
+table gives the output in MB each second, for input in chunks of 16 KiB
+and pieces of 64 KiB at most. The old decoder and the new decoder ran in
+turns in the same VM, and the values are the medians of 7 rounds of CPU
+time. The reference encoder of node made the inputs.
+
+| Input | Before | Now | C decoder of node |
 | --- | --- | --- | --- |
-| GC count | 0 | 0 | no change observed |
-| max heap words | 225,381 | 229,236 | 1.71% higher |
-| final heap words | 225,340 | 4,264 | 98.11% lower |
-| peak queue len | 1,415 | 905 | 36.04% lower |
+| Text, 3.28 MB, quality 5 | 8.7 | 29.9 | approximately 207 |
+| Text, quality 11 | 10.4 | 42.4 | approximately 193 |
+| Map data, 1.14 MB, quality 11 | 29.6 | 79.8 | approximately 357 |
+| Map data, quality 5 | 45.7 | 107.2 | approximately 509 |
+| Output of the encoder of the library (text) | 7.2 | 32.8 | approximately 146 |
 
-Summary:
+The decoder keeps the state of a meta-block in the arguments of its loop,
+and writes its state map only when the loop stops. Each entry of a prefix
+code table gives the value of its symbol in one lookup. A copy of 11 bytes
+costs approximately 49 ns on the BEAM, and a literal 18 ns: most of the
+cost that stays is the cost of the instructions and the allocations of the
+BEAM.
 
-- We did not observe a GC-count reduction in this environment; both revisions stayed at `0` GCs during the sample window.
-- The `:off_heap` queue flag still showed a meaningful isolation benefit after the burst: the controller in `HEAD` drained back to `4,264` heap words instead of remaining inflated at `225,340`.
-- Peak queued messages also dropped from `1,415` to `905`, which suggests smoother recovery under burst pressure even though max heap size was roughly flat.
+The decoders of the library on the same text, in chunks of 16 KiB (wall
+time, median of 5):
 
-### Throughput Parity
+| Coding | Output, MB each second | Compressed input, MB each second |
+| --- | --- | --- |
+| gzip, level 6 | 216 | 60 |
+| zstd, level 3 and 19 | 722 and 755 | 203 and 171 |
+| br, quality 5 and 11, decoder in Elixir | 28 and 36 | 7.0 and 8.0 |
+| br, quality 5 and 11, C decoder (`brotli: :native`) | 222 and 216 | 56 and 48 |
 
-Benchmark script: `mix run bench/throughput.exs`
+On one core, the decoder in Elixir takes less than a link of 100 Mbit/s
+gives. An application that needs more selects `config :web, brotli:
+:native` or `:not_requested`: see `README.md`.
 
-Method:
+## Garbage collection of a stream process
 
-- Run a full `ReadableStream.pipe_through/3` gzip pipeline over 32 MiB of input.
-- Compare the built-in `CompressionStream` against a benchmark-local gzip stream that uses the same `Web.Stream` engine.
-- Use Benchee to measure end-to-end runtime and derive MB/s.
+```shell
+mix run bench/gc_isolation.exs
+```
 
-Results:
+The script writes 100 MiB to a writable stream and examines the stream
+process: it had 0 garbage collections of its own data, and its heap had
+227069 words at most. The chunks are binaries that the VM keeps outside
+the heaps of the processes.
 
-| Pipeline | Avg runtime | Throughput | Relative result |
+## Comparison with other HTTP clients
+
+```shell
+mix run bench/http_clients.exs
+```
+
+The script starts one Bandit server on the machine, and compares
+`Web.fetch/2` with Finch and with Req. Finch and Req use one Finch pool of
+25 HTTP/1.1 connections, which the script starts. `Web.fetch/2` has its own
+pool of 25 connections for the origin. The server sends no compressed
+response. Each pair does the same work: Req with its JSON decode and
+`fetch` with `json/1` give a map, and Req with no decode and `fetch` with
+`text/1` give a binary. The clients run in turns, in 8 rounds, thus a slow
+time of the machine has an effect on each client. Req and Finch are
+dependencies only in the environment `:dev`.
+
+| Test | Finch | Req | `Web.fetch` |
 | --- | --- | --- | --- |
-| `CompressionStream` | 263.68 ms | 121.36 MB/s | baseline |
-| inline zlib stream | 454.42 ms | 70.42 MB/s | 1.72x slower |
+| Small JSON response, one request at a time, as a map | — | 116–125 µs | 132–134 µs |
+| Small JSON response, one request at a time, as a binary | 90–93 µs | 108–112 µs | 123–129 µs |
+| Small JSON response, 50 processes, as a map | — | 22073–22392 req/s | 20310–20559 req/s |
+| Small JSON response, 50 processes, as a binary | 26883–27065 req/s | 23363–24118 req/s | 19374–21212 req/s |
+| 256 MiB body, read as a stream | — | 1192–1372 MiB/s | 1538–2240 MiB/s, +10–24 MiB |
+| 256 MiB body, read into memory | — | 764–815 MiB/s | 673–752 MiB/s |
 
-Summary:
+Before version 0.5.0, a small request with `fetch` took 632–678 µs, and 50
+processes did 5209–5252 requests each second. That comparison ran in a
+separate Mix project on the same machine. With Finch as its HTTP client,
+`fetch` took 135–141 µs for the small request as a binary.
 
-- The previous commit does not contain `CompressionStream`, so there is no direct `HEAD~1` throughput baseline for this feature.
-- Within `HEAD`, the built-in `CompressionStream` was faster than the benchmark-local inline gzip stream by about 72.34%, so we did not detect a throughput regression from the new wrapper path on this machine.
+The HTTP client of `fetch` is in the library, on the connection functions
+of Mint. A request with `fetch` has one process: the process of the
+request, which is also the promise. It gets the connection from the pool
+of its origin, and owns the socket while the response comes. Thus the
+messages of the socket come to it directly. Req has no process: it runs
+Finch in the process that calls it. A process that waits for a message
+must wake up when the message comes, thus each process between the
+network and the caller adds time. For a small response, the body is in the
+struct: the response has no process, and `text/1` starts none.
+
+The process of the request is necessary: it answers a reader of a body
+that comes slowly, the abort signal, and the time limits, while the
+response comes. Finch has a blocking request function, and its pool has no
+other public function, thus a process that uses Finch cannot answer while
+it waits. The process of the request costs approximately 15–20 µs more
+than Req for a small request, on this machine.
+
+For a large body, the process of the request reads the socket and gives
+the chunks to the stream. It reads one message of the socket at a time,
+and it stops to read while it has 64 KiB that no reader took. Thus the
+memory of a stream read stays small.
+
+The numbers vary by up to 2 times between runs on this virtual machine.
+
+## A `tcp:` fetch
+
+```shell
+mix run bench/tcp_fetch.exs
+```
+
+The script starts a server on the machine, and fetches `tcp:` URLs. The
+old and the new code ran in turns, two times each.
+
+| Test | Before | After |
+| --- | --- | --- |
+| Processes for each body that no process reads, with a signal | 15 | 1 |
+| Small response (5 bytes, then the server closes) | 1416–1503 µs | 567–654 µs |
+| Small response to `127.0.0.1` | — | 317 µs, before the change of the address: 451 µs |
+| Stream read of 64 MiB | 119–122 MiB/s | 1685 MiB/s; with the default buffer of `:gen_tcp`, 468–600 MiB/s |
+
+Before, `Web.Dispatcher.TCP` used `Web.connect/2`. A bridge process read the
+socket stream, and gave each chunk to a second stream when it pulled. A
+process watched the abort signal, and examined it each 25 ms. Now the
+process of the request is the promise, as for HTTP: it opens the socket,
+writes the request body, and holds the response body. It reads one message
+of the socket at a time, and it gets the abort as a message. The holder of
+the body is the same code as for HTTP: see `Web.Dispatcher.RequestProcess`.
+
+A small response to `127.0.0.1` takes less time than to `localhost`: a
+connection gives an IP address to Erlang as a tuple, with no lookup. A
+lookup of `localhost` takes approximately 90 µs on this machine. The
+default buffer of `:gen_tcp` gives messages of approximately 9 KiB, and
+each message costs messages between processes: the process of the request
+uses a buffer of 64 KiB.
+
+## A `Web.connect/2` socket
+
+`mix run bench/socket.exs` compares a read and a write of 64 MiB on a socket with raw
+`:gen_tcp` in the process that reads, in turns, 5 times each. The numbers
+are the medians of two runs. Other work used the machine at the same time,
+thus compare the numbers of one column with the raw read.
+
+| Test | Before | After | Raw `:gen_tcp` |
+| --- | --- | --- | --- |
+| Read of 64 MiB | 157–172 MiB/s | 1162–1719 MiB/s | 1618–2281 MiB/s |
+| Write of 64 MiB | 737–883 MiB/s | 888–1009 MiB/s | — |
+| Processes for each socket | 7 | 6 | — |
+
+Before, the socket process enqueued each chunk, and then called the stream
+to get its desired size. The pull of the stream ran in a worker, and sent
+a message to the socket process. Now the stream sends its pull to the
+socket process directly, and the socket asks its connection for one
+message for each pull, with a buffer of 64 KiB. The three promises
+`opened`, `closed`, and `upgraded` stay processes: each `Web.Promise` is a
+process.

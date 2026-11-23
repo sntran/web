@@ -9,18 +9,47 @@
 ---
 
 ## 🚀 Beyond Fetch: A Standardized Runtime
-`Web` provides a predictable, spec-pure interface for high-concurrency systems. [cite_start]While most Elixir libraries buffer data into memory by default, `Web` is built for **Zero-Buffer Streaming**[cite: 20]. By implementing WHATWG and TC39 standards as **Native Process-backed** entities (`:gen_statem`), `Web` ensures your applications remain responsive even when handling gigabytes of data.
+`Web` provides a predictable, spec-pure interface for high-concurrency systems. While most Elixir libraries buffer data into memory by default, `Web` is built for **Zero-Buffer Streaming**. By implementing WHATWG and TC39 standards as **Native Process-backed** entities (`:gen_statem`), `Web` ensures your applications remain responsive even when handling gigabytes of data.
 
 ### Why Standards on the BEAM?
-* **Predictability**: 100% WPT compliance for core primitives like `URL` and `MIME`.
+* **Predictability**: the tests run web-platform-tests, the shared tests of
+  the browsers, against the library: see [Testing & Compliance](#-testing--compliance).
 * **Flow Control**: TC39-aligned concurrency management via `Web.Governor`.
 * **Context Propagation**: Ambient `AsyncContext` for metadata that survives process boundaries.
-* **Structured Data**: WHATWG-style `structured_clone/2` with transferable `ArrayBuffer`s.
-* **Capability Messaging**: `MessageChannel` and `MessagePort` for unforgeable, transferable process-backed handles.
-* **Cluster Coordination**: `BroadcastChannel` fan-out across BEAM nodes with sender-origin metadata.
+* **Structured Data**: `structured_clone/2` of the HTML Standard, with transferable `ArrayBuffer`s and message ports.
+* **Messaging**: `MessageChannel` and `MessagePort` of the HTML Standard, with the port message queue and transferable ports.
+* **Cluster Coordination**: `BroadcastChannel` to the channels of all the connected BEAM nodes.
+* **Developer Tools**: `Console` for `Logger`, `Performance` for times, marks, and measures, and `PerformanceObserver` to get the entries when a process makes them.
 * **Capability Sockets**: WINTERCG-style `Socket` handles with readable/writable streams and `STARTTLS` upgrades.
-* **Resource Disposal**: TC39-inspired `Symbol.dispose` support with a `using` macro for deterministic cleanup.
+* **Resource Disposal**: `Symbol.dispose` and a `using` macro with the rules of ECMAScript.
 * **Zero-Buffer Performance**: Native streaming with backpressure-aware engines.
+
+---
+
+## 📦 Installation
+
+Add `web` to the dependencies in `mix.exs`:
+
+```elixir
+def deps do
+  [
+    {:web, "~> 0.5.0"}
+  ]
+end
+```
+
+The package needs Elixir 1.19 or later and Erlang/OTP 28 or later. The
+tests run on Elixir 1.19 with Erlang/OTP 28, and on Elixir 1.20 with
+Erlang/OTP 29.
+
+For a first look, run the tour in this repository:
+
+```shell
+mix run examples/demo.exs
+```
+
+The directory [`examples/`](examples/README.md) has an index of all the
+examples.
 
 ---
 
@@ -61,9 +90,9 @@ end
 Web.await(GitHub.repositories())
 ```
 
-Disposable resources also fit the same runtime-first DSL. `use Web` now
-aliases `Web.Symbol` and imports a `using` macro that guarantees
-`Symbol.dispose` runs in an `after` block.
+`use Web` also imports the macro `using`, which releases a resource at the
+end of its block, as the `using` declaration of ECMAScript. The resource is
+released also when the block raises.
 
 ```elixir
 use Web
@@ -72,6 +101,12 @@ using channel <- BroadcastChannel.new("audit-log") do
   BroadcastChannel.post_message(channel, %{status: "started"})
 end
 ```
+
+A message port, a broadcast channel, a socket, a reader, a writer, and a
+`GovernorToken` are disposable: see `Web.Symbol`. A value that is not
+disposable raises `Web.TypeError` before the block runs. When the block and
+the disposal fail, the macro raises `Web.SuppressedError` with the two
+errors.
 
 📖 API Usage & Examples
 -----------------------
@@ -97,6 +132,27 @@ responses = await(Promise.all(requests))
 
 ```
 
+`Governor.wrap/2` gives a function that holds a token for each call, and
+`Governor.wrap_iterator/2` gives a `Web.AsyncIterator` that holds a token
+for each step of an iterator, as `wrapIterator(it)`: see "Async Iterator
+Helpers".
+
+A token belongs to the process that acquired it. When that process stops,
+also with a failure, the governor takes the token back. Thus the capacity
+cannot decrease.
+
+A governor from `CountingGovernor.new/1` belongs to the process that made
+it, and stops after that process. For a governor that all the processes of
+an application use, put it in a supervision tree:
+
+```elixir
+children = [
+  {Web.CountingGovernor, capacity: 4, name: MyApp.FetchLimit}
+]
+
+governor = Web.CountingGovernor.get(MyApp.FetchLimit)
+```
+
 Async APIs return `%Web.Promise{}` values. Promise executors capture the current `Web.AsyncContext`, so logger metadata and signals flow into spawned tasks automatically.
 
 ```elixir
@@ -112,6 +168,21 @@ pair = await Promise.all([
 ])
 
 ```
+
+A promise behaves as it does on the Web. Any process can `await` it, and can
+`await` it more than one time. `Promise.then/3`, `Promise.catch/2`, and
+`Promise.finally/2` return a new promise immediately. `Promise.then/3` takes
+the callbacks `on_fulfilled` and `on_rejected`, and `nil` is `undefined`.
+`Promise.try/2` calls a function now and gives a promise of its result.
+`Promise.all/1`, `Promise.all_settled/1`, `Promise.any/1`, and
+`Promise.race/1` accept pending promises.
+
+The BEAM has one rule that the Web does not have: a pending promise has an
+owner, which is the process that made it. The promise stops when its owner
+stops. After a promise settles, it keeps its outcome until the first `await`,
+and then for a linger time (5000 ms by default,
+`config :web, linger: ms`). Keep the awaited value, not the promise,
+when you need the value later.
 
 For externally controlled promise settlement, use
 `Promise.with_resolvers/0` to get a promise plus explicit `resolve` and
@@ -135,7 +206,7 @@ await(promise)
 ```elixir
 use Web
 
-request_id = AsyncContext.Variable.new("request_id")
+request_id = AsyncContext.Variable.new(name: "request_id")
 
 AsyncContext.Variable.run(request_id, "req-42", fn ->
   # Spawning a task or promise here still has access to the request_id
@@ -144,16 +215,246 @@ end)
 # => "req-42"
 ```
 
+`AsyncContext.Snapshot.wrap/1` takes the context now, and gives a function
+that runs in that context at a later time, also in a different process.
+
+### 🔁 Async Iterator Helpers
+
+`Web.AsyncIterator` has the helpers of the TC39 proposal "async iterator
+helpers": `from/1`, and the methods `map`, `filter`, `take`, `drop`,
+`flat_map`, `reduce`, `to_array`, `for_each`, `some`, `every`, and `find`.
+The methods take each async iterator of the library: a `Web.AsyncIterator`,
+the iterator of `ReadableStream.values/2`, and the iterator of
+`Governor.wrap_iterator/2`. `from/1` also takes an enumerable.
+
+```elixir
+use Web
+
+urls = ["https://a.com", "https://b.com", "https://c.com"]
+
+# Two fetches at the same time. The list has the sequence of the URLs.
+statuses =
+  urls
+  |> AsyncIterator.from()
+  |> AsyncIterator.map(fn url -> Promise.then(fetch(url), & &1.status) end)
+  |> AsyncIterator.to_array(2)
+  |> await()
+
+# A stream is a source, and an async iterator is an enumerable.
+ReadableStream.from(["a", "b", "c"])
+|> ReadableStream.values()
+|> AsyncIterator.filter(&(&1 != "b"))
+|> Enum.to_list()
+# => ["a", "c"]
+```
+
+A method that gives an iterator is lazy: it reads its source only at the
+first `next/1`. A method that gives a value returns a promise. A callback
+gets the value and its counter. An error of a callback rejects, and closes
+the source with `return/1`.
+
+Concurrent calls of `next/1` on a helper run at the same time, and get
+their results in their sequence. `flat_map` reads its inner iterator once
+for each call, at the same time, and reads its source again only after the
+end of the inner iterator, as the champion of the proposal specifies. The
+concurrency argument of the TC39 proposal "concurrency control" (a
+governor, or an integer for a `CountingGovernor` of that capacity) lets
+`to_array`, `for_each`, `some`, `every`, `find`, and `reduce` read many
+values at the same time, with the same result. `limit/2` gives an iterator
+that reads its source only with a token of a governor. `return/1` comes
+after the calls of `next/1` before it.
+
+`buffered(iterator, limit, prepopulate \\ false)` reads ahead for you: a
+loop that takes one value at a time then gets the concurrency of the
+helpers before it. `limit` is a governor or an integer. The iterator starts
+its reads at the first `next/1` (or at once with `prepopulate`), and keeps
+`limit` reads ahead. A promise of `next/1` that is not settled counts
+towards the buffer, thus the loop below runs the mapper for 5 values at the
+same time, not 6.
+
+```elixir
+use Web
+
+1..100
+|> AsyncIterator.from()
+|> AsyncIterator.map(fn id -> fetch("https://example.com/items/#{id}") end)
+|> AsyncIterator.buffered(5)
+|> Enum.each(fn response -> IO.puts(response.status) end)
+
+# Two calls of next at the same time read the inner list at the same time.
+iterator = AsyncIterator.flat_map(AsyncIterator.from([1, 2]), &[&1, &1 * 10])
+[first, second] = [AsyncIterator.next(iterator), AsyncIterator.next(iterator)]
+{await(first), await(second)}
+# => {%{value: 1, done: false}, %{value: 10, done: false}}
+```
+
+### 🔂 Iterator Helpers
+
+`Web.Iterator` has the iterator helpers of ECMAScript 2025: `from/1`,
+`next/1`, `return/1`, and the methods `map`, `filter`, `take`, `drop`,
+`flat_map`, `reduce`, `to_array`, `for_each`, `some`, `every`, and `find`.
+`to_async/1` gives a `Web.AsyncIterator`, as `toAsync()` of the proposal
+"async iterator helpers". An iterator keeps its state in a process that
+belongs to the process that made it: each `next/1` gives the next value.
+
+```elixir
+use Web
+
+iterator = Iterator.from(["a", "b", "c", "d"])
+Iterator.next(iterator)
+# => %{value: "a", done: false}
+
+iterator
+|> Iterator.map(fn letter, index -> {index, letter} end)
+|> Iterator.filter(fn {index, _letter} -> index > 1 end)
+|> Iterator.to_array()
+# => [{2, "d"}] (the first next/1 took "a")
+
+Stream.iterate(1, &(&1 + 1))
+|> Iterator.from()
+|> Iterator.drop(2)
+|> Iterator.take(3)
+|> Enum.to_list()
+# => [3, 4, 5]
+
+[[1, 2], [3]] |> Iterator.from() |> Iterator.flat_map(& &1) |> Iterator.reduce(&+/2)
+# => 6
+
+Iterator.from(1..5) |> Iterator.reduce(fn acc, value -> acc + value end, 100)
+# => 115
+
+Iterator.from(1..5) |> Iterator.for_each(&IO.puts/1)
+# => :ok (after it prints 1 to 5)
+
+numbers = fn -> Iterator.from(1..5) end
+{Iterator.some(numbers.(), &(&1 > 4)), Iterator.every(numbers.(), &(&1 > 4)),
+ Iterator.find(numbers.(), &(&1 > 2))}
+# => {true, false, 3}
+
+# return/1 closes the iterator: an enumerable runs its code for the end.
+counter = Stream.resource(fn -> 1 end, &{[&1], &1 + 1}, fn _n -> IO.puts("closed") end)
+counter = Iterator.from(counter)
+Iterator.next(counter)
+# => %{value: 1, done: false}
+Iterator.return(counter)
+# => %{value: nil, done: true} (after it prints "closed")
+
+# toAsync(): the async helpers take a sync iterator.
+Iterator.from([1, 2]) |> Iterator.to_async() |> AsyncIterator.to_array() |> await()
+# => [1, 2]
+```
+
+An error of a callback raises in the caller of `next/1`, after the helper
+closes its source. As in ECMAScript 2025, a callback that is not a function
+or a limit that is not valid closes the iterator, and then raises. A
+`Web.Iterator` is an `Enumerable`: a halt of the enumeration closes the
+iterator.
+
 ### 🌊 Zero-Buffer Streaming
 
 Managed processes that provide data with spec-compliant backpressure.
+
+A stream is a process, and it has an owner: the process that made it. A
+stream stops after it is ended and all its chunks are read. It also stops
+when its owner stops and no process has locked it. A halt, such as
+`Enum.take/2`, cancels the stream.
+
+A stream of bytes in memory has no process until a stream read: the body of
+`Web.Response.new/1` for a binary, and the body of a small `fetch` response. The body functions, such as
+`Web.Response.text/1`, take its bytes with no process. `get_reader/1`, a
+pipe, and `Enum` start the stream process at that time.
+
+Read or cancel each response body that comes slowly. A body that no
+process starts to read releases its connection after 300 seconds
+(`config :web, unread_body_timeout: ms`), and a later read rejects.
+
+The process of a request stops to read its connection while it has
+64 KiB of the body that no reader took: the backpressure. The content
+decoder also gives its output only as the reader takes it, thus a small
+compressed body that expands much does not fill the memory. A connection
+of HTTP/2 that the requests share does not stop for one request: its
+window of HTTP/2 limits the body of each response.
+
+`fetch` has no time limit for a full request, as in the Fetch Standard. Use
+`AbortSignal.timeout/1` for that limit. Two settings limit the wait for the
+network:
+
+| Setting                             | Default   | Time                                                              |
+| ----------------------------------- | --------- | ----------------------------------------------------------------- |
+| `config :web, connect_timeout: ms`  | 10000 ms  | To open a connection.                                             |
+| `config :web, receive_timeout: ms`  | 300000 ms | To wait for the response headers, or for the next part of a body. |
+
+A request that fails for one of these limits rejects with `Web.TypeError`,
+and the field `cause` has the timeout. The value `:infinity` removes a
+limit.
+
+`fetch` uses HTTP/1.1. The setting `:http_protocols` selects the HTTP
+versions. The connection pools read it when the application starts.
+
+| Setting                                         | Versions                                                          |
+| ----------------------------------------------- | ----------------------------------------------------------------- |
+| `config :web, http_protocols: [:http1]`         | HTTP/1.1 only. This is the default.                               |
+| `config :web, http_protocols: [:http2]`         | HTTP/2 only. The requests of an origin share one connection.      |
+| `config :web, http_protocols: [:http1, :http2]` | The server of a TLS connection selects the version (with ALPN).   |
+
+The HTTP client of `fetch` is in the library, on the connection functions
+of Mint. Each origin (a scheme, a host, and a port) has a pool of 25
+connections. A request waits for a free connection with no time limit, as
+in a browser, and its signal stops the wait. The process of the request
+owns the socket while the response comes, thus no other process is
+between the network and the response. With `[:http2]`, one process of the
+origin owns the shared connection. A request on an idle connection that
+the server closed, and a request that an HTTP/2 server did not process,
+go again on a new connection. A request with a body from a stream does not
+go again.
+
+Each request has its own signal, as the Fetch Standard specifies:
+`Request.new/2` and `Request.clone/1` make a new `AbortSignal` that depends
+on the signal of the option `:signal`, or on the signal of the input
+request. An abort of that signal aborts the signal of the request. The
+signal of a request has no process until an operation needs one, such as
+a listener: `Request.new/2` and `fetch` start no process for it, and a
+read such as `AbortSignal.aborted?/1` reads the signal that it depends on.
+
+The field `status_text` of a response follows the HTTP version of its
+connection. An HTTP/2 response has no reason phrase, thus its status text
+is `""`, as the Fetch Standard specifies. For HTTP/1.1, the text is the
+usual reason phrase of the status (for example `"OK"` for 200), because
+the HTTP client does not give the phrase that the server sent.
+
+`fetch` decodes the body of a response with the header `Content-Encoding`,
+as the Fetch Standard specifies: `gzip`, `x-gzip`, `deflate`, `br`, and
+`zstd`. The body is decoded chunk by chunk, and the headers of the response
+do not change. A request with no header `accept-encoding` sends the codings
+that the library can decode. A body with a coding that the library does
+not know is not changed.
+
+The default decoder of brotli is in Elixir. It is approximately 5 to 7
+times slower than the C decoder of brotli: on one core it gives 30 to 45 MB
+of text each second, thus it takes approximately 8 MB (60 Mbit) of
+compressed data each second. The decoders of gzip and zstd come from
+Erlang/OTP: they take 60 MB and 170 to 200 MB of compressed text each
+second. The setting `:brotli` selects the decoder of `br`, and of the
+format `"brotli"` of `DecompressionStream`:
+
+| Setting | Effect |
+| ------- | ------ |
+| `config :web, brotli: :elixir` | The decoder in Elixir. A request accepts `br`. This is the default. |
+| `config :web, brotli: :native` | The C decoder of the Hex package `brotli`. Add `{:brotli, "~> 0.3"}` to the dependencies of the application: the library does not depend on it. A request accepts `br`. |
+| `config :web, brotli: :not_requested` | A request does not accept `br`: the header is `gzip, deflate, zstd`. A server that sends `br` all the same gets the decoder in Elixir. |
+
+One call of the C decoder gives the output of its window at most (16 MiB),
+and the library gives this output in pieces of 64 KiB. A setting that is
+not valid, and `:native` when the application does not have the package
+`brotli`, raise `ArgumentError`: `fetch` then rejects with a
+`Web.TypeError`, and the field `cause` has the error.
 
 ```elixir
 # Create a stream from any enumerable
 source = ReadableStream.from(["chunk1", "chunk2"])
 
 # Split one stream into two independent branches (Zero-copy)
-{branch_a, branch_b} = ReadableStream.tee(source)
+[branch_a, branch_b] = ReadableStream.tee(source)
 
 # Composable pipelines with pipe_through
 upper =
@@ -166,7 +467,14 @@ upper =
 
 ```
 
-Standard-compliant gzip/deflate and UTF-8 encoding that works across streamed chunk boundaries.
+Standard-compliant gzip/deflate and text encoding that works across streamed chunk boundaries.
+The readable side of a compression stream has the high water mark 0, as
+the Compression Standard specifies: a write waits until a reader asks for a
+chunk. Thus read and write at the same time, for example with a pipe, and do
+not await a write before the read.
+`TextDecoder` and `TextDecoderStream` decode UTF-8, UTF-16LE, UTF-16BE, and
+the single-byte encodings of the Encoding Standard, such as windows-1252
+(the label `latin1`), windows-1251, and KOI8-R.
 
 ```elixir
 source = ReadableStream.from(["Hello, ", "🌍"])
@@ -178,15 +486,42 @@ encoded =
   |> ReadableStream.pipe_through(DecompressionStream.new("gzip"))
   |> ReadableStream.pipe_through(TextDecoderStream.new())
 
-await(Response.text(Response.new(body: encoded)))
+await(Response.text(Response.new(encoded)))
 # => "Hello, 🌍"
 ```
 
-Byte-oriented streams also support WHATWG-style BYOB reads. Consumers can
-reuse their own `Uint8Array` buffers while producers fill them through a
-capability-scoped `ReadableStreamBYOBRequest`, with
-`ReadableByteStreamController` exposing the active BYOB request and
-byte-oriented desired-size flow control.
+#### Chunks of bytes
+
+Each stream of bytes gives its chunks as `Uint8Array` values, as the Web
+standards specify. This applies to the body of a request or a response, to
+`Blob.stream/1`, to the readable side of a socket, of a compression stream,
+and of `TextEncoderStream`, and to a default read of a byte stream.
+
+```elixir
+response = await(fetch("https://example.com/data"))
+
+# All the bytes: use the functions of the body.
+text = await(Response.text(response))
+
+# Chunk by chunk: each chunk is a `Uint8Array`.
+for chunk <- response.body do
+  IO.write(to_string(chunk))
+end
+```
+
+Each consumer of bytes accepts a binary, a `Uint8Array`, or an
+`ArrayBuffer`: the body of a request, a write to a socket, and a chunk for
+a compression stream or for `TextDecoderStream`.
+
+Byte-oriented streams also support WHATWG-style BYOB reads. The reader
+gives a `Uint8Array` view, and each read gives not more bytes than the view
+can hold. The producer fills the view through a capability-scoped
+`ReadableStreamBYOBRequest`, and `ReadableByteStreamController` gives the
+active BYOB request and the desired size in bytes.
+
+As in the Streams Standard, a BYOB read moves the buffer into the stream:
+the buffer that you gave becomes detached, and the result has a new view in
+a buffer of the same length. Use `value.buffer` for the subsequent read.
 
 ```elixir
 use Web
@@ -208,14 +543,38 @@ stream =
 reader = ReadableStream.get_reader(stream, mode: "byob")
 view = Uint8Array.new(ArrayBuffer.new(5))
 
-await(ReadableStreamBYOBReader.read(reader, view))
-# => %{value: %Web.Uint8Array<...>, done: false}
+%{value: value, done: false} = await(ReadableStreamBYOBReader.read(reader, view))
+to_string(value)
+# => "hello"
+
+# The first buffer is detached. Use the buffer of the result again.
+ArrayBuffer.detached?(view.buffer)
+# => true
+view = Uint8Array.new(value.buffer)
 ```
 
 For a full buffer-reuse example, run:
 
 ```shell
 mix run examples/secure_byob_stream.exs
+```
+
+A stream also has the async iterator of the Streams Standard, and a queuing
+strategy can have its own `size` function. The function runs in the
+process that enqueues the chunk:
+
+```elixir
+iterator = ReadableStream.values(ReadableStream.from(["a", "b"]))
+await(ReadableStreamAsyncIterator.next(iterator))
+# => %{value: "a", done: false}
+
+# The limit is 10 bytes, and each chunk counts its bytes.
+stream =
+  ReadableStream.new(
+    %{start: fn c -> ReadableStreamDefaultController.enqueue(c, "abc") end},
+    high_water_mark: 10,
+    size: &byte_size/1
+  )
 ```
 
 ### 🔌 Capability Sockets
@@ -227,7 +586,7 @@ the same backpressure-aware primitives as the rest of the runtime.
 ```elixir
 use Web
 
-socket = Web.connect("example.com:443", secureTransport: "on")
+socket = Web.connect("example.com:443", secure_transport: "on")
 await(socket.opened)
 
 writer = WritableStream.get_writer(socket.writable)
@@ -236,11 +595,47 @@ reader = ReadableStream.get_reader(socket.readable)
 await(WritableStreamDefaultWriter.write(writer, "GET / HTTP/1.1\r\nhost: example.com\r\n\r\n"))
 chunk = await(ReadableStreamDefaultReader.read(reader))
 
-chunk.value
+# Each chunk of bytes is a `Uint8Array`. `to_string/1` gives its bytes.
+to_string(chunk.value)
 ```
 
-Explicit `STARTTLS` upgrades are supported through `Socket.start_tls/2`. For a
-full SMTP handshake example, run:
+An IPv6 address has brackets, as in a URL: `Web.connect("[::1]:8080")`, or
+`Web.connect(%{hostname: "::1", port: 8080})`. The socket reads its
+connection only when the readable side wants data: it asks for one message
+of the connection for each pull of the stream. Thus the readable side keeps
+the bytes of its high water mark at most (64 KiB), and one message more.
+
+The socket closes as the Sockets API specifies. `Socket.close/2` cancels
+the readable side and aborts the writable side with its reason, and the
+promise `closed` fulfils with `nil`. A close of the connection by the peer
+closes the socket too, unless the option `allow_half_open: true` keeps the
+writable side open. A cancel of the readable side does not close the
+socket, and a close of the writable side sends only the end of the data
+(a TCP half close). When the connection fails, `opened` and `closed` reject
+with a `SocketError`: a `Web.TypeError` with the reason of Erlang/OTP in
+its field `cause`. The options `:sni` and `:alpn` give the name and the
+protocols of the TLS handshake, and `opened` gives the protocol that the
+server selected.
+
+A TLS socket verifies the certificate of the server and its host name,
+with the trust store of the operating system. `fetch` does the same. The
+setting `:tls_options` gives TLS options to the two functions: a keyword
+list of options of the Erlang application `:ssl`. Each new connection
+reads the setting. For example, this setting names a file of private
+certificate authorities:
+
+```elixir
+config :web, tls_options: [cacertfile: "/etc/ssl/private-ca.pem"]
+```
+
+The option `verify: :verify_none` of the setting stops the verification.
+Use it only for a test.
+
+`Socket.start_tls/1` starts TLS on a socket of
+`Web.connect(address, secure_transport: "starttls")`, as `startTls()`. It
+returns the new TLS socket at once, and its promise `opened` fulfils after
+the handshake. The first socket closes, and `Socket.upgraded?/1` gives
+`true` for it. For a full SMTP handshake example, run:
 
 ```shell
 mix run examples/smtp_client.exs
@@ -248,9 +643,11 @@ mix run examples/smtp_client.exs
 
 ### 🌍 Data & Metadata
 
-Structured cloning is available directly from `Web` and preserves supported
-Web container types, shared references, and transferable `ArrayBuffer`
-semantics.
+`structured_clone/2` is the structured clone of the HTML Standard. All
+data can be cloned: numbers, atoms, binaries, lists, tuples, maps, and
+structs that have only data. A value with an identity, such as an
+`ArrayBuffer` or a `Blob`, gets a new identity. The option `:transfer` moves
+a buffer or a message port, and detaches the source.
 
 ```elixir
 use Web
@@ -258,55 +655,68 @@ use Web
 buffer = ArrayBuffer.new("hello")
 
 clone =
-  structured_clone(%{"payload" => buffer}, transfer: [buffer])
+  structured_clone(%{payload: buffer, tags: [:a, :b]}, transfer: [buffer])
 
-ArrayBuffer.data(clone["payload"])
+to_string(clone.payload)
 # => "hello"
 
-ArrayBuffer.byte_length(buffer)
-# => 0
+ArrayBuffer.detached?(buffer)
+# => true
 ```
 
-Unsupported values and non-transferable entries raise `Web.DOMException`
-with the standard `DataCloneError` name.
+A value that refers to something that runs cannot be cloned: a pid, a
+function, a stream, a promise. The function then raises `Web.DOMException`
+with the name `DataCloneError`, and changes nothing.
 
-`Web.MessageChannel` and `Web.MessagePort` expose the WHATWG capability
-messaging model directly on the BEAM. Ports are transferable handles,
-delivery restores `AsyncContext`, and the receiving process only gains the
-capabilities you explicitly transfer.
+`Web.MessageChannel.new/0` makes a channel with two connected ports, in its
+fields `port1` and `port2`. A message that one port sends arrives at the
+other port as an event `message`. A port can move to
+the listener that gets a message: put it in the transfer list.
 
 ```elixir
 use Web
 
-{controller, worker} = MessageChannel.new()
+%{port1: port1, port2: port2} = MessageChannel.new()
 
-spawn(fn ->
-  worker =
-    MessagePort.onmessage(worker, fn event ->
-      received = event.data["port"]
-      MessagePort.post_message(received, %{"status" => "ok"})
-    end)
-
-  receive do
-    :stop -> MessagePort.close(worker)
-  end
+MessagePort.onmessage(port2, fn event ->
+  # Answer on the port that got the message.
+  MessagePort.post_message(event.target, String.upcase(event.data))
 end)
 
-{client, service} = MessageChannel.new()
+MessagePort.onmessage(port1, fn event -> IO.puts(event.data) end)
+MessagePort.post_message(port1, "hello")
+# Prints "HELLO".
 
-MessagePort.post_message(controller, %{"port" => service}, [service])
+MessagePort.close(port1)
 ```
 
-`Web.BroadcastChannel` turns those structured-clone guarantees into an
-idiomatic, distributed coordination primitive. Every broadcast clones its
-payload before fan-out, preserves sender `origin` metadata across nodes,
-restores `AsyncContext` values while listeners run, and exposes
-WHATWG-style `EventTarget` listener APIs on top of a process-backed runtime.
+The rules are those of a browser:
+
+* A port keeps its messages until it starts. `onmessage/2` starts the port.
+  After `add_event_listener/4`, call `MessagePort.start/1`.
+* The other port gets the event `close` when a port closes, or when the
+  process that holds the port stops.
+* A function on a closed port has no effect and gives no error.
+* A port fires its events in a process of that port, one at a time. A
+  listener can call each function of its port, and a listener that raises
+  does not stop the port.
+* The listener steps are those of the DOM Standard, as for each event
+  target of the library: `dispatch_event/2` runs the listeners in the
+  calling process, before it returns, and the options `:capture`,
+  `:passive`, `:once`, and `:signal` have their effect.
+
+A port and a channel stay until `close/1`, or until the process that made
+them stops. Close them, or use `using`.
+
+`Web.BroadcastChannel` sends a message to each other open channel with the
+same name, in this VM and on each connected node. The event has the node of
+the sender in `origin`, and the listeners run in the `AsyncContext` of the
+sender.
 
 ```elixir
 use Web
 
-request_id = AsyncContext.Variable.new("request_id")
+request_id = AsyncContext.Variable.new(name: "request_id")
 
 sender = BroadcastChannel.new("auth-sync")
 
@@ -315,13 +725,13 @@ receiver =
   |> BroadcastChannel.onmessage(fn event ->
     {
       event.origin,
-      event.data["token"],
+      event.data.token,
       AsyncContext.Variable.get(request_id)
     }
   end)
 
 AsyncContext.Variable.run(request_id, "req-42", fn ->
-  BroadcastChannel.post_message(sender, %{"token" => "token-A"})
+  BroadcastChannel.post_message(sender, %{token: "token-A"})
 end)
 
 using receiver do
@@ -329,18 +739,101 @@ using receiver do
 end
 ```
 
+Each channel sends to the other channels with no process between them.
+Thus a slow listener delays only its channel, and the channels of a node
+continue when a different node stops. The messages of one channel arrive
+in their sequence.
+
 For a full cross-node example, run:
 
 ```shell
 mix run examples/cluster_auth_sync.exs
 ```
 
-For a capability-handover example that keeps secrets isolated behind a
-transferred port, run:
+For an example that gives a port to a worker, and keeps the secrets of the
+worker behind that port, run:
 
 ```shell
 mix run examples/secure_worker.exs
 ```
+
+`Web.Console` has the functions of `console` for the `Logger` of Elixir:
+the levels, the format of the Console Standard, tables, groups, timers,
+and counters. `Web.Performance` has `now/0`, marks, and measures of the
+User Timing Standard.
+
+```elixir
+use Web
+
+Console.group("import")
+Console.time("rows")
+Performance.mark("start")
+
+Console.log(["%s has %d rows", "users.csv", 1200])
+Console.table([%{name: "Ada", score: 10}, %{name: "Linus", score: 8}])
+
+Console.time_end("rows")
+# => rows: 3.214 ms
+Performance.measure("import", "start").duration
+# => 3.305
+Console.group_end()
+```
+
+The groups, the timers, and the counters are the state of the process that
+calls the functions. Each process is also a global object of the Standards:
+it has its own timeline of marks and measures.
+
+A `PerformanceObserver` gets the marks and the measures of its global object
+when they are made, as the Performance Timeline Standard specifies. The
+observer belongs to the global object of the process that calls `new/1`.
+The callback runs later, in a process of the observer, and gets the entries
+that came before it ran:
+
+```elixir
+use Web
+
+observer =
+  PerformanceObserver.new(fn list, _observer, _options ->
+    for entry <- PerformanceObserverEntryList.get_entries(list) do
+      Console.log(["%s took %f ms", entry.name, entry.duration])
+    end
+
+    # The callback runs with the global object of the observer: this mark
+    # is an entry of the process that made the observer.
+    Performance.mark("reported")
+  end)
+
+PerformanceObserver.observe(observer, entry_types: ["measure"])
+
+Performance.mark("start")
+import_rows()
+Performance.measure("import", "start")
+# => import took 3.305 ms (from the process of the observer)
+
+# Takes the entries that no callback got. No callback gets them after this.
+PerformanceObserver.take_records(observer)
+PerformanceObserver.disconnect(observer)
+```
+
+In the callback, `Performance.mark/2`, `measure/3`, the functions
+`get_entries*` and `clear_*`, and `now/0` act on the global object of the
+observer: its timeline, and its time origin, which is the same for each
+process. The observers of that global object get the entries that the
+callback makes. With `type: "mark", buffered: true`, the observer also gets the marks
+that its global object made before the call. `observe/2` from a different
+process registers the observer in its own global object, not in the calling
+process. The observer stops when its global object stops.
+
+A process keeps its entries in its process dictionary. The callback runs in
+a different process, thus the first observer also puts the timeline in an
+ETS table of a server of the global object. Each process of the global
+object writes its entries to the table itself, and the process of the
+global object keeps reading its own copy: a counter tells it when the
+callback changed the table. Thus `mark/2`, `measure/3`, `get_entries*`, and
+`clear_*` wait for no message, and a read sees each earlier write of the
+same process. A new entry also goes to the server, which gives it to the
+observers. The registry of the entry types gives "mark" and "measure" no
+buffer limit: no entry is dropped, and `dropped_entries_count` is always 0.
 
 Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rclone-style URL support.
 
@@ -348,30 +841,42 @@ Strict WHATWG URL parsing with ordered search params, IDNA host handling, and rc
 # WHATWG-style URL parsing
 url = URL.new("https://user:pass@example.com:8080/p/a/t/h?query=string#hash")
 
-# URLPattern for matching and ambient route param injection
+# URLPattern for matching
 pattern = URLPattern.new(%{pathname: "/users/:id"})
 
-URLPattern.match_context(pattern, "https://example.com/users/42", fn ->
-  # Automatically retrieves captured "id" => "42" from context
-  AsyncContext.Variable.get(URLPattern.params())
-end)
+URLPattern.exec(pattern, "https://example.com/users/42").pathname.groups
+# => %{"id" => "42"}
 ```
 
-Standard containers that handle MIME-aware sniffing and live multipart iteration.
+Standard containers for blobs, files, and forms.
 
 ```elixir
-# MIME-aware blobs sniff generic binaries
-html = Response.new(
-  body: "<!doctype html><html>...",
-  headers: [{"content-type", "application/octet-stream"}]
-)
+# The type of a blob comes from the header `content-type`
+html = Response.new("<!doctype html><html>...", headers: [{"content-type", "text/html"}])
 
 await(Response.blob(html)).type # => "text/html"
+
+# The methods of a blob return promises, as the File API specifies
+blob = Blob.new(["line 1\r\nline 2"], type: "text/plain", endings: "native")
+await(Blob.text(blob)) # => "line 1\nline 2" (on each host but Windows)
 
 # Live FormData iteration with O(1) memory usage
 form = await(Response.form_data(response))
 Enum.to_list(form)
+
+# A form as the body of a request: `multipart/form-data`
+form =
+  FormData.new()
+  |> FormData.append("title", "Report")
+  |> FormData.append("file", File.new(["bytes"], "report.txt", type: "text/plain"))
+
+await(fetch("https://example.com/upload", method: "POST", body: form))
 ```
+
+A `FormData` body is encoded as the HTML Standard specifies, and the header
+`content-type` gets the boundary. The bytes of a file are read from its
+stream chunk by chunk. A form with all its data in memory has a content
+length, and it can be sent again after a redirect.
 
 * * * * *
 
@@ -388,6 +893,176 @@ mix precommit
 # Run the compliance suite directly
 mix test --cover
 ```
+
+### Web Platform Tests in QuickJS
+
+The tests also run the JavaScript files of WPT with no change, in the
+JavaScript engine QuickJS, against the library. QuickJS runs `testharness.js`
+and the test file. A layer makes a JavaScript class for each interface from
+the WebIDL files of WPT, and each method calls the Elixir function of the
+library through a port. The layer converts the values as WebIDL specifies,
+and has no other logic: the library does the work. See
+`test/support/quickjs/bridge.ex`.
+
+The library can call a JavaScript function, for example the `pull` of a
+source, and a promise of the library is a promise in JavaScript. JavaScript
+does the steps of a Standard at once: `read()` calls `pull` before it
+returns. The library does them in other processes. Thus the runner answers a
+call only when all the processes of the run are at rest, and sends the
+settled promises in a fixed sequence. The result of each test is the same in
+each run.
+
+QuickJS is a tool of the tests only. The tests download a pinned release of
+its Cosmopolitan build, one file for Linux, macOS, Windows, and the BSD
+systems, and examine its SHA-256 hash.
+
+| Suite | WPT tests | Pass | The runner lacks a feature | The library differs | The Standard changed the test | Not in the scope of the library |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Headers` | 287 | 121 | 32 | 0 | 0 | 134 |
+| `TextEncoder`, `TextDecoder`, and their streams | 12101 | 11885 | 16 | 0 | 2 | 198 |
+| `URL` and `URLSearchParams` | 4869 | 4867 | 2 | 0 | 0 | 0 |
+| `URLPattern` | 373 | 373 | 0 | 0 | 0 | 0 |
+| The streams, the readers, the writers, and the strategies | 1157 | 1030 | 109 | 1 | 0 | 17 |
+| `CompressionStream` and `DecompressionStream` | 318 | 309 | 1 | 0 | 0 | 8 |
+| `Request`, `Response`, the body, and `data:` URLs | 930 | 709 | 163 | 6 | 2 | 50 |
+| `Blob`, `File`, and `FormData` | 527 | 402 | 51 | 3 | 0 | 71 |
+| `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 71 | 5 | 0 | 0 | 0 |
+| `performance`, its marks and measures, and `PerformanceObserver` | 124 | 99 | 20 | 5 | 0 | 0 |
+
+19866 of 20762 tests pass. The tests that are not in the scope of the library
+use `XMLHttpRequest` or `FileReader`, the guard of the forbidden headers of a
+browser, the shared memory of JavaScript, or the conversion of JavaScript of
+a value to a string. The library will not have them: `Web.fetch/2` and the
+functions of `Web.Blob` replace `XMLHttpRequest` and `FileReader`, and a
+server runtime, such as Node.js and Deno, sends each header that the caller
+gives. A library has no document, thus a blob URL has an opaque origin:
+`blob:null/<UUID>`.
+
+A structure of the library is a value, and an object of JavaScript is a
+reference. Thus the runner keeps one object for a struct that is a field of
+its parent, such as `request.headers` or `url.searchParams`: a change of it
+changes the field of the parent, as in JavaScript. A relative URL of a test
+is relative to the page of the test: the runner gives the URL of the page,
+as a browser gives the base URL of a document.
+
+A test that the runner cannot run needs a feature that the runner does not
+have yet: the server of WPT, the conversion to an async sequence of
+`ReadableStream.from()`, `MessageChannel`, `crypto`, or `structuredClone`.
+The `fetch` of the runner reads a file of WPT next to the test: it does not
+use the signal or the body of the request (30 tests of `fetch/api/abort/`). A
+string of Elixir is UTF-8, thus a lone surrogate of JavaScript cannot come to
+the library. The runner answers a call when the library is at rest. Thus the
+library can do a step before the call returns, where JavaScript does it in a
+later microtask (53 stream tests), and the task of a `PerformanceObserver`
+runs before the call that made the entry returns, where a browser runs it
+after the script (4 tests). The layer calls a callback with no `this` value,
+and makes a new array at each read of a `FrozenArray`. The detail `nil` of an
+entry is `undefined` in JavaScript, where the Standard gives `null`, and a
+JavaScript object goes to the library as a reference, which the library
+cannot clone. The executors of a run act for one global object, as the code
+of one page. A timer of the library runs in real time,
+also while JavaScript runs: the result of a test of `AbortSignal.timeout()`
+can change from run to run, as the result of a test that allows 20 ms
+between two calls. The differences of the library are:
+
+* A body accepts a binary of Elixir as a chunk of bytes. The Standard
+  accepts only a `Uint8Array` (5 tests).
+* A `Request` does not keep the blob of a blob URL: a revoke before the
+  fetch makes the fetch fail (2 tests).
+* The library has no Resource Timing: a fetch makes no "resource" entry,
+  and `performance` has no `setResourceTimingBufferSize()` (5 tests).
+* A view of a byte stream is a `Web.Uint8Array`: the library has no other
+  typed array and no `DataView` (15 tests).
+* `TextEncoderStream` converts a chunk with `String.Chars`, not with the
+  rules of JavaScript: `nil` becomes `""`, not `"undefined"`.
+* With TLS, the `ssl` application of Erlang/OTP ends the connection when the
+  peer closes it. Thus `allow_half_open: true` of `Web.connect/2` keeps the
+  writable side open only for a TCP socket, not for a TLS socket.
+
+The library has two extensions that no Standard has. `Web.fetch/2` also
+takes the scheme `tcp:` and the rclone form `remote:path` (a remote name
+with `_`): a TCP connection to the host and the port, where the request
+body goes to the peer, and the response body has the bytes that the peer
+sends until it closes the connection. The Fetch Standard gives a network
+error for these schemes.
+
+The pinned commit of WPT has two tests of the body of an empty `FormData`
+that disagree with a third test of WPT, with RFC 7578, and with each browser:
+the library gives the close delimiter, as browsers do.
+
+The pinned commit of WPT has two tests of `TextDecoder` that the current
+Encoding Standard changed: after a fatal error, `decode()` starts a new
+decoder. The library follows the current Standard.
+
+`test/wpt/quickjs/expectations/` lists each test that does not pass, with
+the group of its cause. A new failure fails the test, and a listed test that
+passes also fails it: remove it from the list. To write the lists again
+after a change of the library, run:
+
+```shell
+WPT_UPDATE=1 mix test test/wpt/quickjs
+```
+
+### Specifications
+
+The directory `tla/` has TLA+ specifications of the parts where an error is
+easy to make and hard to find with an example test:
+
+| Specification        | Subject                                                    |
+| -------------------- | ---------------------------------------------------------- |
+| `Promise.tla`        | One promise: it settles one time, and it stops.            |
+| `StreamLifetime.tla` | When a stream process stops, and when it must stay.        |
+| `TransformStream.tla` | The backpressure of the two sides, and one finish of the transformer. |
+| `PipeAbort.tla`      | The sink `abort` of a pipe starts before the cancel of the source. |
+| `PublicAbort.tla`    | The listeners of an abort run in the caller, in the sequence of the Standard. |
+| `PipeTo.tla`         | The loop of a pipe: the flow control, the propagation, the shutdown, and the locks. |
+| `PriorityMessages.tla` | A priority message goes before the messages of other senders, never before the messages of its sender. |
+| `TransformLifetime.tla` | A lock of one side of a transform stream keeps the two sides: a side ends only after a handshake with the other side. |
+| `LazyStream.tla`     | The copies of a body in memory share one state: the bytes go out one time, and a copy that stops does not take them. A look at the state changes nothing. |
+| `ByteTee.tla`        | The tee of a byte stream: each read of a branch ends, and no buffer is lost. |
+| `AbortSteps.tla`     | The steps "signal abort": the dependent signals, the algorithms, then the events. |
+| `AbortTimeouts.tla`  | The timeouts of one process abort in their sequence. |
+| `EventTarget.tla`    | The listener steps of each event target, a dispatch, and the lifetime of a target of `EventTarget.new()`. |
+| `FormDataParser.tla` | The live parser of a multipart form: each call gets an answer, and a file part ends. |
+| `AbortSignal.tla`    | Subscriptions, the abort message, and the stop of a signal. |
+| `LazySignal.tla`     | The signal of a request: no process until a listener needs one, one process for all the copies, and the listener of each copy runs at the abort. |
+| `ResponseBody.tla`   | The body that a request holds: all its chunks, or an error. |
+| `ConnectionPool.tla` | The connections of an origin, and the slots of a counting governor: the limit, the queue, and the stops. |
+| `SocketFlow.tla`     | A request reads its socket one message at a time, at the limit. |
+| `SocketClose.tla`    | The close of a socket, the half close, and `startTls()`, as the Sockets API specifies. |
+| `SharedConnection.tla` | HTTP/2 streams: one run of each request, the limit, GOAWAY. |
+| `MessagePort.tla`    | The port message queue, the start, the transfer, and the close. |
+| `BroadcastChannel.tla` | The channels of one name, with a channel that is slow.   |
+| `Disposal.tla`       | The blocks of `using`: each resource is released one time. |
+| `Console.tla`        | The groups, the timers, and the counters of the console.   |
+| `Performance.tla`    | The marks and the measures of a process.                   |
+| `PerformanceObserver.tla` | The timeline of a global object and its observer: the entries of the callback in the same timeline, a read that sees each earlier write of its process, the copy of the global object, an entry that comes to the observer from a buffered `observe` or from its queue step but not from the two, one task at a time, `take_records`, `disconnect`, and the stop of the global object. |
+| `AsyncIteratorHelper.tla` | A helper such as `map` of an async iterator: the results of concurrent calls of `next` in their sequence, the end and the errors, the close of the source, and the permits of `limit`. |
+| `AsyncIteratorConsumer.tla` | A method that consumes an async iterator, such as `find`, with a concurrency argument: the first result, the reads in their sequence, and one close before the promise settles. |
+| `AsyncFlatMap.tla`   | Concurrent calls of `next` on `flat_map`: the reads of the inner iterator at the same time, the results of a sequential run, and the read of the source only after the end of the inner iterator. |
+| `AsyncBuffered.tla`  | `buffered`: the reads ahead, the promises of the calls in the buffer, the reads for the calls with no read, and each permit back. |
+| `SyncIterator.tla`   | The calls of a `Web.Iterator`: one step at a time, and a call of an iterator that runs in its own chain fails and does not wait for itself. |
+
+`mix test` examines each specification with the checker of
+[`accord`](https://github.com/sntran/accord), which is written in Elixir and
+needs no Java. The tests in `test/tla/` also do random operations on the
+real code and on the specification together, and compare the two states
+after each step. Where the real system has steps that a test cannot
+control, such as the frames of an HTTP/2 server, a property test checks the
+properties of the specification on the real code.
+
+Each specification has a constant `Bug`. Each of its values removes one
+rule of the design, and a test makes sure that the checker finds it.
+
+```shell
+# Examine the specifications and run the conformance tests
+mix test test/tla
+```
+
+### Contributing
+
+`CONTRIBUTING.md` gives the rules for a change: the compliance with the Web
+Standards, the TLA+ specifications, the property tests, and the gate.
 
 * * * * *
 

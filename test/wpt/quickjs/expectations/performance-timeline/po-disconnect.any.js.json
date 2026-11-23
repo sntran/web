@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "An observer disconnected after a mark must not have its callback invoked": "runner: the library runs the task of an observer before the call that queued it returns",
+    "Entries queued before disconnect() are not delivered after re-observing": "runner: the library runs the task of an observer before the call that queued it returns"
+  }
+}

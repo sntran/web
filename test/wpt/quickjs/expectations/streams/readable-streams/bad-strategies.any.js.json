@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Readable stream: invalid strategy.size return value": "runner: an error of the library is a new object each time",
+    "Readable stream: invalid strategy.size return value when pulling": "runner: an error of the library is a new object each time"
+  }
+}

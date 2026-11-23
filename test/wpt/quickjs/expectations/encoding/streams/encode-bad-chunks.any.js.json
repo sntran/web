@@ -1,0 +1,9 @@
+{
+  "harness": "OK",
+  "failures": {
+    "a chunk that cannot be converted to a string should error the streams": "scope: the rules of JavaScript to convert a value to a string",
+    "input of type array should be converted correctly to string": "scope: the rules of JavaScript to convert a value to a string",
+    "input of type object should be converted correctly to string": "scope: the rules of JavaScript to convert a value to a string",
+    "input of type undefined should be converted correctly to string": "scope: the rules of JavaScript to convert a value to a string"
+  }
+}

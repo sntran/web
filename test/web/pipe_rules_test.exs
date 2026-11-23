@@ -67,6 +67,11 @@ defmodule Web.PipeRulesTest do
       )
 
     assert_receive {:sink, controller}
+    # The start callback sends the message before it returns: the stream
+    # completes the start after it. A destination that did not start gets
+    # an abort that waits for the start, thus the pipe gets the notice of
+    # the abort steps at once (see "a destination that did not start").
+    eventually(fn -> slots(stream).active_operation != :start end)
     {stream, controller}
   end
 

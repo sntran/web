@@ -6,6 +6,17 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- The constants of the Standards, as functions with no argument:
+  `Web.Event.none/0`, `capturing_phase/0`, `at_target/0`, and
+  `bubbling_phase/0`, the 25 legacy codes of `Web.DOMException`
+  (`index_size_err/0` to `data_clone_err/0`), and
+  `Web.Uint8Array.bytes_per_element/0`.
+- `tla/LazySignal.tla`: the lazy signal of a request, its start by one of
+  the copies, and the sequence of the abort events, with a conformance
+  test. `tla/EventTarget.tla` has the listener steps of each target, with
+  the old behaviors as values of `Bug`.
+- The WPT files `fetch/api/abort/general.any.js` and
+  `fetch/api/abort/request.any.js` run in the runner.
 - The members of the Standards that were missing:
   - `for_each/2` of `Web.Headers`, `Web.URLSearchParams`, and
     `Web.FormData`, and `keys/1`, `values/1`, and `entries/1` where they
@@ -686,6 +697,35 @@ All notable changes to this project are documented in this file.
   - `Web.Performance.mark/2` and `measure/3` ignore an option that they do
     not know. A number as a start or end mark is the name of a mark: give a
     time with `:start` and `:end`.
+- **Breaking:** each `Web.Request` has its own `Web.AbortSignal`, as the
+  Fetch Standard specifies: a new signal that depends on the option
+  `:signal` or on the signal of the input request, and a new dependent
+  signal for `Web.Request.clone/1`. Thus `request.signal` is never `nil`,
+  and it is not the signal of the option: use `aborted?/1`, `reason/1`, or
+  a listener, not `==`. `Web.Request.new(request)` gives a new request. The
+  signal is lazy: it has no process until a listener or `onabort/2` needs
+  one, and each copy of the struct uses the same process. A read of the
+  signal and `Web.fetch/2` start no process. `form_data/1` of a request
+  does not use the signal of the request, as "consume body" specifies. The
+  abort events of the signals that depend on one signal come in the
+  sequence in which the signals were made.
+- **Breaking:** the listener steps of each event target follow the DOM
+  Standard:
+  - `dispatch_event/2` of a `Web.MessagePort` or a `Web.BroadcastChannel`
+    runs the listeners in the calling process, waits for them, and returns
+    `false` when a listener cancels the event.
+  - `dispatch_event/2` raises a `Web.DOMException` with the name
+    `InvalidStateError` for an event that is in a dispatch, or that is not
+    initialized, for example a map `%{type: "x"}` or a struct literal. Make
+    the event with `Web.Event.new/2`, `Web.CustomEvent.new/2`,
+    `Web.MessageEvent.new/2`, or `init_event/4`.
+  - On a port and a channel, `:capture` and `:passive` have their effect, a
+    `once` listener is removed before its call, and a listener that an
+    earlier listener removed does not run.
+    `Web.MessagePort.remove_event_listener/4` and
+    `Web.BroadcastChannel.remove_event_listener/4` take the options.
+  - An option `:signal` that is not a `Web.AbortSignal` raises
+    `Web.TypeError`, also with the callback `nil`.
 - `Web.Blob` follows the File API: the type becomes ASCII lowercase, and a
   type with a character outside U+0020 to U+007E becomes `""`. The functions
   of `Web.Blob` accept a `Web.File`. `Web.Blob.stream/1` is a byte stream,

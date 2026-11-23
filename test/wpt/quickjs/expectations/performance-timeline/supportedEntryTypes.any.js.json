@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "supportedEntryTypes caches result": "runner: a FrozenArray is a new array at each read"
+  }
+}

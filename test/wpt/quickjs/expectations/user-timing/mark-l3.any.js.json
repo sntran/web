@@ -1,0 +1,6 @@
+{
+  "harness": "OK",
+  "failures": {
+    "mark entries' detail and startTime are customizable.": "runner: nil is undefined in JavaScript, and an entry with no detail has null"
+  }
+}

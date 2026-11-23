@@ -27,6 +27,9 @@ defmodule Web.Test.QuickJS.Bridge do
   #     the line `jsSettled` settles.
   #   * A promise of the library goes to JavaScript as a promise. A watcher
   #     process waits for it, and the bridge sends the line `settle`.
+  #   * A process is a global object of the library. For a file that uses
+  #     `performance`, one process of the run is the global object of the
+  #     page, and each executor acts for it: see `page_timeline/1`.
   #
   # All these processes, and the processes that the library starts from
   # them, have the same group leader. Thus the bridge can find them: see
@@ -71,6 +74,8 @@ defmodule Web.Test.QuickJS.Bridge do
   # A member with no function of the library fails with a message that
   # names the missing function.
 
+  alias Web.Internal.PerformanceTimeline
+  alias Web.Performance.Mark, as: PerformanceMark
   alias Web.Platform.Test, as: WPT
   alias Web.Test.QuickJS
 
@@ -83,6 +88,14 @@ defmodule Web.Test.QuickJS.Bridge do
     # A JavaScript object that the library keeps, such as a chunk or an
     # error.
     defstruct [:id]
+  end
+
+  defmodule PerformanceObject do
+    @moduledoc false
+    # The object `performance` of the global object. The functions of
+    # `Web.Performance` act on the timeline of the global object of the
+    # calling process: the object has no state.
+    defstruct []
   end
 
   @interfaces %{
@@ -99,6 +112,14 @@ defmodule Web.Test.QuickJS.Bridge do
     "File" => Web.File,
     "FormData" => Web.FormData,
     "Headers" => Web.Headers,
+    # `performance` is the module `Web.Performance`. An entry is a struct:
+    # the attributes of `PerformanceEntry` are its fields.
+    "Performance" => Web.Performance,
+    "PerformanceEntry" => Web.Performance,
+    "PerformanceMark" => Web.Performance.Mark,
+    "PerformanceMeasure" => Web.Performance.Measure,
+    "PerformanceObserver" => Web.PerformanceObserver,
+    "PerformanceObserverEntryList" => Web.PerformanceObserverEntryList,
     "ReadableByteStreamController" => Web.ReadableByteStreamController,
     "ReadableStream" => Web.ReadableStream,
     "ReadableStreamBYOBReader" => Web.ReadableStreamBYOBReader,
@@ -130,6 +151,8 @@ defmodule Web.Test.QuickJS.Bridge do
   # name is the class string of its prototype.
   @iterators %{"ReadableStream AsyncIterator" => Web.ReadableStreamAsyncIterator}
 
+  @performance_paths ["performance-timeline/", "user-timing/"]
+
   # `testharness.js` makes an `AbortController` for each test when the
   # global has one: two calls of the library for each test. Thus only the
   # tests that use these interfaces get them.
@@ -147,7 +170,15 @@ defmodule Web.Test.QuickJS.Bridge do
       "fetch/api/abort",
       "fetch/api/request",
       "fetch/api/response"
-    ]
+    ],
+    # The tests of the Performance Timeline and of User Timing. Their global
+    # object has `performance`.
+    "Performance" => @performance_paths,
+    "PerformanceEntry" => @performance_paths,
+    "PerformanceMark" => @performance_paths,
+    "PerformanceMeasure" => @performance_paths,
+    "PerformanceObserver" => @performance_paths,
+    "PerformanceObserverEntryList" => @performance_paths
   }
 
   @classes Map.new(Map.merge(@interfaces, @iterators), fn {name, module} -> {module, name} end)
@@ -175,12 +206,15 @@ defmodule Web.Test.QuickJS.Bridge do
     "interfaces/dom.idl",
     "interfaces/encoding.idl",
     "interfaces/fetch.idl",
+    "interfaces/hr-time.idl",
+    "interfaces/performance-timeline.idl",
     # The enumeration `ReferrerPolicy` of the member `referrerPolicy` of
     # `RequestInit`.
     "interfaces/referrer-policy.idl",
     "interfaces/streams.idl",
     "interfaces/url.idl",
     "interfaces/urlpattern.idl",
+    "interfaces/user-timing.idl",
     "interfaces/xhr.idl"
   ]
 
@@ -274,6 +308,7 @@ defmodule Web.Test.QuickJS.Bridge do
     })
 
     init_buffers()
+    put(:timeline, page_timeline(start.exposed))
 
     send_line(start)
 
@@ -292,6 +327,28 @@ defmodule Web.Test.QuickJS.Bridge do
       stop_group(group)
       Process.delete(@state)
       close(port)
+    end
+  end
+
+  # The global object of a file that uses `performance`: a process of the
+  # run, which keeps the timeline of the page. Each executor acts for it, as
+  # the code of one page of JavaScript: see `free_executor/0`.
+  defp page_timeline(exposed) do
+    if "Performance" in exposed do
+      bridge = self()
+      ref = make_ref()
+
+      spawn_in_group(fn ->
+        send(bridge, {ref, PerformanceTimeline.share()})
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+      receive do
+        {^ref, server} -> server
+      end
     end
   end
 
@@ -713,15 +770,21 @@ defmodule Web.Test.QuickJS.Bridge do
         pid
 
       nil ->
-        bridge = self()
-        page = get(:page)
-
-        spawn_in_group(fn ->
-          # The adapters run in the executor: see `absolute/1`.
-          Process.put(@page, page)
-          executor_loop(bridge)
-        end)
+        start_executor()
     end
+  end
+
+  defp start_executor do
+    bridge = self()
+    page = get(:page)
+    timeline = get(:timeline)
+
+    spawn_in_group(fn ->
+      # The adapters run in the executor: see `absolute/1`.
+      Process.put(@page, page)
+      if timeline, do: PerformanceTimeline.enter(timeline)
+      executor_loop(bridge)
+    end)
   end
 
   defp executor_loop(bridge) do
@@ -796,6 +859,10 @@ defmodule Web.Test.QuickJS.Bridge do
 
   defp invoke("static", module, member, _self, args, count),
     do: apply_first(module, candidates(snake(member), [], args, count))
+
+  # A static attribute is a function of the module with no argument.
+  defp invoke("getter", module, member, nil, [], _count),
+    do: apply_first(module, [{snake(member), []}])
 
   defp invoke("getter", module, member, self, [], _count) do
     name = snake(member)
@@ -992,6 +1059,30 @@ defmodule Web.Test.QuickJS.Bridge do
   catch
     :error, reason when not is_exception(reason) -> throw(reason)
   end
+
+  # `performance` of the global object, and its members: the functions of
+  # `Web.Performance` act on the timeline of the global object of the
+  # executor. The dictionaries of options are keyword lists in the library.
+  defp adapt("WindowOrWorkerGlobalScope", "getter", "performance", _self, []),
+    do: {:ok, %PerformanceObject{}}
+
+  defp adapt("Performance", "operation", "mark", _self, [name, options]),
+    do: {:ok, Web.Performance.mark(name, Map.to_list(options))}
+
+  defp adapt("Performance", "operation", "measure", _self, [name, %{} = options | end_mark]),
+    do: {:ok, apply(Web.Performance, :measure, [name, Map.to_list(options) | end_mark])}
+
+  defp adapt("Performance", kind, member, _self, args) when kind in ["operation", "getter"],
+    do: {:ok, apply(Web.Performance, String.to_atom(snake(member)), args)}
+
+  defp adapt("PerformanceEntry", "operation", "toJSON", %module{} = entry, []),
+    do: {:ok, module.to_json(entry)}
+
+  defp adapt("PerformanceMark", "constructor", _member, _self, [name | options]),
+    do: {:ok, PerformanceMark.new(name, options(options))}
+
+  defp adapt("PerformanceObserver", "operation", "observe", self, [options]),
+    do: {:ok, Web.PerformanceObserver.observe(self, Map.to_list(options))}
 
   defp adapt(_interface, _kind, _member, _self, _args), do: :default
 
@@ -1542,6 +1633,9 @@ defmodule Web.Test.QuickJS.Bridge do
 
   defp encode(%Web.Uint8Array{} = view), do: %{"$ab" => encode_buffer(view.buffer, view)}
   defp encode(%Web.ArrayBuffer{} = buffer), do: %{"$ab" => encode_buffer(buffer, nil)}
+
+  defp encode(%PerformanceObject{} = performance),
+    do: %{"$h" => new_handle(performance), "$c" => "Performance", "$i" => 1}
 
   # A struct that refers to a process comes back with the same handle: the
   # layer keeps its object (`$i`).

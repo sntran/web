@@ -835,8 +835,9 @@ systems, and examine its SHA-256 hash.
 | `Request`, `Response`, the body, and `data:` URLs | 930 | 709 | 163 | 6 | 2 | 50 |
 | `Blob`, `File`, and `FormData` | 527 | 402 | 51 | 3 | 0 | 71 |
 | `AbortController`, `AbortSignal`, `Event`, and `EventTarget` | 76 | 71 | 5 | 0 | 0 | 0 |
+| `performance`, its marks and measures, and `PerformanceObserver` | 124 | 99 | 20 | 5 | 0 | 0 |
 
-19767 of 20638 tests pass. The tests that are not in the scope of the library
+19866 of 20762 tests pass. The tests that are not in the scope of the library
 use `XMLHttpRequest` or `FileReader`, the guard of the forbidden headers of a
 browser, the shared memory of JavaScript, or the conversion of JavaScript of
 a value to a string. The library will not have them: `Web.fetch/2` and the
@@ -860,14 +861,24 @@ use the signal or the body of the request (30 tests of `fetch/api/abort/`). A
 string of Elixir is UTF-8, thus a lone surrogate of JavaScript cannot come to
 the library. The runner answers a call when the library is at rest. Thus the
 library can do a step before the call returns, where JavaScript does it in a
-later microtask (53 stream tests). A timer of the library runs in real time,
+later microtask (53 stream tests), and the task of a `PerformanceObserver`
+runs before the call that made the entry returns, where a browser runs it
+after the script (4 tests). The layer calls a callback with no `this` value,
+and makes a new array at each read of a `FrozenArray`. The detail `nil` of an
+entry is `undefined` in JavaScript, where the Standard gives `null`, and a
+JavaScript object goes to the library as a reference, which the library
+cannot clone. The executors of a run act for one global object, as the code
+of one page. A timer of the library runs in real time,
 also while JavaScript runs: the result of a test of `AbortSignal.timeout()`
-can change from run to run. The differences of the library are:
+can change from run to run, as the result of a test that allows 20 ms
+between two calls. The differences of the library are:
 
 * A body accepts a binary of Elixir as a chunk of bytes. The Standard
   accepts only a `Uint8Array` (5 tests).
 * A `Request` does not keep the blob of a blob URL: a revoke before the
   fetch makes the fetch fail (2 tests).
+* The library has no Resource Timing: a fetch makes no "resource" entry,
+  and `performance` has no `setResourceTimingBufferSize()` (5 tests).
 * A view of a byte stream is a `Web.Uint8Array`: the library has no other
   typed array and no `DataView` (15 tests).
 * `TextEncoderStream` converts a chunk with `String.Chars`, not with the

@@ -28,7 +28,8 @@ defmodule Web.Test.QuickJS.WPT do
   @real_time "runner: a timer of the library runs in real time between two statements of JavaScript"
   @slow_calls "runner: each call waits until the library is at rest, and the test allows 200 ms for some calls"
   @deferred_race "runner: a deferred call of the layer and the next statement of JavaScript race"
-  @unstable [@real_time, @slow_calls, @deferred_race]
+  @slow_marks "runner: each call waits until the library is at rest, and the test allows 20 ms between two calls"
+  @unstable [@real_time, @slow_calls, @deferred_race, @slow_marks]
 
   @doc "Runs the WPT file at `path`, and compares the results with the list."
   def check!(path) do
@@ -179,7 +180,68 @@ defmodule Web.Test.QuickJS.WPT do
       {:test, "streams/readable-byte-streams/patched-global.any.js",
        "Patched then() sees byobRequest after filling all pending pull-into descriptors",
        @no_view_type}
-    ] ++ microtask_causes() ++ file_api_dom_causes() ++ fetch_abort_causes() ++ base_causes()
+    ] ++
+      microtask_causes() ++
+      file_api_dom_causes() ++ fetch_abort_causes() ++ performance_causes() ++ base_causes()
+  end
+
+  # The rules of the files of the Performance Timeline and of User Timing.
+  defp performance_causes do
+    observer_task =
+      "runner: the library runs the task of an observer before the call that queued it returns"
+
+    nil_detail = "runner: nil is undefined in JavaScript, and an entry with no detail has null"
+
+    [
+      # These tests allow 20 ms between a mark and the call of `now()` after
+      # it. Each call waits until the processes of the run are at rest: on a
+      # busy machine, the two calls took 60 ms. In a browser, the calls take
+      # no time.
+      {:test, "user-timing/mark.any.js", ~r/^Entry \d+ startTime is approximately correct/,
+       @slow_marks},
+      # The library runs the task of an observer in the callback process of
+      # the global object, after the call that made the entry. The runner
+      # answers a call when the library is at rest: the callback ran then,
+      # before the next statement of JavaScript, with the entries that came
+      # before it. In a browser, the task runs after the script, thus the
+      # next statements can take the entries, or disconnect the observer.
+      {:test, "performance-timeline/po-disconnect.any.js",
+       ~r/^(An observer disconnected after a mark must not have its callback invoked|Entries queued before disconnect\(\) are not delivered after re-observing)$/,
+       observer_task},
+      {:test, "performance-timeline/po-entries-sort.any.js",
+       "getEntries, getEntriesByType, getEntriesByName sort order", observer_task},
+      {:test, "performance-timeline/po-takeRecords.any.js",
+       "Test PerformanceObserver's takeRecords()", observer_task},
+      # The layer calls a JavaScript function with no `this` value. The
+      # Standard gives the observer as the `this` value of its callback.
+      {:test, "performance-timeline/po-observe.any.js",
+       "Check observer callback parameter and this values",
+       "runner: the layer calls a callback with no this value"},
+      # The layer makes a new array at each read of a `FrozenArray`.
+      {:test, "performance-timeline/supportedEntryTypes.any.js",
+       "supportedEntryTypes caches result", "runner: a FrozenArray is a new array at each read"},
+      # An entry with no detail has the detail `nil`: the bridge gives it to
+      # JavaScript as `undefined`. The Standard gives `null`.
+      {:test, "user-timing/mark-l3.any.js",
+       "mark entries' detail and startTime are customizable.", nil_detail},
+      {:test, "user-timing/measure-with-dict.any.js",
+       "measure entries' detail and start/end are customizable", nil_detail},
+      {:test, "user-timing/structured-serialize-detail.any.js",
+       ~r/the detail is not provided, just return a null value/, nil_detail},
+      # A JavaScript object goes to the library as a reference. The library
+      # cannot clone it, and cannot see a `Symbol` in it.
+      {:test, "user-timing/structured-serialize-detail.any.js",
+       ~r/structured-clone|is cloned|cannot be structured-serialized/,
+       "runner: a JavaScript object goes to the library as a reference, which it cannot clone"},
+      # The runner loads the scripts of a test from their files, with no
+      # fetch: the page has no "resource" entry.
+      {:test, "performance-timeline/case-sensitivity.any.js",
+       ~r/^getEntriesBy(Type|Name) values are case sensitive$/,
+       "runner: the scripts of a test load with no fetch, thus with no resource entry"},
+      # The library has no Resource Timing: a fetch makes no "resource"
+      # entry, and `performance` has no `setResourceTimingBufferSize()`.
+      {:path, "performance-timeline/droppedentriescount.any.js", "library: no Resource Timing"}
+    ]
   end
 
   # The rules of the files of `fetch/api/abort/`. The `fetch` of the runner

@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "Entry 0 startTime is approximately correct (up to 20ms difference allowed)": "runner: each call waits until the library is at rest, and the test allows 20 ms between two calls",
+    "Entry 1 startTime is approximately correct (up to 20ms difference allowed)": "runner: each call waits until the library is at rest, and the test allows 20 ms between two calls"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "harness": "OK",
+  "failures": {
+    "getEntriesByName values are case sensitive": "runner: the scripts of a test load with no fetch, thus with no resource entry",
+    "getEntriesByType values are case sensitive": "runner: the scripts of a test load with no fetch, thus with no resource entry"
+  }
+}
